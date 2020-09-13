@@ -5,6 +5,7 @@
 //! All ambient state (`.loot/` home, identity, clock, persistence, working-change
 //! id) is owned by the [`Workspace`]; commands are thin verbs over it.
 
+use loot_cli::emit::{self, Emit, OutFmt};
 use loot_cli::flags::{FlagCheck, FlagSpec};
 use loot_cli::{ferry, render, workspace};
 use loot_core::{
@@ -15,6 +16,7 @@ use render::{
     change_col, delta_line, outcome_rows, render_buoy_human, render_history, short,
     short_change,
 };
+use std::fmt::Write as _;
 use std::process::ExitCode;
 use workspace::{
     GlobalConfig, LaneStatus, SnapshotOpts, StepReport, SweepOutcome, Workspace, LANE_STALE_SECS,
@@ -255,14 +257,6 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Machine-output selector for the reconciliation verbs (CA3, ADR 0023).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OutFmt {
-    Human,
-    Porcelain,
-    Json,
-}
-
 /// True if `name` appears as a bare flag anywhere in `args`.
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
@@ -413,13 +407,8 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         // `new` is capture-then-finalize, so on a dirty tree the old hint signed
         // the edits in one stroke, skipping the review lane (#174). `describe` is
         // the first verb on dirty work; `new` is step 6 (docs/agents/workflow.md).
-        match fmt {
-            OutFmt::Human => {
-                println!("no working change (run `loot describe -m \"<subject>\"` to start one)")
-            }
-            OutFmt::Porcelain => print!("{}", verdict::status_porcelain(None, None, &[])),
-            OutFmt::Json => println!("{}", verdict::status_json(None, None, &[])),
-        }
+        let human = "no working change (run `loot describe -m \"<subject>\"` to start one)\n".to_string();
+        print!("{}", emit::Status { change_id: None, version: None, entries: &[], human }.render(fmt));
         return Ok(());
     };
 
@@ -429,36 +418,33 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let version = if row.empty { None } else { Some(&row.version) };
     let entries: &[(std::path::PathBuf, loot_core::Visibility)] =
         if row.empty { &[] } else { &row.entries };
-    match fmt {
-        OutFmt::Human => {
-            // A working change whose change id has another live version renders
-            // with a trailing `!` here too (S3, ADR 0030).
-            let change = change_col(row.change_id, &ws.divergent_change_ids());
-            if row.empty {
-                println!("working change {change} is empty (no changes since the last `new`)");
-                return Ok(());
-            }
-            println!(
-                "working change {change}  {}  \"{}\"",
-                short(&row.version),
-                row.message
-            );
+
+    // Only the human text re-reads the working tree (`working_delta`, a disk
+    // I/O porcelain/json never paid for pre-#321) — so it is built lazily,
+    // gated on the format that will actually print it (emit.rs's module doc).
+    let human = if matches!(fmt, OutFmt::Human) {
+        // A working change whose change id has another live version renders
+        // with a trailing `!` here too (S3, ADR 0030).
+        let change = change_col(row.change_id, &ws.divergent_change_ids());
+        if row.empty {
+            format!("working change {change} is empty (no changes since the last `new`)\n")
+        } else {
+            let mut out =
+                format!("working change {change}  {}  \"{}\"\n", short(&row.version), row.message);
             // The per-path listing is the delta vs the previous finalized
             // change (#7), rendered through the shared #306 line: `+` new,
             // `M` modified, `-` deleted, visibility token trailing. The base
             // is implicit (the working change's anchor) — no selector here.
             for d in &ws.working_delta()? {
-                println!("{}", delta_line(d));
+                let _ = writeln!(out, "{}", delta_line(d));
             }
+            out
         }
-        // status is not a merge: its own working-change shape (ADR 0023/0029).
-        OutFmt::Porcelain => {
-            print!("{}", verdict::status_porcelain(row.change_id, version, entries))
-        }
-        OutFmt::Json => {
-            println!("{}", verdict::status_json(row.change_id, version, entries))
-        }
-    }
+    } else {
+        String::new()
+    };
+    // status is not a merge: its own working-change shape (ADR 0023/0029).
+    print!("{}", emit::Status { change_id: row.change_id, version, entries, human }.render(fmt));
     Ok(())
 }
 
@@ -883,26 +869,22 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
     let newly_captured = captured.filter(|_| !had_working);
     let outcomes = ws.apply_bundle(bytes)?;
 
-    match fmt {
-        OutFmt::Human => {
-            if let Some(id) = &newly_captured {
-                println!(
-                    "captured working change {} (uncaptured edits) before applying",
-                    loot_core::hex::short(&id.0, 4)
-                );
-            }
-            if outcomes.is_empty() {
-                println!("applied {infile}: nothing new (already up to date)");
-            } else {
-                println!("applied {infile} as {identity}:");
-                print!("{}", outcome_rows(&outcomes));
-                println!("run `loot surface` to materialize what you may see");
-            }
-        }
-        // Machine output: just the verdict rows, no prose (empty -> no lines).
-        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
-        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
+    let mut human = String::new();
+    if let Some(id) = &newly_captured {
+        let _ = writeln!(
+            human,
+            "captured working change {} (uncaptured edits) before applying",
+            loot_core::hex::short(&id.0, 4)
+        );
     }
+    if outcomes.is_empty() {
+        let _ = writeln!(human, "applied {infile}: nothing new (already up to date)");
+    } else {
+        let _ = writeln!(human, "applied {infile} as {identity}:");
+        human.push_str(&outcome_rows(&outcomes));
+        let _ = writeln!(human, "run `loot surface` to materialize what you may see");
+    }
+    print!("{}", emit::Reconciliation { verdicts: verdicts_of(&outcomes), human }.render(fmt));
     // Capture-first can create a working change even when the bundle brought
     // nothing new (#219); record the op so that view change is undoable too.
     if !outcomes.is_empty() || newly_captured.is_some() {
@@ -922,28 +904,24 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let report = ferry::run(&mut ws, git_dir, dock, with_wip)?;
 
-    match fmt {
-        OutFmt::Human => {
-            for note in &report.notes {
-                println!("note: {note}");
-            }
-            if report.ingested == 0 && report.projected == 0 && report.outcomes.is_empty() {
-                println!("ferry: up to date (nothing to ingest or project)");
-            } else {
-                println!(
-                    "ferry: ingested {} git commit(s), projected {} loot change(s)",
-                    report.ingested, report.projected
-                );
-                print!("{}", outcome_rows(&report.outcomes));
-            }
-            if let Some(line) = &report.review {
-                println!("{line}");
-            }
-        }
-        // Machine output: the merge verdict rows only (empty -> no lines).
-        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&report.outcomes))),
-        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&report.outcomes))),
+    let mut human = String::new();
+    for note in &report.notes {
+        let _ = writeln!(human, "note: {note}");
     }
+    if report.ingested == 0 && report.projected == 0 && report.outcomes.is_empty() {
+        let _ = writeln!(human, "ferry: up to date (nothing to ingest or project)");
+    } else {
+        let _ = writeln!(
+            human,
+            "ferry: ingested {} git commit(s), projected {} loot change(s)",
+            report.ingested, report.projected
+        );
+        human.push_str(&outcome_rows(&report.outcomes));
+    }
+    if let Some(line) = &report.review {
+        let _ = writeln!(human, "{line}");
+    }
+    print!("{}", emit::Reconciliation { verdicts: verdicts_of(&report.outcomes), human }.render(fmt));
     if report.ingested > 0 || report.projected > 0 || !report.outcomes.is_empty() {
         ws.record_op(
             "ferry",
@@ -1351,29 +1329,30 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             let mut ws = Workspace::open()?;
             let spawned = ws.spawn_lane_as(name, at.as_deref(), handle.as_deref())?;
             ws.record_op("lane new", &format!("spawn lane {}", spawned.id), false);
-            if !matches!(fmt, OutFmt::Human) {
-                // One row, the `loot lanes` shape — an agent wrapper parses the
-                // same columns whether it spawned or listed.
-                let rows = lane_rows(&ws, |s| s.entry.id == spawned.id);
-                match fmt {
-                    OutFmt::Porcelain => print!("{}", verdict::lanes_porcelain(&rows)),
-                    OutFmt::Json => println!("{}", verdict::lanes_json(&rows)),
-                    OutFmt::Human => unreachable!(),
-                }
-                return Ok(());
-            }
-            println!(
-                "lane '{}' at {} — sealed over this repo's store, born at the finalized tip",
+            // One row, the `loot lanes` shape — an agent wrapper parses the same
+            // columns whether it spawned or listed. Computed unconditionally
+            // (like `cmd_lane_list`'s own rows): it's a cheap, side-effect-free
+            // registry read, so there is no format-gated cost to avoid here the
+            // way `status`'s disk re-read has one.
+            let rows = lane_rows(&ws, |s| s.entry.id == spawned.id);
+            let mut human = format!(
+                "lane '{}' at {} — sealed over this repo's store, born at the finalized tip\n",
                 spawned.id,
                 spawned.dir.display()
             );
             match name {
-                Some(n) => println!("  named '{n}' — persists until `loot lane rm {n}`"),
-                None => println!(
-                    "  ephemeral — `loot lane gc` reaps it once it lands or goes stale; \
-                     `loot lane name <n>` (inside it) keeps it"
-                ),
+                Some(n) => {
+                    let _ = writeln!(human, "  named '{n}' — persists until `loot lane rm {n}`");
+                }
+                None => {
+                    let _ = writeln!(
+                        human,
+                        "  ephemeral — `loot lane gc` reaps it once it lands or goes stale; \
+                         `loot lane name <n>` (inside it) keeps it"
+                    );
+                }
             }
+            print!("{}", emit::Lanes { rows, human }.render(fmt));
             Ok(())
         }
         // Full `args` (not `args[1..]`): `out_fmt` only reads flags, and bare
@@ -1443,56 +1422,47 @@ fn cmd_lane_list(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     let ws = Workspace::open()?;
     let rows = lane_rows(&ws, |_| true);
-    match fmt {
-        OutFmt::Human => {
-            if rows.is_empty() {
-                println!("no lanes  (spawn one with `loot lane new`)");
-                return Ok(());
+    let mut human = String::new();
+    if rows.is_empty() {
+        let _ = writeln!(human, "no lanes  (spawn one with `loot lane new`)");
+    } else {
+        for r in &rows {
+            let name = r.name.clone().unwrap_or_else(|| "(unnamed)".to_string());
+            let tip = r.tip.as_ref().map(short).unwrap_or_else(|| "-".to_string());
+            let mut notes = Vec::new();
+            let pr_note;
+            if let Some(pr) = r.pr {
+                pr_note = format!("PR #{pr}");
+                notes.push(pr_note.as_str());
             }
-            for r in &rows {
-                let name = r.name.clone().unwrap_or_else(|| "(unnamed)".to_string());
-                let tip = r.tip.as_ref().map(short).unwrap_or_else(|| "-".to_string());
-                let mut notes = Vec::new();
-                let pr_note;
-                if let Some(pr) = r.pr {
-                    pr_note = format!("PR #{pr}");
-                    notes.push(pr_note.as_str());
-                }
-                match r.dirty {
-                    Some(true) => notes.push("dirty"),
-                    Some(false) => {}
-                    None => notes.push("unreadable"),
-                }
-                if r.landed {
-                    notes.push("landed");
-                }
-                if r.stale {
-                    notes.push("stale");
-                }
-                let notes = if notes.is_empty() {
-                    String::new()
-                } else {
-                    format!("  [{}]", notes.join(", "))
-                };
-                println!(
-                    "{:<16} {:<16} {}  tip {tip}  (heartbeat {}){notes}",
-                    r.id,
-                    name,
-                    r.path.display(),
-                    fmt_age(r.heartbeat_age)
-                );
+            match r.dirty {
+                Some(true) => notes.push("dirty"),
+                Some(false) => {}
+                None => notes.push("unreadable"),
             }
-            Ok(())
-        }
-        OutFmt::Porcelain => {
-            print!("{}", verdict::lanes_porcelain(&rows));
-            Ok(())
-        }
-        OutFmt::Json => {
-            println!("{}", verdict::lanes_json(&rows));
-            Ok(())
+            if r.landed {
+                notes.push("landed");
+            }
+            if r.stale {
+                notes.push("stale");
+            }
+            let notes = if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", notes.join(", "))
+            };
+            let _ = writeln!(
+                human,
+                "{:<16} {:<16} {}  tip {tip}  (heartbeat {}){notes}",
+                r.id,
+                name,
+                r.path.display(),
+                fmt_age(r.heartbeat_age)
+            );
         }
     }
+    print!("{}", emit::Lanes { rows, human }.render(fmt));
+    Ok(())
 }
 
 /// [`LaneStatus`] → the encoder rows, deriving the presentation-side facts
@@ -1544,28 +1514,24 @@ fn cmd_lane_merge(key: &str, args: &[String]) -> Result<(), String> {
         ws.record_op("lane merge", &format!("merge {source} → {current}"), false);
     }
 
-    match fmt {
-        OutFmt::Human => {
-            if outcomes.is_empty() {
-                println!("merge lane '{source}' → '{current}': already up to date");
-                return Ok(());
-            }
-            println!("merged lane '{source}' into '{current}':");
-            print!("{}", outcome_rows(&outcomes));
-            let conflicts = outcomes
-                .values()
-                .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
-                .count();
-            if conflicts > 0 {
-                println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances the primary's tip");
-            } else {
-                println!("merge committed as the primary's tip; run `loot log` to see it");
-            }
+    let human = if outcomes.is_empty() {
+        format!("merge lane '{source}' → '{current}': already up to date\n")
+    } else {
+        let mut out = format!("merged lane '{source}' into '{current}':\n");
+        out.push_str(&outcome_rows(&outcomes));
+        let conflicts =
+            outcomes.values().filter(|o| matches!(o, MergeOutcome::Conflict { .. })).count();
+        if conflicts > 0 {
+            let _ = writeln!(
+                out,
+                "resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances the primary's tip"
+            );
+        } else {
+            let _ = writeln!(out, "merge committed as the primary's tip; run `loot log` to see it");
         }
-        // Machine output: the merge verdict rows only, no prose (empty -> no lines).
-        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
-        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
-    }
+        out
+    };
+    print!("{}", emit::Reconciliation { verdicts: verdicts_of(&outcomes), human }.render(fmt));
     Ok(())
 }
 
@@ -1679,38 +1645,20 @@ fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
     }
 
     // The machine shapes (porcelain/JSON) are the frozen ADR 0025 contract and
-    // encode in loot_core::verdict::BuoyVerdict — one tested home beside the
-    // reconciliation shapes. Human rendering stays here (it needs the peer
-    // registry for attester names). `None`'s porcelain is deliberately empty:
-    // the exit code carries that outcome.
-    use loot_core::verdict::BuoyVerdict;
+    // encode via `emit::Buoy` (which wraps loot_core::verdict::BuoyVerdict) —
+    // one tested home beside the reconciliation shapes. Human rendering is
+    // built here (it needs the peer registry for attester names, kept out of
+    // `emit`/`verdict` by design, R5 #181) and handed in pre-rendered, same as
+    // every other shape's `human` field. `None`'s porcelain is deliberately
+    // empty: the exit code carries that outcome.
     let exit = match &result {
         loot_core::buoy::BuoyResult::Resolved { .. } => ExitCode::SUCCESS,
         loot_core::buoy::BuoyResult::Ambiguous { .. } => ExitCode::from(3),
         loot_core::buoy::BuoyResult::None => ExitCode::from(2),
     };
-    match fmt {
-        OutFmt::Human => {
-            let name_of = |pk: &[u8; 32]| resolve_pubkey_name(&reg, pk);
-            print!("{}", render_buoy_human(&result, role, &name_of));
-        }
-        OutFmt::Porcelain | OutFmt::Json => {
-            let v = match result {
-                loot_core::buoy::BuoyResult::Resolved { change, attesters } => {
-                    BuoyVerdict::Resolved { role: role.to_string(), change, attesters }
-                }
-                loot_core::buoy::BuoyResult::Ambiguous { candidates } => BuoyVerdict::Ambiguous {
-                    role: role.to_string(),
-                    candidates: candidates.into_iter().map(|c| (c.change, c.attesters)).collect(),
-                },
-                loot_core::buoy::BuoyResult::None => BuoyVerdict::None { role: role.to_string() },
-            };
-            match fmt {
-                OutFmt::Porcelain => print!("{}", v.porcelain()),
-                _ => println!("{}", v.json()),
-            }
-        }
-    }
+    let name_of = |pk: &[u8; 32]| resolve_pubkey_name(&reg, pk);
+    let human = render_buoy_human(&result, role, &name_of);
+    print!("{}", emit::Buoy::new(result, role, human).render(fmt));
     Ok(exit)
 }
 
@@ -1729,22 +1677,18 @@ fn cmd_conflicts(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     let ws = Workspace::open()?;
     let conflicts = ws.conflicts();
-    match fmt {
-        OutFmt::Human => {
-            if conflicts.is_empty() {
-                println!("no conflicts");
-                return Ok(());
-            }
-            for (path, (our_oid, their_oid)) in conflicts {
-                println!("conflict at {}", path.display());
-                println!("  ours:   {}", short(our_oid));
-                println!("  theirs: {}", short(their_oid));
-            }
+    let mut human = String::new();
+    if conflicts.is_empty() {
+        let _ = writeln!(human, "no conflicts");
+    } else {
+        for (path, (our_oid, their_oid)) in conflicts {
+            let _ = writeln!(human, "conflict at {}", path.display());
+            let _ = writeln!(human, "  ours:   {}", short(our_oid));
+            let _ = writeln!(human, "  theirs: {}", short(their_oid));
         }
-        // Every recorded conflict is a `C` row (ADR 0023); empty -> no lines.
-        OutFmt::Porcelain => print!("{}", verdict::porcelain(&conflict_verdicts(conflicts))),
-        OutFmt::Json => println!("{}", verdict::json(&conflict_verdicts(conflicts))),
     }
+    // Every recorded conflict is a `C` row (ADR 0023); empty -> no lines.
+    print!("{}", emit::Reconciliation { verdicts: conflict_verdicts(conflicts), human }.render(fmt));
     Ok(())
 }
 
@@ -2324,32 +2268,36 @@ fn run_pull(
     let report = ws.pull_via(transport)?;
     let outcomes = &report.outcomes;
 
-    match fmt {
-        OutFmt::Human => {
-            if outcomes.is_empty() && report.deferred.is_none() {
-                println!("pulled from {url}: nothing new (already up to date)");
-            } else {
-                println!("pulled from {url} as {identity}:");
-                print!("{}", outcome_rows(outcomes));
-                match &report.deferred {
-                    // Capture-first (#219): a dirty tree was captured, so the
-                    // freshly ingested heads are left flat this pass.
-                    Some(id) => println!(
-                        "captured working change {}; heads left unconverged — finalize \
-                         (`loot new`) then re-run `loot pull` to converge",
-                        loot_core::hex::short(&id.0, 4)
-                    ),
-                    None if no_surface => println!(
-                        "converged onto one line; run `loot surface` to materialize what you may see"
-                    ),
-                    None => println!("converged onto one line:"),
-                }
+    let human = if outcomes.is_empty() && report.deferred.is_none() {
+        format!("pulled from {url}: nothing new (already up to date)\n")
+    } else {
+        let mut out = format!("pulled from {url} as {identity}:\n");
+        out.push_str(&outcome_rows(outcomes));
+        match &report.deferred {
+            // Capture-first (#219): a dirty tree was captured, so the
+            // freshly ingested heads are left flat this pass.
+            Some(id) => {
+                let _ = writeln!(
+                    out,
+                    "captured working change {}; heads left unconverged — finalize \
+                     (`loot new`) then re-run `loot pull` to converge",
+                    loot_core::hex::short(&id.0, 4)
+                );
+            }
+            None if no_surface => {
+                let _ = writeln!(
+                    out,
+                    "converged onto one line; run `loot surface` to materialize what you may see"
+                );
+            }
+            None => {
+                let _ = writeln!(out, "converged onto one line:");
             }
         }
-        // Machine output: the merge verdict rows only, no prose (empty -> no lines).
-        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(outcomes))),
-        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(outcomes))),
-    }
+        out
+    };
+    // Machine output: the merge verdict rows only, no prose (empty -> no lines).
+    print!("{}", emit::Reconciliation { verdicts: verdicts_of(outcomes), human }.render(fmt));
     if !outcomes.is_empty() || report.deferred.is_some() {
         ws.record_op("pull", &format!("pull from {url} ({} path(s))", outcomes.len()), false);
     }
