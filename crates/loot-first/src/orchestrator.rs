@@ -322,13 +322,16 @@ pub enum Gate {
     Refuse(String),
 }
 
-/// The auto-minted message `loot resolve` gives the change it creates when a
-/// same-path conflict bounces a land (`crates/loot-core/src/engine.rs`:
-/// `format!("resolve conflict at {}", path.display())`). [`land_gate`] refuses
-/// to finalize a working change still carrying it (#316) — landing it
-/// verbatim would publish the placeholder as git main's permanent commit
-/// subject instead of the change's real described subject. Kept local rather
-/// than shared from loot-core to avoid a cross-crate string coupling; if
+/// The *fallback* message `loot resolve` gives the change it creates when a
+/// same-path conflict bounces a land and no ours-line subject was derivable
+/// (`crates/loot-core/src/engine.rs`, `RESOLVE_FALLBACK_PREFIX`). Since #337
+/// a resolution normally inherits the landed change's subject with a
+/// `(conflict resolution: <path>)` suffix, so this prefix only ever surfaces
+/// on the pre-dock flow or a subject-less line. [`land_gate`] still refuses
+/// to finalize a working change carrying it (#316) — landing it verbatim
+/// would publish the placeholder as git main's permanent commit subject
+/// instead of the change's real described subject. Kept local rather than
+/// shared from loot-core to avoid a cross-crate string coupling; if
 /// engine.rs's format ever changes, this prefix needs to follow it.
 const RESOLVE_PLACEHOLDER_PREFIX: &str = "resolve conflict at ";
 
