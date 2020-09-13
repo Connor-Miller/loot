@@ -33,6 +33,10 @@ fn main() -> ExitCode {
             print_help();
             Ok(())
         }
+        "-V" | "--version" => {
+            println!("{}", version_line());
+            Ok(())
+        }
         other => match COMMANDS.iter().find(|(name, _)| *name == other) {
             Some((_, run)) => run(rest),
             None => Err(format!("unknown command '{other}'\n\n{USAGE}")),
@@ -156,10 +160,22 @@ usage:
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
 first (ADR 0030) — no manual `loot status` needed. Two globals ride any of them:
   --allow-demote <path>   permit this snapshot to re-seal <path> more readably (repeatable)
-  --no-snapshot           act on the last recorded working change; skip the implicit capture";
+  --no-snapshot           act on the last recorded working change; skip the implicit capture
+
+info flags (no repo needed):
+  -h, --help              show this usage
+  -V, --version           print the loot version and exit";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
+}
+
+/// The `loot X.Y.Z` line printed by `loot --version` / `-V` (#237). The version
+/// is the loot-cli crate version — the shipped binary — read straight from Cargo
+/// at compile time, so a cargo-dist release tag and the binary's self-report
+/// cannot drift.
+fn version_line() -> String {
+    format!("loot {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -2146,6 +2162,21 @@ mod tests {
             documented, dispatched,
             "usage text and the COMMANDS dispatch table disagree on the verb set"
         );
+    }
+
+    /// #237: the shipped `loot` binary must report its own version so a
+    /// cargo-dist release tag and the one-liner-installed binary can't drift.
+    /// The line is wired straight from the crate version, not a hand-kept string.
+    #[test]
+    fn version_line_reports_the_crate_version() {
+        // `loot <semver>` — a bin name and a dotted, non-empty version tail so the
+        // Install page's post-install check has something to match. We assert the
+        // shape, not the literal number, so a version bump doesn't break the test.
+        let line = version_line();
+        assert!(line.starts_with("loot "));
+        let ver = line.split(' ').nth(1).unwrap();
+        assert!(!ver.is_empty() && ver.contains('.'), "expected a semver tail, got {ver:?}");
+        assert!(ver.chars().next().is_some_and(|c| c.is_ascii_digit()), "semver starts with a digit");
     }
 
     #[test]
