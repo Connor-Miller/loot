@@ -37,6 +37,18 @@
 //! so the layout has one documented home, and owns the read/write of the small
 //! process files (`working`, `tree-hash`) whose on-disk encoding is otherwise
 //! inlined in the Workspace.
+//!
+//! **Two roots (ADR 0034).** A RepoStore names paths under *two* directories:
+//! the shared store root (`objects/`, `graph`, keyring, config, `git-mirror/`,
+//! the `lanes/` registry — everything with one writer or append-only
+//! discipline) and the **lane root**, which holds this position's private
+//! mutable state (`working`, `working-change`, `tree-hash`, `next-change`,
+//! `tip`, `heads`, `ops`, `abandoned`, `conflicts`, and the dock pointer/dirs).
+//! For the primary directory — lane #0 — the two roots are the same `.loot/`,
+//! so a repo that never spawns a lane is byte-for-byte unchanged on disk. A
+//! spawned lane's `.loot/` is a *directory* containing a `store` pointer at the
+//! shared root plus every lane-owned file; no mutable file ever has two
+//! writers.
 
 use crate::Oid;
 use std::path::{Path, PathBuf};
@@ -71,24 +83,48 @@ const OBJECTS: &str = "objects";
 const ID: &str = "id";
 const ID_PUB: &str = "id.pub";
 const PEERS: &str = "peers";
+const STORE_POINTER: &str = "store";
+const LANE_ID: &str = "lane-id";
+const LANES: &str = "lanes";
+const LANE_PATH: &str = "path";
+const LANE_NAME: &str = "name";
+const LANE_HEARTBEAT: &str = "heartbeat";
+const LANE_LANDED: &str = "landed";
 
 /// Names every artifact under a repo's `.loot/` directory. Cheap to construct
-/// (`new` just stores the directory), so callers that only have the `.loot`
+/// (`new` just stores the directories), so callers that only have the `.loot`
 /// path can wrap it on demand.
 #[derive(Clone, Debug)]
 pub struct RepoStore {
+    /// The shared store root: append-only / single-writer artifacts.
     dot: PathBuf,
+    /// The lane root holding this position's private mutable state (ADR 0034).
+    /// Equal to `dot` for the primary directory (lane #0).
+    lane: PathBuf,
 }
 
 impl RepoStore {
-    /// Wrap a repo's `.loot/` directory.
+    /// Wrap a repo's `.loot/` directory (the primary: store and lane roots
+    /// coincide, the pre-lane on-disk shape).
     pub fn new(dot: impl Into<PathBuf>) -> Self {
-        Self { dot: dot.into() }
+        let dot = dot.into();
+        Self { lane: dot.clone(), dot }
     }
 
-    /// The `.loot/` directory itself.
+    /// Wrap a spawned lane: `dot` is the shared store's `.loot/`, `lane` the
+    /// lane's own `.loot/` directory carrying every lane-owned file (ADR 0034).
+    pub fn for_lane(dot: impl Into<PathBuf>, lane: impl Into<PathBuf>) -> Self {
+        Self { dot: dot.into(), lane: lane.into() }
+    }
+
+    /// The shared store's `.loot/` directory.
     pub fn dot(&self) -> &Path {
         &self.dot
+    }
+
+    /// Whether this store views the repo through a spawned lane (distinct roots).
+    pub fn is_lane(&self) -> bool {
+        self.dot != self.lane
     }
 
     // --- engine-owned artifacts ---
@@ -99,7 +135,9 @@ impl RepoStore {
     pub fn escrow(&self) -> PathBuf { self.dot.join(ESCROW) }
     pub fn manifest(&self) -> PathBuf { self.dot.join(MANIFEST) }
     pub fn purges(&self) -> PathBuf { self.dot.join(PURGES) }
-    pub fn conflicts(&self) -> PathBuf { self.dot.join(CONFLICTS) }
+    /// Unresolved merge conflicts — positional view state, so lane-owned
+    /// (ADR 0034): one lane's half-finished merge never blocks another.
+    pub fn conflicts(&self) -> PathBuf { self.lane.join(CONFLICTS) }
     pub fn attestations(&self) -> PathBuf { self.dot.join(ATTESTATIONS) }
 
     // --- Workspace-owned process artifacts (per-dock, ADR 0022) ---
@@ -109,12 +147,14 @@ impl RepoStore {
     // the ambient-dock pointer are repo-wide, not per-dock.
     pub fn config(&self) -> PathBuf { self.dot.join(CONFIG) }
 
-    /// Directory a dock's process files live in: the repo root for home, else
-    /// `.loot/docks/<name>/`.
+    /// Directory a dock's process files live in: the lane root for home, else
+    /// `<lane root>/docks/<name>/`. Dock state is positional, so it is
+    /// lane-owned (ADR 0034) — on the primary the lane root is `.loot/` itself,
+    /// the unchanged pre-lane shape.
     fn dock_dir(&self, dock: Option<&str>) -> PathBuf {
         match dock {
-            None => self.dot.clone(),
-            Some(name) => self.dot.join(DOCKS).join(name),
+            None => self.lane.clone(),
+            Some(name) => self.lane.join(DOCKS).join(name),
         }
     }
 
@@ -125,8 +165,9 @@ impl RepoStore {
 
     /// The ambient-dock pointer: names the dock this workspace is currently on.
     /// Absent (or `home`) means the home dock — so pre-dock repos read as home.
-    pub fn dock_pointer(&self) -> PathBuf { self.dot.join(DOCK) }
-    pub fn docks_dir(&self) -> PathBuf { self.dot.join(DOCKS) }
+    /// Positional, so lane-owned.
+    pub fn dock_pointer(&self) -> PathBuf { self.lane.join(DOCK) }
+    pub fn docks_dir(&self) -> PathBuf { self.lane.join(DOCKS) }
 
     // --- loot-identity-owned artifacts (named here; written there) ---
     pub fn id(&self) -> PathBuf { self.dot.join(ID) }
@@ -144,22 +185,24 @@ impl RepoStore {
     pub fn git_allowed_signers(&self) -> PathBuf { self.git_mirror_dir().join("allowed-signers") }
     pub fn git_config(&self) -> PathBuf { self.git_mirror_dir().join("config") }
     pub fn git_wip(&self) -> PathBuf { self.git_mirror_dir().join("wip") }
+    pub fn git_pr_map(&self) -> PathBuf { self.git_mirror_dir().join("pr-map") }
 
     // --- operation log (S4, ADR 0031) ---
     //
-    // Local-only, repo-wide, append-only history of view-changing operations
-    // backing `loot undo` / `loot op`. Like `keyring`/`escrow`/the git mark map
-    // it is per-machine and **never enters a bundle** — losing it loses undo
-    // history, not repo data.
-    pub fn ops(&self) -> PathBuf { self.dot.join(OPS) }
+    // Local-only, append-only history of view-changing operations backing
+    // `loot undo` / `loot op`. Like `keyring`/`escrow`/the git mark map it is
+    // per-machine and **never enters a bundle** — losing it loses undo
+    // history, not repo data. Lane-owned (ADR 0034): a lane's op views can
+    // only capture per-lane state, so undo in one lane cannot rewind another.
+    pub fn ops(&self) -> PathBuf { self.lane.join(OPS) }
 
     // --- divergent-change abandonment (S3, ADR 0029/0030) ---
     //
     // Local-only set of **abandoned version ids** — versions dropped from a
     // divergent change by `loot abandon`. A view-level filter (never deletes the
     // node from the graph or object store), captured by the oplog so abandon is
-    // undoable. Never bundled, like `ops`/the git marks.
-    pub fn abandoned(&self) -> PathBuf { self.dot.join(ABANDONED) }
+    // undoable. Never bundled, like `ops`/the git marks. Lane-owned (ADR 0034).
+    pub fn abandoned(&self) -> PathBuf { self.lane.join(ABANDONED) }
 
     /// The set of abandoned version ids (each 32 raw bytes), or empty if none.
     /// A malformed/short file reads as empty (best-effort; the oplog can rebuild).
@@ -316,9 +359,12 @@ impl RepoStore {
     // (`working-change`) persist beside the shared graph, like git's per-worktree
     // HEAD. The engine writes both on `save` and reads them on `load`; a repo with
     // no `heads` file predates this and derives its tips from the whole graph.
+    // Both are lane-owned (ADR 0034): each lane's `heads` is its own view
+    // frontier, and its unsigned working change never leaves the lane — that is
+    // the seal. Only signed changes enter the shared graph, at finalize.
 
-    pub fn heads(&self) -> PathBuf { self.dot.join(HEADS) }
-    pub fn working_change(&self) -> PathBuf { self.dot.join(WORKING_CHANGE) }
+    pub fn heads(&self) -> PathBuf { self.lane.join(HEADS) }
+    pub fn working_change(&self) -> PathBuf { self.lane.join(WORKING_CHANGE) }
 
     /// This dock's lineage tips, or `None` for a legacy repo with no `heads` file
     /// (the loader then derives them from the whole graph). An empty or malformed
@@ -365,6 +411,151 @@ impl RepoStore {
             }
         }
     }
+
+    // --- lane pointer + registry (ADR 0034, #231) ---
+    //
+    // A spawned lane's `.loot/` directory carries a `store` file (the absolute
+    // path of the shared store's `.loot/`) and a `lane-id` file (its registry
+    // entry's id). The shared store carries one registry entry directory per
+    // live lane at `.loot/lanes/<id>/` — `path` (the lane's working directory),
+    // `name` (present iff the lane was promoted to a dock), `heartbeat` (unix
+    // seconds, rewritten on every workspace open from the lane), and `landed`
+    // (a marker the land path writes so the gc-sweep can reap without a stale
+    // wait). Writer discipline is per-entry single-writer: each entry is
+    // written only by its own lane; the reaper is the only deleter. The
+    // registry is deliberately **not** captured by the op log — an undo in one
+    // lane must never rewind another lane's entry.
+
+    /// The shared-store path a lane's `.loot/` directory points at, if `dot`
+    /// is one (it contains a `store` pointer file). The primary's `.loot/` has
+    /// no pointer and reads as `None`.
+    pub fn read_store_pointer(dot: &Path) -> Option<PathBuf> {
+        read_trimmed(&dot.join(STORE_POINTER)).map(PathBuf::from)
+    }
+
+    /// Stamp a fresh lane `.loot/` directory: the `store` pointer at the shared
+    /// root and the lane's registry id. Creates the directory.
+    pub fn write_lane_pointer(dot: &Path, shared: &Path, id: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dot)?;
+        std::fs::write(dot.join(STORE_POINTER), shared.display().to_string())?;
+        std::fs::write(dot.join(LANE_ID), id)
+    }
+
+    /// The registry id recorded in a lane's `.loot/` directory, if present.
+    pub fn read_lane_id(dot: &Path) -> Option<String> {
+        read_trimmed(&dot.join(LANE_ID))
+    }
+
+    pub fn lanes_dir(&self) -> PathBuf { self.dot.join(LANES) }
+    pub fn lane_entry_dir(&self, id: &str) -> PathBuf { self.lanes_dir().join(id) }
+
+    /// Whether a registry entry exists for `id`.
+    pub fn lane_entry_exists(&self, id: &str) -> bool {
+        self.lane_entry_dir(id).is_dir()
+    }
+
+    /// Register a spawned lane: its working-directory path, its dock-name if it
+    /// was born named, and a first heartbeat.
+    pub fn create_lane_entry(
+        &self,
+        id: &str,
+        path: &Path,
+        name: Option<&str>,
+        now: u64,
+    ) -> std::io::Result<()> {
+        let dir = self.lane_entry_dir(id);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(LANE_PATH), path.display().to_string())?;
+        if let Some(n) = name {
+            std::fs::write(dir.join(LANE_NAME), n)?;
+        }
+        std::fs::write(dir.join(LANE_HEARTBEAT), now.to_string())
+    }
+
+    /// The registry entry for `id`, or `None` if absent/malformed (no `path`).
+    pub fn read_lane_entry(&self, id: &str) -> Option<LaneEntry> {
+        let dir = self.lane_entry_dir(id);
+        let path = std::fs::read_to_string(dir.join(LANE_PATH)).ok()?;
+        let name = std::fs::read_to_string(dir.join(LANE_NAME))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let heartbeat = std::fs::read_to_string(dir.join(LANE_HEARTBEAT))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let landed = dir.join(LANE_LANDED).exists();
+        Some(LaneEntry {
+            id: id.to_string(),
+            path: PathBuf::from(path.trim()),
+            name,
+            heartbeat,
+            landed,
+        })
+    }
+
+    /// Every registered lane, sorted by id. Entries without a readable `path`
+    /// are skipped (malformed; the reaper's concern, not the lister's).
+    pub fn list_lane_entries(&self) -> Vec<LaneEntry> {
+        let mut ids: Vec<String> = std::fs::read_dir(self.lanes_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        ids.sort();
+        ids.iter().filter_map(|id| self.read_lane_entry(id)).collect()
+    }
+
+    /// Promote (name) a lane: record its dock-name in the registry entry.
+    pub fn write_lane_name(&self, id: &str, name: &str) -> std::io::Result<()> {
+        std::fs::write(self.lane_entry_dir(id).join(LANE_NAME), name)
+    }
+
+    /// Refresh a lane's heartbeat. Self-healing: recreates the entry (and its
+    /// `path`) if a sweep removed it while the lane was still alive on disk.
+    pub fn touch_lane_heartbeat(&self, id: &str, path: &Path, now: u64) -> std::io::Result<()> {
+        let dir = self.lane_entry_dir(id);
+        std::fs::create_dir_all(&dir)?;
+        if !dir.join(LANE_PATH).exists() {
+            std::fs::write(dir.join(LANE_PATH), path.display().to_string())?;
+        }
+        std::fs::write(dir.join(LANE_HEARTBEAT), now.to_string())
+    }
+
+    /// Mark a lane's change as landed (the land path writes this; the gc-sweep
+    /// reaps landed unnamed lanes without waiting for staleness).
+    pub fn mark_lane_landed(&self, id: &str) -> std::io::Result<()> {
+        std::fs::write(self.lane_entry_dir(id).join(LANE_LANDED), b"")
+    }
+
+    /// Delete a lane's registry entry (the reaper is the only deleter).
+    pub fn remove_lane_entry(&self, id: &str) -> std::io::Result<()> {
+        std::fs::remove_dir_all(self.lane_entry_dir(id))
+    }
+}
+
+/// One registered lane, as read from `.loot/lanes/<id>/` (ADR 0034, #231).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneEntry {
+    pub id: String,
+    /// The lane's working directory (holds its `.loot/` and tree).
+    pub path: PathBuf,
+    /// The dock-name, present iff the lane was promoted (named lanes persist).
+    pub name: Option<String>,
+    /// Unix seconds of the lane's last workspace open.
+    pub heartbeat: u64,
+    /// Whether the land path marked this lane's change landed.
+    pub landed: bool,
+}
+
+impl LaneEntry {
+    /// Whether the heartbeat is older than `stale_secs` at `now` — the gc-sweep
+    /// condition for an unnamed lane that never landed.
+    pub fn stale(&self, now: u64, stale_secs: u64) -> bool {
+        now.saturating_sub(self.heartbeat) > stale_secs
+    }
 }
 
 /// Validate a name for a *new* named dock. The charset (ASCII alphanumerics plus
@@ -386,6 +577,13 @@ pub fn valid_dock_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Read a small text pointer file, trimmed; absent or blank reads as `None`.
+fn read_trimmed(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Read a 32-byte Oid file, or `None` if absent/malformed.
@@ -514,6 +712,125 @@ mod tests {
         s.write_abandoned(&std::collections::BTreeSet::new()).unwrap();
         assert!(s.read_abandoned().is_empty());
         assert!(!s.abandoned().exists(), "empty set removes the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lane_store_routes_private_state_to_the_lane_root() {
+        // The ADR 0034 partition: lane-owned files under the lane's `.loot/`,
+        // shared/single-writer artifacts under the store root.
+        let s = RepoStore::for_lane("/repo/.loot", "/repo-lanes/l1/.loot");
+        assert!(s.is_lane());
+        for lane_owned in [
+            s.working(None),
+            s.working_change(),
+            s.tree_hash(None),
+            s.next_change(None),
+            s.tip(None),
+            s.heads(),
+            s.ops(),
+            s.abandoned(),
+            s.conflicts(),
+            s.dock_pointer(),
+            s.docks_dir(),
+        ] {
+            assert!(
+                lane_owned.starts_with("/repo-lanes/l1/.loot"),
+                "{} must live under the lane root",
+                lane_owned.display()
+            );
+        }
+        for shared in [
+            s.objects_dir(),
+            s.graph(),
+            s.identity(),
+            s.keyring(),
+            s.escrow(),
+            s.manifest(),
+            s.purges(),
+            s.attestations(),
+            s.config(),
+            s.git_mirror_dir(),
+            s.id(),
+            s.peers(),
+            s.lanes_dir(),
+        ] {
+            assert!(
+                shared.starts_with("/repo/.loot"),
+                "{} must live under the store root",
+                shared.display()
+            );
+        }
+        // The primary is lane #0: equal roots, byte-for-byte the old layout.
+        let p = RepoStore::new("/repo/.loot");
+        assert!(!p.is_lane());
+        assert!(p.heads().starts_with("/repo/.loot"));
+    }
+
+    #[test]
+    fn lane_pointer_round_trips_and_primary_reads_none() {
+        let dir = std::env::temp_dir().join(format!("loot-store-lp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lane_dot = dir.join("lane").join(".loot");
+        RepoStore::write_lane_pointer(&lane_dot, Path::new("/shared/.loot"), "lane-ab12").unwrap();
+        assert_eq!(
+            RepoStore::read_store_pointer(&lane_dot),
+            Some(PathBuf::from("/shared/.loot"))
+        );
+        assert_eq!(RepoStore::read_lane_id(&lane_dot), Some("lane-ab12".to_string()));
+        // A primary `.loot/` (no pointer file) is not a lane.
+        let primary = dir.join("primary").join(".loot");
+        std::fs::create_dir_all(&primary).unwrap();
+        assert_eq!(RepoStore::read_store_pointer(&primary), None);
+        assert_eq!(RepoStore::read_lane_id(&primary), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lane_registry_round_trips_names_heartbeats_and_landed() {
+        let dir = std::env::temp_dir().join(format!("loot-store-lr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = RepoStore::new(&dir);
+
+        assert!(s.list_lane_entries().is_empty(), "no registry yet");
+        s.create_lane_entry("lane-a", Path::new("/w/a"), None, 100).unwrap();
+        s.create_lane_entry("lane-b", Path::new("/w/b"), Some("feat"), 200).unwrap();
+
+        let a = s.read_lane_entry("lane-a").unwrap();
+        assert_eq!(a.path, PathBuf::from("/w/a"));
+        assert_eq!(a.name, None, "unnamed by default");
+        assert_eq!(a.heartbeat, 100);
+        assert!(!a.landed);
+        let b = s.read_lane_entry("lane-b").unwrap();
+        assert_eq!(b.name.as_deref(), Some("feat"), "born named");
+
+        // Promotion mid-flight, heartbeat refresh, landed marker.
+        s.write_lane_name("lane-a", "keeper").unwrap();
+        s.touch_lane_heartbeat("lane-a", Path::new("/w/a"), 300).unwrap();
+        s.mark_lane_landed("lane-b").unwrap();
+        let a = s.read_lane_entry("lane-a").unwrap();
+        assert_eq!(a.name.as_deref(), Some("keeper"));
+        assert_eq!(a.heartbeat, 300);
+        assert!(s.read_lane_entry("lane-b").unwrap().landed);
+
+        // Staleness is a pure threshold over the heartbeat.
+        assert!(!a.stale(300, 86_400));
+        assert!(a.stale(300 + 86_401, 86_400));
+
+        // List is sorted; removal deletes the entry only.
+        let ids: Vec<_> = s.list_lane_entries().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec!["lane-a".to_string(), "lane-b".to_string()]);
+        s.remove_lane_entry("lane-b").unwrap();
+        assert!(s.read_lane_entry("lane-b").is_none());
+        assert!(s.lane_entry_exists("lane-a"));
+
+        // Touch is self-healing: a swept entry regrows with its path.
+        s.remove_lane_entry("lane-a").unwrap();
+        s.touch_lane_heartbeat("lane-a", Path::new("/w/a"), 400).unwrap();
+        let a = s.read_lane_entry("lane-a").unwrap();
+        assert_eq!((a.path, a.heartbeat), (PathBuf::from("/w/a"), 400));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

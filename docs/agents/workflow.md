@@ -38,9 +38,13 @@ Every change carries two identifiers, shown throughout:
 The common case — the dev, or a trusted agent docking into the dev's store. One
 code path; **every change lands through a PR** (you self-approve your own).
 
-1. **Open a lane.** `loot dock <task>` — an isolated worktree over the store
-   (ADR 0022). Cheap; a lane hosts one in-flight change → PR at a time. Parallel
-   work = more docks.
+1. **Open a lane.** `loot lane new --ticket <n>` (ADR 0034/0035, #232) — a
+   sealed working directory over the store, spawned from the primary; work from
+   the printed dir. `loot lanes` reports every live lane (tip, in-flight PR,
+   dirty/clean, heartbeat) — check it before acting on shared state. Cheap; a
+   lane hosts one in-flight change → PR at a time; parallel work = more lanes.
+   (`loot dock <task>` — the ADR 0022 in-place switch — survives in the primary
+   until the harbor, #229.)
 2. **Work.** Edit. The working change accrues by auto-snapshot (map #132); you
    never run a manual `status -m` before finalize.
 3. **Project for review.** `loot ferry --with-wip` snapshots the dock's WIP and

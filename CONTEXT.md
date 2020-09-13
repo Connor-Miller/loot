@@ -111,7 +111,55 @@ operator switched away: still that dock's working pointer, still a live head in
 the shared graph, resumed in place by the dock's next snapshot. It is in-flight
 WIP, not a line: converge never folds it (#203), projection never ships it
 (unsigned never travels, ADR 0018), and `loot dock rm` drops it with its dock
-(#212). _Avoid_: stray head, orphan WIP.
+(#212). *(ADR 0034 retires the concept once lanes land: WIP stays inside its
+[[Lane]] and never enters the shared heads, so there is nothing to park.)*
+_Avoid_: stray head, orphan WIP.
+
+**Lane** *(ADR 0034 accepted 2026-07-12; seam + lifecycle shipped, #231/ADR
+0035; adopt + land-from-lane ride the harbor, #229)* — the sealed,
+ephemeral-by-default isolation unit for concurrent agents: a working
+directory whose `.loot` is a *directory* carrying a `store` pointer at the
+owning repo's shared `.loot/` plus **all** lane-owned mutable state
+(`working`, `working-change`, `tree-hash`, `next-change`, `tip`, its own
+`heads` view frontier, `ops`, `abandoned`, `conflicts` — the full inventory
+lives in ADR 0034's ownership table). Position is place,
+not state: no ambient pointer, no env binding — `Workspace::open` resolves
+everything from the cwd. Only *signed* changes cross the seal (at finalize,
+into the shared graph); isolation is by view, so reap = delete the directory.
+Governing rule: **no mutable file has more than one writer** — three classes:
+shared append-only (store/graph), lane-owned, harbor-owned (the whole
+`git-mirror/` surface). Lanes register at `.loot/lanes/<id>/` (entry written
+only by its own lane); directories default to a `<repo>-lanes/<id>` sibling,
+path overridable at spawn — co-located lanes from several repos compose a
+multi-repo agent workspace. The primary directory is lane #0 (its files stay
+at `.loot/` root; never-spawned repos are byte-identical on disk).
+**Lifecycle (ADR 0035)**: `loot lane new` spawns (primary-only, keyed repos
+only, born at the finalized anchor); every verb run in the lane refreshes its
+registry heartbeat; `loot lane name <n>` promotes it mid-flight to a [[Dock]]
+(persists until `loot lane rm`); `loot-first land` *marks* the entry landed
+and `loot lane gc` *reaps* — unnamed lanes only, when landed or when the
+heartbeat has been silent past the threshold (24 h default). Reaping verifies
+the directory's `lane-id` and is **not undoable** (the op log never captures
+lane-registry state). Single-owner verbs (`gc`, `remote add/rm`, the dock
+family, lane spawn/rm/gc) refuse from inside a lane.
+**Spawn/observe DevX (#232)**: `loot lanes [--porcelain|--json]` reports every
+lane — id, name, path, tip, in-flight PR (matched against the `pr-map` by
+durable change id), dirty/clean, heartbeat age, landed/stale — and observing
+is read-only: it never touches another lane's heartbeat (the entry's one
+writer is its own lane). `loot lane new --ticket <n>` spawns under the
+ticket-derived handle (`t<n>`, suffixed until free); wayfinder's claim ritual
+(docs/agents/issue-tracker.md) is assign → spawn → work from the lane.
+Distinct from a *review lane* (a `pr-map` entry, ADR 0033): a lane opens a
+review lane when it ferries for review. _Avoid_: worktree, sandbox, session.
+
+**Adopt** *(ADR 0034 accepted 2026-07-12; build pending)* — `loot adopt`:
+catch a [[Lane]] up to everything landed, by extending its view frontier with
+the [[Harbor]]'s heads and running the existing in-process converge — no
+network, objects already in the shared store. Defined against the harbor
+lineage *only* (never "whatever is in the shared graph"), all-or-nothing on
+purpose (per-change adoption is refused — it would reintroduce divergence).
+Spawn is the degenerate case (a lane is born adopted); bounce-back reconcile
+is adopt → resolve → re-land. _Avoid_: rebase, sync, cherry-pick.
 
 **Dock** *(CA1 shipped, 2026-07-06)* — an isolated working tree plus its own
 [[Working change]] tip, materialized cheaply over the *shared* `.loot/` object
@@ -127,8 +175,12 @@ disk; named docks live under `.loot/docks/<name>/`. CA1 is the *checkout* model
 — one physical working tree a switch re-materializes (auto-snapshotting the
 outgoing dock first, so nothing uncommitted is lost); per-dock *physical*
 directories for truly simultaneous editing are a later, additive step (the
-on-disk format is already dock-agnostic). _Avoid_: worktree, checkout, berth,
-slip.
+on-disk format is already dock-agnostic). *(Redefined by ADR 0034: a dock
+becomes a **named [[Lane]]** — since #231 the promotion verb is `loot lane
+name <n>`. Legacy in-place switching still lives in the primary because
+today's landing ritual runs on it; its retirement — and `loot dock <name>`
+becoming the naming verb — rides the harbor, #229/ADR 0035.)* _Avoid_:
+worktree, checkout, berth, slip.
 
 **Buoy** *(CA4 shipped, 2026-07-09)* — a change that
 carries a navigational-role [[Attestation]] (e.g. `reviewed`, `base`), used as a
@@ -147,7 +199,12 @@ convention, not a gated branch (branches stay a permanent non-goal). Merging is
 direct and local — `loot dock merge <name>` applies one dock's tip onto
 another's working change in-process, reusing the `apply`/converge path with no
 relay hop, because docks share one object store. The relay remains the path for
-*remote* agents only. _Avoid_: main, master, trunk.
+*remote* agents only. *(Promoted by ADR 0034 from convention to **owner**,
+build pending: the harbor — physically the primary directory, lane #0 — is
+the sole serialized integrator to git-main and the single writer of the
+entire `git-mirror/` directory. Lanes never touch it; review/land become
+in-process requests through the harbor seam. Mechanism — daemon vs on-demand
+lock — is #229's decision.)* _Avoid_: main, master, trunk.
 
 **Verdict** *(CA3 shipped, 2026-07-07)* — the machine-readable form of a
 reconciliation outcome. The [[Convergence classifier]] already computes a
@@ -161,11 +218,14 @@ is unchanged human text. Scope note (CA3): `base`/`incoming` content addresses
 are populated only for a `C` row (the outcome's `ours`/`theirs`); other rows
 carry `-`. Widening them to every row means threading both trees through
 `apply` and is, per ADR 0023, a *breaking* contract change. `status` is not a
-merge, so it has its own shape — `~<TAB>path<TAB>visibility`. The column order
+merge, so it has its own shape — `~<TAB>path<TAB>visibility`; so do `buoy`
+(`B`/`A` rows, ADR 0025) and `loot lanes` (`L` rows, #232 — observability for
+agents is exactly the machine-output case). The column order
 and status chars are a **frozen contract** once agents parse them, versioned
 with the format gate (`format::FORMAT_MAJOR`, ADR 0019). CLI: `loot apply --porcelain`,
-`loot conflicts --json`, etc. (ADR 0023). _Avoid_: adding machine output to the
-~25 non-reconciliation verbs — deliberately out of scope.
+`loot conflicts --json`, etc. (ADR 0023). _Avoid_: adding machine output to
+the remaining non-reconciliation verbs without an agent consumer — a per-verb
+shape is frozen forever once shipped.
 
 **Ferry** *(GB1 shipped, 2026-07-10)* — one deliberate bidirectional loot ↔ git
 mirror pass (ADR 0028): ingest git-native commits from the mirrored `main` as

@@ -224,6 +224,135 @@ pub fn status_json(
     s
 }
 
+// --- lane encoders (`loot lanes` — the sealed-lane observability shape, #232) ---
+
+/// Leading marker for a `loot lanes` row — one registered lane per line.
+pub const LANE_MARK: char = 'L';
+
+/// One lane's observable status, lifted to encoder primitives (the CLI derives
+/// these from the registry entry plus a read-only peek at the lane's `.loot`).
+/// `change` is the durable review-lane key (change-id hex, version hex for
+/// legacy changes) — the same key the `pr-map` ledger uses, which is how `pr`
+/// was matched. `dirty` is `None` when the lane's tree could not be read (a
+/// hand-deleted directory); `heartbeat_age` is seconds since the last workspace
+/// open from the lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneRow {
+    pub id: String,
+    pub name: Option<String>,
+    pub path: PathBuf,
+    pub tip: Option<Oid>,
+    pub change: Option<String>,
+    pub pr: Option<u64>,
+    pub dirty: Option<bool>,
+    pub heartbeat_age: u64,
+    pub landed: bool,
+    pub stale: bool,
+}
+
+fn lane_state_token(dirty: Option<bool>) -> &'static str {
+    match dirty {
+        Some(true) => "dirty",
+        Some(false) => "clean",
+        None => NONE_ADDR,
+    }
+}
+
+fn lane_flags_token(landed: bool, stale: bool) -> String {
+    let mut flags = Vec::new();
+    if landed {
+        flags.push("landed");
+    }
+    if stale {
+        flags.push("stale");
+    }
+    if flags.is_empty() { NONE_ADDR.to_string() } else { flags.join(",") }
+}
+
+/// Porcelain for `loot lanes`: `L \t id \t name \t path \t tip \t change \t pr
+/// \t state \t heartbeat-age \t flags`, one row per lane. `name`/`tip`/
+/// `change`/`pr` render `-` when absent; `state` is `dirty`/`clean` (`-` when
+/// the lane tree was unreadable); `flags` is a comma-joined subset of
+/// `landed,stale` (`-` when neither). Empty input yields the empty string.
+/// A frozen per-verb contract like the status shape; paths are written
+/// verbatim, so use [`lanes_json`] when they may contain control characters.
+pub fn lanes_porcelain(rows: &[LaneRow]) -> String {
+    let mut out = String::new();
+    for r in rows {
+        out.push(LANE_MARK);
+        out.push('\t');
+        out.push_str(&r.id);
+        out.push('\t');
+        out.push_str(r.name.as_deref().unwrap_or(NONE_ADDR));
+        out.push('\t');
+        out.push_str(&r.path.to_string_lossy());
+        out.push('\t');
+        out.push_str(&addr_col(r.tip.clone()));
+        out.push('\t');
+        out.push_str(r.change.as_deref().unwrap_or(NONE_ADDR));
+        out.push('\t');
+        out.push_str(&r.pr.map(|p| p.to_string()).unwrap_or_else(|| NONE_ADDR.to_string()));
+        out.push('\t');
+        out.push_str(lane_state_token(r.dirty));
+        out.push('\t');
+        out.push_str(&r.heartbeat_age.to_string());
+        out.push('\t');
+        out.push_str(&lane_flags_token(r.landed, r.stale));
+        out.push('\n');
+    }
+    out
+}
+
+/// JSON for `loot lanes`: `{"contract":<n>,"lanes":[{id,name,path,tip,change,
+/// pr,dirty,heartbeat_age,landed,stale},...]}` — nullable where porcelain
+/// renders `-`, lossless for adversarial paths.
+pub fn lanes_json(rows: &[LaneRow]) -> String {
+    let mut s = String::new();
+    s.push_str("{\"contract\":");
+    s.push_str(&VERDICT_CONTRACT.to_string());
+    s.push_str(",\"lanes\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"id\":");
+        json_string(&r.id, &mut s);
+        s.push_str(",\"name\":");
+        match &r.name {
+            Some(n) => json_string(n, &mut s),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"path\":");
+        json_string(&r.path.to_string_lossy(), &mut s);
+        s.push_str(",\"tip\":");
+        json_opt_addr(r.tip.clone(), &mut s);
+        s.push_str(",\"change\":");
+        match &r.change {
+            Some(c) => json_string(c, &mut s),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"pr\":");
+        match r.pr {
+            Some(p) => s.push_str(&p.to_string()),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"dirty\":");
+        match r.dirty {
+            Some(d) => s.push_str(if d { "true" } else { "false" }),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"heartbeat_age\":");
+        s.push_str(&r.heartbeat_age.to_string());
+        s.push_str(",\"landed\":");
+        s.push_str(if r.landed { "true" } else { "false" });
+        s.push_str(",\"stale\":");
+        s.push_str(if r.stale { "true" } else { "false" });
+        s.push('}');
+    }
+    s.push_str("]}");
+    s
+}
+
 // --- buoy encoders (the resolver — a distinct, per-verb frozen shape) ---
 
 /// The buoy resolver's outcome, lifted to a serializable value so its frozen
@@ -478,6 +607,78 @@ mod tests {
         assert!(out.contains("\"visibility\":\"public\""));
         assert!(out.contains(&format!("\"change\":\"{}\"", hex::encode(&[0xAB; 16]))));
         assert!(out.contains(&format!("\"version\":\"{}\"", hex::encode(&[0x3f; 32]))));
+    }
+
+    fn lane_row(id: &str) -> LaneRow {
+        LaneRow {
+            id: id.into(),
+            name: None,
+            path: PathBuf::from(format!("/repo-lanes/{id}")),
+            tip: None,
+            change: None,
+            pr: None,
+            dirty: None,
+            heartbeat_age: 0,
+            landed: false,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn lanes_porcelain_rows_are_the_frozen_contract() {
+        // #232: `L` rows, ten tab-separated columns, `-` for every absent value.
+        let bare = lane_row("t7");
+        assert_eq!(lanes_porcelain(&[bare]), "L\tt7\t-\t/repo-lanes/t7\t-\t-\t-\t-\t0\t-\n");
+
+        let full = LaneRow {
+            id: "t232".into(),
+            name: Some("spawn-devx".into()),
+            path: PathBuf::from("/repo-lanes/t232"),
+            tip: Some(oid(0x3f)),
+            change: Some(hex::encode(&[0xAB; 16])),
+            pr: Some(235),
+            dirty: Some(true),
+            heartbeat_age: 90,
+            landed: true,
+            stale: true,
+        };
+        assert_eq!(
+            lanes_porcelain(&[full]),
+            format!(
+                "L\tt232\tspawn-devx\t/repo-lanes/t232\t{}\t{}\t235\tdirty\t90\tlanded,stale\n",
+                hex::encode(&[0x3f; 32]),
+                hex::encode(&[0xAB; 16])
+            )
+        );
+
+        let mut clean = lane_row("t8");
+        clean.dirty = Some(false);
+        let out = lanes_porcelain(&[clean]);
+        assert!(out.contains("\tclean\t"), "clean state token: {out}");
+        for line in out.lines() {
+            assert_eq!(line.split('\t').count(), 10);
+        }
+        assert_eq!(lanes_porcelain(&[]), "");
+    }
+
+    #[test]
+    fn lanes_json_nullables_and_contract() {
+        let out = lanes_json(&[lane_row("t7")]);
+        assert!(out.starts_with(&format!("{{\"contract\":{VERDICT_CONTRACT},\"lanes\":[")));
+        for key in ["\"name\":null", "\"tip\":null", "\"change\":null", "\"pr\":null", "\"dirty\":null"] {
+            assert!(out.contains(key), "{key} in {out}");
+        }
+        assert!(out.contains("\"landed\":false"));
+
+        let mut full = lane_row("t9");
+        full.pr = Some(12);
+        full.dirty = Some(false);
+        full.stale = true;
+        let out = lanes_json(&[full]);
+        assert!(out.contains("\"pr\":12"), "{out}");
+        assert!(out.contains("\"dirty\":false"), "{out}");
+        assert!(out.contains("\"stale\":true"), "{out}");
+        assert_eq!(lanes_json(&[]), format!("{{\"contract\":{VERDICT_CONTRACT},\"lanes\":[]}}"));
     }
 
     #[test]

@@ -11,7 +11,8 @@
 //! ([`loot_cli::workspace::Workspace`], [`loot_cli::ferry`]) rather than by
 //! parsing `loot` stdout.
 //!
-//! - [`ledger`] — typed owners of the on-disk `pr-map` and `wip` ledgers.
+//! - [`loot_cli::ledger`] — typed owner of the on-disk `pr-map` ledger (moved
+//!   crate-side for `loot lanes`, #232; this orchestrator stays its writer).
 //! - [`forge`] — the GitHub seam: the [`forge::Forge`] trait, a `gh`-shelling
 //!   production adapter, and a fake for policy tests.
 //! - [`policy`] — the land decisions, each a pure `decide`-shaped function.
@@ -19,6 +20,5 @@
 //!   Workspace + ferry + Forge + ledgers + policy.
 
 pub mod forge;
-pub mod ledger;
 pub mod orchestrator;
 pub mod policy;

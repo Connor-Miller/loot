@@ -14,7 +14,9 @@ use render::{
     change_col, outcome_rows, render_buoy_human, render_history, seal_hint, short, short_change,
 };
 use std::process::ExitCode;
-use workspace::{GlobalConfig, SnapshotOpts, StepReport, Workspace};
+use workspace::{
+    GlobalConfig, LaneStatus, SnapshotOpts, StepReport, SweepOutcome, Workspace, LANE_STALE_SECS,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +65,8 @@ const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
     ("surface", |_| cmd_surface()),
     ("dock", cmd_dock),
     ("docks", |_| cmd_docks()),
+    ("lane", cmd_lane),
+    ("lanes", cmd_lane_list),
     ("log", |_| cmd_log()),
     ("gc", cmd_gc),
     ("bundle", cmd_bundle),
@@ -120,6 +124,11 @@ usage:
   loot dock rm <name>                       remove a dock: drop its parked unsigned WIP + pointers; undoable (#212)
   loot docks                                list docks with their working tip
                                             (convention: a dock named `harbor` is the shared integration dock)
+  loot lane new [--ticket <n>] [--name <n>] [--at <dir>] [--porcelain|--json]  spawn a sealed ephemeral lane over the shared store (primary-only, keyed repos; ADR 0034); --ticket derives the handle (t<n>) for the claim-to-lane flow (#232)
+  loot lanes [--porcelain|--json]           lane observability: id, name, path, tip, in-flight PR, dirty/clean, heartbeat, landed/stale — check before acting on shared state (alias: loot lane list)
+  loot lane name <n>                        (inside a lane) promote it to a dock — persists until removed
+  loot lane rm <id-or-name>                 reap a lane: delete its directory + registry entry (NOT undoable)
+  loot lane gc [--stale-hours <h>]          sweep unnamed lanes that landed or went stale (default 24h)
   loot manifest                             show the grant audit trail (and attestations)
   loot attest <change-id> [role]            attest a change (advisory sign-off, ADR 0018)
   loot buoy [role] [--verbose] [--porcelain|--json]  resolve the newest trusted role-attested change (CA4, ADR 0025)
@@ -1049,6 +1058,202 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
     }
     ws.record_op("dock", &format!("dock {name}"), false);
     Ok(())
+}
+
+/// `loot lane <new|list|name|rm|gc>` — the sealed-lane lifecycle (ADR 0034,
+/// #231). A lane is an ephemeral working directory over this repo's shared
+/// store, born at the finalized tip; naming it makes it a dock (persisted).
+/// Unnamed lanes are reaped by `lane gc` once their change lands or their
+/// heartbeat goes stale.
+fn cmd_lane(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "new" => {
+            let fmt = out_fmt(args);
+            let name = flag(args, "--name");
+            let at = flag(args, "--at").map(std::path::PathBuf::from);
+            // The ticket-derived handle (#232): `--ticket 232` spawns lane
+            // `t232` (a bare number is prefixed; anything else is the handle
+            // itself), so `loot lanes` reads as a claim board.
+            let handle = flag(args, "--ticket").map(|t| {
+                let t = t.trim_start_matches('#');
+                if t.chars().all(|c| c.is_ascii_digit()) { format!("t{t}") } else { t.to_string() }
+            });
+            let mut ws = Workspace::open()?;
+            let spawned = ws.spawn_lane_as(name, at.as_deref(), handle.as_deref())?;
+            ws.record_op("lane new", &format!("spawn lane {}", spawned.id), false);
+            if !matches!(fmt, OutFmt::Human) {
+                // One row, the `loot lanes` shape — an agent wrapper parses the
+                // same columns whether it spawned or listed.
+                let rows = lane_rows(&ws, |s| s.entry.id == spawned.id);
+                match fmt {
+                    OutFmt::Porcelain => print!("{}", verdict::lanes_porcelain(&rows)),
+                    OutFmt::Json => println!("{}", verdict::lanes_json(&rows)),
+                    OutFmt::Human => unreachable!(),
+                }
+                return Ok(());
+            }
+            println!(
+                "lane '{}' at {} — sealed over this repo's store, born at the finalized tip",
+                spawned.id,
+                spawned.dir.display()
+            );
+            match name {
+                Some(n) => println!("  named '{n}' — persists until `loot lane rm {n}`"),
+                None => println!(
+                    "  ephemeral — `loot lane gc` reaps it once it lands or goes stale; \
+                     `loot lane name <n>` (inside it) keeps it"
+                ),
+            }
+            Ok(())
+        }
+        "list" | "ls" => cmd_lane_list(&args[1..]),
+        "name" => {
+            let name = args.get(1).ok_or("usage: loot lane name <name>  (inside the lane)")?;
+            let ws = Workspace::open()?;
+            ws.name_lane(name)?;
+            println!(
+                "lane '{}' named '{name}' — now a dock; persists until `loot lane rm {name}`",
+                ws.lane_id().unwrap_or("?")
+            );
+            Ok(())
+        }
+        "rm" => {
+            let key = args.get(1).ok_or("usage: loot lane rm <id-or-name>")?;
+            let mut ws = Workspace::open()?;
+            let e = ws.remove_lane(key)?;
+            println!(
+                "reaped lane '{}' ({}) — unsigned WIP died with the directory; \
+                 signed changes stay in the store",
+                e.id,
+                e.path.display()
+            );
+            Ok(())
+        }
+        "gc" => {
+            let stale_secs: u64 = match flag(args, "--stale-hours") {
+                Some(v) => {
+                    let hours: u64 =
+                        v.parse().map_err(|_| format!("--stale-hours: not a number: {v}"))?;
+                    hours * 3600
+                }
+                None => LANE_STALE_SECS,
+            };
+            let mut ws = Workspace::open()?;
+            let outcomes = ws.lane_gc(stale_secs)?;
+            if outcomes.is_empty() {
+                println!("no lanes to sweep");
+                return Ok(());
+            }
+            for (e, o) in outcomes {
+                match o {
+                    SweepOutcome::Reaped(why) => println!("reaped {:<16} ({why})", e.id),
+                    SweepOutcome::Kept(why) => println!("kept   {:<16} ({why})", e.id),
+                    SweepOutcome::Failed(why) => println!("FAILED {:<16} — {why}", e.id),
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown lane subcommand '{other}'\n\nusage: loot lane new [--ticket <n>] [--name <n>] \
+             [--at <dir>] | list | name <n> | rm <id-or-name> | gc [--stale-hours <h>]"
+        )),
+    }
+}
+
+/// `loot lanes [--porcelain|--json]` (also `loot lane list`) — the lane
+/// observability report (#232): each registered lane's id, name, path, tip,
+/// in-flight PR, dirty/clean, heartbeat age, and landed/stale markers. The
+/// check an agent (or the human) runs before acting on shared state — and it
+/// is read-only: no heartbeat refreshes, no capture, no op recorded.
+fn cmd_lane_list(args: &[String]) -> Result<(), String> {
+    let fmt = out_fmt(args);
+    let ws = Workspace::open()?;
+    let rows = lane_rows(&ws, |_| true);
+    match fmt {
+        OutFmt::Human => {
+            if rows.is_empty() {
+                println!("no lanes  (spawn one with `loot lane new`)");
+                return Ok(());
+            }
+            for r in &rows {
+                let name = r.name.clone().unwrap_or_else(|| "(unnamed)".to_string());
+                let tip = r.tip.as_ref().map(short).unwrap_or_else(|| "-".to_string());
+                let mut notes = Vec::new();
+                let pr_note;
+                if let Some(pr) = r.pr {
+                    pr_note = format!("PR #{pr}");
+                    notes.push(pr_note.as_str());
+                }
+                match r.dirty {
+                    Some(true) => notes.push("dirty"),
+                    Some(false) => {}
+                    None => notes.push("unreadable"),
+                }
+                if r.landed {
+                    notes.push("landed");
+                }
+                if r.stale {
+                    notes.push("stale");
+                }
+                let notes = if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", notes.join(", "))
+                };
+                println!(
+                    "{:<16} {:<16} {}  tip {tip}  (heartbeat {}){notes}",
+                    r.id,
+                    name,
+                    r.path.display(),
+                    fmt_age(r.heartbeat_age)
+                );
+            }
+            Ok(())
+        }
+        OutFmt::Porcelain => {
+            print!("{}", verdict::lanes_porcelain(&rows));
+            Ok(())
+        }
+        OutFmt::Json => {
+            println!("{}", verdict::lanes_json(&rows));
+            Ok(())
+        }
+    }
+}
+
+/// [`LaneStatus`] → the encoder rows, deriving the presentation-side facts
+/// (heartbeat age from the clock, staleness from the gc threshold — named
+/// lanes never read stale because they never sweep).
+fn lane_rows(ws: &Workspace, keep: impl Fn(&LaneStatus) -> bool) -> Vec<verdict::LaneRow> {
+    let now = ws.now();
+    ws.lane_statuses()
+        .into_iter()
+        .filter(keep)
+        .map(|s| verdict::LaneRow {
+            id: s.entry.id.clone(),
+            name: s.entry.name.clone(),
+            path: s.entry.path.clone(),
+            tip: s.tip,
+            change: s.change,
+            pr: s.pr,
+            dirty: s.dirty,
+            heartbeat_age: now.saturating_sub(s.entry.heartbeat),
+            stale: s.entry.name.is_none() && s.entry.stale(now, LANE_STALE_SECS),
+            landed: s.entry.landed,
+        })
+        .collect()
+}
+
+/// Rough age for `lane list` heartbeats — humans triage staleness in units,
+/// not seconds.
+fn fmt_age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3_600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3_600),
+        s => format!("{}d ago", s / 86_400),
+    }
 }
 
 /// `loot dock merge <name> [--porcelain|--json]` — collapse another dock's tip

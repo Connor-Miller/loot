@@ -1,5 +1,5 @@
 //! The `review` / `land` / `status` flows — the ps1's body, now composing the
-//! typed pieces: [`crate::ledger`] owns the on-disk ledgers, [`crate::forge`]
+//! typed pieces: [`loot_cli::ledger`] owns the pr-map ledger, [`crate::forge`]
 //! is the only door to GitHub, [`crate::policy`] holds the decisions, and loot
 //! state is read/mutated **in-process** through `loot_cli`'s [`Workspace`] and
 //! [`ferry`]. Two seams that face GitHub — [`land_gate`] (the pre-finalize
@@ -8,7 +8,7 @@
 //! [`crate::forge::FakeForge`] without a real Workspace or network.
 
 use crate::forge::{Forge, PrState};
-use crate::ledger::{PrLane, PrMap};
+use loot_cli::ledger::{PrLane, PrMap};
 use crate::policy::{
     approval, dock_targeting, interpret_landing, parse_review_line, pre_land, review_currency,
     Approval, Currency, DockTarget, LandingStatus, PreLand, ReviewOutcome,
@@ -29,7 +29,7 @@ fn paths(ws: &Workspace) -> Paths {
     let mirror_dir = ws.store().git_mirror_dir();
     let root = ws.dot().parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     Paths {
-        pr_map: mirror_dir.join("pr-map"),
+        pr_map: ws.store().git_pr_map(),
         wip: ws.store().git_wip(),
         mirror: mirror_dir.join("mirror.git"),
         root,
@@ -375,6 +375,20 @@ pub fn land(
         lane.change,
         landing_word(status)
     );
+
+    // Lane lifecycle (ADR 0034, #231): a landed *isolation* lane is done — mark
+    // it so `loot lane gc` reaps it (unnamed lanes only; the reaper cannot run
+    // here because this process's cwd is the lane directory). Best-effort: a
+    // failed marker never un-lands anything.
+    if let Some(id) = ws.lane_id() {
+        match ws.store().mark_lane_landed(id) {
+            Ok(()) => println!(
+                "lane '{id}' marked landed — `loot lane gc` (from the primary) reaps it \
+                 unless it was named"
+            ),
+            Err(e) => eprintln!("warning: could not mark lane '{id}' landed ({e})"),
+        }
+    }
     Ok(())
 }
 

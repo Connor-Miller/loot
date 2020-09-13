@@ -1,10 +1,13 @@
 //! Typed owner of the `pr-map` ledger under `.loot/git-mirror/` — the review
-//! lanes the orchestrator opens and clears. Its sibling `wip` ledger is written
-//! by `loot_cli::ferry`, so its single typed owner lives there
-//! ([`loot_cli::ferry::WipState`]); the orchestrator reads it through that type
-//! rather than a duplicate parser here. Same on-disk format as the ps1
-//! predecessor, so a shadow-run reads/writes byte-identical files. The format
-//! is deliberately dumb (whitespace-split rows) and parsed leniently: malformed
+//! lanes the `loot-first` orchestrator opens (`review`) and clears (`land`).
+//! It lives in loot-cli (not loot-first) because `loot lanes` reads it to
+//! report a lane's in-flight PR (#232) and the workspace dependency points
+//! this way; the orchestrator stays its only *writer* (the mirror surface is
+//! harbor-owned, ADR 0034). Its sibling `wip` ledger is written by
+//! [`crate::ferry`], so its single typed owner lives there
+//! ([`crate::ferry::WipState`]). Same on-disk format as the ps1 predecessor,
+//! so a shadow-run reads/writes byte-identical files. The format is
+//! deliberately dumb (whitespace-split rows) and parsed leniently: malformed
 //! lines are skipped, never fatal.
 
 /// One in-flight review lane in the `pr-map` ledger: `<change> <dock> <pr>`.
