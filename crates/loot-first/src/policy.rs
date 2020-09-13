@@ -1,0 +1,258 @@
+//! Land policy, extracted from `tools/loot-first.ps1` into pure, tested
+//! `decide`-shaped functions. Each takes already-read facts (never a Workspace,
+//! never a Forge) and returns a verdict; the orchestrator does the I/O and then
+//! consults these. That split is the whole point of #218 — the ps1's policy was
+//! only ever exercised by running a real land; here it is unit-tested against
+//! the [`crate::forge::FakeForge`] and against literal inputs.
+
+use crate::forge::{PrState, ReviewDecision};
+
+/// The approval rule (#152). GitHub forbids approving your own PR, so a
+/// self-authored PR lands on the weaker signal "no changes requested".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// `reviewDecision == APPROVED`.
+    Approved,
+    /// Self-authored (author is the viewer) and not `CHANGES_REQUESTED`.
+    SelfAuthoredFastPath,
+    /// Neither — the land refuses.
+    Refused,
+}
+
+pub fn approval(decision: ReviewDecision, author: &str, viewer: &str) -> Approval {
+    if decision == ReviewDecision::Approved {
+        Approval::Approved
+    } else if author == viewer && decision != ReviewDecision::ChangesRequested {
+        Approval::SelfAuthoredFastPath
+    } else {
+        Approval::Refused
+    }
+}
+
+/// The review-currency guard (ADR 0033). `loot edit` can amend an already
+/// reviewed change; landing must refuse a working change whose version differs
+/// from the one the review lane last projected — the reviewer approved a now
+/// stale version. An empty working change (already finalized) has no live
+/// version and skips the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Currency {
+    /// The live version matches what was reviewed (or there is nothing to
+    /// compare — no reviewed version, or an empty working change).
+    Current,
+    /// The working change was amended since the last review round.
+    Stale,
+}
+
+pub fn review_currency(reviewed_version: Option<&str>, current_version: Option<&str>) -> Currency {
+    match (reviewed_version, current_version) {
+        (Some(r), Some(c)) if r != c => Currency::Stale,
+        _ => Currency::Current,
+    }
+}
+
+/// The dock-targeting guard (#153): finalize must hit the PR's dock, not
+/// whatever is ambient. The orchestrator resolves the ambient dock in-process
+/// (`Workspace::current_dock`, normalizing the main dock to `"main"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockTarget {
+    Match,
+    Mismatch,
+}
+
+pub fn dock_targeting(ambient_dock: &str, lane_dock: &str) -> DockTarget {
+    if ambient_dock == lane_dock {
+        DockTarget::Match
+    } else {
+        DockTarget::Mismatch
+    }
+}
+
+/// The pre-land gate (#155): the review approved *projected WIP*, but nothing
+/// has yet proven the commit about to land builds. `cargo test` runs at the
+/// point of no return (before finalize); `-SkipTests` is the break-glass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreLand {
+    /// Run `cargo test`; a failure aborts the land.
+    RunTests,
+    /// Break-glass — skip the gate (non-code lands).
+    Skip,
+}
+
+pub fn pre_land(skip_tests: bool) -> PreLand {
+    if skip_tests {
+        PreLand::Skip
+    } else {
+        PreLand::RunTests
+    }
+}
+
+/// Landing-signal interpretation (#150/#166). After finalize + ferry, the
+/// orchestrator fast-forwards main and collapses the PR head onto the landed
+/// sha. GitHub reacts asynchronously; this maps the observed outcome to the
+/// audit status:
+///
+/// - main could not fast-forward (diverged, #151) → close with a pointer;
+/// - main advanced and GitHub marked the PR `MERGED` by reachability → merged;
+/// - main advanced and GitHub auto-closed on the zero-diff collapse (the live
+///   #166 finding — that close *is* the landing signal) → closed-by-collapse;
+/// - main advanced but the PR is still `OPEN` after polling → close with a
+///   pointer anyway (the signed commit on main is the authoritative record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandingStatus {
+    Merged,
+    ClosedByCollapse,
+    ClosedWithPointer,
+}
+
+pub fn interpret_landing(main_fast_forwarded: bool, polled_state: PrState) -> LandingStatus {
+    if !main_fast_forwarded {
+        return LandingStatus::ClosedWithPointer;
+    }
+    match polled_state {
+        PrState::Merged => LandingStatus::Merged,
+        PrState::Closed => LandingStatus::ClosedByCollapse,
+        PrState::Open => LandingStatus::ClosedWithPointer,
+    }
+}
+
+/// A parsed `review:` line from `ferry`'s `FerryReport`. Once in-process this is
+/// the typed contract the orchestrator consumes instead of a regex over stdout;
+/// the string is kept as `ferry`'s stable machine line so the ps1 shadow-run
+/// reads the identical bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLine {
+    pub dock: String,
+    pub branch: String,
+    pub sha: String,
+    pub change: String,
+    pub version: String,
+    pub round: u64,
+    pub op: String,
+}
+
+/// What one `ferry --with-wip` review pass did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    /// Nothing to review (`op=none`): no working change, or the tree matches the
+    /// anchor.
+    Nothing,
+    /// A provisional review lane was projected/refreshed.
+    Projected(ReviewLine),
+}
+
+/// Parse `ferry`'s review line. `op=none` short-circuits to
+/// [`ReviewOutcome::Nothing`]; otherwise every field must be present.
+pub fn parse_review_line(line: &str) -> Result<ReviewOutcome, String> {
+    let body = line.strip_prefix("review:").unwrap_or(line).trim();
+    let mut kv = std::collections::HashMap::new();
+    for tok in body.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            kv.insert(k, v);
+        }
+    }
+    if kv.get("op") == Some(&"none") {
+        return Ok(ReviewOutcome::Nothing);
+    }
+    let get = |k: &str| kv.get(k).copied().ok_or_else(|| format!("review line missing {k}: {line:?}"));
+    let round = get("round")?
+        .parse()
+        .map_err(|_| format!("review line: bad round: {line:?}"))?;
+    Ok(ReviewOutcome::Projected(ReviewLine {
+        dock: get("dock")?.into(),
+        branch: get("branch")?.into(),
+        sha: get("sha")?.into(),
+        change: get("change")?.into(),
+        version: get("version")?.into(),
+        round,
+        op: get("op")?.into(),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_takes_explicit_approved() {
+        assert_eq!(approval(ReviewDecision::Approved, "someone", "connor"), Approval::Approved);
+        // APPROVED wins even when self-authored (no fast-path note needed).
+        assert_eq!(approval(ReviewDecision::Approved, "connor", "connor"), Approval::Approved);
+    }
+
+    #[test]
+    fn approval_self_authored_fast_path() {
+        // Self-authored + no CHANGES_REQUESTED (empty decision) → fast path.
+        assert_eq!(approval(ReviewDecision::Other, "connor", "connor"), Approval::SelfAuthoredFastPath);
+    }
+
+    #[test]
+    fn approval_refuses_changes_requested_even_self() {
+        assert_eq!(approval(ReviewDecision::ChangesRequested, "connor", "connor"), Approval::Refused);
+    }
+
+    #[test]
+    fn approval_refuses_unapproved_from_other_author() {
+        assert_eq!(approval(ReviewDecision::Other, "someone", "connor"), Approval::Refused);
+    }
+
+    #[test]
+    fn review_currency_stale_only_when_both_present_and_differ() {
+        assert_eq!(review_currency(Some("aa"), Some("bb")), Currency::Stale);
+        assert_eq!(review_currency(Some("aa"), Some("aa")), Currency::Current);
+        // Empty working change (no current version) skips.
+        assert_eq!(review_currency(Some("aa"), None), Currency::Current);
+        // No reviewed version recorded skips.
+        assert_eq!(review_currency(None, Some("bb")), Currency::Current);
+        assert_eq!(review_currency(None, None), Currency::Current);
+    }
+
+    #[test]
+    fn dock_targeting_matches_exactly() {
+        assert_eq!(dock_targeting("ferry", "ferry"), DockTarget::Match);
+        assert_eq!(dock_targeting("main", "ferry"), DockTarget::Mismatch);
+    }
+
+    #[test]
+    fn pre_land_gate_honours_break_glass() {
+        assert_eq!(pre_land(false), PreLand::RunTests);
+        assert_eq!(pre_land(true), PreLand::Skip);
+    }
+
+    #[test]
+    fn landing_signal_interpretation() {
+        // Diverged main → pointer regardless of PR state.
+        assert_eq!(interpret_landing(false, PrState::Merged), LandingStatus::ClosedWithPointer);
+        // Fast-forwarded main, GitHub outcomes:
+        assert_eq!(interpret_landing(true, PrState::Merged), LandingStatus::Merged);
+        assert_eq!(interpret_landing(true, PrState::Closed), LandingStatus::ClosedByCollapse);
+        // Poll exhausted, still open → pointer close.
+        assert_eq!(interpret_landing(true, PrState::Open), LandingStatus::ClosedWithPointer);
+    }
+
+    #[test]
+    fn parse_review_line_op_none() {
+        assert_eq!(
+            parse_review_line("review: op=none (no working change to project)").unwrap(),
+            ReviewOutcome::Nothing
+        );
+    }
+
+    #[test]
+    fn parse_review_line_projected() {
+        let line = "review: dock=ferry branch=review/ferry sha=abc123 change=deadbeef version=cafef00d round=2 op=appended";
+        let ReviewOutcome::Projected(r) = parse_review_line(line).unwrap() else {
+            panic!("expected projected");
+        };
+        assert_eq!(r.dock, "ferry");
+        assert_eq!(r.branch, "review/ferry");
+        assert_eq!(r.change, "deadbeef");
+        assert_eq!(r.version, "cafef00d");
+        assert_eq!(r.round, 2);
+        assert_eq!(r.op, "appended");
+    }
+
+    #[test]
+    fn parse_review_line_rejects_missing_field() {
+        assert!(parse_review_line("review: dock=ferry op=appended").is_err());
+    }
+}

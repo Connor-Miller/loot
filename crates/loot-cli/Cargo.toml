@@ -22,9 +22,19 @@ dist = true
 name = "loot"
 path = "src/main.rs"
 
+[features]
+# White-box test access to the raw engine (`Workspace::repo`/`with_repo_mut`,
+# R1 #177). Off by default, so a production build cannot reach the seam. The
+# self dev-dependency below turns it on for the *binary* test target, whose
+# `cfg(test)` does not reach this crate when it links itself as a library.
+test-support = []
+
 [dependencies]
 loot-core.workspace = true
 loot-net.workspace = true
 loot-identity.workspace = true
 blake3.workspace = true
 git2.workspace = true
+
+[dev-dependencies]
+loot-cli = { path = ".", features = ["test-support"] }

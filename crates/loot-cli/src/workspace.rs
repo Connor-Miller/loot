@@ -183,8 +183,11 @@ impl Workspace {
     /// Raw engine access — **compiled only for tests** (R1, #177): production
     /// verbs go through the named faces below (`history`/`graph`/
     /// `buoy_resolution`/the sync queries), so the engine's concrete surface
-    /// physically cannot leak past this seam outside a test build.
-    #[cfg(test)]
+    /// physically cannot leak past this seam outside a test build. The
+    /// `test-support` feature widens the gate to loot-cli's *binary* test target
+    /// (which links this lib as a dependency, where `cfg(test)` is inactive);
+    /// it is off by default, so a production build still cannot reach it.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn repo(&self) -> &DagRepo {
         &self.repo
     }
@@ -789,8 +792,8 @@ impl Workspace {
 
     /// Raw mutate-then-persist — **compiled only for tests**: the mutation
     /// twin of [`Workspace::repo`], for white-box state seeding. Production
-    /// code cannot call it (R1, #177).
-    #[cfg(test)]
+    /// code cannot call it (R1, #177); gated with [`Workspace::repo`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_repo_mut<T>(
         &mut self,
         f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
@@ -2167,6 +2170,15 @@ pub struct WorkingRow {
     pub message: String,
     pub entries: Vec<(PathBuf, Visibility)>,
     pub empty: bool,
+}
+
+impl WorkingRow {
+    /// The working version as full hex — the form the `wip` ledger stores, so
+    /// the loot-first review-currency guard (ADR 0033) compares like with like
+    /// without reaching into the `Oid` newtype at the call site.
+    pub fn version_hex(&self) -> String {
+        loot_core::hex::encode(&self.version.0)
+    }
 }
 
 /// What `loot edit` did, for CLI reporting (ADR 0032).
