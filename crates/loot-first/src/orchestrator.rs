@@ -761,12 +761,16 @@ fn harbor_moved_main(before: Option<&str>, after: &str) -> bool {
 /// 2. the mirror's `main` is **strictly ahead** of it (origin's tip is a proper
 ///    ancestor — asked of the mirror, which always holds its own lineage, the
 ///    same oracle choice as [`mirror_ancestry`]); and
-/// 3. a commit reachable from mirror `main` carries this land's finalized tip
-///    as its `Loot-Change-Id` trailer — the trailer every ferry projection
-///    mints, so "an earlier ferry already projected exactly the line this land
-///    was about to" is a fact, not an inference. Without this walk, a
-///    *sibling's* unpushed projection would unlock a land whose own change
-///    never integrated — the exact green lie #195 forbids.
+/// 3. a commit in `origin/main..main` — the **unpushed** span only, never all
+///    of history (#367) — carries this land's finalized tip as its
+///    `Loot-Change-Id` trailer — the trailer every ferry projection mints, so
+///    "an earlier ferry already projected exactly the line this land was about
+///    to" is a fact, not an inference. Without this walk, a *sibling's*
+///    unpushed projection would unlock a land whose own change never
+///    integrated — and without the range bound, a tip *already pushed* (its
+///    trailer reachable from origin) would pass all three conditions and land
+///    the sibling's projected-but-unlanded line: both are the exact green lie
+///    #195 forbids.
 ///
 /// Anything unprovable — no origin ref, mirror behind or diverged, no finalized
 /// tip, trailer absent — reads `false`, leaving the #195 refusal as the
@@ -785,19 +789,24 @@ fn already_projected_unpushed(
     if !is_ancestor(mirror, /* ancestor */ &origin, /* descendant */ main_sha) {
         return false; // behind or diverged: no clean fast-forward is owed from here
     }
-    projected_on(mirror, main_sha, tip)
+    projected_on(mirror, &origin, main_sha, tip)
 }
 
-/// Whether a commit reachable from `main_sha` in `repo` carries
+/// Whether a commit in `origin..main_sha` in `repo` carries
 /// `Loot-Change-Id: <change_hex>` — the trailer [`ferry`]'s projection mints on
-/// every mirrored change. `--fixed-strings` so the needle is never a regex;
-/// any git failure reads as "not projected" (the conservative answer).
-fn projected_on(repo: &Path, main_sha: &str, change_hex: &str) -> bool {
+/// every mirrored change. The walk is bounded to the unpushed span (#367): a
+/// trailer already reachable from `origin` means the tip is published, so this
+/// land owes no push — proceeding would publish whatever *else* sits unpushed
+/// on the mirror. The caller's ancestry check guarantees `origin` exists in
+/// `repo`. `--fixed-strings` so the needle is never a regex; any git failure
+/// reads as "not projected" (the conservative answer).
+fn projected_on(repo: &Path, origin: &str, main_sha: &str, change_hex: &str) -> bool {
     let needle = format!("{}: {change_hex}", loot_core::bridge::TRAILER_CHANGE_ID);
+    let range = format!("{origin}..{main_sha}");
     std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["log", "--fixed-strings", "-1", "--format=%H", &format!("--grep={needle}"), main_sha])
+        .args(["log", "--fixed-strings", "-1", "--format=%H", &format!("--grep={needle}"), &range])
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
@@ -1710,6 +1719,28 @@ mod tests {
         let mirror = mirror_of(&base, &checkout);
         let main_sha = projected_commit(&mirror, &"cd".repeat(32));
         assert!(!already_projected_unpushed(&checkout, &mirror, &main_sha, Some(&"ab".repeat(32))));
+    }
+
+    #[test]
+    fn an_already_pushed_tip_behind_a_siblings_projection_does_not_unlock_the_land() {
+        // The #367 variant of the green lie: this land's tip is already
+        // published (its trailer commit IS origin/main), and a sibling's
+        // unpushed projection sits ahead of it on the mirror. All three
+        // conditions of the unbounded walk would pass — and the land would
+        // push the sibling's projected-but-unlanded line. Bounding the
+        // trailer walk to `origin/main..main` must read this as "nothing
+        // unpushed of OURS" and keep the refusal.
+        let base = scratch("367-pushed-tip-sibling-ahead");
+        let checkout = git_repo(&base, "checkout");
+        let tip = "ab".repeat(32);
+        let ours_pushed = projected_commit(&checkout, &tip);
+        git(&checkout, &["update-ref", "refs/remotes/origin/main", &ours_pushed]);
+        let mirror = mirror_of(&base, &checkout);
+        let main_sha = projected_commit(&mirror, &"cd".repeat(32));
+        assert!(
+            !already_projected_unpushed(&checkout, &mirror, &main_sha, Some(&tip)),
+            "a tip reachable from origin/main owes no push — the ahead line is the sibling's"
+        );
     }
 
     #[test]
