@@ -133,7 +133,7 @@ const COMMANDS: &[Verb] = &[
     verb("peer", &[], &[], cmd_peer),
     verb("serve", &["--dir", "--addr", "--allow"], &[], cmd_serve),
     verb("push", &["--remote"], &[], cmd_push),
-    verb("pull", &["--remote"], OUT, cmd_pull),
+    verb("pull", &["--remote"], &["--no-surface", "--porcelain", "--json"], cmd_pull),
     verb("pull-grants", &["--remote"], &[], cmd_pull_grants),
     verb("grants", &["--remote"], &[], cmd_grants),
     verb("clone", &["--identity"], &[], cmd_clone),
@@ -203,7 +203,7 @@ usage:
   loot peer list                            show all known peers
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
-  loot pull [<url>] [--remote <name>] [--porcelain|--json]  fetch, merge, and converge changes from a relay
+  loot pull [<url>] [--remote <name>] [--no-surface] [--porcelain|--json]  fetch, merge, converge, and surface changes from a relay
   loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip also projects the ambient dock's unfinalized WIP to review/<lane-id> (review/<dock> on the primary; map #148, #281)
 
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
@@ -729,14 +729,26 @@ fn cmd_surface() -> Result<(), String> {
         println!("nothing to surface (no changes recorded)");
         return Ok(());
     }
-    for (path, vis) in &written {
+    print_surface_listing(&head, &written, skipped, ws.identity());
+    Ok(())
+}
+
+/// The `loot surface` listing — written paths with visibility marks, the
+/// sealed-skip count, and the surfaced-as line — shared with `pull`'s
+/// auto-surface (#3) so the two verbs cannot drift apart.
+fn print_surface_listing(
+    head: &Oid,
+    written: &[(std::path::PathBuf, Visibility)],
+    skipped: usize,
+    identity: &str,
+) {
+    for (path, vis) in written {
         println!("  {:<32} {}", path.display(), mark(vis));
     }
     if skipped > 0 {
         println!("  ({skipped} sealed path(s) skipped — request a grant to access them)");
     }
-    println!("surfaced {} as {}", short(&head), ws.identity());
-    Ok(())
+    println!("surfaced {} as {identity}", short(head));
 }
 
 fn cmd_gc(args: &[String]) -> Result<(), String> {
@@ -2199,14 +2211,30 @@ impl workspace::SyncTransport for HttpTransport {
 
 fn cmd_pull(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
+    let no_surface = has_flag(args, "--no-surface");
     let mut ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
+    run_pull(&mut ws, &HttpTransport { url: url.clone() }, &url, fmt, no_surface)
+}
+
+/// The verb behind the transport seam, so tests drive it in-process (#3).
+/// The whole pipeline — negotiate, batched fetch with per-batch persist,
+/// apply, post-pull converge, worst-folding — is `Workspace::pull_via`
+/// (#217); this renders, then auto-surfaces after a non-empty converged
+/// apply, exactly as `loot clone` does — users ran `loot surface` by hand
+/// after nearly every pull. `--no-surface` opts out, and a deferred pull
+/// (capture-first left heads unconverged, #219) keeps the
+/// finalize-then-re-pull instruction instead: surfacing there would only
+/// rewrite the operator's own captured tree, not the pulled content.
+fn run_pull(
+    ws: &mut Workspace,
+    transport: &impl workspace::SyncTransport,
+    url: &str,
+    fmt: OutFmt,
+    no_surface: bool,
+) -> Result<(), String> {
     let identity = ws.identity().to_string();
-    // The whole pipeline — negotiate, batched fetch with per-batch persist,
-    // apply, post-pull converge, worst-folding — is `Workspace::pull_via`
-    // (#217); this verb resolves the remote, adapts loot-net to the seam,
-    // and renders.
-    let report = ws.pull_via(&HttpTransport { url: url.clone() })?;
+    let report = ws.pull_via(transport)?;
     let outcomes = &report.outcomes;
 
     match fmt {
@@ -2224,9 +2252,10 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
                          (`loot new`) then re-run `loot pull` to converge",
                         loot_core::hex::short(&id.0, 4)
                     ),
-                    None => println!(
+                    None if no_surface => println!(
                         "converged onto one line; run `loot surface` to materialize what you may see"
                     ),
+                    None => println!("converged onto one line:"),
                 }
             }
         }
@@ -2236,6 +2265,15 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     }
     if !outcomes.is_empty() || report.deferred.is_some() {
         ws.record_op("pull", &format!("pull from {url} ({} path(s))", outcomes.len()), false);
+    }
+    // Auto-surface (#3): a non-empty converged apply materializes the tree.
+    // Machine output still materializes — the working tree is behavior, not
+    // rendering — but stays verdict-rows-only; a no-op pull stays quiet.
+    if !no_surface && !outcomes.is_empty() && report.deferred.is_none() {
+        let (head, written, skipped) = ws.surface_with_report()?;
+        if matches!(fmt, OutFmt::Human) {
+            print_surface_listing(&head, &written, skipped, ws.identity());
+        }
     }
     Ok(())
 }
@@ -2386,6 +2424,10 @@ mod tests {
         assert_eq!(check("serve", &["--dir", "d", "--addr", "a", "--allow", "k"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("push", &["--remote", "origin"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("pull", &["--remote", "origin", "--porcelain"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("pull", &["--no-surface"]), Ok(FlagCheck::Proceed));
+        // #3: registering `--no-surface` must not loosen the gate — a typo'd
+        // spelling is still refused, not read as "surface as usual".
+        assert!(check("pull", &["--no-surfac"]).is_err());
         assert_eq!(check("pull-grants", &["--remote", "origin"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("grants", &["--remote", "origin"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("ferry", &["--git-dir", "g", "--dock", "main", "--with-wip", "--json"]), Ok(FlagCheck::Proceed));
@@ -2900,5 +2942,77 @@ mod tests {
 
         let _ = ws.snapshotted(&SnapshotOpts::default()).unwrap();
         assert_ne!(ws.working_id(), before.as_ref(), "a real capture moves the working change");
+    }
+
+    // --- #3: `loot pull` auto-surfaces after a non-empty apply ---
+
+    /// The in-memory adapter at the SyncTransport seam, as workspace.rs's own
+    /// pull tests build it (that module is private to the lib, so the bin's
+    /// tests mirror it): a relay-role DagRepo answering offer/fetch with
+    /// exactly the engine methods the HTTP relay's handlers call.
+    struct InMemoryRelay(DagRepo);
+    impl workspace::SyncTransport for InMemoryRelay {
+        fn offer(&self, have: &[Oid]) -> Result<Vec<Oid>, String> {
+            Ok(self.0.offered_objects(have))
+        }
+        fn fetch(&self, have: &[Oid], wants: &[Oid]) -> Result<Vec<u8>, String> {
+            self.0.bundle_wanted(have, wants).map(|b| b.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// An alice workspace with one finalized public `doc.txt` change, a relay
+    /// stowing everything she published, and a fresh bob who has pulled
+    /// nothing yet — the auto-surface scenario (#3).
+    fn pull_fixture(
+        tag: &str,
+    ) -> (Workspace, InMemoryRelay, std::path::PathBuf, Workspace) {
+        let dir_a = tmp(&format!("{tag}-a"));
+        init_repo(&dir_a, "alice").unwrap();
+        let mut alice = Workspace::open_at(&dir_a).unwrap();
+        std::fs::write(dir_a.join("doc.txt"), b"v1").unwrap();
+        alice.snapshot("doc").unwrap();
+        alice.finalize_working().unwrap();
+        let mut relay = DagRepo::init(tmp(&format!("{tag}-relay")), "relay").unwrap();
+        relay.stow(&alice.repo().bundle(&[]).unwrap()).unwrap();
+        let dir_b = tmp(&format!("{tag}-b"));
+        init_repo(&dir_b, "bob").unwrap();
+        let bob = Workspace::open_at(&dir_b).unwrap();
+        (alice, InMemoryRelay(relay), dir_b, bob)
+    }
+
+    /// #3: a non-empty converged apply auto-surfaces — the pulled content
+    /// lands on disk without a separate `loot surface`, as `loot clone` does.
+    #[test]
+    fn pull_materializes_the_tree_after_a_nonempty_apply() {
+        let (_alice, relay, dir_b, mut bob) = pull_fixture("pull-surf");
+        run_pull(&mut bob, &relay, "mem://relay", OutFmt::Human, false).unwrap();
+        assert_eq!(
+            std::fs::read(dir_b.join("doc.txt")).unwrap(),
+            b"v1",
+            "the pull surfaced what bob may see"
+        );
+    }
+
+    /// #3: `--no-surface` opts out — the graph still converges onto the
+    /// pulled line, but the tree stays untouched.
+    #[test]
+    fn pull_no_surface_skips_materialization() {
+        let (alice, relay, dir_b, mut bob) = pull_fixture("pull-nosurf");
+        run_pull(&mut bob, &relay, "mem://relay", OutFmt::Human, true).unwrap();
+        assert!(!dir_b.join("doc.txt").exists(), "--no-surface leaves the tree alone");
+        assert_eq!(bob.heads(), alice.heads(), "the pull itself still converged");
+    }
+
+    /// #3: a no-op pull stays quiet — nothing new to apply means no surface
+    /// pass: the tree, the graph, and the working slot are all untouched.
+    #[test]
+    fn noop_pull_skips_surface() {
+        let (_alice, relay, dir_b, mut bob) = pull_fixture("pull-noop");
+        run_pull(&mut bob, &relay, "mem://relay", OutFmt::Human, false).unwrap();
+        let heads = bob.heads();
+        run_pull(&mut bob, &relay, "mem://relay", OutFmt::Human, false).unwrap();
+        assert_eq!(bob.heads(), heads, "nothing new ingested");
+        assert!(bob.working_id().is_none(), "a no-op pull mints no working change");
+        assert_eq!(std::fs::read(dir_b.join("doc.txt")).unwrap(), b"v1");
     }
 }
