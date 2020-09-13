@@ -2853,8 +2853,15 @@ impl Workspace {
     /// forks from the resolved line rather than the pre-resolution merge (CA2, ADR
     /// 0022). On the pre-dock home dock it keeps the original behavior (resolve
     /// against all heads; finalize with `loot new`). Returns the resolution
-    /// content oid, for display.
-    pub fn resolve_conflict(&mut self, path: &Path, resolution: &[u8], vis: Visibility) -> Result<Oid, String> {
+    /// content oid and the minted message — the ours-line subject with a
+    /// `(conflict resolution: <path>)` suffix, or the placeholder when no
+    /// subject was derivable (#337) — for display.
+    pub fn resolve_conflict(
+        &mut self,
+        path: &Path,
+        resolution: &[u8],
+        vis: Visibility,
+    ) -> Result<(Oid, String), String> {
         let base = self.position.tip().cloned();
         let (change_id, content) = self
             .repo
@@ -2897,10 +2904,14 @@ impl Workspace {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             std::fs::write(&dest, resolution).map_err(|e| e.to_string())?;
-            self.position.advance(&self.store, Some(change_id));
+            self.position.advance(&self.store, Some(change_id.clone()));
         }
         self.persist()?;
-        Ok(content)
+        let message = self
+            .repo
+            .change_message(&change_id)
+            .unwrap_or_else(|| format!("resolve conflict at {}", path.display()));
+        Ok((content, message))
     }
 
     // --- git interop bridge support (GB1, ADR 0028) ---
@@ -6540,6 +6551,53 @@ mod tests {
         assert!(ws.repo().conflicts().is_empty(), "all conflicts resolved in one pass");
         assert_eq!(std::fs::read(dir.join("d.txt")).unwrap(), b"resolved d\n");
         assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"uncommitted work\n");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn bounced_land_resolution_inherits_the_described_subject() {
+        // #337: a harbor bounce is reconciled with `loot resolve`, and the
+        // resolution used to mint "resolve conflict at <path>" — projected 1:1
+        // to git main, that placeholder buried the landed change's real
+        // subject under a wall of identical commits. The resolution must
+        // inherit the described subject instead, and the workspace must
+        // surface the minted message to the operator.
+        let (area, dir, mut ws) = lane_setup("337-inherit-subject");
+        // A sibling forks at base and lands a conflicting edit of base.txt.
+        let c2 = lane_with_change(
+            &mut ws,
+            &area,
+            "sibling",
+            &[("base.txt", b"theirs\n")],
+            "sibling landed",
+        );
+        let mut ws = Workspace::open_at(&dir).unwrap();
+
+        // Ours: the described change being landed edits the same path.
+        std::fs::write(dir.join("base.txt"), b"ours\n").unwrap();
+        ws.snapshot("loot grant-status <path>: list current grantees (#5)").unwrap();
+        ws.finalize_working().unwrap();
+        let ours = ws.finalized_anchor();
+
+        // The ferry reconcile the land runs — same-path divergence bounces.
+        let outcomes = ws
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", false)
+            .unwrap();
+        assert!(
+            matches!(outcomes[&PathBuf::from("base.txt")], MergeOutcome::Conflict { .. }),
+            "precondition: the reconcile bounced on base.txt"
+        );
+
+        let (_oid, message) =
+            ws.resolve_conflict(Path::new("base.txt"), b"resolved\n", Visibility::Public).unwrap();
+        assert_eq!(
+            message,
+            "loot grant-status <path>: list current grantees (#5) (conflict resolution: base.txt)",
+            "the resolution inherits the landed change's subject"
+        );
+        // The tip change — what ferry will project to git main — carries it.
+        let tip = ws.anchor().expect("resolve advanced the tip");
+        assert_eq!(ws.repo().change_message(&tip).as_deref(), Some(message.as_str()));
         let _ = std::fs::remove_dir_all(&area);
     }
 

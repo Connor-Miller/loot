@@ -235,10 +235,60 @@ impl DagRepo {
 
 }
 
+/// The fallback subject `resolve` mints when no ours-line subject is
+/// derivable (#337). loot-first's land gate refuses a working change carrying
+/// this prefix (#316) and keeps its own copy of the string
+/// (`crates/loot-first/src/orchestrator.rs`) — change one, change both.
+const RESOLVE_FALLBACK_PREFIX: &str = "resolve conflict at ";
+
+/// Opens the suffix a subject-inheriting resolution appends (#337):
+/// `"<subject> (conflict resolution: <path>)"`. Also what the inheritance walk
+/// strips from a sibling resolution's message so chained resolutions never
+/// stack suffixes.
+const RESOLUTION_SUFFIX_OPEN: &str = " (conflict resolution: ";
+
+/// loot-cli's placeholder for a never-described working change
+/// (`workspace.rs`, `UNDESCRIBED_MESSAGE`) — a finalized bare one is a real
+/// state history has carried. Inheriting it would mint an undescribed subject
+/// that evades loot-first's placeholder gate (#316), so the walk skips it
+/// like the resolve placeholder. Same deliberate cross-crate string coupling
+/// as [`RESOLVE_FALLBACK_PREFIX`]: change one, change both.
+const UNDESCRIBED_SUBJECT: &str = "(working change)";
+
 /// **Reconcile & relay face** (R3, #179): what happens when lines of history
 /// meet — the conflict set and its resolution, the relay's append-only `stow`,
 /// and the `apply_sync` machinery under the classifier (ADR 0001/0011).
 impl DagRepo {
+    /// The subject a resolution change inherits (#337): the nearest
+    /// describable change on the ours line, found by walking first-parent
+    /// edges from `base`. Structural nodes never name the work and are
+    /// skipped: merges (2+ parents — the conflicted reconcile itself, and any
+    /// converge fold beneath it; their first parent IS the ours side, by
+    /// `merge_tips`' parent order) and placeholder-subject legacy resolutions.
+    /// A sibling resolution's own suffix is stripped, so resolving several
+    /// paths in sequence inherits the same bare subject each time. `None`
+    /// when the walk exhausts — the caller falls back to the placeholder.
+    fn inherited_resolution_subject(&self, base: &Oid) -> Option<String> {
+        let mut cur = base.clone();
+        // Bounded: a pathological first-parent chain must not stall resolve.
+        for _ in 0..64 {
+            let node = self.graph.get(&cur)?;
+            if node.parents.len() <= 1 {
+                let msg = node.message.as_str();
+                if !msg.starts_with(RESOLVE_FALLBACK_PREFIX) && msg != UNDESCRIBED_SUBJECT {
+                    let subject = match msg.rfind(RESOLUTION_SUFFIX_OPEN) {
+                        Some(i) if msg.ends_with(')') => &msg[..i],
+                        _ => msg,
+                    };
+                    if !subject.is_empty() {
+                        return Some(subject.to_string());
+                    }
+                }
+            }
+            cur = node.parents.first()?.clone();
+        }
+        None
+    }
     /// All unresolved conflicts from the last `apply`, keyed by path.
     /// Each value is `(our_oid, their_oid)`.
     pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
@@ -255,6 +305,14 @@ impl DagRepo {
     /// resolves onto its own conflicted merge change and advances it (ADR 0022),
     /// rather than folding in every head. `None` keeps the pre-dock behavior
     /// (parent on all heads, base on the merged `current_tree`).
+    ///
+    /// The resolution's message inherits the ours-line subject with a
+    /// `(conflict resolution: <path>)` suffix (#337) — see
+    /// [`inherited_resolution_subject`]; when no subject is derivable it falls
+    /// back to the `resolve conflict at <path>` placeholder, which loot-first's
+    /// land gate refuses to publish as a commit subject (#316).
+    ///
+    /// [`inherited_resolution_subject`]: DagRepo::inherited_resolution_subject
     pub fn resolve(
         &mut self,
         base: Option<&Oid>,
@@ -278,11 +336,17 @@ impl DagRepo {
             Some(tip) => (self.graph.tree_at(tip), vec![tip.clone()]),
             None => (self.graph.current_tree(), self.graph.heads()),
         };
+        let message = base
+            .and_then(|tip| self.inherited_resolution_subject(tip))
+            .map(|subject| {
+                format!("{subject}{RESOLUTION_SUFFIX_OPEN}{})", path.display())
+            })
+            .unwrap_or_else(|| format!("{RESOLVE_FALLBACK_PREFIX}{}", path.display()));
         new_tree.insert(path.to_path_buf(), (new_oid.clone(), vis));
         let change = Change {
             id: Oid([0; 32]),
             parents,
-            message: format!("resolve conflict at {}", path.display()),
+            message,
             tree: new_tree,
         };
         let change_id = self.record(change)?;
@@ -4258,6 +4322,225 @@ mod tests {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
         let result = alice.resolve(None, Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
         assert!(matches!(result, Err(RepoError::Backend(_))), "unknown path must error");
+    }
+
+    // --- #337: a resolution inherits the ours-line subject ------------------
+    // A bounced land is reconciled with `loot resolve`, which used to mint
+    // every resolution change as "resolve conflict at <path>" — so git main
+    // read as a wall of placeholders with the real subjects buried. The
+    // resolution now inherits the nearest describable subject on the ours
+    // line (first-parent walk from `base`, skipping merges and placeholder
+    // subjects); the placeholder survives only as the fallback.
+
+    /// A conflicted reconcile in miniature: base → ours edit (message
+    /// `subject`) and theirs edit of the same `paths`, merged as the ferry
+    /// does. Returns the repo and the conflicted merge id.
+    fn bounced_merge(subject: &str, paths: &[&str]) -> (DagRepo, Oid) {
+        let vis = Visibility::Public;
+        let mut repo = DagRepo::init(tmp(), "alice").unwrap();
+        let mut base_tree = BTreeMap::new();
+        let base_oid = repo.put(b"base\n", vis.clone()).unwrap();
+        for p in paths {
+            base_tree.insert(PathBuf::from(p), (base_oid.clone(), vis.clone()));
+        }
+        let base = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree })
+            .unwrap();
+
+        let ours_oid = repo.put(b"ours\n", vis.clone()).unwrap();
+        let mut ours_tree = BTreeMap::new();
+        for p in paths {
+            ours_tree.insert(PathBuf::from(p), (ours_oid.clone(), vis.clone()));
+        }
+        let ours = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![base.clone()],
+                message: subject.into(),
+                tree: ours_tree,
+            })
+            .unwrap();
+
+        let theirs_oid = repo.put(b"theirs\n", vis.clone()).unwrap();
+        let mut their_tree = BTreeMap::new();
+        for p in paths {
+            their_tree.insert(PathBuf::from(p), (theirs_oid.clone(), vis.clone()));
+        }
+        let theirs = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![base],
+                message: "landed on main meanwhile".into(),
+                tree: their_tree,
+            })
+            .unwrap();
+
+        let (merge, _) = repo.merge_tips(&ours, &theirs, "ferry: reconcile git main", 0).unwrap();
+        for p in paths {
+            assert!(repo.conflicts.contains_key(Path::new(p)), "precondition: {p} conflicted");
+        }
+        (repo, merge)
+    }
+
+    #[test]
+    fn resolve_inherits_the_ours_line_subject_over_a_bounced_merge() {
+        let subject = "loot grant-status <path>: list current grantees (#5)";
+        let (mut repo, merge) = bounced_merge(subject, &["contested.txt"]);
+        let (res, _) = repo
+            .resolve(Some(&merge), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .unwrap();
+        assert_eq!(
+            repo.graph.get(&res).unwrap().message,
+            format!("{subject} (conflict resolution: contested.txt)"),
+            "the resolution carries the landed change's subject, not the placeholder"
+        );
+    }
+
+    #[test]
+    fn sequential_resolutions_inherit_without_stacking_suffixes() {
+        // A multi-path bounce resolves one path at a time, each resolution
+        // building on the previous one — inheriting through a sibling
+        // resolution must re-derive the bare subject, not stack suffixes.
+        let subject = "wave subject (#23)";
+        let (mut repo, merge) = bounced_merge(subject, &["a.txt", "d.txt"]);
+        let (r1, _) = repo
+            .resolve(Some(&merge), Path::new("a.txt"), b"resolved a\n", Visibility::Public, 0)
+            .unwrap();
+        assert_eq!(
+            repo.graph.get(&r1).unwrap().message,
+            format!("{subject} (conflict resolution: a.txt)")
+        );
+        let (r2, _) = repo
+            .resolve(Some(&r1), Path::new("d.txt"), b"resolved d\n", Visibility::Public, 0)
+            .unwrap();
+        assert_eq!(
+            repo.graph.get(&r2).unwrap().message,
+            format!("{subject} (conflict resolution: d.txt)"),
+            "no suffix stacking through the sibling resolution"
+        );
+    }
+
+    #[test]
+    fn resolve_walks_past_a_legacy_placeholder_subject() {
+        // An ours line whose tip is an old-style placeholder resolution still
+        // yields the real subject beneath it.
+        let subject = "the real subject (#42)";
+        let (mut repo, merge) = bounced_merge(subject, &["contested.txt"]);
+        // Splice a legacy placeholder change between the merge and resolve:
+        // resolve builds on it, exactly like a pre-#337 partial reconcile.
+        let oid = repo.put(b"legacy\n", Visibility::Public).unwrap();
+        let mut tree = repo.graph.tree_at(&merge);
+        tree.insert(PathBuf::from("other.txt"), (oid, Visibility::Public));
+        let legacy = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![merge],
+                message: "resolve conflict at other.txt".into(),
+                tree,
+            })
+            .unwrap();
+        let (res, _) = repo
+            .resolve(Some(&legacy), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .unwrap();
+        assert_eq!(
+            repo.graph.get(&res).unwrap().message,
+            format!("{subject} (conflict resolution: contested.txt)"),
+            "the walk skips placeholder subjects on its way to the real one"
+        );
+    }
+
+    #[test]
+    fn resolve_without_a_base_keeps_the_placeholder() {
+        // The pre-dock home flow (base = None) has no single ours line to
+        // inherit from — the placeholder stays, and loot-first's land gate
+        // (#316) keeps refusing it.
+        let (mut repo, _merge) = bounced_merge("some subject", &["contested.txt"]);
+        let (res, _) = repo
+            .resolve(None, Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .unwrap();
+        assert_eq!(
+            repo.graph.get(&res).unwrap().message,
+            "resolve conflict at contested.txt"
+        );
+    }
+
+    #[test]
+    fn resolve_walks_past_an_undescribed_working_change_subject() {
+        // "(working change)" is loot-cli's un-described placeholder
+        // (`UNDESCRIBED_MESSAGE`); a finalized bare one has reached git main
+        // before (fd926e4). Inheriting it would mint an undescribed subject
+        // that additionally evades the #316 land gate — skip it like the
+        // resolve placeholder.
+        let subject = "the real subject (#42)";
+        let (mut repo, merge) = bounced_merge(subject, &["contested.txt"]);
+        let oid = repo.put(b"wip\n", Visibility::Public).unwrap();
+        let mut tree = repo.graph.tree_at(&merge);
+        tree.insert(PathBuf::from("other.txt"), (oid, Visibility::Public));
+        let undescribed = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![merge],
+                message: "(working change)".into(),
+                tree,
+            })
+            .unwrap();
+        let (res, _) = repo
+            .resolve(Some(&undescribed), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .unwrap();
+        assert_eq!(
+            repo.graph.get(&res).unwrap().message,
+            format!("{subject} (conflict resolution: contested.txt)"),
+            "an undescribed placeholder subject is never inherited"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_when_the_walk_finds_no_subject() {
+        // An ours line made only of placeholder subjects derives nothing —
+        // fall back rather than inherit a placeholder.
+        let vis = Visibility::Public;
+        let mut repo = DagRepo::init(tmp(), "alice").unwrap();
+        let base_oid = repo.put(b"base\n", vis.clone()).unwrap();
+        let mut t0 = BTreeMap::new();
+        t0.insert(PathBuf::from("contested.txt"), (base_oid, vis.clone()));
+        let root = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![],
+                message: "resolve conflict at ancient.txt".into(),
+                tree: t0,
+            })
+            .unwrap();
+        let ours_oid = repo.put(b"ours\n", vis.clone()).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("contested.txt"), (ours_oid, vis.clone()));
+        let ours = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![root.clone()],
+                message: "resolve conflict at old.txt".into(),
+                tree: t1,
+            })
+            .unwrap();
+        let theirs_oid = repo.put(b"theirs\n", vis.clone()).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("contested.txt"), (theirs_oid, vis.clone()));
+        let theirs = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![root],
+                message: "resolve conflict at other-old.txt".into(),
+                tree: t2,
+            })
+            .unwrap();
+        let (merge, _) = repo.merge_tips(&ours, &theirs, "ferry: reconcile git main", 0).unwrap();
+        let (res, _) = repo
+            .resolve(Some(&merge), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .unwrap();
+        assert_eq!(
+            repo.graph.get(&res).unwrap().message,
+            "resolve conflict at contested.txt"
+        );
     }
 
     // --- golden-byte fixtures + major-rejection for conflicts (ADR 0019) ---

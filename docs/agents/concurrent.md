@@ -115,7 +115,10 @@ Landing is the single serialized funnel. From the lane:
 3. If the change conflicts with what landed while the lane worked, the land
    **bounces** — nothing is pushed, the signed change is safe. Reconcile
    (`loot resolve …`, or `loot adopt` to take the landed line) and re-run `land`.
-   The queue is never blocked by a bounce.
+   The queue is never blocked by a bounce. Each resolution inherits your
+   change's subject as `<subject> (conflict resolution: <path>)` (#337); if
+   `resolve` reports the bare `resolve conflict at …` placeholder instead, run
+   `loot describe -m "<subject>"` before re-landing (#316 refuses otherwise).
 4. After the land, mark-and-reap the lane: the land marks the entry; run
    `loot lane gc` **from the primary** afterwards to reap it. Don't `rm -rf` the
    directory by hand — gc verifies the `lane-id` first (reaping is not undoable,
