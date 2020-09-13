@@ -3,3 +3,12 @@ target/
 test-repos/
 .claude/
 .scratch/
+# Site (loot.millerbyte.com, #257) deps + build output + Vercel CLI link.
+site/node_modules/
+site/.output/
+site/.tanstack/
+site/.nitro/
+site/dist/
+site/.vercel/
+site/*.tsbuildinfo
+.vercel/
