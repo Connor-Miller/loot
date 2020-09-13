@@ -374,8 +374,26 @@ fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
     println!("public key: {}", pub_line.trim());
     println!("tip: share your public key with peers via `loot whoami`");
     println!("tip: declare per-file privacy in .lootattributes, e.g. `.env restricted={id_name}`");
+    // Quickstart (#21): teach the three visibility modes right at init, on
+    // stdout so CI logs carry it too. Print-only — pasting it is the user's call.
+    println!("\nquickstart — paste this into a .lootattributes file to control visibility:\n");
+    println!("{}", lootattributes_quickstart());
     let _ = keypair;
     Ok(())
+}
+
+/// The commented `.lootattributes` example `init` prints (#21): one comment per
+/// visibility mode and one concrete line exercising each. Never written to disk.
+fn lootattributes_quickstart() -> &'static str {
+    "\
+# .lootattributes — control per-path visibility
+# public      — everyone can read
+# restricted  — only named identities
+# embargoed   — sealed until unix timestamp
+
+*.md          public
+.env          restricted=alice
+RELEASE.md    embargoed=1800000000"
 }
 
 fn cmd_status(args: &[String]) -> Result<(), String> {
@@ -2804,6 +2822,43 @@ mod tests {
         let mut ws = Workspace::open_at(&dir).unwrap();
         ws.finalize_capturing(&[], false).unwrap();
         assert!(ws.repo().log().is_empty(), "no spurious empty change: {:?}", ws.repo().log());
+    }
+
+    // --- #21: `loot init` prints a `.lootattributes` quickstart ---
+
+    /// The quickstart template printed after init must teach all three
+    /// visibility modes — a comment explaining each, plus a concrete example
+    /// line per mode — so a new user understands the model without the docs.
+    #[test]
+    fn lootattributes_quickstart_covers_all_three_modes() {
+        let t = lootattributes_quickstart();
+        // A comment line names and explains each mode.
+        for mode in ["public", "restricted", "embargoed"] {
+            assert!(
+                t.lines().any(|l| l.starts_with('#') && l.contains(mode)),
+                "no comment line explaining `{mode}`:\n{t}"
+            );
+        }
+        // A concrete (non-comment) example line exercises each mode.
+        let examples: Vec<&str> =
+            t.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).collect();
+        assert!(examples.iter().any(|l| l.ends_with("public")), "no public example:\n{t}");
+        assert!(examples.iter().any(|l| l.contains("restricted=")), "no restricted example:\n{t}");
+        assert!(examples.iter().any(|l| l.contains("embargoed=")), "no embargoed example:\n{t}");
+        // It names the file it's meant to be pasted into.
+        assert!(t.contains(".lootattributes"), "template must name .lootattributes:\n{t}");
+    }
+
+    /// The quickstart is print-only: init must never materialize
+    /// `.lootattributes` in the new repo — the user pastes it if they want it.
+    #[test]
+    fn init_never_writes_lootattributes_to_disk() {
+        let dir = tmp("init-no-lootattributes");
+        init_repo(&dir, "alice").unwrap();
+        assert!(
+            !dir.join(".lootattributes").exists(),
+            ".lootattributes must not be written by init"
+        );
     }
 
     /// An implicit capture (via the Snapshotted handle, #182) re-records the

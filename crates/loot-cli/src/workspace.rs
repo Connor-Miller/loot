@@ -1373,6 +1373,83 @@ impl Workspace {
         Ok(out)
     }
 
+    /// The working change's live path-level delta over the previous finalized
+    /// change (`loot status`, #7): the [`render::PathDelta`] per changed path,
+    /// ordered by path. The base is implicit — the anchor the working change
+    /// forks from; no anchor (the repo's first change) reads every file as
+    /// added. The working side is the tree on **disk**, keeping status's
+    /// read-only live semantics (ADR 0030) rather than the last captured
+    /// snapshot; a disk-side row's `oid` is the live plaintext fingerprint (the
+    /// `working_preview` convention), and `prev_visibility` stays `None` — the
+    /// working side has one side (#306). Stored addresses move on re-seal, so
+    /// "modified" is judged on plaintext + visibility — the same judgment
+    /// snapshot's address-reuse makes (#98). A base path sealed to the ambient
+    /// identity is carried forward untouched by snapshot (ADR 0006), so its
+    /// absence from disk is not a deletion and it does not row; a deleted row
+    /// keeps the base side's stored address and visibility, as `diff` does.
+    pub fn working_delta(&mut self) -> Result<Vec<PathDelta>, String> {
+        let base_tree = match self.anchor() {
+            Some(a) => self.repo.change_tree(&a).unwrap_or_default(),
+            None => Default::default(),
+        };
+        let (entries, _) = self.read_working_tree()?;
+        let disk: BTreeMap<PathBuf, (Vec<u8>, Visibility)> =
+            entries.into_iter().map(|(path, bytes, vis)| (path, (bytes, vis))).collect();
+        let plain = |bytes: &[u8]| Oid(*blake3::hash(bytes).as_bytes());
+
+        let mut paths: std::collections::BTreeSet<&PathBuf> = base_tree.keys().collect();
+        paths.extend(disk.keys());
+
+        let mut out = Vec::new();
+        for path in paths {
+            let delta = match (base_tree.get(path), disk.get(path)) {
+                (None, Some((bytes, vis))) => PathDelta {
+                    class: DeltaClass::Added,
+                    path: path.clone(),
+                    oid: plain(bytes),
+                    sealed: false,
+                    visibility: vis.clone(),
+                    prev_visibility: None,
+                },
+                (Some((oid, vis)), None) => {
+                    // Absent from disk because sealed to us, not deleted by us.
+                    if self.repo.get(oid, &self.identity, self.now).is_err() {
+                        continue;
+                    }
+                    PathDelta {
+                        class: DeltaClass::Deleted,
+                        path: path.clone(),
+                        oid: oid.clone(),
+                        sealed: false,
+                        visibility: vis.clone(),
+                        prev_visibility: None,
+                    }
+                }
+                (Some((base_oid, base_vis)), Some((bytes, vis))) => {
+                    let same = base_vis == vis
+                        && self
+                            .repo
+                            .get(base_oid, &self.identity, self.now)
+                            .is_ok_and(|old| old == *bytes);
+                    if same {
+                        continue; // unchanged — the delta shows only what moved
+                    }
+                    PathDelta {
+                        class: DeltaClass::Modified,
+                        path: path.clone(),
+                        oid: plain(bytes),
+                        sealed: false,
+                        visibility: vis.clone(),
+                        prev_visibility: None,
+                    }
+                }
+                (None, None) => unreachable!("path came from the union of the two trees"),
+            };
+            out.push(delta);
+        }
+        Ok(out)
+    }
+
     /// `loot abandon <version>`: drop `version` from its divergent change, leaving
     /// the other live version(s) under the change id (ADR 0030). Refuses a version
     /// that is not a live member of a *divergent* change, so it only ever collapses
@@ -7297,6 +7374,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    // --- status: the #7 working delta over the previous finalized change ----
+
+    #[test]
+    fn working_delta_reports_added_modified_and_deleted_vs_the_parent() {
+        let dir = std::env::temp_dir().join(format!("loot-wdelta-amd-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("keep.txt"), b"same").unwrap();
+        std::fs::write(dir.join("edit.txt"), b"v1").unwrap();
+        std::fs::write(dir.join("gone.txt"), b"bye").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        // Live, un-captured edits: status is read-only (ADR 0030), so the delta
+        // must come off the disk tree, not the last snapshot.
+        std::fs::write(dir.join("edit.txt"), b"v2").unwrap(); // modified
+        std::fs::remove_file(dir.join("gone.txt")).unwrap(); // deleted
+        std::fs::write(dir.join("new.txt"), b"hello").unwrap(); // added
+
+        let deltas = ws.working_delta().unwrap();
+        let by_path = |name: &str| {
+            deltas
+                .iter()
+                .find(|d| d.path == Path::new(name))
+                .unwrap_or_else(|| panic!("no delta for {name}"))
+        };
+        assert_eq!(by_path("new.txt").class, DeltaClass::Added);
+        assert_eq!(by_path("edit.txt").class, DeltaClass::Modified);
+        assert_eq!(by_path("gone.txt").class, DeltaClass::Deleted);
+        assert!(
+            !deltas.iter().any(|d| d.path == Path::new("keep.txt")),
+            "an unchanged path is not in the delta"
+        );
+        // A deleted path keeps its base-side visibility, exactly as `diff` does.
+        assert!(matches!(by_path("gone.txt").visibility, Visibility::Public));
+        // The rows render through the shared #306 line: gutter, path, token.
+        let line = crate::render::delta_line(by_path("new.txt"));
+        assert!(line.starts_with("  +  new.txt"), "{line}");
+        assert!(line.ends_with("public"), "the visibility token trails: {line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn working_delta_reads_every_file_as_added_with_no_parent() {
+        // The repo's first change has no parent to diff against — every file on
+        // disk is new (#7).
+        let dir = std::env::temp_dir().join(format!("loot-wdelta-first-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        std::fs::write(dir.join("b.txt"), b"two").unwrap();
+
+        let deltas = ws.working_delta().unwrap();
+        assert_eq!(deltas.len(), 2, "both files row");
+        assert!(deltas.iter().all(|d| d.class == DeltaClass::Added), "all added");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn working_delta_carries_a_sealed_absent_base_path_untouched() {
+        // A base path sealed to the ambient identity is never materialized, and
+        // snapshot carries it forward untouched (ADR 0006) — so its absence from
+        // disk is not a deletion and it must not row as `-`.
+        let dir = std::env::temp_dir().join(format!("loot-wdelta-seal-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("doc.txt"), b"open").unwrap();
+        std::fs::write(dir.join(".lootattributes"), "secret.txt restricted=alice\n").unwrap();
+        std::fs::write(dir.join("secret.txt"), b"top secret").unwrap();
+        ws.snapshot("seal").unwrap();
+        ws.finalize_working().unwrap();
+        // The sealed path leaves the disk; everything else is unchanged.
+        std::fs::remove_file(dir.join("secret.txt")).unwrap();
+
+        let deltas = ws.working_delta().unwrap();
+        assert!(
+            !deltas.iter().any(|d| d.path == Path::new("secret.txt")),
+            "a sealed-to-us absent path is carried forward, not deleted"
+        );
+        assert!(deltas.is_empty(), "no other path moved");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // `dock rm` (`dock_rm_*`) and the `--at` worktree dock (`dock_at_binds_…`)
