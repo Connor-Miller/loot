@@ -143,7 +143,13 @@ pub fn load_objects_loose(obj_dir: &Path) -> Result<ObjectStore, RepoError> {
         let Some(addr) = crate::hex::decode_array::<32>(&name) else {
             continue; // skip *.tmp and anything not a content address
         };
-        let bytes = std::fs::read(entry.path()).map_err(|e| RepoError::Backend(e.to_string()))?;
+        // A loose object is staged temp+rename (immutable once present), so on
+        // Windows a concurrent lane's rename-into-place can transiently deny a
+        // reader's open just like the metadata files — read through the same
+        // retry so `load_from` (which loads objects before the graph) doesn't
+        // fail the whole open on a passing sharing window (#476).
+        let bytes =
+            crate::store::read_replaced(&entry.path()).map_err(|e| RepoError::Backend(e.to_string()))?;
         objects.put(Oid(addr), decode_object(&bytes)?);
     }
     Ok(objects)

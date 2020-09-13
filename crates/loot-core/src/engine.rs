@@ -34,7 +34,7 @@ use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 pub(crate) use change_graph::ChangeNode;
 pub use change_graph::change_signing_message;
 use change_graph::{compute_change_id, mint_change_id, ChangeGraph};
-use crate::store::{read_replaced, RepoStore};
+use crate::store::{read_replaced, read_replaced_required, RepoStore};
 pub use custody::{MaroonResult, MigrateResult, RotateRegrant, RotateReport};
 use custody::{decode_manifest, decode_purges, encode_manifest, encode_purges, Custody};
 use object_store::{ObjectStore, Stored};
@@ -2361,14 +2361,14 @@ impl DagRepo {
     /// treat the whole shared graph as the default dock's lineage (back-compat).
     pub fn load_from(store: &RepoStore, root: PathBuf) -> Result<Self, RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-        let identity = String::from_utf8(read_replaced(&store.identity()).map_err(io)?)
+        let identity = String::from_utf8(read_replaced_required(&store.identity()).map_err(io)?)
             .map_err(|e| RepoError::Backend(e.to_string()))?;
         let objects = persist_codec::load_objects_loose(&store.objects_dir())?;
 
         // Build the candidate node pool: shared finalized nodes plus this dock's
         // own working change (which lives outside the shared graph).
         let mut pool: BTreeMap<Oid, ChangeNode> = BTreeMap::new();
-        for node in persist_codec::decode_nodes(&read_replaced(&store.graph()).map_err(io)?)? {
+        for node in persist_codec::decode_nodes(&read_replaced_required(&store.graph()).map_err(io)?)? {
             pool.insert(node.id.clone(), node);
         }
         if let Some(blob) = store.read_working_change() {
@@ -2383,7 +2383,7 @@ impl DagRepo {
             .unwrap_or_else(|| ChangeGraph::derive_all_heads(&pool));
         let graph = ChangeGraph::reachable_from(&pool, &heads);
 
-        let keyring = persist_codec::decode_keyring(&read_replaced(&store.keyring()).map_err(io)?)?;
+        let keyring = persist_codec::decode_keyring(&read_replaced_required(&store.keyring()).map_err(io)?)?;
         // Escrow file may not exist in repos created before ADR 0007 — default empty.
         let escrow = match read_replaced(&store.escrow()) {
             Ok(b) => persist_codec::decode_escrow(&b)?,

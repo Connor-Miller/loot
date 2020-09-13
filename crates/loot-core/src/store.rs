@@ -79,24 +79,55 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Read a file that is replaced via [`atomic_write`]. On Windows the
-/// rename-replace leaves a brief delete-pending window in which opening the
-/// destination transiently fails with `PermissionDenied` — so a reader racing a
-/// writer would error even though the file is never torn (#293 tail). Retry
-/// briefly on `PermissionDenied` only: `NotFound` keeps meaning "absent", and a
-/// persistent permission error still propagates after the retries.
-pub fn read_replaced(path: &Path) -> std::io::Result<Vec<u8>> {
+/// True for the transient errors a Windows `rename`-replace produces when a
+/// reader opens the destination inside the brief delete-pending / sharing window:
+/// `PermissionDenied` (ERROR_ACCESS_DENIED, 5) **and** the raw
+/// `ERROR_SHARING_VIOLATION` (os error 32) — which the writer's `MoveFileEx`
+/// contention often yields and which Rust surfaces as an *uncategorized* error,
+/// not `PermissionDenied`. `NotFound` is deliberately excluded: it keeps meaning
+/// "absent", so an absent optional file still reads as empty rather than stalling.
+pub(crate) fn is_transient_replace_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32)
+}
+
+/// Read `path`, retrying while `retry(err)` holds. The backoff budget (~300ms:
+/// 16 attempts, 1ms doubling to a 25ms cap) is enough to slip through a tight
+/// writer loop's rename windows under CPU load without stalling a real read.
+fn read_retrying(path: &Path, retry: impl Fn(&std::io::Error) -> bool) -> std::io::Result<Vec<u8>> {
     let mut delay = Duration::from_millis(1);
-    for _ in 0..8 {
+    for _ in 0..16 {
         match std::fs::read(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(e) if retry(&e) => {
                 std::thread::sleep(delay);
-                delay = delay.saturating_mul(2);
+                delay = (delay * 2).min(Duration::from_millis(25));
             }
             other => return other,
         }
     }
     std::fs::read(path)
+}
+
+/// Read a file that is replaced via [`atomic_write`]. On Windows the
+/// rename-replace leaves a brief window in which opening the destination
+/// transiently fails (`PermissionDenied` / `ERROR_SHARING_VIOLATION`) even though
+/// the file is never torn (#293 tail, #476). Retry briefly on those transient
+/// errors so a reader racing a writer observes whole-old-or-whole-new; `NotFound`
+/// still means "absent" (so an optional store file reads as empty), and a
+/// persistent error propagates after the budget.
+pub fn read_replaced(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_retrying(path, is_transient_replace_error)
+}
+
+/// Like [`read_replaced`] but for a file the caller knows **must** exist — the
+/// graph, identity, and keyring of a keyed store. For those, a `NotFound` cannot
+/// mean "absent": it can only be the momentary gap a Windows rename-replace opens
+/// as it swaps the target, so it is retried as one more transient window rather
+/// than propagated. This closes the last tear a plain [`read_replaced`] leaves,
+/// where a required file blinks missing mid-replace under heavy contention (#476).
+pub fn read_replaced_required(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_retrying(path, |e| {
+        is_transient_replace_error(e) || e.kind() == std::io::ErrorKind::NotFound
+    })
 }
 
 /// A short-lived exclusive lock over a shared store's mutable metadata files
@@ -936,6 +967,23 @@ fn write_oid_file(path: &Path, oid: Option<&Oid>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_replace_errors_are_retried_but_not_found_is_absent() {
+        use std::io::{Error, ErrorKind};
+        // ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32) are the two
+        // shapes a Windows rename-replace window yields — both retry.
+        assert!(is_transient_replace_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(is_transient_replace_error(&Error::from_raw_os_error(32)));
+        // Absent stays absent (an optional store file reads as empty), and a
+        // genuine unrelated error is not silently swallowed by retrying.
+        assert!(!is_transient_replace_error(&Error::from(ErrorKind::NotFound)));
+        assert!(!is_transient_replace_error(&Error::from(
+            ErrorKind::InvalidData
+        )));
+    }
 
     #[test]
     fn paths_are_under_dot() {
