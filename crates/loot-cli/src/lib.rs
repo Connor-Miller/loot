@@ -17,6 +17,7 @@
 
 pub mod bisect;
 pub mod blame;
+pub mod dup;
 pub mod emit;
 pub mod error;
 pub mod evolog;
