@@ -222,6 +222,17 @@ impl Workspace {
         &self.dot
     }
 
+    /// The position's working directory — where this workspace's tree
+    /// materializes: the lane (or `--at` worktree) dir for a spawned position,
+    /// the checkout itself for the primary. Distinct from [`Workspace::dot`],
+    /// which is always the *shared* store's `.loot/` (identity and keys are
+    /// shared across positions, ADR 0034) — deriving a working root from
+    /// `dot()` is exactly how loot-first's pre-land gate ended up testing the
+    /// primary's tree on a lane land (#287).
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Prune orphaned loose objects from `.loot/objects/` (ADR 0012, #66).
     /// Delegates to the engine, which owns the object store and the reachability
     /// walk over the change graph. `dry_run` reports what would be pruned
@@ -5303,6 +5314,25 @@ mod tests {
         assert_eq!(lw.lane_id(), Some("l1"));
         assert!(ws.spawn_lane(None, Some(&lane_dir)).is_err(), "dir already a position");
 
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn a_lane_workspaces_root_is_the_lane_dir_and_its_dot_the_shared_store() {
+        // #287: `dot()` is ALWAYS the shared store's `.loot` (identity/keys are
+        // shared across positions, ADR 0034); `root()` is the position's own
+        // tree. loot-first derived its pre-land gate cwd from `dot()` and so
+        // cargo-tested the primary's tree on lane lands.
+        let (area, dir, mut ws) = lane_setup("root-vs-dot");
+        let spawned = ws.spawn_lane(None, Some(&area.join("l287"))).unwrap();
+        let lw = Workspace::open_at(&spawned.dir).unwrap();
+        assert_eq!(lw.root(), spawned.dir, "a lane's root is its own tree");
+        assert_eq!(
+            std::fs::canonicalize(lw.dot()).unwrap(),
+            std::fs::canonicalize(dir.join(DOT)).unwrap(),
+            "a lane's dot is the SHARED store's .loot"
+        );
+        assert_eq!(ws.root(), dir, "the primary's root is the checkout itself");
         let _ = std::fs::remove_dir_all(&area);
     }
 

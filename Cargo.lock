@@ -1128,6 +1128,7 @@ version = "0.1.0"
 dependencies = [
  "loot-cli",
  "loot-core",
+ "loot-identity",
 ]
 
 [[package]]
