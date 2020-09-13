@@ -1427,14 +1427,24 @@ impl DagRepo {
     /// write (#98), so address equality alone cannot see that two separately
     /// recorded changes carry the same bytes — exactly the bridge's case,
     /// where a capture snapshot and an ingested commit both seal the same
-    /// pulled content (GB1, ADR 0028). An unopenable pair counts as different.
+    /// pulled content (GB1, ADR 0028). An unopenable pair counts as different,
+    /// as is an unknown change id.
+    ///
+    /// Judges the two changes' **recorded manifests** (each change carries its
+    /// complete tree, deletion = absence — [`Self::change_tree`]), NOT the
+    /// ancestry overlay `tree_at` builds: that union keeps an ancestor's entry
+    /// for a path the child deleted, so a deletion-only change would compare
+    /// identical to its parent — which silently dropped a described
+    /// deletion-only working change at finalize (#289).
     pub fn same_tree_content(&self, a: &Oid, b: &Oid, now: u64) -> bool {
-        let ta = self.graph.tree_at(a);
-        let tb = self.graph.tree_at(b);
+        let (Some(na), Some(nb)) = (self.graph.get(a), self.graph.get(b)) else {
+            return false;
+        };
+        let (ta, tb) = (&na.tree, &nb.tree);
         if ta.len() != tb.len() {
             return false;
         }
-        for (path, (oa, va)) in &ta {
+        for (path, (oa, va)) in ta {
             let Some((ob, vb)) = tb.get(path) else {
                 return false;
             };
@@ -1577,11 +1587,15 @@ impl DagRepo {
     /// a "content right now" fingerprint, and the only holdable handle for the
     /// working change is its durable change id.
     ///
-    /// Emptiness is judged against `tip`'s *openable* tree: the working change is
-    /// empty when every live entry matches a tip path by plaintext + visibility
-    /// and nothing openable was added or removed. Sealed tip paths this identity
-    /// cannot read carry forward untouched and are not this caller's pending
-    /// delta, so they are ignored. With no `tip`, empty means no files at all.
+    /// Emptiness is judged against `tip`'s *openable* recorded manifest: the
+    /// working change is empty when every live entry matches a tip path by
+    /// plaintext + visibility and nothing openable was added or removed. Sealed
+    /// tip paths this identity cannot read carry forward untouched and are not
+    /// this caller's pending delta, so they are ignored. With no `tip`, empty
+    /// means no files at all. The tip's own manifest — not the `tree_at`
+    /// ancestry overlay, which resurrects paths an ancestor held but the tip
+    /// deleted and would read a clean tree as dirty forever after a deletion
+    /// lands (#289).
     pub fn working_preview(
         &self,
         tip: Option<&Oid>,
@@ -1611,8 +1625,10 @@ impl DagRepo {
 
         let empty = match tip {
             Some(t) => {
+                let tip_tree =
+                    self.graph.get(t).map(|n| n.tree.clone()).unwrap_or_default();
                 let mut openable: BTreeMap<PathBuf, (Oid, Visibility)> = BTreeMap::new();
-                for (path, (oid, vis)) in &self.graph.tree_at(t) {
+                for (path, (oid, vis)) in &tip_tree {
                     if let Ok(bytes) = self.get(oid, &self.identity, now) {
                         openable.insert(path.clone(), (plain(&bytes), vis.clone()));
                     }
@@ -3496,6 +3512,42 @@ mod tests {
         assert!(tree.contains_key(&PathBuf::from("keep.txt")));
         assert!(!tree.contains_key(&PathBuf::from("gone.txt")), "visible+absent => deleted");
         let _ = w2;
+    }
+
+    #[test]
+    fn same_tree_content_sees_a_deletion_only_child_as_different() {
+        // #289: judged by the recorded manifests, a change whose only content is
+        // deleting a path differs from its parent. The ancestry overlay
+        // (`tree_at`) unions the parent's entry back in, so it can never see a
+        // missing path — that blindness silently dropped a described
+        // deletion-only change at finalize as a "tip-duplicate".
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let base = repo
+            .snapshot(
+                None,
+                None,
+                &[
+                    entry("keep.txt", b"k", Visibility::Public),
+                    entry("gone.txt", b"g", Visibility::Public),
+                ],
+                "base",
+                0,
+            )
+            .unwrap();
+        // A deletion-only child: identical content minus gone.txt.
+        let del = repo
+            .snapshot(Some(&base), None, &[entry("keep.txt", b"k", Visibility::Public)], "del", 0)
+            .unwrap();
+        assert!(!repo.same_tree_content(&base, &del, 0), "a deletion-only change ≠ its parent");
+        assert!(!repo.same_tree_content(&del, &base, 0), "and the judgment is symmetric");
+
+        // Regression: a child re-recording the identical manifest still compares
+        // equal — the truly-redundant drop (bare `new`, co-located checkout after
+        // a `git pull`) must keep working.
+        let dup = repo
+            .snapshot(Some(&del), None, &[entry("keep.txt", b"k", Visibility::Public)], "dup", 0)
+            .unwrap();
+        assert!(repo.same_tree_content(&del, &dup, 0), "identical manifests still compare equal");
     }
 
     #[test]
