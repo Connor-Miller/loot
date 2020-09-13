@@ -71,13 +71,24 @@ impl ObjectStore {
             .map(move |(addr, &pos)| (addr.clone(), &self.log[pos]))
     }
 
+    /// Drop the object at `addr` from the in-memory store (ADR 0038 burn). A
+    /// no-op if absent (idempotent — a burned object may already be gone).
+    /// Unlike [`retain`](Self::retain) this is address-driven destruction, not
+    /// reachability gc: the caller has recorded a tombstone, so the ciphertext
+    /// is removed even though the change graph still references its address.
+    pub fn remove(&mut self, addr: &Oid) {
+        if !self.by_addr.contains_key(addr) {
+            return;
+        }
+        let keep: BTreeSet<Oid> = self.by_addr.keys().filter(|k| *k != addr).cloned().collect();
+        self.retain(&keep);
+    }
+
     /// Drop every object whose address is not in `keep`, returning the removed
     /// addresses. Used by `gc` (ADR 0012): an object no ChangeNode references is
     /// unreachable and safe to delete — content-addressing makes this exact, with
     /// no false positives. Compacts the backing log so pruned ciphertext does not
     /// linger in memory.
-    // gc is deferred (#17); this backend is kept ready to wire up when it lands.
-    #[allow(dead_code)]
     pub fn retain(&mut self, keep: &BTreeSet<Oid>) -> Vec<Oid> {
         let mut removed = Vec::new();
         let mut new_log: Vec<SealedObject> = Vec::with_capacity(keep.len().min(self.log.len()));

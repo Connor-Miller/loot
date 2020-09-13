@@ -23,6 +23,7 @@ mod object_store;
 mod persist_codec;
 
 use crate::attestation::{Attestation, AttestationLog};
+use crate::burn::{BurnLog, Tombstone, BURN_PURGE_MARKER};
 use crate::bundle_codec::{BundleBody, Frame};
 use crate::converge;
 use crate::escrow::Escrow;
@@ -90,6 +91,10 @@ pub struct VerifyReport {
     /// `--accept-loss`): reported for the record, but not a failure —
     /// acknowledged loss must not drown out NEW damage.
     pub lost: Vec<Oid>,
+    /// Absent addresses recorded in the burn log (ADR 0038, #344): their bytes
+    /// were deliberately destroyed by `loot burn`, so their absence is legible,
+    /// not corruption. Reported for the record; never a failure.
+    pub burned: Vec<Oid>,
 }
 
 impl VerifyReport {
@@ -164,6 +169,11 @@ pub struct DagRepo {
     /// Detachable, advisory attestations over changes (S4, ADR 0018). Travels in
     /// bundles; verified-and-dropped on ingest; never affects a change id.
     attestations: AttestationLog,
+    /// Signed tombstones for objects `loot burn` destroyed (ADR 0038, #344).
+    /// Shared and append-only. Consulted by `store` (permanent re-accept
+    /// refusal), sync negotiation (`missing_objects`), `surface`, and — as
+    /// associated functions over the store — `verify` and `gc`.
+    burn_log: BurnLog,
 }
 
 /// **Object & key-routing helpers** (R3, #179): the shared entitlement/dedup
@@ -190,6 +200,13 @@ impl DagRepo {
     /// If dedup collapsed us onto an existing address, the minted key seals
     /// discarded ciphertext and must not be filed anywhere.
     fn store(&mut self, addr: Oid, obj: SealedObject, key: Option<ContentKey>) -> Oid {
+        // A burned oid is permanently refused (ADR 0038 §2): once destroyed, no
+        // ingest path — a local put, an `apply`, a relay `stow`, a grant — may
+        // ever re-accept those bytes. This one chokepoint closes the pull-
+        // resurrection hole for every caller (they all funnel through here).
+        if self.burn_log.contains(&addr) {
+            return addr;
+        }
         let entitled = self.entitled(&obj.grant_ids);
         let reveal_at = if let Visibility::Embargoed { reveal_at } = obj.vis {
             Some(reveal_at)
@@ -400,6 +417,11 @@ impl DagRepo {
             }
         }
 
+        // Honor burn-purge events before storing objects (ADR 0038 §3): a relay
+        // that already recorded a burn — or learns of one here — must not stow
+        // the destroyed ciphertext back. `store` below then refuses it.
+        self.honor_burn_purges(&purges, 0);
+
         // Store ciphertext, retaining any keys that rode along so they keep
         // forwarding downstream. Only ANYONE-granted, non-embargoed (public)
         // keys ever travel in a sync bundle — RESTRICTED keys never do
@@ -461,6 +483,9 @@ impl DagRepo {
                 self.custody.keyring.remove(purge_oid);
             }
         }
+        // Honor burn-purge events before storing objects (ADR 0038 §3), so the
+        // burn is recorded and `store` refuses to re-accept the destroyed bytes.
+        self.honor_burn_purges(&purges, now);
 
         // Our tree before applying, used to detect concurrent same-path edits.
         let local_before = self.graph.current_tree();
@@ -563,6 +588,95 @@ impl DagRepo {
 
 }
 
+/// **Burn face** (ADR 0038 §2–4, #344): the cure for a secret sealed public.
+/// `burn` destroys an object's bytes and files a signed tombstone; the change
+/// graph is never touched. The read side (refuse-to-re-accept, verify/surface
+/// legibility) lives in the object/sync/persistence faces that consult
+/// `burn_log`; this face is the write side plus the whole-store path scan the
+/// CLI needs to build tombstones and detect git projection.
+impl DagRepo {
+    /// Read-only view of the burn log (for the CLI to report tiers/paths).
+    pub fn burn_log(&self) -> &BurnLog {
+        &self.burn_log
+    }
+
+    /// Every historical content address recorded at `path` **anywhere in the
+    /// shared store** — the whole graph, not this lane's lineage — each mapped
+    /// to the version-ids of the changes that reference it. This is the set
+    /// `burn <path>` destroys (every historical object of the path), and the
+    /// referencing version-ids are what the CLI checks against the git mark map
+    /// to decide whether to print the mirror-rewrite guidance (§4). Reads the
+    /// shared graph file and every lane's working change ([`disk_rooted_nodes`])
+    /// plus this position's own loaded nodes, so a burn is complete regardless
+    /// of which position runs it.
+    pub fn objects_at_path(
+        &self,
+        store: &RepoStore,
+        path: &Path,
+    ) -> Result<BTreeMap<Oid, Vec<Oid>>, RepoError> {
+        let mut map: BTreeMap<Oid, Vec<Oid>> = BTreeMap::new();
+        let mut record = |oid: &Oid, change: &Oid| {
+            let sites = map.entry(oid.clone()).or_default();
+            if !sites.contains(change) {
+                sites.push(change.clone());
+            }
+        };
+        for node in disk_rooted_nodes(store)? {
+            if let Some((oid, _vis)) = node.tree.get(path) {
+                record(oid, &node.id);
+            }
+        }
+        for node in self.graph.in_order() {
+            if let Some((oid, _vis)) = node.tree.get(path) {
+                record(oid, &node.id);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Destroy the objects named by `tombstones` and file each in the burn log
+    /// (ADR 0038 §2). Drops the ciphertext from the in-memory store and — for a
+    /// Pushed-tier tombstone — deposits a purge event on the existing purge lane
+    /// (ADR 0009/0010) so the tombstone travels to cooperating relays/peers
+    /// (§3). The change graph, ids, signatures, and keyring are all untouched.
+    ///
+    /// The **on-disk** ciphertext is destroyed at the next [`save_to`](Self::save_to)
+    /// (its single destruction point unions the burn log first), so the caller
+    /// must persist for the bytes to leave disk — every CLI verb does.
+    pub fn burn(&mut self, tombstones: &[Tombstone]) {
+        for t in tombstones {
+            self.burn_log.insert(t.clone());
+            self.objects.remove(&t.oid);
+            if t.tier == crate::burn::BurnTier::Pushed {
+                let ev = (t.oid.clone(), BURN_PURGE_MARKER.to_string());
+                if !self.custody.purges.contains(&ev) {
+                    self.custody.purges.push(ev);
+                }
+            }
+        }
+    }
+
+    /// Honor any burn-purge events in `purges` (ADR 0038 §3): a purge whose
+    /// marooned-identity is [`BURN_PURGE_MARKER`] announces a destroyed object.
+    /// File an unauthored tombstone (the oid is all a bare purge event carries)
+    /// and drop the ciphertext, so a cooperating relay/peer stops holding it and
+    /// every later ingest refuses to re-accept it. Called *before* object
+    /// storage on the ingest paths so `store` sees the burn.
+    fn honor_burn_purges(&mut self, purges: &[(Oid, String)], now: u64) {
+        for (oid, marooned) in purges {
+            if marooned == BURN_PURGE_MARKER {
+                self.burn_log.insert(Tombstone::unauthored(
+                    oid.clone(),
+                    PathBuf::new(),
+                    crate::burn::BurnTier::Pushed,
+                    now,
+                ));
+                self.objects.remove(oid);
+            }
+        }
+    }
+}
+
 /// **Persistence & gc face** (R3, #179): the `.loot/` round-trip — save/load
 /// via the RepoStore (the layout's single owner, ADR 0017), loose-object gc
 /// (ADR 0012). No policy: what a change means lives in the other faces.
@@ -613,6 +727,17 @@ impl DagRepo {
         let store = RepoStore::new(dir);
         let mut live = self.referenced_oids();
         live.extend(disk_rooted_oids(&store)?);
+        // A burned oid is **already collected** (ADR 0038): its bytes were
+        // destroyed on purpose even though the graph still references its
+        // address, so it must not count as live — otherwise gc would treat any
+        // lingering burned file as needed. Dropping it from the keep set means
+        // a stray burned file is pruned, and the in-memory compaction below
+        // never resurrects it.
+        if let Ok(b) = read_replaced(&store.burn_log()) {
+            for oid in crate::burn::decode(&b)?.burned_oids() {
+                live.remove(&oid);
+            }
+        }
         let (pruned, bytes) =
             persist_codec::prune_orphaned_objects_loose(&store.objects_dir(), &live, dry_run)?;
         if !dry_run {
@@ -648,14 +773,31 @@ impl DagRepo {
         // entry whose object is present again (or no longer referenced) is
         // simply inert.
         let acknowledged = store.read_lost();
+        // A burned oid's absence is deliberate (ADR 0038): partition it out of
+        // `missing` like an acknowledged loss, so `verify` passes on a store
+        // with burned objects but still fails on undocumented absence.
+        let burned_oids = match read_replaced(&store.burn_log()) {
+            Ok(b) => crate::burn::decode(&b)?.burned_oids(),
+            Err(_) => BTreeSet::new(),
+        };
         let absent: BTreeSet<Oid> = nodes
             .iter()
             .flat_map(|n| n.tree.values())
             .filter(|(oid, _)| !scan.present.contains(oid))
             .map(|(oid, _)| oid.clone())
             .collect();
-        let (lost, unacknowledged): (Vec<Oid>, Vec<Oid>) =
-            absent.into_iter().partition(|a| acknowledged.contains(a));
+        let mut burned: Vec<Oid> = Vec::new();
+        let mut lost: Vec<Oid> = Vec::new();
+        let mut unacknowledged: Vec<Oid> = Vec::new();
+        for a in absent {
+            if burned_oids.contains(&a) {
+                burned.push(a);
+            } else if acknowledged.contains(&a) {
+                lost.push(a);
+            } else {
+                unacknowledged.push(a);
+            }
+        }
         let mut refs: BTreeMap<Oid, Vec<MissingRef>> =
             unacknowledged.into_iter().map(|a| (a, Vec::new())).collect();
         for node in &nodes {
@@ -680,6 +822,7 @@ impl DagRepo {
                 .map(|(addr, referenced_by)| MissingObject { addr, referenced_by })
                 .collect(),
             lost,
+            burned,
         })
     }
 
@@ -870,6 +1013,22 @@ impl DagRepo {
             }
             atomic_write(&store.attestations(), &encode_attestations(&attestations))
                 .map_err(io)?;
+
+            // Burn log: the same append-only union (ADR 0038, #344). A burned oid
+            // is burned for every identity, so a concurrent lane's tombstones
+            // merge in rather than clobber ours. Then destroy the ciphertext of
+            // every burned address on disk — the single on-disk destruction
+            // point, covering both `burn` (which removed the bytes from memory)
+            // and a burn-purge *received* via `apply`/`stow` (a cooperating
+            // relay stops holding the object). `save_objects_loose` above only
+            // ever adds surviving objects and never re-creates these, so the
+            // order is safe. Idempotent: an already-absent file is already gone.
+            let mut burn_log = self.burn_log.clone();
+            if let Ok(bytes) = std::fs::read(store.burn_log()) {
+                burn_log.merge(&crate::burn::decode(&bytes)?);
+            }
+            atomic_write(&store.burn_log(), &crate::burn::encode(&burn_log)).map_err(io)?;
+            persist_codec::destroy_objects_loose(&store.objects_dir(), &burn_log.burned_oids())?;
         }
 
         // --- lane-owned state (single-writer; ADR 0034). Not under the lock, but
@@ -1656,6 +1815,13 @@ impl DagRepo {
                     skipped += 1;
                     continue;
                 }
+                // A burned object's bytes are gone by design (ADR 0038): surface
+                // an old change that still references it by *labelling* the path
+                // burned (via [`burned_paths_at`]) rather than erroring on the
+                // absence. Skip writing it, exactly like a sealed path.
+                Err(RepoError::NotFound(_)) if self.burn_log.contains(oid) => {
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
             let dest = self.root.join(path);
@@ -1688,6 +1854,21 @@ impl DagRepo {
                 !self.grant_expired_for(oid, reader, now) && self.get(oid, reader, now).is_ok()
             })
             .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// The paths at `change` whose recorded object has been **burned** (ADR
+    /// 0038): each as `(path, burned_oid)`. `surface`/checkout use this to label
+    /// an old change's burned paths instead of erroring on the deliberate
+    /// absence. Unknown change => empty.
+    pub fn burned_paths_at(&self, change: &Oid) -> Vec<(PathBuf, Oid)> {
+        let Some(node) = self.graph.get(change) else {
+            return Vec::new();
+        };
+        node.tree
+            .iter()
+            .filter(|(_, (oid, _))| self.burn_log.contains(oid))
+            .map(|(path, (oid, _))| (path.clone(), oid.clone()))
             .collect()
     }
 
@@ -1789,6 +1970,11 @@ impl DagRepo {
             Ok(b) => decode_attestations(&b)?,
             Err(_) => AttestationLog::new(),
         };
+        // Burn log may not exist in repos created before ADR 0038 — default empty.
+        let burn_log = match read_replaced(&store.burn_log()) {
+            Ok(b) => crate::burn::decode(&b)?,
+            Err(_) => BurnLog::new(),
+        };
         Ok(DagRepo {
             root,
             identity,
@@ -1798,6 +1984,7 @@ impl DagRepo {
             graph,
             conflicts,
             attestations,
+            burn_log,
         })
     }
 }
@@ -1813,6 +2000,7 @@ impl Repo for DagRepo {
             graph: ChangeGraph::new(),
             conflicts: BTreeMap::new(),
             attestations: AttestationLog::new(),
+            burn_log: BurnLog::new(),
         })
     }
 
@@ -1852,10 +2040,12 @@ impl Repo for DagRepo {
                 continue;
             }
             // Materialize only the visible slice: skip content this reader
-            // cannot see rather than erroring on it.
+            // cannot see rather than erroring on it. A burned object (ADR 0038)
+            // is deliberately gone — skip it too, never error on the absence.
             let bytes = match self.get(oid, reader, now) {
                 Ok(b) => b,
                 Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => continue,
+                Err(RepoError::NotFound(_)) if self.burn_log.contains(oid) => continue,
                 Err(e) => return Err(e),
             };
             let dest = self.root.join(path);
@@ -2007,7 +2197,11 @@ impl DagRepo {
     pub fn missing_objects(&self, offered: &[Oid]) -> Vec<Oid> {
         offered
             .iter()
-            .filter(|oid| self.object(oid).is_err())
+            // A burned oid we lack is *deliberately* absent (ADR 0038): never
+            // request it back, or a pull from a relay that still holds the bytes
+            // would resurrect what we burned. `store` would refuse it anyway;
+            // filtering here means we never even ask.
+            .filter(|oid| self.object(oid).is_err() && !self.burn_log.contains(oid))
             .cloned()
             .collect()
     }
@@ -5456,5 +5650,225 @@ mod tests {
         assert_eq!(*theirs, Oid([2; 32]));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- burn: destroy + tombstone, no resurrection (ADR 0038, #344) ----
+
+    mod burn {
+        use super::*;
+        use crate::burn::{BurnTier, Tombstone};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        fn unique_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "loot-burn-{tag}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        /// Seal `bytes` at `path` in a fresh committed change, then save. Returns
+        /// (dir, oid). The repo is authored-less (keyless) unless a signer is set.
+        fn repo_with_secret(dir: &Path, path: &str, bytes: &[u8]) -> Oid {
+            let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+            let oid = repo.put(bytes, Visibility::Public).unwrap();
+            let mut tree = BTreeMap::new();
+            tree.insert(PathBuf::from(path), (oid.clone(), Visibility::Public));
+            repo.record_unauthored(Change {
+                id: Oid([0; 32]),
+                parents: vec![],
+                message: "leak".into(),
+                tree,
+            })
+            .unwrap();
+            repo.save(&dir.join(".loot")).unwrap();
+            oid
+        }
+
+        fn signed_tombstone(oid: &Oid, path: &str, tier: BurnTier) -> Tombstone {
+            let sk = SigningKey::from_bytes(&[13u8; 32]);
+            let pk = sk.verifying_key().to_bytes();
+            let p = PathBuf::from(path);
+            let sig = sk.sign(&crate::burn::signing_bytes(oid, &p, tier, &pk, 7)).to_bytes();
+            Tombstone { oid: oid.clone(), path: p, tier, burner: pk, burned_at: 7, signature: sig }
+        }
+
+        #[test]
+        fn burn_destroys_bytes_and_verify_still_passes() {
+            let dir = unique_dir("verify");
+            let oid = repo_with_secret(&dir, ".env", b"TOKEN=leaked\n");
+            // The object exists and verify is clean before burning.
+            assert!(dir.join(".loot/objects").join(crate::hex::encode(&oid.0)).exists());
+            assert!(DagRepo::verify(&dir.join(".loot")).unwrap().is_clean());
+
+            // Burn it (signed tombstone), then persist to destroy on disk.
+            let mut repo = DagRepo::load(&dir.join(".loot"), dir.join("work")).unwrap();
+            let ts = signed_tombstone(&oid, ".env", BurnTier::NeverPushed);
+            assert!(ts.verify(), "tombstone is signed");
+            repo.burn(&[ts]);
+            repo.save(&dir.join(".loot")).unwrap();
+
+            // Bytes are gone from disk; the change graph still names the oid.
+            assert!(
+                !dir.join(".loot/objects").join(crate::hex::encode(&oid.0)).exists(),
+                "burned ciphertext must be destroyed on disk"
+            );
+            let report = DagRepo::verify(&dir.join(".loot")).unwrap();
+            assert!(report.is_clean(), "verify passes on a store with burned objects");
+            assert_eq!(report.burned, vec![oid.clone()], "the burned oid is reported, not failed");
+            assert!(report.missing.is_empty());
+        }
+
+        #[test]
+        fn verify_still_fails_on_undocumented_absence() {
+            let dir = unique_dir("undoc");
+            let oid = repo_with_secret(&dir, ".env", b"secret\n");
+            // Delete the object file WITHOUT a tombstone — real corruption.
+            std::fs::remove_file(dir.join(".loot/objects").join(crate::hex::encode(&oid.0))).unwrap();
+            let report = DagRepo::verify(&dir.join(".loot")).unwrap();
+            assert!(!report.is_clean(), "an undocumented absence is still a failure");
+            assert_eq!(report.missing.len(), 1);
+        }
+
+        #[test]
+        fn pull_does_not_resurrect_a_burned_oid() {
+            // A relay still holds the object; a peer that burned it must not
+            // re-accept it on apply (ADR 0038 §2 no pull-resurrection).
+            let relay_dir = unique_dir("relay");
+            let oid = repo_with_secret(&relay_dir, ".env", b"TOKEN=x\n");
+            let relay = DagRepo::load(&relay_dir.join(".loot"), relay_dir.join("w")).unwrap();
+            let bundle = relay.bundle(&[]).unwrap();
+
+            // Peer clones the same content, then burns it.
+            let peer_dir = unique_dir("peer");
+            let _ = repo_with_secret(&peer_dir, ".env", b"TOKEN=x\n");
+            let mut peer = DagRepo::load(&peer_dir.join(".loot"), peer_dir.join("w")).unwrap();
+            // Burn whatever oid the peer holds at .env.
+            let peer_oid = peer.current_tree_oid(Path::new(".env")).unwrap();
+            peer.burn(&[signed_tombstone(&peer_oid, ".env", BurnTier::Pushed)]);
+            peer.save(&peer_dir.join(".loot")).unwrap();
+            assert!(peer.object(&peer_oid).is_err(), "burned object dropped from memory");
+
+            // Applying the relay's bundle (which carries the relay's oid) must not
+            // restore the *burned* oid if it matches. Use the SAME sealed object by
+            // having the peer burn the relay's oid specifically.
+            let mut peer2 = DagRepo::load(&peer_dir.join(".loot"), peer_dir.join("w")).unwrap();
+            peer2.burn(&[signed_tombstone(&oid, ".env", BurnTier::Pushed)]);
+            peer2.save(&peer_dir.join(".loot")).unwrap();
+            peer2.apply(&bundle, 0).unwrap();
+            assert!(
+                peer2.object(&oid).is_err(),
+                "a burned oid must never be re-accepted from a relay's bundle"
+            );
+            // And negotiation never even asks for it.
+            assert!(
+                !peer2.missing_objects(&[oid.clone()]).contains(&oid),
+                "a burned oid is never requested as a want"
+            );
+        }
+
+        #[test]
+        fn stow_refuses_a_burned_oid() {
+            // A relay that recorded a burn must refuse to re-stow the ciphertext.
+            let src_dir = unique_dir("src");
+            let oid = repo_with_secret(&src_dir, ".env", b"TOKEN=y\n");
+            let src = DagRepo::load(&src_dir.join(".loot"), src_dir.join("w")).unwrap();
+            let bundle = src.bundle(&[]).unwrap();
+
+            let mut relay = DagRepo::init(unique_dir("relay2").join("w"), "relay").unwrap();
+            relay.burn(&[Tombstone::unauthored(oid.clone(), PathBuf::from(".env"), BurnTier::Pushed, 0)]);
+            relay.stow(&bundle).unwrap();
+            assert!(relay.object(&oid).is_err(), "stow must not store a burned oid");
+        }
+
+        #[test]
+        fn stow_honors_a_burn_purge_event() {
+            // A burn-purge on the wire makes a cooperating relay drop the object.
+            let src_dir = unique_dir("src2");
+            let oid = repo_with_secret(&src_dir, ".env", b"TOKEN=z\n");
+            let src = DagRepo::load(&src_dir.join(".loot"), src_dir.join("w")).unwrap();
+            let sync = src.bundle(&[]).unwrap();
+
+            // Relay first stows the object (holds ciphertext), then receives a
+            // separate bundle carrying the burn-purge.
+            let mut relay = DagRepo::init(unique_dir("relay3").join("w"), "relay").unwrap();
+            relay.stow(&sync).unwrap();
+            assert!(relay.object(&oid).is_ok(), "relay holds the object first");
+
+            let purge_bundle = SyncBundle(
+                Frame::Sync {
+                    purges: vec![(oid.clone(), crate::burn::BURN_PURGE_MARKER.to_string())],
+                    body: BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), attestations: vec![] },
+                }
+                .encode(),
+            );
+            relay.stow(&purge_bundle).unwrap();
+            assert!(relay.object(&oid).is_err(), "a burn-purge drops the object from the relay");
+            assert!(relay.burn_log().contains(&oid), "the relay records the burn");
+        }
+
+        #[test]
+        fn pushed_tier_deposits_a_purge_event_never_pushed_does_not() {
+            let dir = unique_dir("tier");
+            let oid = repo_with_secret(&dir, ".env", b"s\n");
+            let mut repo = DagRepo::load(&dir.join(".loot"), dir.join("w")).unwrap();
+            repo.burn(&[signed_tombstone(&oid, ".env", BurnTier::Pushed)]);
+            assert!(
+                repo.custody.purges.iter().any(|(o, m)| o == &oid && m == crate::burn::BURN_PURGE_MARKER),
+                "pushed tier deposits a burn-purge event"
+            );
+
+            let dir2 = unique_dir("tier2");
+            let oid2 = repo_with_secret(&dir2, ".env", b"s\n");
+            let mut repo2 = DagRepo::load(&dir2.join(".loot"), dir2.join("w")).unwrap();
+            repo2.burn(&[signed_tombstone(&oid2, ".env", BurnTier::NeverPushed)]);
+            assert!(repo2.custody.purges.is_empty(), "never-pushed tier deposits nothing");
+        }
+
+        #[test]
+        fn surface_labels_burned_path_instead_of_erroring() {
+            let dir = unique_dir("surface");
+            let oid = repo_with_secret(&dir, ".env", b"leak\n");
+            let mut repo = DagRepo::load(&dir.join(".loot"), dir.join("w")).unwrap();
+            let head = repo.heads()[0].clone();
+            repo.burn(&[signed_tombstone(&oid, ".env", BurnTier::NeverPushed)]);
+            repo.save(&dir.join(".loot")).unwrap();
+
+            // Surface must not error on the burned object; it skips writing it.
+            let reloaded = DagRepo::load(&dir.join(".loot"), dir.join("w")).unwrap();
+            let (written, _skipped) = reloaded.surface_with_report(&head, "alice", 0).unwrap();
+            assert!(written.iter().all(|(p, _)| p != Path::new(".env")), "burned path is not written");
+            let burned = reloaded.burned_paths_at(&head);
+            assert_eq!(burned, vec![(PathBuf::from(".env"), oid.clone())], "surface labels the burned path");
+        }
+
+        #[test]
+        fn gc_treats_burned_as_already_collected() {
+            let dir = unique_dir("gc");
+            let oid = repo_with_secret(&dir, ".env", b"leak\n");
+            let mut repo = DagRepo::load(&dir.join(".loot"), dir.join("w")).unwrap();
+            repo.burn(&[signed_tombstone(&oid, ".env", BurnTier::NeverPushed)]);
+            repo.save(&dir.join(".loot")).unwrap();
+            // gc runs clean (the file is already gone) and reports nothing to prune.
+            let report = repo.gc(&dir.join(".loot"), false).unwrap();
+            assert_eq!(report.pruned, 0, "a burned object is already collected");
+            assert!(DagRepo::verify(&dir.join(".loot")).unwrap().is_clean());
+        }
+
+        #[test]
+        fn burn_survives_save_load_and_refuses_local_reput() {
+            let dir = unique_dir("reput");
+            let oid = repo_with_secret(&dir, ".env", b"leak\n");
+            let mut repo = DagRepo::load(&dir.join(".loot"), dir.join("w")).unwrap();
+            repo.burn(&[signed_tombstone(&oid, ".env", BurnTier::NeverPushed)]);
+            repo.save(&dir.join(".loot")).unwrap();
+
+            let reloaded = DagRepo::load(&dir.join(".loot"), dir.join("w")).unwrap();
+            assert!(reloaded.burn_log().contains(&oid), "burn log survives save/load");
+        }
     }
 }

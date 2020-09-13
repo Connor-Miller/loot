@@ -197,6 +197,10 @@ const LOST: &str = "lost";
 /// Directory of grants quarantined at `pull-grants` from an unregistered
 /// sender (#12). Shared-store-rooted; see [`RepoStore::quarantine_dir`].
 const QUARANTINE: &str = "quarantine";
+/// The burn log: signed tombstones for destroyed objects (ADR 0038, #344).
+/// Shared-store-rooted and append-only — a burned oid is burned for every
+/// identity; see [`RepoStore::burn_log`].
+const BURN: &str = "burn";
 /// The shared-store metadata lock (#293). `save_to` persists the append-only
 /// shared surface (graph, keyring, …) by a read-modify-write of whole files;
 /// without serialization two concurrent writers lose one another's appends. A
@@ -408,6 +412,17 @@ impl RepoStore {
     // rule (ADR 0034) holds. Never bundled — another clone may still hold the
     // bytes.
     pub fn lost(&self) -> PathBuf { self.dot.join(LOST) }
+
+    // --- burn log (ADR 0038, #344) ---
+    //
+    // Shared-store-rooted, append-only signed tombstones for objects `loot
+    // burn` destroyed: a burned oid is burned for every identity, so the record
+    // lives with the shared graph, not per-lane. `verify`, `surface`, sync
+    // negotiation, `apply`, `stow`, and `gc` all consult it; the burn verb and
+    // `save_to`'s append-only union are the only writers. Decoded via
+    // [`crate::burn::decode`] — the codec lives with the type, like the
+    // manifest/attestation logs.
+    pub fn burn_log(&self) -> PathBuf { self.dot.join(BURN) }
 
     /// The set of acknowledged-lost addresses (each 32 raw bytes), or empty if
     /// none. A malformed file reads as empty — verify then fails on the
@@ -1086,6 +1101,7 @@ mod tests {
             s.peers(),
             s.lanes_dir(),
             s.quarantine_dir(),
+            s.burn_log(),
         ] {
             assert!(
                 shared.starts_with("/repo/.loot"),

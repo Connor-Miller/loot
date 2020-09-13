@@ -128,6 +128,7 @@ const COMMANDS: &[Verb] = &[
     verb("embargo-status", &[], &[], cmd_embargo_status),
     verb("maroon", DEMOTE, &["--hard", "--no-snapshot", "--ignore-working-copy"], cmd_maroon),
     verb("migrate", DEMOTE, SKIP, cmd_migrate),
+    verb("burn", &["--oid"], &[], cmd_burn),
     verb("manifest", &[], &[], |_| cmd_manifest()),
     verb("attest", &[], &[], cmd_attest),
     verb("conflicts", &[], OUT, cmd_conflicts),
@@ -191,6 +192,7 @@ usage:
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay; quarantines any from an unregistered sender to `.loot/quarantine/`
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
+  loot burn <path> [--oid <hex>]            destroy every historical object of <path> and record a signed tombstone (ADR 0038): absence becomes legible, sync never resurrects it. Non-undoable. Prints the tier (never-pushed=complete / pushed=best-effort) + the rotate-the-secret and git-mirror guidance
   loot lane new [--ticket <n>] [--name <n>] [--at <dir>] [--porcelain|--json]  spawn a sealed ephemeral lane over the shared store (primary-only, keyed repos; ADR 0034); --ticket derives the handle (t<n>) for the claim-to-lane flow (#232)
   loot lanes [--porcelain|--json]           lane observability: id, name, path, tip, in-flight PR, dirty/clean, heartbeat, landed/stale — check before acting on shared state (alias: loot lane list)
   loot lane merge <id-or-name> [--porcelain|--json]  fold a named lane's finalized line into the primary (local, CA2; ADR 0034 — a dock is a named lane)
@@ -786,25 +788,31 @@ fn print_step(r: &StepReport) {
 fn cmd_surface() -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let (head, written, skipped) = ws.surface_with_report()?;
-    if written.is_empty() && skipped == 0 {
+    let burned = ws.burned_paths_at(&head);
+    if written.is_empty() && skipped == 0 && burned.is_empty() {
         println!("nothing to surface (no changes recorded)");
         return Ok(());
     }
-    print_surface_listing(&head, &written, skipped, ws.identity());
+    print_surface_listing(&head, &written, skipped, &burned, ws.identity());
     Ok(())
 }
 
 /// The `loot surface` listing — written paths with visibility marks, the
-/// sealed-skip count, and the surfaced-as line — shared with `pull`'s
-/// auto-surface (#3) so the two verbs cannot drift apart.
+/// sealed-skip count, any burned paths (ADR 0038 — labelled, never silently
+/// skipped), and the surfaced-as line — shared with `pull`'s auto-surface (#3)
+/// so the two verbs cannot drift apart.
 fn print_surface_listing(
     head: &Oid,
     written: &[(std::path::PathBuf, Visibility)],
     skipped: usize,
+    burned: &[(std::path::PathBuf, Oid)],
     identity: &str,
 ) {
     for (path, vis) in written {
         println!("  {:<32} {}", path.display(), mark(vis));
+    }
+    for (path, _oid) in burned {
+        println!("  {:<32} burned (bytes destroyed — ADR 0038)", path.display());
     }
     if skipped > 0 {
         println!("  ({skipped} sealed path(s) skipped — request a grant to access them)");
@@ -1410,6 +1418,83 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
     snap.record_op("maroon", &format!("maroon {} ⁄ {marooned}", path.display()), true);
     Ok(())
 }
+
+/// `loot burn <path> [--oid <hex>]` — the cure for a secret sealed public (ADR
+/// 0038 §2–4, #344). Destroys every historical object of `path` and records a
+/// signed tombstone in the burn log; the change graph is never touched. Prints
+/// which honesty tier applied and the forward-fix + rotate-the-secret guidance,
+/// plus the git-mirror remedy when (and only when) a referencing change was
+/// projected. A non-undoable barrier (ADR 0031).
+fn cmd_burn(args: &[String]) -> Result<(), String> {
+    let oid_val = flag(args, "--oid");
+    // `positionals` skips only the bare `--oid` flag, not its value, so drop the
+    // hex value explicitly — then `burn --oid <hex> <path>` and `burn <path>
+    // --oid <hex>` both resolve <path> correctly regardless of order.
+    let path = positionals(args)
+        .into_iter()
+        .find(|p| Some(*p) != oid_val)
+        .ok_or("burn requires <path> (optionally with --oid <hex>)")?;
+    let path = std::path::Path::new(path);
+    let only_oid = match oid_val {
+        Some(hex) => Some(Oid(loot_core::hex::decode_array::<32>(hex).ok_or_else(|| {
+            format!("--oid expects a 64-char hex content address, got '{hex}'")
+        })?)),
+        None => None,
+    };
+
+    let mut ws = Workspace::open()?;
+    let report = ws.burn_path(path, only_oid)?;
+
+    println!(
+        "burned {} object(s) at {} — tier: {}",
+        report.burned.len(),
+        path.display(),
+        report.tier.label()
+    );
+    for (oid, _p) in &report.burned {
+        println!("  destroyed {}", short(oid));
+    }
+    match report.tier {
+        loot_core::BurnTier::NeverPushed => {
+            println!("  never pushed — destruction is complete on this machine.");
+        }
+        loot_core::BurnTier::Pushed => {
+            println!(
+                "  already pushed — a purge event was deposited; cooperating relays/peers \
+                 will destroy their copy on next sync (best-effort, like hard maroon)."
+            );
+        }
+    }
+    // Forward fix + rotate-the-secret guidance (ADR 0038 §2).
+    println!(
+        "  forward fix: re-seal the path restricted (`loot migrate {} restricted=<you>`) \
+         or delete it at tip, then finalize.",
+        path.display()
+    );
+    println!("  ROTATE THE LEAKED SECRET — burning bytes cannot recall what was already read.");
+
+    // Git-mirror guidance, only when a referencing change was projected (§4).
+    if !report.projected.is_empty() {
+        println!(
+            "  ⚠ this content was projected into the git mirror ({} commit(s)):",
+            report.projected.len()
+        );
+        for (_version, sha) in &report.projected {
+            println!("      git {}", &sha[..sha.len().min(12)]);
+        }
+        println!(
+            "    loot never rewrites git history. FIX THE GIT TIP FIRST (remove/re-seal the \
+             path at HEAD, then ferry) — otherwise ferry re-ingests the tip's bytes under a \
+             fresh oid the burn log cannot match. Then rewrite the mirror + any git remote \
+             with git-filter-repo/BFG, or accept-and-rotate."
+        );
+    }
+
+    // A burn is a one-way destruction — a non-undoable barrier (ADR 0031).
+    ws.record_op("burn", &format!("burn {}", path.display()), true);
+    Ok(())
+}
+
 
 fn parse_vis_spec(spec: &str) -> Result<Visibility, String> {
     if spec == "public" {
@@ -2795,7 +2880,8 @@ fn run_pull(
     if !no_surface && !outcomes.is_empty() && report.deferred.is_none() {
         let (head, written, skipped) = ws.surface_with_report()?;
         if matches!(fmt, OutFmt::Human) {
-            print_surface_listing(&head, &written, skipped, ws.identity());
+            let burned = ws.burned_paths_at(&head);
+            print_surface_listing(&head, &written, skipped, &burned, ws.identity());
         }
     }
     Ok(())

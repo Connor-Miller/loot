@@ -230,6 +230,31 @@ pub fn prune_orphaned_objects_loose(
     Ok((count, bytes))
 }
 
+/// Destroy the loose object files for exactly the addresses in `oids` (ADR
+/// 0038 burn). Unlike [`prune_orphaned_objects_loose`] this is **address-driven
+/// destruction**, not reachability gc: the caller has recorded a signed
+/// tombstone, so the ciphertext is removed even though the change graph still
+/// references the address. Idempotent — an already-absent file is already
+/// destroyed. A missing objects directory is a no-op. Any other removal error
+/// propagates — a burn that silently failed to delete bytes is the exact
+/// failure the tombstone would then lie about.
+pub fn destroy_objects_loose(obj_dir: &Path, oids: &BTreeSet<Oid>) -> Result<(), RepoError> {
+    for oid in oids {
+        let dest = obj_dir.join(crate::hex::encode(&oid.0));
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(RepoError::Backend(format!(
+                    "destroy object {}: {e}",
+                    crate::hex::encode(&oid.0)
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn encode_graph(graph: &ChangeGraph) -> Vec<u8> {
     // A graph file is just a versioned, topo-ordered node array — the same wire
     // shape `encode_nodes` produces, so the two share one encoder.

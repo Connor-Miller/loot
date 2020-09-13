@@ -2973,6 +2973,104 @@ impl Workspace {
         Ok((content, message))
     }
 
+    // --- burn: destroy + tombstone, no resurrection (ADR 0038, #344) ---
+
+    /// `loot burn <path>` (or an oid-level burn): destroy every historical
+    /// object of `path` and record a signed tombstone for each (ADR 0038 §2).
+    /// The change graph is never touched. Detects the honesty tier from the op
+    /// log's disclosure barriers (a prior `push` ⇒ Pushed, else NeverPushed,
+    /// §3) and — for the Pushed tier — deposits a purge event so the tombstone
+    /// travels to cooperating relays/peers. Also checks the git mark map: any
+    /// referencing change that was projected is reported so the CLI can print
+    /// the mirror-rewrite guidance (§4). Signs each tombstone with this repo's
+    /// key when it has one; a keyless repo records unauthored tombstones.
+    pub fn burn_path(&mut self, path: &Path, only_oid: Option<Oid>) -> Result<BurnReport, String> {
+        // Tier from the disclosure barrier (ADR 0038 §3): a `push` op ever
+        // recorded means the bytes may have left this machine.
+        let pushed = oplog::read(&self.store)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|op| op.barrier && op.command == "push");
+        let tier = if pushed {
+            loot_core::BurnTier::Pushed
+        } else {
+            loot_core::BurnTier::NeverPushed
+        };
+
+        // The oid → referencing-version-ids map to destroy. An explicit `--oid`
+        // is the escape hatch (a renamed path, or an oid a scan can't reach);
+        // otherwise scan every historical object recorded at `path`.
+        let scanned = self
+            .repo
+            .objects_at_path(&self.store, path)
+            .map_err(|e| e.to_string())?;
+        let targets: std::collections::BTreeMap<Oid, Vec<Oid>> = match only_oid {
+            Some(oid) => {
+                let refs = scanned.get(&oid).cloned().unwrap_or_default();
+                std::collections::BTreeMap::from([(oid, refs)])
+            }
+            None => scanned,
+        };
+        if targets.is_empty() {
+            return Err(format!(
+                "no historical object recorded at {} — nothing to burn (pass `--oid <hex>` to burn a specific address)",
+                path.display()
+            ));
+        }
+
+        // Git-mirror detection (ADR 0038 §4): the mark map keys git commits by
+        // the loot version-id they projected. Report every burned object whose
+        // referencing change was ever projected — and ONLY those.
+        let marks = loot_core::bridge::MarkMap::parse(
+            &std::fs::read_to_string(self.store.git_marks()).unwrap_or_default(),
+        )
+        .unwrap_or_default();
+
+        let mut tombstones = Vec::new();
+        let mut burned = Vec::new();
+        let mut projected: Vec<(Oid, String)> = Vec::new();
+        for (oid, referencing) in &targets {
+            tombstones.push(self.make_tombstone(oid, path, tier));
+            burned.push((oid.clone(), path.to_path_buf()));
+            for version in referencing {
+                if let Some(sha) = marks.sha_for(version) {
+                    projected.push((version.clone(), sha.to_string()));
+                }
+            }
+        }
+
+        self.repo.burn(&tombstones);
+        self.persist()?;
+        Ok(BurnReport { tier, burned, projected })
+    }
+
+    /// The paths at `head` whose recorded object has been burned (ADR 0038),
+    /// each as `(path, oid)` — what `surface` labels instead of writing.
+    pub fn burned_paths_at(&self, head: &Oid) -> Vec<(PathBuf, Oid)> {
+        self.repo.burned_paths_at(head)
+    }
+
+    /// Build a tombstone for `oid` at `path` under `tier`, signing with this
+    /// repo's key if it has one (ADR 0018 verify-only core; signing at the CLI).
+    fn make_tombstone(&self, oid: &Oid, path: &Path, tier: loot_core::BurnTier) -> loot_core::Tombstone {
+        match &self.signer {
+            Some(signer) => {
+                let burner = signer.public_key_bytes();
+                let signature =
+                    signer.sign(&loot_core::burn::signing_bytes(oid, path, tier, &burner, self.now));
+                loot_core::Tombstone {
+                    oid: oid.clone(),
+                    path: path.to_path_buf(),
+                    tier,
+                    burner,
+                    burned_at: self.now,
+                    signature,
+                }
+            }
+            None => loot_core::Tombstone::unauthored(oid.clone(), path.to_path_buf(), tier, self.now),
+        }
+    }
+
     // --- git interop bridge support (GB1, ADR 0028) ---
 
     /// The repo's on-disk layout — the bridge keeps its marks/state/config
@@ -3878,6 +3976,19 @@ pub struct StepReport {
     pub working: Option<Oid>,
 }
 
+/// What `loot burn` destroyed (ADR 0038, #344), for the CLI to report.
+#[derive(Debug)]
+pub struct BurnReport {
+    /// The honesty tier the burn achieved (never-pushed ⇒ complete; pushed ⇒
+    /// best-effort with a purge event).
+    pub tier: loot_core::BurnTier,
+    /// The destroyed `(oid, path)` pairs.
+    pub burned: Vec<(Oid, PathBuf)>,
+    /// Referencing changes that were projected into the git mirror, as
+    /// `(version-id, git-sha)` — non-empty means the git-side guidance applies.
+    pub projected: Vec<(Oid, String)>,
+}
+
 /// Flatten an [`oplog::StepError`] into a CLI message. A barrier refusal is
 /// expanded into the "why + real remedy" prose ADR 0031 mandates.
 fn step_error(e: oplog::StepError) -> String {
@@ -3901,6 +4012,10 @@ fn barrier_message(b: &oplog::BarrierRefusal) -> String {
                      key. re-grant explicitly to restore access.",
         "pull-grants" => "pull-grants filed keys into your keyring; undo only moves view \
                           pointers, never keys, so there is nothing for it to reverse.",
+        "burn" => "a burn destroyed an object's bytes and recorded a signed tombstone; \
+                   undo cannot un-destroy them. the forward fix is to re-seal the path \
+                   restricted (`loot migrate <path> restricted=<you>`) or remove it at \
+                   tip — and to rotate the leaked secret itself.",
         _ => "this operation changed permission or key state that undo cannot retract.",
     };
     format!(
@@ -8198,5 +8313,100 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // --- burn: destroy + tombstone, no resurrection (ADR 0038, #344) ---
+
+    /// Finalize `.env` as a committed change and return its content oid + the
+    /// head version-id that references it.
+    fn committed_secret(ws: &mut Workspace, dir: &Path) -> (Oid, Oid) {
+        std::fs::write(dir.join(".env"), b"TOKEN=leaked\n").unwrap();
+        ws.snapshot("leak").unwrap();
+        ws.finalize_working().unwrap();
+        let head = ws.repo().heads()[0].clone();
+        let oid = ws.repo().current_tree_oid(Path::new(".env")).unwrap();
+        (oid, head)
+    }
+
+    #[test]
+    fn burn_destroys_bytes_records_signed_tombstone_and_reports_never_pushed() {
+        let dir = std::env::temp_dir().join(format!("loot-burn-ws-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (oid, _head) = committed_secret(&mut ws, &dir);
+        let obj_file = ws.store().objects_dir().join(loot_core::hex::encode(&oid.0));
+        assert!(obj_file.exists(), "the sealed object exists before burning");
+
+        let report = ws.burn_path(Path::new(".env"), None).unwrap();
+        assert_eq!(report.tier, loot_core::BurnTier::NeverPushed, "no push recorded ⇒ never-pushed");
+        assert_eq!(report.burned.len(), 1);
+        assert!(report.projected.is_empty(), "no mirror ⇒ no git guidance");
+        assert!(!obj_file.exists(), "burn destroyed the ciphertext on disk");
+
+        // The tombstone is signed (authored repo) and survives reload; verify is clean.
+        let reloaded = Workspace::open_at(&dir).unwrap();
+        let ts = reloaded.repo().burn_log().get(&oid).expect("tombstone recorded");
+        assert!(!ts.is_unauthored() && ts.verify(), "authored repo signs the tombstone");
+        assert!(
+            DagRepo::verify(reloaded.store().dot()).unwrap().is_clean(),
+            "verify passes on a store with burned objects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burn_is_a_non_undoable_barrier() {
+        let dir = std::env::temp_dir().join(format!("loot-burn-barrier-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let _ = committed_secret(&mut ws, &dir);
+        ws.burn_path(Path::new(".env"), None).unwrap();
+        // Record the barrier op exactly as cmd_burn does, then undo must refuse.
+        ws.record_op("burn", "burn .env", true);
+        let err = ws.undo().unwrap_err();
+        assert!(err.contains("barrier"), "undo refuses across a burn: {err}");
+        assert!(err.to_lowercase().contains("rotate"), "the refusal names the rotate-the-secret remedy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burn_after_a_push_reports_the_pushed_tier() {
+        let dir = std::env::temp_dir().join(format!("loot-burn-pushed-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let _ = committed_secret(&mut ws, &dir);
+        // Simulate a prior disclosure barrier (ADR 0038 §3 tier source).
+        ws.record_op("push", "push → origin", true);
+        let report = ws.burn_path(Path::new(".env"), None).unwrap();
+        assert_eq!(report.tier, loot_core::BurnTier::Pushed, "a recorded push ⇒ pushed tier");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burn_detects_and_reports_git_projection() {
+        use loot_core::bridge::{MarkMap, MarkOrigin};
+        let dir = std::env::temp_dir().join(format!("loot-burn-mirror-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (_oid, head) = committed_secret(&mut ws, &dir);
+        // Record that the referencing change was projected into the git mirror.
+        let mut marks = MarkMap::new();
+        marks.insert("a".repeat(40), head.clone(), MarkOrigin::Loot);
+        std::fs::create_dir_all(ws.store().git_mirror_dir()).unwrap();
+        std::fs::write(ws.store().git_marks(), marks.encode()).unwrap();
+
+        let report = ws.burn_path(Path::new(".env"), None).unwrap();
+        assert_eq!(
+            report.projected.iter().map(|(_, sha)| sha.clone()).collect::<Vec<_>>(),
+            vec!["a".repeat(40)],
+            "burn reports the projected commit so the CLI prints git guidance"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burn_refuses_a_path_with_no_object() {
+        let dir = std::env::temp_dir().join(format!("loot-burn-empty-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let _ = committed_secret(&mut ws, &dir);
+        let err = ws.burn_path(Path::new("nonexistent"), None).unwrap_err();
+        assert!(err.contains("no historical object"), "burning an unknown path refuses: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

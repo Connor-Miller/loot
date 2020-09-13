@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 pub mod attestation;    // detachable advisory signatures over changes (S4, ADR 0018)
 pub mod bridge;         // git interop bridge formats: trailers, marks, dates (GB1, ADR 0028)
+pub mod burn;           // burn log: signed tombstones for destroyed objects (ADR 0038, #344)
 pub mod buoy;           // navigational-role resolver over the attestation lane (CA4, ADR 0025)
 pub mod bundle_codec;   // sync bundle wire format (ADR 0003, 0004, 0007)
 pub mod converge;
@@ -23,6 +24,7 @@ pub mod store;          // the .loot/ on-disk layout (single source of truth)
 pub mod verdict;        // machine-facing reconciliation output (CA3, ADR 0023)
 
 pub use attestation::{Attestation, AttestationLog};
+pub use burn::{BurnLog, BurnTier, Tombstone};
 pub use liveness::{HeadPartition, Liveness};
 pub use engine::{
     change_signing_message, DagRepo, GcReport, LogGraph, LogNode, MaroonResult, MigrateResult,
