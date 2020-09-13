@@ -79,6 +79,16 @@ pub enum RepoError {
     /// prose string) and re-run with `--allow-demote` for the ones it intends.
     #[error("refusing to demote visibility of {}: an attributes change would re-seal private content more readably; restore the .lootattributes rule, or re-run with `--allow-demote <path>` to demote deliberately", .paths.join(", "))]
     Demotion { paths: Vec<String> },
+    /// The mis-seal gate (#63, ADR 0038 §1): a secret-shaped path is being
+    /// sealed public for the first time, but resolves Public only by
+    /// *fallthrough* — no `.lootattributes` rule names it, so the default (or a
+    /// catch-all glob) is what makes it readable. The sibling of `Demotion`: a
+    /// typed, matchable refusal carrying the offending paths so a driver can
+    /// classify the abort rather than scrape prose, overridable per-path with
+    /// `--allow-reveal`. Content is never inspected — only the name and the
+    /// resolution provenance.
+    #[error("refusing to seal {} publicly: it matches a built-in secret-shaped name and resolves Public only by fallthrough (no .lootattributes rule names it). Name it in .lootattributes — `<path> restricted=<id>` to seal it, or `<path> public` to consent — or re-run with `--allow-reveal <path>` to seal it public deliberately", .paths.join(", "))]
+    MisSeal { paths: Vec<String> },
     #[error("backend error: {0}")]
     Backend(String),
 }

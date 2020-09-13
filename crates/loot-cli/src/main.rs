@@ -108,8 +108,8 @@ const COMMANDS: &[Verb] = &[
     verb("init", &["--identity"], &[], cmd_init),
     verb("status", &[], OUT, cmd_status),
     verb("diff", &["--conflict"], &[], cmd_diff),
-    verb("describe", &["-m", "--message", "--allow-demote"], &[], cmd_describe),
-    verb("new", &["-m", "--message", "--allow-demote"], SKIP, cmd_new),
+    verb("describe", &["-m", "--message", "--allow-demote", "--allow-reveal"], &[], cmd_describe),
+    verb("new", &["-m", "--message", "--allow-demote", "--allow-reveal"], SKIP, cmd_new),
     verb("edit", &[], &[], cmd_edit),
     verb("abandon", &[], &["--head"], cmd_abandon),
     verb("adopt", &[], &["--discard-wip"], cmd_adopt),
@@ -165,7 +165,7 @@ usage:
   loot status [--porcelain|--json]          show the working change read-only (live version id + durable change id; no snapshot)
   loot diff [<from>] [<to>]                 show which paths changed between two changes (defaults: HEAD vs @ working); selectors: @, HEAD, HEAD~<n>, id prefix
   loot diff --conflict <path>               inspect both sides (ours/theirs) of a recorded conflict; decrypts when the key is held, else shows the OIDs
-  loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
+  loot describe -m <message> [--allow-demote <path>]... [--allow-reveal <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
   loot abandon <selector>                   drop a version from a divergent change (marked `!` in log), leaving one; undoable; selectors: @, HEAD, HEAD~<n>, id prefix
@@ -219,6 +219,8 @@ usage:
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
 first (ADR 0030) — no manual `loot status` needed. Two globals ride them:
   --allow-demote <path>   permit this snapshot to re-seal <path> more readably (repeatable)
+  --allow-reveal <path>   permit sealing a secret-shaped <path> public by fallthrough (repeatable;
+                          on describe/new — the mis-seal gate, ADR 0038)
   --no-snapshot           act on the last recorded working change; skip the implicit capture
                           (not on `describe` — recording the tree is its whole job)
 
@@ -516,7 +518,12 @@ fn cmd_describe(args: &[String]) -> Result<(), String> {
     let message = message_flag(args).ok_or("describe requires -m <message>")?;
     let allow_demote: Vec<std::path::PathBuf> =
         flag_values(args, "--allow-demote").into_iter().map(Into::into).collect();
+    let allow_reveal: Vec<std::path::PathBuf> =
+        flag_values(args, "--allow-reveal").into_iter().map(Into::into).collect();
     let mut ws = Workspace::open()?;
+    // The mis-seal gate (#63, ADR 0038 §1): refuse a first-time public-by-
+    // fallthrough seal of a secret-shaped path before the capture names it.
+    ws.seal_gate(&allow_reveal)?;
     // describe is the namer: it always records the tree (its whole job), so it
     // snapshots-and-names in one step — `--no-snapshot` does not apply. The
     // demotion guard still rides it via `--allow-demote`.
@@ -528,7 +535,14 @@ fn cmd_describe(args: &[String]) -> Result<(), String> {
 
 fn cmd_new(args: &[String]) -> Result<(), String> {
     let opts = parse_snapshot_opts(args);
+    let allow_reveal: Vec<std::path::PathBuf> =
+        flag_values(args, "--allow-reveal").into_iter().map(Into::into).collect();
     let mut ws = Workspace::open()?;
+    // The mis-seal gate (#63, ADR 0038 §1): vet the tree before this finalize
+    // signs it. Refuses a first-time public-by-fallthrough seal of a secret-
+    // shaped path; the first-seal list it returns (relative to the current
+    // anchor) is exactly what this change is about to seal for the first time.
+    let first_seals = ws.seal_gate(&allow_reveal)?;
     // Convenience `new -m <msg>`: name the working change before finalizing, so
     // finalize-and-name is one step (ADR 0030). It is a mutating snapshot, so it
     // honors the demotion guard via `--allow-demote`.
@@ -548,9 +562,20 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
         Some(id) => format!("finalize {}", short(id)),
         None => "new (nothing to finalize)".to_string(),
     };
+    let did_finalize = finalized.is_some();
     match finalized {
         Some(id) => println!("finalized working change {}; started fresh change {next}", short(&id)),
         None => println!("nothing to finalize; started fresh change {next}"),
+    }
+    // First-seal summary (#63, ADR 0038 §1): when this finalize actually sealed
+    // a change, list the paths it sealed for the first time and how each
+    // resolved — so a surprise (a secret waved through with `--allow-reveal`, or
+    // any path outside the name set) is visible at the moment of signing.
+    if did_finalize && !first_seals.is_empty() {
+        println!("first-seal summary ({} new path{}):", first_seals.len(), if first_seals.len() == 1 { "" } else { "s" });
+        for (path, vis) in &first_seals {
+            println!("  {}  {}", render::visibility_label(vis), path.display());
+        }
     }
     ws.record_op("new", &desc, false);
     Ok(())
@@ -2867,6 +2892,13 @@ mod tests {
         for v in ["new", "describe", "grant", "maroon", "migrate"] {
             assert_eq!(check(v, &["--allow-demote", "a"]), Ok(FlagCheck::Proceed), "`loot {v}`");
         }
+        // The mis-seal override (#63, ADR 0038) rides the two signing verbs that
+        // introduce content; the read-only `status` refuses it just as it does
+        // `--allow-demote`.
+        for v in ["new", "describe"] {
+            assert_eq!(check(v, &["--allow-reveal", "a"]), Ok(FlagCheck::Proceed), "`loot {v} --allow-reveal`");
+        }
+        assert!(check("status", &["--allow-reveal", "a"]).is_err());
         // `describe` always records the tree, so the skip is meaningless there,
         // and `status` is read-only — neither takes what it cannot honour.
         assert!(check("describe", &["--no-snapshot"]).is_err());

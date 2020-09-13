@@ -49,6 +49,21 @@ Alongside the refusal, finalize prints a **first-seal summary**: each path
 being sealed for the first time, with its resolved visibility — so surprises
 outside the name set are at least visible at the moment of signing.
 
+*Implementation (#343).* The refusal is `RepoError::MisSeal`, a sibling of
+`Demotion`; the override is `--allow-reveal <path>` (repeatable), riding
+`describe`/`new` exactly as `--allow-demote` does and refused on read-only
+`status`. The gate is **first-seal scoped** — it fires only on a path absent
+from the finalized anchor, mirroring the demotion guard's history-relativity so
+an override or explicit rule is a one-time ceremony and carry-along captures
+(ferry/adopt/merge) never re-trip it. The secret-shaped name set is the
+`SECRET_NAMES` constant in `crates/loot-cli/src/workspace.rs`, matched against a
+path's basename anywhere in the tree, case-insensitively: the ADR's `.env*` /
+`*.pem` / `*.key` / `*credentials*` families plus common cert/credential files,
+with precise SSH key names (`id_rsa`, `id_ed25519`, …) chosen over a broad
+`id_*` to avoid false-positives on ordinary source files. "Fallthrough" is the
+default *or* a catch-all glob — a pattern made only of `*`/`/` (`* public`);
+any literal segment makes a rule an explicit naming, i.e. consent.
+
 ### 2. `loot burn <path>` (the cure)
 
 Burn **destroys the object's bytes and records a signed tombstone** — the

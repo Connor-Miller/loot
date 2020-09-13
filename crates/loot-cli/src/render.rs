@@ -250,6 +250,13 @@ fn vis_human(vis: &Visibility) -> String {
     }
 }
 
+/// The human visibility label (`public` / `restricted=a,b` / `embargoed until
+/// <date>`) — the shared `vis_human` rendering, exposed for the first-seal
+/// summary `loot new` prints (#63, ADR 0038 §1).
+pub fn visibility_label(vis: &Visibility) -> String {
+    vis_human(vis)
+}
+
 /// The bare visibility *class* — what a sealed path shows when the caller can't
 /// read its recipients: `public` / `restricted` / `embargoed`.
 fn vis_class(vis: &Visibility) -> &'static str {

@@ -451,16 +451,21 @@ so `--allow-demote` is a global on any snapshotting verb (`new`, `describe`,
 `grant`, `maroon`, `migrate`), not a `status`-only flag — `status` is read-only
 and never demotes, so it does **not** take the flag (and refuses it since #67).
 Widening a Restricted identity set is not guarded — `grant`/`maroon` own that
-audit trail. A third safeguard is decided and being built (ADR 0038, map #339):
-the **mis-seal gate** — a path matching a built-in secret-shaped name set
-(`.env*`, `*.pem`, `*.key`, …) that resolves Public *via fallthrough* (the
-default or a catch-all, not an explicit rule naming it) refuses at the signing
-verbs, per-path overridable; finalize also prints a **first-seal summary**
-(each never-before-sealed path with its resolved visibility). An explicit rule
-is consent; falling through is not — the gate exists because a typo'd rule
-(`.evn restricted=alice`) sails a secret to the public default, which the
-demotion guard cannot see (a new path has no prior visibility). The cure side
-is [[Burn]].
+audit trail. A third safeguard shipped (ADR 0038 §1, map #339, #343): the
+**mis-seal gate** — a path whose basename matches a built-in secret-shaped name
+set (`.env*`, `*.pem`, `*.key`, `*credentials*`, `id_rsa`/`id_ed25519`, … — the
+`SECRET_NAMES` constant in `workspace.rs`) that resolves Public *via
+fallthrough* (the default or a catch-all glob, not an explicit rule naming it)
+and is being sealed for the **first time** (absent from the finalized anchor)
+refuses at the signing verbs `describe`/`new` with a typed `RepoError::MisSeal`,
+per-path overridable via the global **`--allow-reveal <path>`** (a sibling of
+`--allow-demote`, likewise refused on read-only `status`). Finalize also prints
+a **first-seal summary** (each never-before-sealed path with its resolved
+visibility). An explicit rule is consent; falling through is not — the gate
+exists because a typo'd rule (`.evn restricted=alice`) sails a secret to the
+public default, which the demotion guard cannot see (a new path has no prior
+visibility). First-seal scoping mirrors the demotion guard's history-relativity
+so the override is a one-time ceremony. The cure side is [[Burn]].
 
 **`.lootignore`** *(#64, 2026-07-09)* — a gitignore-style file excluding paths
 from [[Snapshot (reconcile)]]: one glob per line, `#` comments, the **same

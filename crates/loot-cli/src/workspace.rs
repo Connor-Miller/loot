@@ -12,8 +12,8 @@ use crate::position::Position;
 use crate::reconcile::{self, REFUSE_UNDESCRIBED_PARENT};
 use loot_core::bridge::{FerryState, MarkMap};
 use loot_core::{
-    oplog, valid_dock_name, DagRepo, LaneEntry, MergeOutcome, Oid, Operation, Repo, RepoStore,
-    Visibility, HOME_DOCK,
+    oplog, valid_dock_name, DagRepo, LaneEntry, MergeOutcome, Oid, Operation, Repo, RepoError,
+    RepoStore, Visibility, HOME_DOCK,
 };
 use loot_identity::Identity;
 use std::collections::BTreeMap;
@@ -757,6 +757,56 @@ impl Workspace {
         let finalized = self.working.clone();
         self.finalize_working()?;
         Ok(finalized)
+    }
+
+    /// The **mis-seal gate** (#63, ADR 0038 §1) — run by the signing verbs
+    /// (`describe`, `new`) before they capture. Two guarantees in one pass over
+    /// the working tree, both content-agnostic (name + resolution provenance
+    /// only, never plaintext):
+    ///
+    /// - **Refusal.** A path whose basename is [secret-shaped](SECRET_NAMES),
+    ///   that resolves Public *by fallthrough* (the default or a catch-all, not
+    ///   an explicit `.lootattributes` rule naming it), and is being sealed for
+    ///   the **first time** (absent from the finalized anchor tree) is refused
+    ///   with [`RepoError::MisSeal`] — unless the operator listed it in
+    ///   `allow_reveal` (the `--allow-reveal <path>` override, mirroring
+    ///   `--allow-demote`). First-seal scoping mirrors the demotion guard's
+    ///   history-relative nature (#62): once a path is in the anchor the gate is
+    ///   silent, so an override (or an explicit rule) is a one-time ceremony and
+    ///   carry-along captures (ferry/adopt/merge) never re-trip it.
+    /// - **First-seal summary.** Returns every never-before-sealed path with its
+    ///   resolved visibility, so `new` can print what it is about to seal for the
+    ///   first time — surfacing surprises even outside the secret-name set.
+    ///
+    /// A read-only preflight: it never mutates the store, so the subsequent
+    /// capture sees the same disk tree it vetted.
+    pub fn seal_gate(&self, allow_reveal: &[PathBuf]) -> Result<Vec<(PathBuf, Visibility)>, String> {
+        let anchor_tree = self
+            .anchor()
+            .and_then(|a| self.repo.change_tree(&a))
+            .unwrap_or_default();
+        let items = read_seal_provenance(&self.root)?;
+        let mut refusals: Vec<String> = Vec::new();
+        let mut first_seals: Vec<(PathBuf, Visibility)> = Vec::new();
+        for (path, vis, fallthrough) in items {
+            // A path already in the finalized anchor is not a first seal —
+            // it was vetted (and sealed) when it first appeared.
+            if anchor_tree.contains_key(&path) {
+                continue;
+            }
+            first_seals.push((path.clone(), vis.clone()));
+            if is_secret_name(&path)
+                && matches!(vis, Visibility::Public)
+                && fallthrough
+                && !allow_reveal.iter().any(|p| p == &path)
+            {
+                refusals.push(path.display().to_string());
+            }
+        }
+        if !refusals.is_empty() {
+            return Err(RepoError::MisSeal { paths: refusals }.to_string());
+        }
+        Ok(first_seals)
     }
 
     /// Finalize the working change and start fresh: the next snapshot appends a
@@ -3920,6 +3970,32 @@ fn read_tree_at(
     Ok((entries, reported))
 }
 
+/// The mis-seal gate's front half (#63, ADR 0038 §1): walk the working tree and
+/// resolve each path's `(visibility, public_by_fallthrough)` from
+/// `.lootattributes` — **without reading a single byte of content**. Loot stays
+/// content-agnostic: the gate decides on the *name* and the *resolution
+/// provenance* alone. Same walk + ignore + attribute rules as [`read_tree_at`],
+/// so the paths and visibilities it reports are exactly the ones a snapshot
+/// would seal.
+fn read_seal_provenance(root: &Path) -> Result<Vec<(PathBuf, Visibility, bool)>, String> {
+    let attrs = Attributes::load(&root.join(ATTRS));
+    let ignore = Ignore::load(&root.join(IGNORE));
+    let mut out = Vec::new();
+    for path in walk(root, &ignore)? {
+        let rel = path
+            .strip_prefix(root)
+            .or_else(|_| path.strip_prefix("./"))
+            .unwrap_or(&path)
+            .to_path_buf();
+        let key = rel.to_string_lossy();
+        let vis = attrs.visibility_for(&key);
+        let fallthrough = attrs.public_by_fallthrough(&key);
+        out.push((rel, vis, fallthrough));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 /// Recursively list files under `dir`, skipping `.loot/`, `.git`, and paths
 /// matched by `.lootignore` (#64). Ignored directories are pruned without
 /// descending, so an ignored `target/` is never read — the pilot's 38 MB
@@ -4048,6 +4124,77 @@ impl Attributes {
         }
         Visibility::Public
     }
+
+    /// Does `path` resolve **Public via fallthrough** — the default (no rule
+    /// matched) or a catch-all glob — rather than an explicit rule naming it?
+    /// This is the mis-seal gate's consent test (#63, ADR 0038 §1): an explicit
+    /// rule that names the path public is deliberate consent; falling through a
+    /// dropped/typo'd rule to the public default (or through a `* public`
+    /// catch-all every real repo wants) is the accident the gate catches. A
+    /// non-Public resolution is never a fallthrough-public (it is not public at
+    /// all), so the gate leaves restricted/embargoed paths alone.
+    fn public_by_fallthrough(&self, path: &str) -> bool {
+        for (glob, vis) in &self.rules {
+            if glob.matches(path) {
+                // First matching rule wins. It is a fallthrough only when it is
+                // a catch-all *and* resolves Public; an explicit (named) rule is
+                // consent, and any non-Public rule is not a public seal at all.
+                return is_catchall(&glob.pattern) && matches!(vis, Visibility::Public);
+            }
+        }
+        // No rule matched: the default Public — the plainest fallthrough.
+        true
+    }
+}
+
+/// Is a glob a **catch-all** — a pattern made only of wildcards and separators
+/// (`*`, `**`, `**/*`, `*/**`), with no literal segment that ties it to a name?
+/// The mis-seal gate treats a catch-all `* public` like the bare default: it
+/// waves every path through, so a secret riding it is a fallthrough, not
+/// consent (ADR 0038 §1 — "a catch-all rule, which every real repo wants,
+/// waves the typo'd-rule case straight through"). Any literal character
+/// (`*.pem`, `id_*`, `.env*`) makes the rule an explicit naming.
+fn is_catchall(pattern: &str) -> bool {
+    !pattern.is_empty() && pattern.chars().all(|c| c == '*' || c == '/')
+}
+
+/// The built-in **secret-shaped name set** (#63, ADR 0038 §1): file *basenames*
+/// that look like credentials — matched anywhere in the tree, case-insensitively
+/// (secrets do not care about case, and the gate fails closed). The gate refuses
+/// a first-time *public-by-fallthrough* seal of any path whose basename matches;
+/// it never inspects content. The exact set lives here, as the ADR defers it to
+/// the implementation. We pick precise SSH key names over the ADR's illustrative
+/// broad `id_*` to avoid false-positives on ordinary source files (`id_map.rs`),
+/// while keeping the `.env*` / `*.pem` / `*.key` / `*credentials*` families it
+/// names.
+const SECRET_NAMES: &[&str] = &[
+    ".env*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.keystore",
+    "*.jks",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "*credentials*",
+    ".npmrc",
+    ".pgpass",
+    ".htpasswd",
+];
+
+/// True when `rel`'s **basename** matches a [`SECRET_NAMES`] pattern — a
+/// secret-shaped file anywhere in the tree (#63, ADR 0038 §1). Basename, not
+/// full path, so a nested `config/.env` is caught while a root-anchored glob
+/// would miss it. Case-insensitive.
+fn is_secret_name(rel: &Path) -> bool {
+    let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    SECRET_NAMES.iter().any(|pat| glob_match(pat, &lower))
 }
 
 fn parse_visibility(spec: &str) -> Option<Visibility> {
@@ -5478,6 +5625,148 @@ mod tests {
             "docs/private/* must seal OS-native paths, got {vis:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the mis-seal gate (#63, ADR 0038 §1) ---
+
+    /// A fresh keyless workspace at a unique temp dir — enough for `seal_gate`,
+    /// which reads the working tree + `.lootattributes` and never signs.
+    fn gate_ws(tag: &str) -> (PathBuf, Workspace) {
+        let dir = std::env::temp_dir().join(format!("loot-gate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        let ws = Workspace::open_at(&dir).unwrap();
+        (dir, ws)
+    }
+
+    #[test]
+    fn mis_seal_gate_refuses_secret_falling_through_to_public() {
+        // `.env` with no rule naming it → the public default → refusal.
+        let (dir, ws) = gate_ws("fallthrough");
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        std::fs::write(dir.join("README.md"), b"# hi").unwrap();
+        let err = ws.seal_gate(&[]).unwrap_err();
+        assert!(err.contains("refusing to seal"), "{err}");
+        assert!(err.contains(".env"), "names the offending path: {err}");
+        assert!(err.contains("--allow-reveal"), "points at the fix: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_consents_to_an_explicit_public_rule() {
+        // An explicit rule that *names* the path public is deliberate consent.
+        let (dir, ws) = gate_ws("consent");
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        std::fs::write(dir.join(".lootattributes"), ".env public\n").unwrap();
+        let seals = ws.seal_gate(&[]).expect("explicit rule is consent");
+        assert!(
+            seals.iter().any(|(p, v)| p.ends_with(".env") && matches!(v, Visibility::Public)),
+            "the consented .env is a first seal: {seals:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_override_flag_allows_the_seal() {
+        // `--allow-reveal .env` waves the exact path through (still refuses others).
+        let (dir, ws) = gate_ws("override");
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        std::fs::write(dir.join("server.pem"), b"-----BEGIN-----").unwrap();
+        // Only `.env` is allowed → `server.pem` still refuses, `.env` does not.
+        let err = ws.seal_gate(&[PathBuf::from(".env")]).unwrap_err();
+        assert!(err.contains("server.pem"), "the un-allowed path is named: {err}");
+        assert!(!err.contains(".env"), "the allowed path is waved through: {err}");
+        // Both allowed → clean.
+        ws.seal_gate(&[PathBuf::from(".env"), PathBuf::from("server.pem")])
+            .expect("both overridden");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_leaves_non_secret_paths_untouched() {
+        // An ordinary file falling through to public is exactly the common case —
+        // never a refusal, only a first-seal line.
+        let (dir, ws) = gate_ws("nonsecret");
+        std::fs::write(dir.join("main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"todo").unwrap();
+        let seals = ws.seal_gate(&[]).expect("non-secret public paths never refuse");
+        assert_eq!(seals.len(), 2, "both are first seals: {seals:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_catch_all_public_rule_still_refuses() {
+        // A `* public` catch-all is the fallthrough the ADR calls out — it waves
+        // the secret through without naming it, so the gate still refuses.
+        let (dir, ws) = gate_ws("catchall");
+        std::fs::write(dir.join("id_rsa"), b"PRIVATE KEY").unwrap();
+        std::fs::write(dir.join(".lootattributes"), "* public\n").unwrap();
+        let err = ws.seal_gate(&[]).unwrap_err();
+        assert!(err.contains("id_rsa"), "catch-all does not count as consent: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_restricted_secret_does_not_refuse() {
+        // A secret sealed *restricted* is not a public seal at all — no refusal,
+        // and it is not offered as a public first-seal.
+        let (dir, ws) = gate_ws("restricted");
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        std::fs::write(dir.join(".lootattributes"), ".env restricted=connor\n").unwrap();
+        let seals = ws.seal_gate(&[]).expect("restricted secret is safe");
+        assert!(
+            seals.iter().any(|(p, v)| p.ends_with(".env")
+                && matches!(v, Visibility::Restricted(ids) if ids == &["connor"])),
+            "the .env first-seal is restricted, not public: {seals:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_is_silent_once_the_secret_is_anchored() {
+        // First-seal scoping (mirrors the demotion guard's history-relativity):
+        // once a path is in the finalized anchor, the gate never re-trips — so an
+        // override is a one-time ceremony and carry-along captures stay quiet.
+        let (dir, mut ws) = gate_ws("anchored");
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        // Seal it (deliberately public, via the override) and finalize.
+        ws.seal_gate(&[PathBuf::from(".env")]).unwrap();
+        ws.snapshot("seal env").unwrap();
+        ws.finalize_working().unwrap();
+        // A fresh change touching another file: `.env` is now anchored, so a bare
+        // gate (no override) is clean.
+        std::fs::write(dir.join("app.rs"), b"fn main() {}").unwrap();
+        let seals = ws.seal_gate(&[]).expect("anchored secret no longer trips the gate");
+        assert!(
+            !seals.iter().any(|(p, _)| p.ends_with(".env")),
+            "an anchored path is not a first seal: {seals:?}"
+        );
+        assert!(seals.iter().any(|(p, _)| p.ends_with("app.rs")), "the new file is: {seals:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_catchall_distinguishes_wildcards_from_named_rules() {
+        assert!(is_catchall("*"));
+        assert!(is_catchall("**"));
+        assert!(is_catchall("**/*"));
+        assert!(is_catchall("*/**"));
+        assert!(!is_catchall(""));
+        assert!(!is_catchall("*.pem"));
+        assert!(!is_catchall(".env*"));
+        assert!(!is_catchall("id_*"));
+        assert!(!is_catchall("docs/private/*"));
+    }
+
+    #[test]
+    fn is_secret_name_matches_basenames_anywhere_case_insensitively() {
+        for p in [".env", ".env.local", "config/.env", "server.pem", "tls.KEY", "id_ed25519",
+                  "deploy/aws_credentials.json", ".npmrc", "store.p12"] {
+            assert!(is_secret_name(Path::new(p)), "should be secret-shaped: {p}");
+        }
+        for p in ["main.rs", "README.md", "id_map.rs", "envelope.txt", "keymap.json"] {
+            assert!(!is_secret_name(Path::new(p)), "should NOT be secret-shaped: {p}");
+        }
     }
 
     #[test]
