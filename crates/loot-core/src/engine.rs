@@ -2035,6 +2035,57 @@ impl DagRepo {
         Ok((written, skipped))
     }
 
+    /// Decrypt every path in `change`'s tree that `reader` can open at `now`,
+    /// returning `(path, plaintext)` pairs plus a count of paths skipped because
+    /// they are sealed/embargoed to this reader (grant-expired or burned paths
+    /// count as skipped too — all are unreadable). The **read-only twin** of
+    /// [`surface_with_report`](Self::surface_with_report): it routes through the
+    /// same key oracle ([`get`](Self::get)) but collects plaintext in memory
+    /// rather than writing it to the working tree, so nothing touches disk. This
+    /// is the one primitive `loot grep` searches through, which is how grep
+    /// honours visibility without ever seeing ciphertext (#391).
+    pub fn readable_tree(
+        &self,
+        change: &Oid,
+        reader: &str,
+        now: u64,
+    ) -> Result<(Vec<(PathBuf, Vec<u8>)>, usize), RepoError> {
+        let node = self
+            .graph
+            .get(change)
+            .ok_or_else(|| RepoError::NotFound(change.clone()))?;
+
+        let mut readable: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let mut skipped = 0usize;
+
+        for (path, (oid, _vis)) in &node.tree {
+            // Grant expiry gate (#20), mirrored from `surface_with_report`.
+            if self.grant_expired_for(oid, reader, now) {
+                skipped += 1;
+                continue;
+            }
+            let bytes = match self.get(oid, reader, now) {
+                Ok(b) => b,
+                // Sealed or embargoed to this reader: correct invisibility, not
+                // an error (#391). A burned object's bytes are gone by design
+                // (ADR 0038) — likewise unreadable, so count and skip it rather
+                // than error on the deliberate absence.
+                Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(RepoError::NotFound(_)) if self.burn_log.contains(oid) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            readable.push((path.clone(), bytes));
+        }
+
+        Ok((readable, skipped))
+    }
+
     /// Paths at `tip` whose content `reader` can open now — the change's own tree
     /// (exactly what [`surface`] would write) minus anything sealed or embargoed
     /// against this reader. This is the set a dock switch may prune from disk, so
@@ -2468,6 +2519,50 @@ mod tests {
 
     fn tmp() -> PathBuf {
         std::env::temp_dir()
+    }
+
+    /// `readable_tree` (#391) is the key oracle applied to a whole change: the
+    /// keyholder (whose keyring holds the keys) reads every path's plaintext; a
+    /// non-keyholder who only relays the ciphertext reads just the public paths,
+    /// and the restricted one is *counted as skipped*, never handed back as
+    /// ciphertext. Visibility here is enforced exactly the way loot enforces it
+    /// everywhere — by who holds the key ("permissioning is key management") —
+    /// so the non-keyholder is a second repo that applied the sync bundle but
+    /// never received the restricted key. This is the invisibility grep relies on.
+    #[test]
+    fn readable_tree_decrypts_for_keyholder_and_skips_for_non_keyholder() {
+        let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let head = alice
+            .snapshot(
+                None,
+                None,
+                &[
+                    entry(".env", b"TOKEN=needle\n", Visibility::Restricted(vec!["alice".into()])),
+                    entry("README", b"hello needle\nworld\n", Visibility::Public),
+                ],
+                "init",
+                0,
+            )
+            .unwrap();
+
+        // Alice holds both keys: both paths decrypt, nothing skipped.
+        let (readable, skipped) = alice.readable_tree(&head, "alice", 0).unwrap();
+        assert_eq!(skipped, 0, "the keyholder skips nothing");
+        let by_path: BTreeMap<_, _> = readable.into_iter().collect();
+        assert_eq!(by_path[&PathBuf::from(".env")], b"TOKEN=needle\n".to_vec());
+        assert_eq!(by_path[&PathBuf::from("README")], b"hello needle\nworld\n".to_vec());
+
+        // Bob relays alice's bundle but holds no key for the restricted path: he
+        // reads only the public one, and the sealed path is counted, never
+        // handed back as ciphertext (#391 — correct invisibility, not an error).
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+        let (readable, skipped) = bob.readable_tree(&head, "bob", 0).unwrap();
+        assert_eq!(skipped, 1, "the sealed path is invisible to a non-keyholder");
+        assert_eq!(readable.len(), 1);
+        assert_eq!(readable[0].0, PathBuf::from("README"));
+        assert_eq!(readable[0].1, b"hello needle\nworld\n".to_vec());
     }
 
     /// ADR 0003 leak guard: a Restricted content key must NEVER appear in a sync
