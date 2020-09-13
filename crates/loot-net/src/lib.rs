@@ -362,6 +362,32 @@ async fn handle_pull_grants(
 
 // --- client (`loot push` / `loot pull`) ---
 
+/// Build the error for a non-success relay response, attaching an actionable
+/// hint for the failure shapes an operator can act on. Centralizing it keeps the
+/// hint identical across every client verb (push, wants, offer, fetch, …) rather
+/// than re-deriving it at each call site.
+fn relay_rejected(verb: &str, code: reqwest::StatusCode, msg: &str) -> NetError {
+    let hint = if code == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        // 413: one bundle exceeded the relay's request-body buffer. Batches are
+        // byte-capped below MAX_BODY_BYTES, so either the relay predates the
+        // raised limit (#309) or a single object outgrows it.
+        "\n  the relay's body limit is smaller than this bundle — upgrade the relay \
+         (a pre-#309 build caps at 2 MiB), or a single object exceeds its limit"
+    } else if msg.contains("unsupported format version") {
+        // The relay could not read the format version this build wrote (#361,
+        // #431). Every client verb here sends bytes marked with the *current*
+        // FORMAT_MAJOR, so a version rejection means the relay is behind — not
+        // that this build is stale. The wire message says "upgrade loot", which
+        // is right for a too-new local artifact but misleading over the wire:
+        // the fix is to redeploy the relay.
+        "\n  the relay is behind on loot's format version and cannot read what this \
+         build wrote — redeploy the relay (`npm run setup:loot` from the scripts repo)"
+    } else {
+        ""
+    };
+    NetError::Http(format!("relay rejected {verb} ({code}): {msg}{hint}"))
+}
+
 /// Push raw sync-bundle bytes to a relay's `/stow` endpoint. The bundle is
 /// wrapped in a signed envelope (ADR 0014) so the relay can verify authenticity.
 /// A deliberate disclosure act: it publishes sealed content to a node that
@@ -376,18 +402,7 @@ pub fn push(base_url: &str, bundle_bytes: Vec<u8>, id: &identity::Identity) -> R
         .send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        // 413 means one bundle exceeded the relay's request-body buffer.
-        // Batches are byte-capped below MAX_BODY_BYTES, so either the relay
-        // predates the raised limit (#309) or a single object outgrows it.
-        let hint = if code == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-            "\n  the relay's body limit is smaller than this bundle — upgrade the relay \
-             (a pre-#309 build caps at 2 MiB), or a single object exceeds its limit"
-        } else {
-            ""
-        };
-        return Err(NetError::Http(format!("relay rejected push ({code}): {msg}{hint}")));
+        return Err(relay_rejected("push", resp.status(), &resp.text().unwrap_or_default()));
     }
     Ok(())
 }
@@ -404,9 +419,7 @@ pub fn pull(base_url: &str, have: &[Oid]) -> Result<Vec<u8>, NetError> {
         .send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected pull ({code}): {msg}")));
+        return Err(relay_rejected("pull", resp.status(), &resp.text().unwrap_or_default()));
     }
     let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
     Ok(bytes.to_vec())
@@ -423,9 +436,7 @@ pub fn offer(base_url: &str, have: &[Oid]) -> Result<Vec<Oid>, NetError> {
         .send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected offer ({code}): {msg}")));
+        return Err(relay_rejected("offer", resp.status(), &resp.text().unwrap_or_default()));
     }
     let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
     decode_addrs(&bytes)
@@ -442,9 +453,7 @@ pub fn fetch(base_url: &str, have: &[Oid], wants: &[Oid]) -> Result<Vec<u8>, Net
         .send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected fetch ({code}): {msg}")));
+        return Err(relay_rejected("fetch", resp.status(), &resp.text().unwrap_or_default()));
     }
     let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
     Ok(bytes.to_vec())
@@ -461,9 +470,7 @@ pub fn wants(base_url: &str, offered: &[Oid]) -> Result<Vec<Oid>, NetError> {
         .send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected wants ({code}): {msg}")));
+        return Err(relay_rejected("wants", resp.status(), &resp.text().unwrap_or_default()));
     }
     let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
     decode_addrs(&bytes)
@@ -492,9 +499,7 @@ pub fn deliver_grant(base_url: &str, recipient_pubkey: &[u8; 32], blob: &[u8]) -
     let resp = client.post(&url).body(body).send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected grant deposit ({code}): {msg}")));
+        return Err(relay_rejected("grant deposit", resp.status(), &resp.text().unwrap_or_default()));
     }
     Ok(())
 }
@@ -512,9 +517,7 @@ pub fn peek_grants(base_url: &str, recipient_pubkey: &[u8; 32]) -> Result<usize,
     let resp = client.post(&url).body(body).send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected peek ({code}): {msg}")));
+        return Err(relay_rejected("peek", resp.status(), &resp.text().unwrap_or_default()));
     }
     let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
     if bytes.len() < 4 {
@@ -538,9 +541,7 @@ pub fn fetch_grants(base_url: &str, recipient_pubkey: &[u8; 32]) -> Result<Vec<V
     let resp = client.post(&url).body(body).send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected pull-grants ({code}): {msg}")));
+        return Err(relay_rejected("pull-grants", resp.status(), &resp.text().unwrap_or_default()));
     }
     let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
     mailbox::decode_blobs(&bytes)
@@ -585,6 +586,38 @@ mod tests {
         let mut enc = encode_addrs(&[oid(1)]);
         enc[0] = loot_core::format::FORMAT_MAJOR + 1; // pretend a newer major wrote it
         assert!(decode_addrs(&enc).is_err(), "an unknown future major is rejected");
+    }
+
+    #[test]
+    fn rejection_hints_relay_redeploy_on_format_skew() {
+        // A relay too old to read our FORMAT_MAJOR returns the reader-centric
+        // "upgrade loot" text. On push the client always writes the *current*
+        // major, so a version rejection means the relay is behind, not that this
+        // build is stale — the client must point at a relay redeploy (#361/#431),
+        // not at upgrading the local loot.
+        let e = relay_rejected(
+            "wants",
+            reqwest::StatusCode::BAD_REQUEST,
+            "unsupported format version v8 — upgrade loot (this build reads up to v7)",
+        );
+        let s = e.to_string();
+        assert!(s.contains("redeploy the relay"), "expected redeploy hint, got: {s}");
+        assert!(s.contains("setup:loot"), "expected the concrete command, got: {s}");
+    }
+
+    #[test]
+    fn rejection_hints_body_limit_on_413() {
+        let e = relay_rejected("push", reqwest::StatusCode::PAYLOAD_TOO_LARGE, "too big");
+        assert!(e.to_string().contains("body limit"), "expected 413 hint");
+    }
+
+    #[test]
+    fn rejection_plain_error_carries_no_spurious_hint() {
+        let e = relay_rejected("pull", reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        let s = e.to_string();
+        assert!(s.contains("relay rejected pull"), "keeps the base message: {s}");
+        assert!(!s.contains("redeploy"), "no spurious redeploy hint: {s}");
+        assert!(!s.contains("body limit"), "no spurious 413 hint: {s}");
     }
 
     #[test]

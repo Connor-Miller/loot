@@ -263,6 +263,42 @@ fn allowlist_rejects_unknown_pusher() {
     }
 }
 
+/// A relay too old to read the format version this build wrote (the #361
+/// outage: a `FORMAT_MAJOR` bump outran the deployed relay) rejects the push at
+/// `stow` with the reader-centric "upgrade loot" message. End-to-end, the client
+/// must translate that into the actionable truth — the *relay* is behind and
+/// needs a redeploy — rather than passing the misleading "upgrade loot" through
+/// (#431). Simulated by pushing a bundle marked one major ahead of the relay.
+#[test]
+fn push_of_future_major_bundle_hints_relay_redeploy() {
+    let relay_dir = tmp("relay-format-skew");
+    let addr = "127.0.0.1:47201";
+    let base = format!("http://{addr}");
+
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
+    });
+    wait_for_relay(&base);
+
+    // A bundle whose two-byte version marker claims a major the relay cannot
+    // read. Auth passes (open relay, valid signature); stow's Frame::decode hits
+    // read_version and returns UnsupportedFormat — exactly what a stale relay
+    // does to a newer client's bundle.
+    let id = Identity::generate();
+    let future_major_bundle = vec![loot_core::format::FORMAT_MAJOR + 1, 0];
+    let err = loot_net::push(&base, future_major_bundle, &id).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsupported format version"),
+        "relay should reject the future major at stow, got: {msg}"
+    );
+    assert!(
+        msg.contains("redeploy the relay") && msg.contains("setup:loot"),
+        "client must surface the relay-redeploy hint, not just 'upgrade loot', got: {msg}"
+    );
+}
+
 /// Sealed grant relay round-trip: alice seals a content key for bob (x25519/ECIES),
 /// signs it in a push envelope, deposits it at the relay mailbox addressed by
 /// bob's pubkey hex, bob fetches+unwraps the envelope, checks the grantor is
