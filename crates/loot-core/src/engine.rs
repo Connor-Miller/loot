@@ -612,6 +612,7 @@ impl DagRepo {
         purges: Vec<(Oid, String)>,
         body: BundleBody,
         now: u64,
+        abandoned: &std::collections::BTreeSet<Oid>,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
         let BundleBody { changes, objs, keys, attestations } = body;
 
@@ -659,7 +660,12 @@ impl DagRepo {
         // base, those classified as conflicts whenever our line had moved on.
         let batch: BTreeMap<&Oid, &ChangeNode> = changes.iter().map(|n| (&n.id, n)).collect();
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
-        let superseded = self.superseded_versions();
+        // One Liveness view for the whole batch (#216) — built before any
+        // insert, so it reflects exactly what we held when the bundle arrived.
+        // The caller's abandoned set rides in: an incoming co-version of a
+        // locally-abandoned version is NOT divergence-forming (the abandoned
+        // side isn't live) and classifies normally.
+        let liveness = self.liveness(abandoned, &[]);
         for node in &changes {
             // An incoming co-version of a change id we already hold live is
             // not an independent line meeting ours — it is (or exposes)
@@ -672,12 +678,10 @@ impl DagRepo {
             // exempt — that is the clean-replacement path, classified as
             // today.
             let forms_divergence = node.change_id.is_some_and(|cid| {
-                self.graph.in_order().into_iter().any(|held| {
-                    held.id != node.id
-                        && held.change_id == Some(cid)
-                        && !superseded.contains(&held.id)
-                        && !node.predecessors.contains(&held.id)
-                })
+                liveness
+                    .live_of(&cid)
+                    .iter()
+                    .any(|held| held != &node.id && !node.predecessors.contains(held))
             });
             if forms_divergence {
                 continue;
@@ -1099,74 +1103,24 @@ impl DagRepo {
         self.author.map(|_| mint_change_id())
     }
 
-    /// The **superseded** version ids in this dock's graph (v7, ADR 0032): every
-    /// version some same-change-id version names in its `predecessors`. The
-    /// naming version's own abandoned/superseded state is deliberately ignored —
-    /// the graph is append-only, so a direct claim, once made, stands forever:
-    /// abandoning your amend *kills* the change, it never resurrects the version
-    /// the amend replaced (abandon means kill, not revert). Superseded joins
-    /// abandoned as a liveness filter: live = in-graph ∧ ¬abandoned ∧ ¬superseded.
-    pub fn superseded_versions(&self) -> std::collections::BTreeSet<Oid> {
-        let mut superseded = std::collections::BTreeSet::new();
-        for node in self.graph.in_order() {
-            let Some(cid) = node.change_id else { continue };
-            for p in &node.predecessors {
-                // Defensive: a predecessors entry only supersedes a version of
-                // the SAME change id — a cross-change claim is meaningless.
-                if self.graph.get(p).is_some_and(|t| t.change_id == Some(cid)) {
-                    superseded.insert(p.clone());
-                }
-            }
-        }
-        superseded
-    }
-
-    /// The **divergent** change ids in this dock's graph (S3, ADR 0029/0032): a
-    /// change id carried by more than one **live** version node — where a version
-    /// is live iff it is in the graph, not in `abandoned`, and not superseded
-    /// (ADR 0032). Divergence is per change id, *not* head-counting: two versions
-    /// of one change id can sit under a single graph head (e.g. as the two
-    /// parents of a merge), and their trees may even be identical — so this scans
-    /// every node, never just the heads. A solo amend is therefore never
-    /// divergent (its predecessor is superseded), anywhere: the claim travels.
-    /// Legacy/keyless nodes (`change_id = None`) can never be divergent.
-    pub fn divergent_change_ids(
+    /// Build the [`Liveness`] view for one operation (map #215, #216): the
+    /// one home for live/superseded/divergent/parked and the head partition.
+    /// The caller supplies the store-owned inputs — the local abandoned set
+    /// and the sibling docks' parked working pointers (the Workspace's job);
+    /// pass empty sets where they don't apply (ingest classification, tests
+    /// without abandonment). The superseded scan runs once, here.
+    pub fn liveness(
         &self,
         abandoned: &std::collections::BTreeSet<Oid>,
-    ) -> std::collections::BTreeSet<[u8; 16]> {
-        let superseded = self.superseded_versions();
-        let mut by_change: BTreeMap<[u8; 16], usize> = BTreeMap::new();
-        for node in self.graph.in_order() {
-            if abandoned.contains(&node.id) || superseded.contains(&node.id) {
-                continue;
-            }
-            if let Some(cid) = node.change_id {
-                *by_change.entry(cid).or_default() += 1;
-            }
-        }
-        by_change.into_iter().filter(|(_, n)| *n > 1).map(|(cid, _)| cid).collect()
-    }
-
-    /// The live version ids (graph nodes) carrying `change_id`, skipping any in
-    /// `abandoned` or superseded (ADR 0032). `loot abandon` resolves its target
-    /// among these, and refuses to touch a change that is not divergent (would
-    /// leave zero live versions); `loot edit` reopens the single live version.
-    pub fn versions_of_change(
-        &self,
-        change_id: &[u8; 16],
-        abandoned: &std::collections::BTreeSet<Oid>,
-    ) -> Vec<Oid> {
-        let superseded = self.superseded_versions();
-        self.graph
+        parked: &[Oid],
+    ) -> crate::Liveness {
+        let nodes = self
+            .graph
             .in_order()
             .into_iter()
-            .filter(|n| {
-                n.change_id.as_ref() == Some(change_id)
-                    && !abandoned.contains(&n.id)
-                    && !superseded.contains(&n.id)
-            })
-            .map(|n| n.id.clone())
-            .collect()
+            .map(|n| (n.id.clone(), n.change_id, n.predecessors.clone()))
+            .collect();
+        crate::Liveness::compute(nodes, abandoned.clone(), parked.iter().cloned().collect())
     }
 
     /// Drop a divergent version from this dock's **live heads** (S3, `loot
@@ -1854,11 +1808,44 @@ impl Repo for DagRepo {
         bundle: &SyncBundle,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
+        // The bake-off trait keeps its frozen shape; a keyholder CLI applies
+        // through [`DagRepo::apply_with`] so the local abandoned set reaches
+        // ingest classification (#216). No-abandonment callers (bench, tests,
+        // relay-adjacent flows) are exactly the empty-set case.
+        self.apply_with(bundle, now, &std::collections::BTreeSet::new())
+    }
+
+    fn heads(&self) -> Vec<Oid> {
+        self.graph.heads()
+    }
+
+    fn flush_embargo(&mut self, now: u64) {
+        self.flush_escrow(now);
+    }
+}
+
+/// **Sync-negotiation face** (R3, #179): the wire conversation — what we'd
+/// offer, what we lack, and the batched bundles for a want set (S5/S6,
+/// ADR 0021/0024). The 9-method `Repo` trait above is the narrow generic face
+/// loot-net and the bench consume; this is its object-level negotiation twin.
+impl DagRepo {
+    /// [`Repo::apply`] with the caller's local abandoned set (#216): ingest
+    /// classification consults the [`Liveness`](crate::Liveness) view, so an
+    /// incoming co-version of a locally-abandoned version is not
+    /// divergence-forming and classifies normally. This is the keyholder
+    /// CLI's apply — the Workspace passes `.loot/abandoned` through; the
+    /// bake-off trait's `apply` delegates here with the empty set.
+    pub fn apply_with(
+        &mut self,
+        bundle: &SyncBundle,
+        now: u64,
+        abandoned: &std::collections::BTreeSet<Oid>,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
         // One decode, then dispatch on the typed frame. A relay would call `stow`
         // instead and skip the merge. Sealed-key grants (tag 3) need the caller's
         // unseal closure, so they go through `apply_sealed_grant`, not here.
         match Frame::decode(&bundle.0)? {
-            Frame::Sync { purges, body } => self.apply_sync(purges, body, now),
+            Frame::Sync { purges, body } => self.apply_sync(purges, body, now, abandoned),
             Frame::Grant { grantee, body } => {
                 let BundleBody { objs, keys, .. } = body;
                 // Install objects and, if the grant is addressed to us, its keys.
@@ -1884,20 +1871,6 @@ impl Repo for DagRepo {
         }
     }
 
-    fn heads(&self) -> Vec<Oid> {
-        self.graph.heads()
-    }
-
-    fn flush_embargo(&mut self, now: u64) {
-        self.flush_escrow(now);
-    }
-}
-
-/// **Sync-negotiation face** (R3, #179): the wire conversation — what we'd
-/// offer, what we lack, and the batched bundles for a want set (S5/S6,
-/// ADR 0021/0024). The 9-method `Repo` trait above is the narrow generic face
-/// loot-net and the bench consume; this is its object-level negotiation twin.
-impl DagRepo {
     /// Returns `true` if the repo has any authored-but-unsigned change (a working
     /// change the author has not yet signed). Such changes are excluded from
     /// bundles (ADR 0018), so a push while one exists silently transfers nothing.
@@ -2537,20 +2510,20 @@ mod tests {
 
         let none: BTreeSet<Oid> = BTreeSet::new();
         assert_eq!(
-            repo.divergent_change_ids(&none),
+            repo.liveness(&none, &[]).divergent().clone(),
             BTreeSet::from([cid]),
             "one change id with two live versions is divergent"
         );
-        assert_eq!(repo.versions_of_change(&cid, &none).len(), 2);
+        assert_eq!(repo.liveness(&none, &[]).live_of(&cid).len(), 2);
 
         // Abandoning one version collapses the divergence — over the abandoned
         // filter it is no longer counted, and it drops out of the live heads.
         let abandoned = BTreeSet::from([vb.clone()]);
         assert!(
-            repo.divergent_change_ids(&abandoned).is_empty(),
+            repo.liveness(&abandoned, &[]).divergent().clone().is_empty(),
             "abandoned version no longer makes the change divergent"
         );
-        assert_eq!(repo.versions_of_change(&cid, &abandoned), vec![va.clone()]);
+        assert_eq!(repo.liveness(&abandoned, &[]).live_of(&cid), vec![va.clone()]);
         assert!(repo.abandon_head(&vb), "vb was a live head");
         assert!(!repo.heads().contains(&vb), "abandon drops it from the live heads");
         assert!(repo.heads().contains(&va), "the surviving version stays a head");
@@ -3759,9 +3732,80 @@ mod tests {
             "no conflict recorded — the ! marker carries the two-writer event"
         );
         assert_eq!(
-            bob.divergent_change_ids(&Default::default()).len(),
+            bob.liveness(&Default::default(), &[]).divergent().clone().len(),
             1,
             "the handle IS divergent — the event is represented exactly once"
+        );
+    }
+
+    #[test]
+    fn apply_with_abandoned_coversion_is_not_divergence_forming() {
+        // #216 (locked in the map #215 grilling): the local abandoned set now
+        // reaches ingest classification. Bob held two live co-versions of one
+        // handle and ABANDONED his own side — so when alice's amend of the
+        // survivor arrives, there is no second live version: it is a clean
+        // replacement, classified normally, not a skipped divergence.
+        let cid = [7u8; 16];
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+
+        let oid_base = alice.put(b"base
+", Visibility::Public).unwrap();
+        let mut base_tree = BTreeMap::new();
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        let x = alice
+            .record_carrying(
+                Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree },
+                Some(cid),
+            )
+            .unwrap();
+        let seed = alice.bundle(&[]).unwrap();
+        bob.apply(&seed, 0).unwrap();
+
+        // Bob's own co-version (no supersession claim), then abandoned.
+        let oid_bob = bob.put(b"bob's take
+", Visibility::Public).unwrap();
+        let mut bob_tree = BTreeMap::new();
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob, Visibility::Public));
+        let y = bob
+            .record_carrying(
+                Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "take".into(), tree: bob_tree },
+                Some(cid),
+            )
+            .unwrap();
+        // Mirror `loot abandon` faithfully: the version joins the abandoned
+        // set AND leaves the live heads (workspace.rs does both).
+        bob.abandon_head(&y);
+        let abandoned = std::collections::BTreeSet::from([y.clone()]);
+
+        // Alice amends X (supersedes it) and ships the amend.
+        let oid_alice = alice.put(b"alice's take
+", Visibility::Public).unwrap();
+        let mut alice_tree = BTreeMap::new();
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice
+            .record_superseding(
+                Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "amend".into(), tree: alice_tree },
+                Some(cid),
+                vec![x.clone()],
+            )
+            .unwrap();
+        let bundle = alice.bundle(&bob.heads()).unwrap();
+
+        // WITH the abandoned set: y is not live, X is exempt (named in the
+        // amend's predecessors) — classification runs, outcomes flow.
+        let outcomes = bob.apply_with(&bundle, 0, &abandoned).unwrap();
+        assert!(
+            outcomes.contains_key(Path::new("f.txt")),
+            "a co-version of an abandoned version classifies normally"
+        );
+        assert!(
+            !matches!(outcomes.get(Path::new("f.txt")), Some(MergeOutcome::Conflict { .. })),
+            "and it is a clean replacement, not a conflict"
+        );
+        assert!(
+            bob.liveness(&abandoned, &[]).divergent().is_empty(),
+            "no divergence: the abandoned side is not a live version"
         );
     }
 
@@ -4358,16 +4402,16 @@ mod tests {
             )
             .unwrap();
         assert_ne!(x, x2, "the amend minted a distinct sibling version");
-        assert!(repo.superseded_versions().contains(&x));
         let none = std::collections::BTreeSet::new();
-        assert!(repo.divergent_change_ids(&none).is_empty(), "a solo amend is not divergence");
-        assert_eq!(repo.versions_of_change(&cid, &none), vec![x2.clone()], "one live version");
+        assert!(repo.liveness(&none, &[]).superseded().contains(&x));
+        assert!(repo.liveness(&none, &[]).divergent().clone().is_empty(), "a solo amend is not divergence");
+        assert_eq!(repo.liveness(&none, &[]).live_of(&cid), vec![x2.clone()], "one live version");
 
         // Abandoning the amend leaves ZERO live versions — X stays superseded.
         let mut abandoned = std::collections::BTreeSet::new();
         abandoned.insert(x2);
         assert!(
-            repo.versions_of_change(&cid, &abandoned).is_empty(),
+            repo.liveness(&abandoned, &[]).live_of(&cid).is_empty(),
             "abandon kills the change; it never resurrects the superseded version"
         );
 
@@ -4380,8 +4424,8 @@ mod tests {
                 vec![x.clone()],
             )
             .unwrap();
-        assert!(repo.divergent_change_ids(&none).contains(&cid));
-        let live = repo.versions_of_change(&cid, &none);
+        assert!(repo.liveness(&none, &[]).divergent().clone().contains(&cid));
+        let live = repo.liveness(&none, &[]).live_of(&cid);
         assert!(!live.contains(&x) && live.len() == 2 && live.contains(&x3));
     }
 

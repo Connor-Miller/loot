@@ -1721,8 +1721,8 @@ mod tests {
         put_file(dir, "a.txt", content);
         ws.snapshot("feature").unwrap();
         ws.finalize_working().unwrap();
-        ws.repo()
-            .versions_of_change(&cid, &Default::default())
+        ws.liveness()
+            .live_of(&cid)
             .into_iter()
             .next()
             .unwrap()
@@ -1842,8 +1842,8 @@ mod tests {
         assert!(git.find_reference(&format!("refs/heads/review/{dock}")).is_ok());
         ws.finalize_working().unwrap();
         let x = ws
-            .repo()
-            .versions_of_change(&cid, &Default::default())
+            .liveness()
+            .live_of(&cid)
             .into_iter()
             .next()
             .unwrap();

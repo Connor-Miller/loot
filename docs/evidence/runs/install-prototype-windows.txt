@@ -1,0 +1,74 @@
+loot install prototype — real Windows 11 box run (2026-07-12)
+=============================================================
+Ticket #206. dist v0.32.0. Target x86_64-pc-windows-msvc.
+Marquee reproduced as `irm <installer> | iex` with the download host swapped
+from the (not-yet-cut) GitHub Release to a local static server, via the
+installer's first-class LOOT_CLI_DOWNLOAD_URL override. Everything downstream of
+the URL is the shipped code path.
+
+$ dist plan
+announcing v0.1.0
+  loot-cli 0.1.0
+    loot-cli-installer.sh
+    loot-cli-installer.ps1
+    sha256.sum
+    loot-cli-aarch64-apple-darwin.tar.xz          [bin] loot
+    loot-cli-aarch64-pc-windows-msvc.zip          [bin] loot.exe
+    loot-cli-aarch64-unknown-linux-gnu.tar.xz     [bin] loot
+    loot-cli-x86_64-apple-darwin.tar.xz           [bin] loot
+    loot-cli-x86_64-pc-windows-msvc.zip           [bin] loot.exe
+    loot-cli-x86_64-unknown-linux-gnu.tar.xz      [bin] loot
+(reproduces the #205 artifact contract exactly)
+
+
+===== BEFORE =====
+loot on PATH? NOT FOUND (expected)
+~/.loot/bin exists? False
+User PATH contains .loot\bin? False
+
+===== RUN MARQUEE: irm http://127.0.0.1:8799/loot-cli-installer.ps1 | iex =====
+(env: LOOT_CLI_DOWNLOAD_URL=http://127.0.0.1:8799)
+downloading loot-cli 0.1.0 (x86_64-pc-windows-msvc)
+installing to C:\Users\conno\.loot\bin
+  loot.exe
+everything's installed!
+
+To add C:\Users\conno\.loot\bin to your PATH, either restart your shell or run:
+    $env:Path = "C:\Users\conno\.loot\bin;$env:Path"   (powershell)
+
+===== AFTER =====
+Contents of ~/.loot/bin:
+  Name      Length
+  ----      ------
+  loot.exe  8263680
+
+Registry User PATH entry: 'C:\Users\conno\.loot\bin'   (prepended: True)
+
+Fresh process (env from persisted registry User+Machine PATH):
+  (Get-Command loot).Source  ->  C:\Users\conno\.loot\bin\loot.exe
+  loot status  ->  "loot: not a loot repo at . (no .loot/). Run `loot init` first."
+  # i.e. loot resolved from PATH and executed correctly in a brand-new shell.
+
+===== IDEMPOTENT RE-RUN (upgrade path) =====
+downloading loot-cli 0.1.0 (x86_64-pc-windows-msvc)
+installing to C:\Users\conno\.loot\bin
+  loot.exe
+everything's installed!
+PATH entries containing .loot\bin after re-run: 1   (no duplication)
+
+===== FAILURE MODE: download 404 =====
+(env: LOOT_CLI_DOWNLOAD_URL=http://127.0.0.1:8799/does-not-exist)
+downloading loot-cli 0.1.0 (x86_64-pc-windows-msvc)
+failed to download from http://127.0.0.1:8799/does-not-exist
+  failed to download http://127.0.0.1:8799/does-not-exist/loot-cli-x86_64-pc-windows-msvc.zip
+  to C:\Users\...\loot-cli.zip: The remote server returned an error: (404) Not Found.
+failed to download binaries
+
+===== FINDINGS =====
+- WORKS: detect, download, unpack, ~/.loot/bin placement, HKCU PATH prepend
+  (persisted, fresh-shell resolvable), idempotent re-run (single PATH entry),
+  no-admin. Ship the generated installer unmodified.
+- GAP 1: `loot` has no `--version`/`version` command. Release blocker.
+- GAP 2: loot-cli-installer.ps1 has NO checksum verification (loot-cli-installer.sh
+  DOES). Windows-first integrity asymmetry — needs a decision.
+- CONFIG: install-path set to ~/.loot/bin (not dist default CARGO_HOME).

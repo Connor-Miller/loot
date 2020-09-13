@@ -15,6 +15,7 @@ pub mod engine;
 pub mod escrow;
 pub mod format;         // format version markers + compatibility gate (S1, ADR 0019)
 pub mod hex;            // shared byte<->hex conversion (one home for all crates)
+pub mod liveness;       // one home for live/superseded/divergent/parked + the head partition (map #215)
 pub mod manifest;
 pub mod oplog;          // operation log + undo (S4, ADR 0031)
 pub mod sealed;
@@ -22,6 +23,7 @@ pub mod store;          // the .loot/ on-disk layout (single source of truth)
 pub mod verdict;        // machine-facing reconciliation output (CA3, ADR 0023)
 
 pub use attestation::{Attestation, AttestationLog};
+pub use liveness::{HeadPartition, Liveness};
 pub use engine::{
     change_signing_message, DagRepo, GcReport, LogGraph, LogNode, MaroonResult, MigrateResult,
 };

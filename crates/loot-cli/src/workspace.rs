@@ -206,11 +206,11 @@ impl Workspace {
     pub fn history(&mut self) -> Result<HistoryView, String> {
         let working = self.live_working_row()?;
         let working_node = self.working.clone();
-        let divergent = self.divergent_change_ids();
-        // Superseded versions (ADR 0032) leave the live view exactly like
-        // abandoned ones: an amended change renders once, as its live version.
-        let mut abandoned = self.abandoned_versions();
-        abandoned.extend(self.repo.superseded_versions());
+        // One Liveness view (#216): superseded versions (ADR 0032) leave the
+        // live view exactly like abandoned ones — an amended change renders
+        // once, as its live version. No hand-assembled union here anymore.
+        let lv = self.liveness();
+        let divergent = lv.divergent().clone();
 
         let row_of = |id: &Oid, message: &str, total: usize, restricted: usize, embargoed: usize| HistoryRow {
             version: id.clone(),
@@ -245,7 +245,7 @@ impl Workspace {
             let rows = detailed
                 .into_iter()
                 .rev()
-                .filter(|(id, ..)| Some(id) != working_node.as_ref() && !abandoned.contains(id))
+                .filter(|(id, ..)| Some(id) != working_node.as_ref() && lv.is_live(id))
                 .map(|(id, m, t, r, e)| row_of(&id, &m, t, r, e))
                 .collect();
             return Ok(HistoryView { rows, divergent, working, graph: None });
@@ -265,7 +265,7 @@ impl Workspace {
             .map(|hi| {
                 g.changes
                     .iter()
-                    .filter(|n| n.reachable_from == [hi] && !abandoned.contains(&n.id))
+                    .filter(|n| n.reachable_from == [hi] && lv.is_live(&n.id))
                     .map(|n| node_row(&n.id))
                     .collect()
             })
@@ -273,7 +273,7 @@ impl Workspace {
         let shared = g
             .changes
             .iter()
-            .filter(|n| n.reachable_from.len() > 1 && !abandoned.contains(&n.id))
+            .filter(|n| n.reachable_from.len() > 1 && lv.is_live(&n.id))
             .map(|n| node_row(&n.id))
             .collect();
         Ok(HistoryView {
@@ -397,8 +397,12 @@ impl Workspace {
         bytes: Vec<u8>,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
         let now = self.now;
+        // The local abandoned set rides into ingest classification (#216): an
+        // incoming co-version of an abandoned version is not divergence-forming.
+        let abandoned = self.store.read_abandoned();
         self.with_repo(|repo| {
-            repo.apply(&loot_core::SyncBundle(bytes), now).map_err(|e| e.to_string())
+            repo.apply_with(&loot_core::SyncBundle(bytes), now, &abandoned)
+                .map_err(|e| e.to_string())
         })
     }
 
@@ -970,16 +974,49 @@ impl Workspace {
 
     // --- divergent changes (S3, ADR 0029/0030) ---
 
-    /// The abandoned-version set for this repo — versions dropped from a
-    /// divergent change (`loot abandon`), filtered out of the live view.
-    pub fn abandoned_versions(&self) -> std::collections::BTreeSet<Oid> {
-        self.store.read_abandoned()
-    }
-
     /// The change ids that are currently **divergent** — one change id, more than
     /// one live version (ADR 0029). `log`/`status` mark these with a trailing `!`.
     pub fn divergent_change_ids(&self) -> std::collections::BTreeSet<[u8; 16]> {
-        self.repo.divergent_change_ids(&self.store.read_abandoned())
+        self.liveness().divergent().clone()
+    }
+
+    /// The [`Liveness`] view for the current operation (#216, map #215): the
+    /// graph plus this store's abandoned set and the sibling docks' parked
+    /// working changes — everything the rule behind the `!` marker needs, in
+    /// one place. Build once per operation; queries answer from the cached
+    /// view. Public because it IS the read interface for liveness questions
+    /// (version resolution in the CLI included).
+    pub fn liveness(&self) -> loot_core::Liveness {
+        let parked: Vec<Oid> = self
+            .store
+            .list_docks()
+            .iter()
+            .filter(|name| name.as_str() != self.dock)
+            .filter_map(|name| self.store.read_working(opt(name)))
+            .collect();
+        self.repo.liveness(&self.store.read_abandoned(), &parked)
+    }
+
+    /// Resolve a **version-id** hex prefix among this dock's LIVE version
+    /// nodes — the one Liveness rule (#216): abandoned and superseded
+    /// versions do not resolve (pre-#216 a superseded version still resolved
+    /// here), and the still-changing working change is excluded. `loot
+    /// abandon` targets a version by this id.
+    pub fn resolve_live_version(&self, prefix: &str) -> Result<Oid, String> {
+        let lv = self.liveness();
+        let working = self.working.clone();
+        let matches: Vec<Oid> = self
+            .version_ids()
+            .into_iter()
+            .filter(|id| lv.is_live(id))
+            .filter(|id| Some(id) != working.as_ref())
+            .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
+            .collect();
+        match matches.len() {
+            0 => Err(format!("no live version matching '{prefix}'")),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            n => Err(format!("ambiguous version prefix '{prefix}' — matches {n} versions")),
+        }
     }
 
     /// `loot abandon <version>`: drop `version` from its divergent change, leaving
@@ -998,7 +1035,7 @@ impl Workspace {
             .repo
             .change_change_id(version)
             .ok_or("that version has no change id (a legacy/unsigned change is never divergent)")?;
-        let live = self.repo.versions_of_change(&cid, &abandoned);
+        let live = self.liveness().live_of(&cid);
         if !live.contains(version) {
             return Err("no such live version in this repo".into());
         }
@@ -1022,7 +1059,7 @@ impl Workspace {
         // otherwise the tip names a dead version and the next snapshot forks
         // from it. Captured by the op view (per-dock tips), so undo restores it.
         if self.tip.as_ref() == Some(version) {
-            let survivor = self.repo.versions_of_change(&cid, &abandoned).into_iter().next();
+            let survivor = live.into_iter().find(|v| v != version);
             if let Some(s) = survivor {
                 self.tip = Some(s);
                 let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
@@ -1086,7 +1123,7 @@ impl Workspace {
 
         // One live version to reopen: a divergent handle is refused with its
         // truthful remedy (ADR 0032) rather than a guess or a disambiguator.
-        let live = self.repo.versions_of_change(&cid, &self.abandoned_versions());
+        let live = self.liveness().live_of(&cid);
         let target = match live.len() {
             0 => return Err(format!("change {handle} has no live version (abandoned or superseded)")),
             1 => live.into_iter().next().unwrap(),
@@ -1502,19 +1539,16 @@ impl Workspace {
         if self.working.is_some() {
             return Ok(BTreeMap::new());
         }
-        // Drop **superseded** heads before collapsing forks (ADR 0032): a solo
-        // amend arriving from a peer must land as a clean replacement — never
-        // content-merged with the version it superseded (which would resurrect
-        // exactly what the amend removed). The dropped head stays in the store;
-        // it just stops being live, like an abandoned version.
-        let superseded = self.repo.superseded_versions();
-        let stale: Vec<Oid> = self
-            .repo
-            .heads()
-            .into_iter()
-            .filter(|h| superseded.contains(h))
-            .collect();
-        for h in &stale {
+        // The head partition (#216) decides everything converge may do; this
+        // method only EXECUTES it: drop `stale` (superseded heads, ADR 0032 —
+        // a solo amend lands as a clean replacement, never content-merged
+        // with what it removed), leave `flat` alone (divergent co-versions +
+        // parked working changes stay live heads, never content-merged,
+        // #198/#203), fold `fold` (the genuinely independent lines) onto
+        // `ours` — which the partition guarantees is never a parked head.
+        let lv = self.liveness();
+        let part = lv.partition(&self.repo.heads(), base, self.anchor().as_ref());
+        for h in &part.stale {
             self.repo.abandon_head(h);
         }
         let heads = self.repo.heads();
@@ -1522,7 +1556,7 @@ impl Workspace {
             // Nothing left to merge — but if dropping superseded heads moved
             // the dock off its old tip (the solo-amend case), adopt the
             // survivor: re-point the tip and materialize its tree.
-            if let (Some(survivor), true) = (heads.first().cloned(), !stale.is_empty()) {
+            if let (Some(survivor), true) = (heads.first().cloned(), !part.stale.is_empty()) {
                 let from = base.cloned().or_else(|| self.anchor());
                 if from.as_ref() != Some(&survivor) {
                     if self.docks_active() {
@@ -1537,44 +1571,15 @@ impl Workspace {
             }
             return Ok(BTreeMap::new());
         }
-        // Converge merges genuinely INDEPENDENT concurrent heads — two live
-        // versions of one change id are not that (#198/#203, amending ADR
-        // 0032). Each concurrent amend supersedes the *original*, never its
-        // sibling, so neither co-version lands in the superseded drop above;
-        // folding them into a content-merge would re-represent the one
-        // two-writer event as a per-path conflict on a signed merge that
-        // `abandon` cannot un-mint. They stay flat as live heads (the `!`
-        // listing), the tip stays on ours, and `loot abandon` is the
-        // tree-settle. Likewise a head that is a sibling dock's parked
-        // *working* change is in-flight WIP, not a line to converge — that
-        // dock's next snapshot rewrites it in place.
-        let divergent = self.repo.divergent_change_ids(&self.store.read_abandoned());
-        let parked: Vec<Oid> = self
-            .store
-            .list_docks()
-            .iter()
-            .filter(|name| name.as_str() != self.dock)
-            .filter_map(|name| self.store.read_working(opt(name)))
-            .collect();
-        // `ours` must be a line this dock actually materialized — never a
-        // sibling dock's parked WIP (the live #203 footgun: a caller passing
-        // "first head" as the base handed converge the parked head as OURS,
-        // and the dock's own tip was merged INTO foreign in-flight work).
-        let ours = base
-            .cloned()
-            .filter(|b| heads.contains(b) && !parked.contains(b))
-            .or_else(|| self.anchor().filter(|a| heads.contains(a) && !parked.contains(a)))
-            .or_else(|| heads.iter().find(|h| !parked.contains(h)).cloned())
-            .or_else(|| heads.first().cloned())
-            .ok_or("nothing to converge onto")?;
-        let others: Vec<Oid> = heads
-            .into_iter()
-            .filter(|h| h != &ours)
-            .filter(|h| !parked.contains(h))
-            .filter(|h| {
-                !self.repo.change_change_id(h).is_some_and(|cid| divergent.contains(&cid))
-            })
-            .collect();
+        // Dropping a stale head can restore parents as heads the first pass
+        // never saw — re-partition over the post-drop heads.
+        let part = if part.stale.is_empty() {
+            part
+        } else {
+            lv.partition(&heads, base, self.anchor().as_ref())
+        };
+        let ours = part.ours.ok_or("nothing to converge onto")?;
+        let others = part.fold;
         if others.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -2744,7 +2749,7 @@ mod tests {
         // Abandon vb: divergence collapses, and it is one op in the log.
         ws.abandon(&vb).unwrap();
         assert!(!ws.divergent_change_ids().contains(&cid), "abandon collapsed the fork");
-        assert!(ws.abandoned_versions().contains(&vb));
+        assert!(ws.store().read_abandoned().contains(&vb));
         assert!(!ws.repo().heads().contains(&vb), "vb stopped being a live head");
         assert!(ws.repo().heads().contains(&va), "va survives");
 
@@ -2752,7 +2757,7 @@ mod tests {
         let r = ws.undo().unwrap();
         let _ = r;
         assert!(ws.divergent_change_ids().contains(&cid), "undo brought the version back");
-        assert!(!ws.abandoned_versions().contains(&vb), "undo cleared the abandoned mark");
+        assert!(!ws.store().read_abandoned().contains(&vb), "undo cleared the abandoned mark");
         assert!(ws.repo().heads().contains(&vb), "vb is a live head again");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2775,7 +2780,7 @@ mod tests {
         // rather than hide the change's only version.
         let err = ws.abandon(&only).unwrap_err();
         assert!(err.contains("not divergent"), "message explains the refusal: {err}");
-        assert!(ws.abandoned_versions().is_empty(), "nothing was abandoned");
+        assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3379,7 +3384,7 @@ mod tests {
         let reopened = ws.working_id().cloned().expect("the reopen is the working change");
         assert_eq!(ws.repo().change_change_id(&reopened), Some(cid), "handle carried");
         assert_eq!(ws.repo().change_predecessors(&reopened), vec![x.clone()]);
-        assert!(ws.repo().superseded_versions().contains(&x), "the claim is live from the reopen");
+        assert!(ws.liveness().superseded().clone().contains(&x), "the claim is live from the reopen");
         assert!(!ws.divergent_change_ids().contains(&cid), "an amend is not divergence");
         assert_eq!(
             std::fs::read(dir.join("a.txt")).unwrap(),
@@ -3391,7 +3396,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), b"target amended").unwrap();
         ws.snapshot("target").unwrap();
         ws.finalize_working().unwrap();
-        let live = ws.repo().versions_of_change(&cid, &Default::default());
+        let live = ws.liveness().live_of(&cid);
         assert_eq!(live.len(), 1, "one live version — no divergence, no resurrection");
         let x2 = live.into_iter().next().unwrap();
         assert_ne!(x2, x, "the amend minted a new version id");
@@ -3473,7 +3478,7 @@ mod tests {
         assert!(ws.working_id().is_none(), "undo closed the reopen");
         assert_eq!(ws.repo().heads(), vec![x.clone()], "the view is back on the target");
         assert!(
-            ws.repo().superseded_versions().is_empty(),
+            ws.liveness().superseded().clone().is_empty(),
             "the unfinalized claim left the view with the reopen"
         );
         assert_eq!(
@@ -3495,8 +3500,8 @@ mod tests {
         ws.snapshot("target").unwrap();
         ws.finalize_working().unwrap();
         let x2 = ws
-            .repo()
-            .versions_of_change(&cid, &Default::default())
+            .liveness()
+            .live_of(&cid)
             .into_iter()
             .next()
             .unwrap();
@@ -3569,8 +3574,8 @@ mod tests {
         ws.snapshot("target").unwrap();
         ws.finalize_working().unwrap();
         let x2 = ws
-            .repo()
-            .versions_of_change(&cid, &Default::default())
+            .liveness()
+            .live_of(&cid)
             .into_iter()
             .next()
             .unwrap();
@@ -3689,6 +3694,29 @@ mod tests {
         assert!(outcomes.is_empty(), "a parked base never becomes the merge side");
         assert_eq!(ws.repo().log_detailed().len(), nodes_before, "still no merge node");
         assert!(ws.repo().heads().contains(&parked), "the parked head survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_live_version_refuses_abandoned_and_superseded_prefixes() {
+        // The #216 regression: pre-Liveness, version resolution filtered
+        // abandoned but NOT superseded, so a superseded version still
+        // resolved by prefix. Both are dead to the live view; neither
+        // resolves.
+        let (dir, mut ws, x, cid) = amendable_ws("resolve-live");
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir.join("a.txt"), b"target amended").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let x2 = ws.liveness().live_of(&cid).into_iter().next().unwrap();
+
+        let err = ws.resolve_live_version(&loot_core::hex::encode(&x.0)).unwrap_err();
+        assert!(err.contains("no live version"), "superseded must not resolve: {err}");
+        assert_eq!(
+            ws.resolve_live_version(&loot_core::hex::encode(&x2.0)).unwrap(),
+            x2,
+            "the live amend resolves"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

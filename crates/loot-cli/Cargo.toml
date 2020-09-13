@@ -1,8 +1,18 @@
 [package]
 name = "loot-cli"
-version = "0.0.0"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "loot: a content-addressed, sealed-aware version control system"
+
+# We don't publish loot-cli to crates.io (publish = false), but it IS the one
+# product binary we ship via GitHub Releases — so opt it back into dist, which
+# otherwise skips unpublished packages.
+[package.metadata.dist]
+dist = true
 
 # The first product crate: a CLI over the canonical engine (ADR 0005).
 # Dependency-light by design — args are parsed by hand, no clap. The async/HTTP

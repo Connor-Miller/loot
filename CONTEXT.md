@@ -81,6 +81,35 @@ non-divergent change so it can never hide a change's sole version. Genuine
 tree-*merge* of two versions stays the existing converge path (a different
 intent — it produces a new version).
 
+**Liveness** *(decided 2026-07-12, map #215)* — the one home for the rule the
+`!` marker renders: **live = in-graph ∧ ¬abandoned ∧ ¬superseded**, plus
+"divergent co-versions stay flat" and "a [[Parked working change]] is not a
+mergeable line." A loot-core view built per operation from the change graph,
+the local abandoned set, and the parked dock pointers; it computes the
+superseded scan once and answers `is_live` / `live_of(cid)` / `divergent` /
+`superseded`, and owns the [[Head partition]]. Every consumer (converge, ingest
+classification, log/status rendering, abandon/edit guards, version resolution)
+crosses this one seam — the rule is never re-derived at a call site. (Being
+built as #216; the per-line `supersedes` ancestry check stays a separate
+DagRepo predicate.)
+
+**Head partition** *(decided 2026-07-12, map #215)* — [[Liveness]]'s answer to
+"given these graph heads, what may converge do": `{ ours, stale, flat, fold }`.
+`ours` is the line the dock actually materialized (never a parked head — the
+#203 footgun made unrepresentable), `stale` are superseded heads to drop
+without merging (ADR 0032), `flat` are divergent co-versions and parked working
+changes that stay live heads and are never content-merged (#198/#203), `fold`
+are the genuinely independent concurrent lines converge merges. Converge is an
+executor of the partition, not an owner of the rule.
+
+**Parked working change** *(named 2026-07-12; behavior from #171/#203)* — a
+[[Dock]]'s in-progress, unsigned [[Working change]] left behind when the
+operator switched away: still that dock's working pointer, still a live head in
+the shared graph, resumed in place by the dock's next snapshot. It is in-flight
+WIP, not a line: converge never folds it (#203), projection never ships it
+(unsigned never travels, ADR 0018), and `loot dock rm` drops it with its dock
+(#212). _Avoid_: stray head, orphan WIP.
+
 **Dock** *(CA1 shipped, 2026-07-06)* — an isolated working tree plus its own
 [[Working change]] tip, materialized cheaply over the *shared* `.loot/` object
 store and change graph. loot's answer to a git worktree, and the isolation unit

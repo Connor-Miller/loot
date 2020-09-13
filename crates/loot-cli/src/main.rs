@@ -416,7 +416,7 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
 fn cmd_abandon(args: &[String]) -> Result<(), String> {
     let prefix = first_positional(args).ok_or("usage: loot abandon <version-id>")?;
     let mut ws = Workspace::open()?;
-    let version = resolve_version(&ws, prefix)?;
+    let version = ws.resolve_live_version(prefix)?;
     ws.abandon(&version)?;
     println!(
         "abandoned version {} — its change id keeps the remaining live version(s)",
@@ -424,27 +424,6 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
     );
     println!("  nothing was deleted; `loot undo` brings it back (see `loot op log`)");
     Ok(())
-}
-
-/// Resolve a **version-id** hex prefix among this dock's live version nodes
-/// (skipping abandoned ones and the still-changing working change), the way
-/// [`resolve_change`] resolves a finalized change. `loot abandon` targets a
-/// version by this id.
-fn resolve_version(ws: &Workspace, prefix: &str) -> Result<Oid, String> {
-    let abandoned = ws.abandoned_versions();
-    let working = ws.working_id().cloned();
-    let matches: Vec<Oid> = ws
-        .version_ids()
-        .into_iter()
-        .filter(|id| !abandoned.contains(id))
-        .filter(|id| Some(id) != working.as_ref())
-        .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
-        .collect();
-    match matches.len() {
-        0 => Err(format!("no live version matching '{prefix}'")),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        n => Err(format!("ambiguous version prefix '{prefix}' — matches {n} versions")),
-    }
 }
 
 /// `loot undo` — step the view back one operation (ADR 0031). Refuses across a

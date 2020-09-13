@@ -14,7 +14,7 @@ members = [
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Connor Miller"]
-repository = "https://github.com/connormiller/loot"
+repository = "https://github.com/Connor-Miller/loot"
 
 [workspace.dependencies]
 loot-core = { path = "crates/loot-core" }
@@ -36,3 +36,8 @@ ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 git2 = { version = "0.19", default-features = false }
 rand = "0.8"
 chacha20poly1305 = "0.10"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
