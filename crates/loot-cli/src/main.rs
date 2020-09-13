@@ -268,6 +268,7 @@ usage:
   loot remote add <name> <url>              register a relay URL under a name
   loot remote remove <name>                 forget a named relay
   loot remote list                          show all named relays
+  loot remote info [<name>]                 probe a relay's /info: version, format, allowlist (uses 'origin' if no name)
   loot keygen                               generate an identity keypair (backfills existing repos)
   loot whoami [--pubkey]                    show this repo's public key (with the flag: bare OpenSSH line only, for scripting)
   loot id export <file>                     export keypair to <file>, passphrase-encrypted
@@ -2793,7 +2794,38 @@ fn cmd_remote(args: &[String]) -> Emitted {
                 msg(text)
             }
         }
-        other => Err(format!("unknown remote subcommand '{other}': use add | remove | list").into()),
+        "info" => {
+            // `loot remote info [<name>]` (#10): probe a relay's `GET /info`.
+            // Resolves the named remote, or `origin` when no name is given.
+            let name = args.get(1).map(String::as_str).unwrap_or("origin");
+            let ws = open_repo()?;
+            let url = ws.remotes().url(name).ok_or_else(|| {
+                format!("no remote '{name}' configured — use `loot remote add {name} <url>`")
+            })?;
+            let info = loot_net::info(&url).map_err(|e| e.to_string())?;
+            let mut text = String::new();
+            let _ = writeln!(text, "remote '{name}' → {url}");
+            let _ = writeln!(text, "  version   {}", info.version);
+            let _ = writeln!(text, "  format    v{}.{}", info.format_major, info.format_minor);
+            match info.relay_pubkey {
+                Some(pk) => {
+                    let _ = writeln!(text, "  relay key {pk}");
+                }
+                None => {
+                    let _ = writeln!(text, "  relay key (none — zero-knowledge relay)");
+                }
+            }
+            if info.allowed_pubkeys.is_empty() {
+                let _ = writeln!(text, "  allowlist open — any signed push accepted");
+            } else {
+                let _ = writeln!(text, "  allowlist {} key(s) permitted to push:", info.allowed_pubkeys.len());
+                for key in &info.allowed_pubkeys {
+                    let _ = writeln!(text, "    {key}");
+                }
+            }
+            msg(text)
+        }
+        other => Err(format!("unknown remote subcommand '{other}': use add | remove | list | info").into()),
     }
 }
 
@@ -2815,7 +2847,7 @@ const SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("bisect", &["start", "good", "bad", "skip", "run", "status", "reset"]),
     ("lane", &["new", "list", "merge", "name", "rm", "gc"]),
     ("peer", &["add", "remove", "list"]),
-    ("remote", &["add", "remove", "list"]),
+    ("remote", &["add", "remove", "list", "info"]),
     ("id", &["export", "import", "rotate"]),
     ("config", &["set", "unset", "list"]),
     ("op", &["log", "restore"]),
