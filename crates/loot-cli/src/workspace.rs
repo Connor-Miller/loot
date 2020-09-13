@@ -1396,6 +1396,61 @@ impl Workspace {
         self.signer.as_ref().map(|s| s.public_key_bytes())
     }
 
+    // --- reconcile: THE home for "advance a tip to cover another line" (R2, #178) ---
+    //
+    // The converge classifier (ADR 0001) is the pure per-path rule; everything
+    // above it — when to capture disk work, whether to adopt or merge, which
+    // tip advances — decides HERE. `reconcile_onto` is the bridge/pull-shaped
+    // entry (an incoming finalized line meets the ambient dock);
+    // [`Workspace::merge_dock`] is the dock-shaped entry; and
+    // [`Workspace::converge_heads`] is the post-pull fork collapse. The
+    // ferry_* mechanics below are private to this decision.
+
+    /// Advance the ambient dock to cover `target` — the whole reconcile
+    /// decision, one place (previously smeared across ferry.rs's match and
+    /// these mechanics; the four live ferry bugs of 2026-07-10 all lived in
+    /// that smear). With `capture`, in-progress disk work is captured first
+    /// against `pinned` (the caller's pre-ingest anchor, so the two lines meet
+    /// only through the converge classifier); a capture matching `pinned` or
+    /// `target` is dropped, not minted. Then:
+    ///   - real concurrent work captured → merge it with `target`;
+    ///   - no local line (`pinned` None) → adopt (fast-forward);
+    ///   - `target` covered by us        → no-op (the other side is behind);
+    ///   - we are behind `target`        → adopt (fast-forward);
+    ///   - genuinely diverged            → merge via the classifier.
+    ///
+    /// Returns the per-path outcomes (empty on adopt/no-op).
+    pub fn reconcile_onto(
+        &mut self,
+        target: Option<&Oid>,
+        pinned: Option<&Oid>,
+        capture: bool,
+        label: &str,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        let wip = if capture { self.ferry_capture(pinned, target)? } else { None };
+        let Some(target) = target else {
+            return Ok(BTreeMap::new());
+        };
+        match (wip, pinned) {
+            (Some(w), _) => self.ferry_merge(&w, target, label),
+            (None, None) => {
+                self.ferry_adopt(target)?;
+                Ok(BTreeMap::new())
+            }
+            (None, Some(o)) if o == target || self.graph().is_ancestor(target, o) => {
+                Ok(BTreeMap::new())
+            }
+            (None, Some(o)) if self.graph().is_ancestor(o, target) => {
+                self.ferry_adopt(target)?;
+                Ok(BTreeMap::new())
+            }
+            (None, Some(o)) => {
+                let ours = o.clone();
+                self.ferry_merge(&ours, target, label)
+            }
+        }
+    }
+
     /// Capture in-progress disk work before the bridge moves the dock tip,
     /// exactly as `merge_dock` captures before merging: adopt/merge
     /// re-materialize the full target tree, so uncaptured edits — including
@@ -1411,7 +1466,7 @@ impl Workspace {
     /// again, so no redundant change is minted and no stray head is left for
     /// reconcile or a later pass's anchor derivation to trip over. Returns
     /// the captured change when real work was finalized.
-    pub fn ferry_capture(
+    fn ferry_capture(
         &mut self,
         base: Option<&Oid>,
         target: Option<&Oid>,
@@ -1442,7 +1497,7 @@ impl Workspace {
     /// Fast-forward the ambient dock to `new_tip` (an ingested change that
     /// descends from the current anchor) and materialize its tree. The bridge's
     /// no-fork path: git advanced, loot didn't.
-    pub fn ferry_adopt(&mut self, new_tip: &Oid) -> Result<(), String> {
+    fn ferry_adopt(&mut self, new_tip: &Oid) -> Result<(), String> {
         let from = self.anchor();
         self.repo
             .materialize(from.as_ref(), new_tip, &self.identity, self.now)
@@ -1462,7 +1517,7 @@ impl Workspace {
     /// the per-path outcomes.
     ///
     /// [`ferry_capture`]: Workspace::ferry_capture
-    pub fn ferry_merge(
+    fn ferry_merge(
         &mut self,
         ours: &Oid,
         their: &Oid,

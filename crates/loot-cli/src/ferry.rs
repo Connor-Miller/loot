@@ -163,36 +163,18 @@ pub fn run(
         }
         let target = marks.change_for(tip).cloned().map(|(t, _)| t);
 
-        // Capture in-progress disk work before reconcile re-materializes the
-        // tree. Ingesting first lets the capture recognize (and drop) a
-        // snapshot that matches the incoming target — the co-located checkout
-        // after a `git pull`, where the disk already holds exactly what the
-        // ingested line delivers; without that check every pass would mint a
-        // spurious capture + merge and walk the mirror's main ahead of the
-        // checkout's. The capture forks from the pinned anchor, so the two
-        // lines still meet only through the converge classifier below.
-        let wip = if had_new {
-            ws.ferry_capture(ours.as_ref(), target.as_ref())?
-        } else {
-            None
-        };
-
         // --- reconcile: advance the ambient dock to cover the git side ---
-        if let Some(target) = target {
-            match (wip, ours) {
-                // Real concurrent work was captured: both sides advanced.
-                (Some(w), _) => {
-                    report.outcomes = ws.ferry_merge(&w, &target, "ferry: reconcile git main")?;
-                }
-                (None, None) => ws.ferry_adopt(&target)?,
-                // git behind loot: projection moves main below, nothing here.
-                (None, Some(ref o)) if *o == target || ws.graph().is_ancestor(&target, o) => {}
-                (None, Some(ref o)) if ws.graph().is_ancestor(o, &target) => ws.ferry_adopt(&target)?,
-                (None, Some(ref o)) => {
-                    report.outcomes = ws.ferry_merge(o, &target, "ferry: reconcile git main")?;
-                }
-            }
-        }
+        // The whole decision — capture-vs-not (ingesting first lets the
+        // capture recognize and drop a snapshot matching the incoming target,
+        // the co-located checkout after a `git pull`), adopt-vs-merge, which
+        // tip advances — lives in Workspace::reconcile_onto (R2, #178); the
+        // bridge only supplies the incoming line and its pinned anchor.
+        report.outcomes = ws.reconcile_onto(
+            target.as_ref(),
+            ours.as_ref(),
+            had_new,
+            "ferry: reconcile git main",
+        )?;
     }
 
     // --- project: every travel-worthy change gets a mirrored commit ---
