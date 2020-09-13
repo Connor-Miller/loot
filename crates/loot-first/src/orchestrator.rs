@@ -16,7 +16,7 @@ use crate::policy::{
     ReviewOutcome,
 };
 use loot_cli::ferry::{self, WipState};
-use loot_cli::workspace::Workspace;
+use loot_cli::workspace::{is_undescribed, Workspace};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -147,20 +147,40 @@ pub fn review(
     Ok(())
 }
 
-/// The PR title: explicit `--title`, else the working change's message (unless
-/// it is the un-described placeholder), else a dock-derived fallback.
+/// The PR title: explicit `--title`, else the working change's **subject** — its
+/// first line, git-style (unless it is the un-described placeholder) — else a
+/// dock-derived fallback.
+///
+/// Subject-only because a loot message is subject + body like a commit message's,
+/// and GitHub hard-caps a PR title at 256 chars: passing the whole thing failed
+/// the `createPullRequest` mutation outright. Latent until #174 made
+/// `describe -m` mandatory before a land, which is what made bodies routine.
 fn resolve_title(ws: &mut Workspace, title: Option<&str>, dock: &str) -> String {
     if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
         return t.to_string();
     }
     if let Ok(Some(row)) = ws.live_working_row() {
         let m = row.message.trim();
-        if !m.is_empty() && m != "(working change)" {
-            return m.to_string();
+        if !is_undescribed(m) {
+            return subject_of(m).to_string();
         }
     }
     format!("loot-first: {dock}")
 }
+
+/// A message's subject: its first line, trimmed. GitHub rejects a PR title over
+/// 256 chars, so a subject that long is truncated on a char boundary (never a
+/// byte one — loot messages are UTF-8 and a split mid-codepoint would panic).
+fn subject_of(message: &str) -> &str {
+    let first = message.lines().next().unwrap_or("").trim_end();
+    match first.char_indices().nth(MAX_PR_TITLE) {
+        None => first,
+        Some((cut, _)) => &first[..cut],
+    }
+}
+
+/// GitHub's hard cap on a PR title (`createPullRequest` rejects longer).
+const MAX_PR_TITLE: usize = 256;
 
 // ---------------------------------------------------------------------------
 // land — the pre-finalize gate (forge-only, tested against the fake)
@@ -808,6 +828,35 @@ pub fn init_hook(ws: &Workspace) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::forge::{FakeForge, PrView, ReviewDecision};
+
+    // -----------------------------------------------------------------------
+    // subject_of — the PR title is a subject, not a whole message (#174 lane)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_pr_title_is_the_messages_first_line_not_its_body() {
+        // Live finding on the #174 land: the whole subject+body message went to
+        // `gh pr create`, and GitHub rejected the mutation ("Title is too long").
+        let msg = "fix: the subject\n\nA body paragraph explaining why, which is\nnot the title.";
+        assert_eq!(subject_of(msg), "fix: the subject");
+    }
+
+    #[test]
+    fn a_one_line_message_is_its_own_subject() {
+        assert_eq!(subject_of("fix: a one-liner"), "fix: a one-liner");
+        assert_eq!(subject_of(""), "");
+    }
+
+    #[test]
+    fn an_overlong_subject_is_cut_to_githubs_cap_on_a_char_boundary() {
+        // Cutting on a *byte* boundary would panic mid-codepoint. The em-dashes
+        // loot's own messages are full of are 3 bytes each, so the cut lands
+        // inside one unless char_indices drives it.
+        let long = "—".repeat(400);
+        let cut = subject_of(&long);
+        assert_eq!(cut.chars().count(), MAX_PR_TITLE, "cut to the cap, in chars");
+        assert!(long.starts_with(cut), "and it is a prefix of the subject");
+    }
 
     // -----------------------------------------------------------------------
     // mirror_ancestry — the oracle behind the drift guard (#273)

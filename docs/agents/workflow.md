@@ -46,7 +46,12 @@ code path; **every change lands through a PR** (you self-approve your own).
    (`loot dock <task>` — the ADR 0022 in-place switch — survives in the primary
    until the harbor, #229.)
 2. **Work.** Edit. The working change accrues by auto-snapshot (map #132); you
-   never run a manual `status -m` before finalize.
+   never run a manual `status -m` before finalize. **`loot describe -m
+   "<subject>"` is the first verb on dirty work** — it captures *without*
+   finalizing, and names the change while you still remember what it does. Skip
+   it and step 6 refuses (#174): `new` is capture-then-finalize, so on a dirty
+   tree it would otherwise sign your edits in one stroke, straight past this
+   lane, under the `(working change)` placeholder.
 3. **Project for review.** `loot ferry --with-wip` snapshots the dock's WIP and
    projects it to a sealed-free `review/<dock>` branch, then a single-ref push
    publishes it to GitHub; `loot-first review` opens the PR. The PR reviews
@@ -57,6 +62,10 @@ code path; **every change lands through a PR** (you self-approve your own).
 5. **Approve.** Approve the PR on GitHub.
 6. **Finalize.** `loot new` signs the change (ADR 0018) and starts the next one.
    This is **git-quiet** — no mirror I/O, so parallel lanes never contend here.
+   It **refuses an un-described change** (#174) — the message it signs is
+   permanent, and becomes the subject of the commit projected onto `main`. Name
+   it with `describe -m` (step 2) or `new -m "<subject>"`; the refusal keeps your
+   captured edits and withholds only the signature.
 7. **Land.** `loot-first land --pr <n>` detects the approval
    (`reviewDecision == APPROVED`, or the self-authored fast path — GitHub forbids
    approving your own PR), runs the **pre-land gate** (`cargo test` — review

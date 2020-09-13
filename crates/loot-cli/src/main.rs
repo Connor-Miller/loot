@@ -333,8 +333,15 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let Some(row) = ws.live_working_row()? else {
         // No in-progress change and no eagerly-minted handle (a keyless/legacy
         // or freshly-initialized repo). Nothing pending to report.
+        //
+        // The hint names `describe -m` — capture *without* finalize — because
+        // `new` is capture-then-finalize, so on a dirty tree the old hint signed
+        // the edits in one stroke, skipping the review lane (#174). `describe` is
+        // the first verb on dirty work; `new` is step 6 (docs/agents/workflow.md).
         match fmt {
-            OutFmt::Human => println!("no working change (run `loot new` to start one)"),
+            OutFmt::Human => {
+                println!("no working change (run `loot describe -m \"<subject>\"` to start one)")
+            }
             OutFmt::Porcelain => print!("{}", verdict::status_porcelain(None, None, &[])),
             OutFmt::Json => println!("{}", verdict::status_json(None, None, &[])),
         }
@@ -2476,6 +2483,9 @@ mod tests {
 
     /// A file written but never `status`-ed is captured by `loot new` and lands
     /// in finalized history — the headline of the trigger moving to implicit.
+    /// The name comes from `describe`/`new -m` (finalize refuses an un-described
+    /// change, #174); the *capture* is still implicit, which is what this guards:
+    /// `b.txt` is written after the name and never `status`-ed.
     #[test]
     fn new_captures_pending_edits_without_a_manual_status() {
         let dir = tmp("s1-new-capture");
@@ -2483,14 +2493,17 @@ mod tests {
         std::fs::write(dir.join("a.txt"), b"hello\n").unwrap();
 
         let mut ws = Workspace::open_at(&dir).unwrap();
+        ws.snapshot_allowing("add the greeting files", &[]).unwrap();
+        std::fs::write(dir.join("b.txt"), b"world\n").unwrap();
         ws.finalize_capturing(&[], false).unwrap();
 
-        // Finalized: no working change left, one change carrying a.txt.
+        // Finalized: no working change left, one change carrying both files.
         assert!(ws.working_id().is_none());
         let log = ws.repo().log();
         assert_eq!(log.len(), 1, "exactly one finalized change");
         let tree = ws.repo().change_tree(&log[0].0).unwrap();
         assert!(tree.contains_key(std::path::Path::new("a.txt")), "a.txt captured: {tree:?}");
+        assert!(tree.contains_key(std::path::Path::new("b.txt")), "b.txt captured: {tree:?}");
     }
 
     /// A bare `loot new` with nothing pending must not mint an empty signed
@@ -2530,7 +2543,7 @@ mod tests {
         init_repo(&dir, "alice").unwrap();
         let mut ws = Workspace::open_at(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"v1\n").unwrap();
-        ws.snapshot_allowing("(working change)", &[]).unwrap();
+        ws.snapshot_allowing(workspace::UNDESCRIBED_MESSAGE, &[]).unwrap();
         let before = ws.working_id().cloned();
 
         std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();

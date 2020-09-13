@@ -119,6 +119,10 @@ The lane that landed this section added the missing **pre-land gate** to
   `describe -m` (capture without finalize); the hint should say so. The
   accidental finalize rode to `main` break-glass beneath this lane's
   reviewed commit — content correct, subject the default, unreviewed.
+  **Fixed #174 (2026-07-15):** the hint names `describe -m`, and finalize now
+  refuses an un-described change outright rather than defaulting its subject —
+  the hint was the trigger, but `new`'s willingness to sign a nameless change
+  was the foot-gun (ADR 0030 amendment).
 - **An oplog younger than the mistake protects nothing.** S4's `undo` exists
   for exactly this, but `.loot/ops` was minted the same day — the accidental
   finalize was **op 1, the floor**, and `undo` refuses to step behind it.

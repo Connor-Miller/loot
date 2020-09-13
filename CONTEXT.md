@@ -15,7 +15,11 @@ visibility. Permissions attach here, not to the repo.
 
 **Working change** — the always-present change at the tip that the working tree
 *is* (JJ-style, ADR 0006). There is no separate "commit" step: `describe` names
-the working change and `new` finalizes it and starts a fresh one on top. Under
+the working change and `new` finalizes it and starts a fresh one on top. It is
+**un-described** until named — carrying no message, or the `(working change)`
+placeholder an internal carry-along capture stored. Naming stays after-the-fact,
+but `new` **refuses to sign** an un-described change (#174, ADR 0030 amendment):
+a signed message is permanent and becomes the subject on git `main`. Under
 implicit auto-snapshot (ADR 0030, #144) every **mutating** verb (`new`,
 `describe`, `grant`, `maroon`, `migrate`, and — since #219 — `pull`/`apply`)
 captures the tree first, so edits are never lost between commands and no manual

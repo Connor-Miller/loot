@@ -89,6 +89,45 @@ change <next-change>`.
 mutating verb, so it snapshots first, then sets the message). No up-front message
 requirement anywhere; naming is always after-the-fact.
 
+> **Amended 2026-07-15 (#174): describe-after, but `new` refuses to *sign* an
+> un-described change.** Naming stays after-the-fact — nothing demands a message
+> up front, and every capture still runs nameless. But `new` is capture-**then**-
+> finalize, so on a dirty tree "no up-front requirement" quietly meant *the
+> placeholder is a valid subject for signed history*: the second loot-first day
+> signed a dirty tree in one stroke (`0729287d`, subject `(working change)`),
+> which rode to git `main` beneath the reviewed lane, unreviewed. Finalize is the
+> signing boundary and a signed message is **permanent** — it becomes the subject
+> of the commit projected onto `main` — so that is where the requirement lands:
+> `finalize_capturing` refuses an un-described change (no message, or the
+> `(working change)` placeholder a carry-along capture stored), naming
+> `describe -m` first and `new -m` second. The refusal sits **after** the capture,
+> so the edits are held safely in the working change and only the signature is
+> withheld; and **below** the empty/duplicate drop, so a bare `new` on a clean
+> tree stays the no-op it was rather than becoming a refusal. Deriving a subject
+> from the changed paths was rejected: it would mint plausible-looking history
+> nobody wrote, and loot has no changed-path concept to derive one from — `status`
+> lists the whole tree. The two verbs that finalize on the operator's say-so —
+> `loot new` and `loot-first land` — are the two callers of `finalize_capturing`,
+> so both inherit the refusal: the "run `loot describe -m` before landing" ritual
+> is now enforced rather than remembered.
+>
+> **The residual, named honestly.** The refusal is on the *deliberate* finalize,
+> not on every path that can sign. `merge_dock` and the bridge's
+> `reconcile_capture` capture-and-`finalize_working` in passing, to make a signed
+> merge parent — and what they sign is the operator's own authored working
+> change; only the *trigger* is mechanical. So a `dock merge`/`ferry` over dirty
+> un-described work can still mint a signed `(working change)` subject and
+> project it onto `main` — #174's exact harm, on a rarer path. Extending the
+> refusal there is **not** obviously right: this ADR already rejected
+> refuse-on-dirt for the sync verbs (#219, "it nags the mid-work-sync case"), and
+> a ferry that refuses is a ferry that blocks a land. The naming these paths want
+> is probably a *prompt* or an auto-subject at projection, not a refusal — which
+> is a different decision than this one. Tracked as
+> [#275](https://github.com/Connor-Miller/loot/issues/275) rather than guessed at
+> here. What is settled: the placeholder is minted in exactly one
+> place (`working_message_or_placeholder`) and tested in exactly one place
+> (`is_undescribed`), so wherever the rule ends up, it has one seam to move.
+
 ### `log` and `status` go columnar
 
 Two ids per change cannot ride the flat `{short} {message}` line legibly (the

@@ -612,6 +612,22 @@ impl Workspace {
             .and_then(|w| self.repo.change_message(w))
     }
 
+    /// The working change's message, or [`UNDESCRIBED_MESSAGE`] when nobody has
+    /// named it. The carry-along captures (dock switch, adopt, ferry, merge) all
+    /// re-record the tree *under the name it already has*, so they share this —
+    /// it is the one place the placeholder is minted.
+    pub fn working_message_or_placeholder(&self) -> String {
+        self.working_message().unwrap_or_else(|| UNDESCRIBED_MESSAGE.to_string())
+    }
+
+    /// Has nobody named the working change yet? Both shapes of "un-described"
+    /// are the same state: no message at all (a capture `new` is about to make),
+    /// and [`UNDESCRIBED_MESSAGE`] (a carry-along capture already stored it).
+    /// [`finalize_capturing`](Self::finalize_capturing) refuses on this (#174).
+    fn working_is_undescribed(&self) -> bool {
+        self.working_message().is_none_or(|m| is_undescribed(&m))
+    }
+
     /// `loot new` under implicit snapshot (ADR 0030): capture any edits made
     /// since the last command into the working change *first* — so `edit; new`
     /// never loses work — then finalize. A snapshot that adds nothing over the
@@ -623,13 +639,19 @@ impl Workspace {
     /// nothing to finalize (a bare `new` whose capture added nothing over the
     /// tip) — so `loot new` can name the finalized version alongside the freshly
     /// minted next change id.
+    ///
+    /// **Refuses an un-described change** ([`REFUSE_UNDESCRIBED`], #174): this is
+    /// the signing boundary, and a signed change's message is permanent — it
+    /// becomes the subject of the commit projected onto git `main`. The refusal
+    /// lands *after* the capture, so the edits are held safely in the working
+    /// change; only the signature is withheld, and `describe -m` clears it.
     pub fn finalize_capturing(
         &mut self,
         allow_demote: &[PathBuf],
         skip_snapshot: bool,
     ) -> Result<Option<Oid>, String> {
         if !skip_snapshot {
-            let msg = self.working_message().unwrap_or_else(|| "(working change)".to_string());
+            let msg = self.working_message().unwrap_or_else(|| UNDESCRIBED_MESSAGE.to_string());
             let (id, _) = self.snapshot_allowing(&msg, allow_demote)?;
             let anchor = self.anchor();
             let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
@@ -640,6 +662,12 @@ impl Workspace {
                 self.working = None;
                 self.persist()?;
             }
+        }
+        // Sits below the empty/duplicate drop above: a bare `new` on a clean tree
+        // has no working change left by here, mints no signed change, and so has
+        // no subject to get wrong — it must stay a no-op, not become a refusal.
+        if self.working.is_some() && self.working_is_undescribed() {
+            return Err(REFUSE_UNDESCRIBED.to_string());
         }
         let finalized = self.working.clone();
         self.finalize_working()?;
@@ -790,7 +818,7 @@ impl Workspace {
             None => self.next_change_id,
         };
         let (entries, reported) = self.read_working_tree()?;
-        let message = self.working_message().unwrap_or_else(|| "(working change)".to_string());
+        let message = self.working_message_or_placeholder();
         let base = self.anchor();
 
         // When a working node exists AND the tree on disk still matches its last
@@ -906,7 +934,7 @@ impl Workspace {
     /// a `describe`d name: an implicit capture must not clobber it.
     pub fn snapshotted(&mut self, opts: &SnapshotOpts) -> Result<Snapshotted<'_>, String> {
         if !opts.skip {
-            let msg = self.working_message().unwrap_or_else(|| "(working change)".to_string());
+            let msg = self.working_message_or_placeholder();
             self.snapshot_allowing(&msg, &opts.allow_demote)?;
         }
         Ok(Snapshotted { ws: self })
@@ -1401,10 +1429,7 @@ impl Workspace {
             // change in place (ADR 0006), so the redundancy check below judges
             // what the disk actually holds.
             if self.tree_is_dirty_over(Some(&w))? {
-                let m = self
-                    .repo
-                    .change_message(&w)
-                    .unwrap_or_else(|| "(working change)".to_string());
+                let m = self.working_message_or_placeholder();
                 w = self.snapshot(&m)?.0;
             }
             let empty = self.repo.change_tree(&w).is_none_or(|t| t.is_empty());
@@ -1692,11 +1717,7 @@ impl Workspace {
         }
 
         // 1. Capture the outgoing dock's working tree, preserving its message.
-        let msg = self
-            .working
-            .as_ref()
-            .and_then(|w| self.repo.change_message(w))
-            .unwrap_or_else(|| "(working change)".to_string());
+        let msg = self.working_message_or_placeholder();
         self.snapshot(&msg)?;
         // Drop an empty/tip-duplicate capture, exactly as `finalize_capturing`
         // does: an idle dock must not park a stray "(working change)" child on
@@ -1795,11 +1816,7 @@ impl Workspace {
         }
         // Capture the current dock's work so the new dock forks from a real tip.
         if self.working.is_some() {
-            let msg = self
-                .working
-                .as_ref()
-                .and_then(|w| self.repo.change_message(w))
-                .unwrap_or_else(|| "(working change)".to_string());
+            let msg = self.working_message_or_placeholder();
             self.snapshot(&msg)?;
         }
         let anchor = self
@@ -1939,11 +1956,7 @@ impl Workspace {
         // Capture current disk edits so the lane forks from a real finalized
         // anchor (the same move as `bind_dock_dir`).
         if self.working.is_some() {
-            let msg = self
-                .working
-                .as_ref()
-                .and_then(|w| self.repo.change_message(w))
-                .unwrap_or_else(|| "(working change)".to_string());
+            let msg = self.working_message_or_placeholder();
             self.snapshot(&msg)?;
         }
         let anchor = self
@@ -2283,11 +2296,7 @@ impl Workspace {
         // Capture and finalize any in-progress work so our side of the merge is a
         // signed tip (a merge parent must be finalized to travel in a bundle).
         if self.working.is_some() {
-            let m = self
-                .working
-                .as_ref()
-                .and_then(|w| self.repo.change_message(w))
-                .unwrap_or_else(|| "(working change)".to_string());
+            let m = self.working_message_or_placeholder();
             self.snapshot(&m)?;
             self.finalize_working()?;
         }
@@ -2368,8 +2377,10 @@ impl Workspace {
             return Ok(None);
         }
         // Implicit snapshot (ADR 0030): the demotion guard rides the default
-        // allowlist, matching a bare mutating verb.
-        let (id, _) = self.snapshot_allowing("(working change)", &[])?;
+        // allowlist, matching a bare mutating verb. Nameless by construction —
+        // the named case returned above — so this mints the placeholder rather
+        // than carrying a message along.
+        let (id, _) = self.snapshot_allowing(UNDESCRIBED_MESSAGE, &[])?;
         Ok(Some(id))
     }
 
@@ -2761,11 +2772,7 @@ impl Workspace {
         base: Option<&Oid>,
         target: Option<&Oid>,
     ) -> Result<Option<Oid>, String> {
-        let msg = self
-            .working
-            .as_ref()
-            .and_then(|w| self.repo.change_message(w))
-            .unwrap_or_else(|| "(working change)".to_string());
+        let msg = self.working_message_or_placeholder();
         let (id, _) = self.snapshot_from(base, &msg, &[])?;
         let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
         let duplicate = empty
@@ -2875,7 +2882,33 @@ impl Workspace {
 /// only when a caller skipped capture-first; pull/apply never see it.
 const REFUSE_UNCAPTURED_TREE: &str =
     "refusing to materialize over uncaptured working-tree edits — capture them first \
-     (`loot describe` or `loot new`), then retry";
+     (`loot describe -m \"<subject>\"`), then retry";
+
+/// The message a capture carries when nobody has named the change yet. It is a
+/// *display* placeholder — honest in `status`/`log`, where it says "un-described"
+/// — but it must never reach signed history, where it would become the permanent
+/// subject of the commit projected onto git `main` (#174). Mint it only via
+/// [`Workspace::working_message_or_placeholder`]; test it only via
+/// [`is_undescribed`].
+pub const UNDESCRIBED_MESSAGE: &str = "(working change)";
+
+/// Does `message` name the change, or is it still the un-described placeholder?
+/// The one seam every consumer crosses — the rule is never re-derived at a call
+/// site, so the refusal in [`Workspace::finalize_capturing`] and the PR-title
+/// fallback in `loot-first` cannot drift apart (#174).
+pub fn is_undescribed(message: &str) -> bool {
+    let m = message.trim();
+    m.is_empty() || m == UNDESCRIBED_MESSAGE
+}
+
+/// The refusal [`Workspace::finalize_capturing`] prints rather than sign a change
+/// nobody named (#174). It names `describe -m` first — the capture-*without*-
+/// finalize verb, which is the first verb on dirty work (docs/agents/workflow.md)
+/// — and `new -m` second, for when finalizing really is the next step.
+const REFUSE_UNDESCRIBED: &str = "refusing to sign an un-described working change — its message \
+     becomes the permanent subject on git `main`\n  name it:        loot describe -m \"<subject>\"\n  \
+     or in one step: loot new -m \"<subject>\"\n  (your edits are captured and safe — only the \
+     signature was withheld)";
 
 /// Resolve visibility for `path` under an explicit `.lootattributes` text.
 /// The bridge classifies ingested files under the *ingested commit's own*
@@ -4493,7 +4526,7 @@ mod tests {
         let (area, dir, c2) = landed_from_lane("adopt-265-stale");
         std::fs::write(dir.join("landed.txt"), b"landed").unwrap();
         let mut ws = Workspace::open_at(&dir).unwrap();
-        ws.snapshot("(working change)").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
         assert!(ws.working_id().is_some(), "precondition: the stale capture exists");
 
         let report = ws.adopt_harbor().unwrap();
@@ -4515,7 +4548,7 @@ mod tests {
         let mut ws = Workspace::open_at(&dir).unwrap();
         // The stale capture: pre-reset content in the landed path.
         std::fs::write(dir.join("landed.txt"), b"old guess").unwrap();
-        ws.snapshot("(working change)").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
         // The reset: the disk now holds exactly the landed content.
         std::fs::write(dir.join("landed.txt"), b"landed").unwrap();
 
@@ -5135,6 +5168,92 @@ mod tests {
             finalized.into_iter().collect::<Vec<_>>(),
             "tip == the head",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undescribed_is_the_one_seam_both_shapes_cross() {
+        // The refusal keys on this predicate and `loot-first`'s PR title keys on
+        // it too, so the placeholder must be minted and tested in one place only
+        // — a stray literal that drifted would silently stop the #174 refusal
+        // firing on whichever path still carried the old string.
+        assert!(is_undescribed(UNDESCRIBED_MESSAGE), "the placeholder is un-described");
+        assert!(is_undescribed(""), "so is an empty message");
+        assert!(is_undescribed("   "), "so is whitespace");
+        assert!(is_undescribed(&format!("  {UNDESCRIBED_MESSAGE}  ")), "untrimmed too");
+        assert!(!is_undescribed("feat: a real subject"), "a real name is described");
+    }
+
+    #[test]
+    fn finalize_refuses_an_undescribed_capture_but_keeps_the_work() {
+        // #174: `status`'s hint sent a dirty tree at `loot new`, which is
+        // capture-*then*-finalize — one stroke signed the edits under the
+        // un-described placeholder, skipping the review lane, and that string
+        // rode to git main as a permanent commit subject. Finalize is the
+        // signing boundary, so it is where the refusal belongs.
+        let dir = std::env::temp_dir().join(format!("loot-174-undescribed-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+
+        std::fs::write(dir.join("work.txt"), b"unreviewed").unwrap();
+        let err = ws.finalize_capturing(&[], false).unwrap_err();
+        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+
+        // Refusing is safe, not lossy: the capture still happened, so the edits
+        // are held in the working change — only the *signing* was withheld.
+        assert!(ws.working.is_some(), "the edits were captured, not dropped");
+        assert_eq!(ws.finalized_anchor(), None, "nothing was signed");
+
+        // And naming it clears the refusal — the two-step the hint now points at.
+        ws.snapshot("work: a subject that reads like history").unwrap();
+        let finalized = ws.finalize_capturing(&[], false).unwrap();
+        assert!(finalized.is_some(), "a described change finalizes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_refuses_a_capture_left_under_the_placeholder_message() {
+        // The placeholder is *stored* by every carry-along capture (dock switch,
+        // adopt, ferry), so by the time `new` runs, "un-described" usually looks
+        // like `Some("(working change)")` rather than `None`. Both are the same
+        // state and both must refuse (#174).
+        let dir = std::env::temp_dir().join(format!("loot-174-placeholder-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+
+        std::fs::write(dir.join("work.txt"), b"unreviewed").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
+        let err = ws.finalize_capturing(&[], false).unwrap_err();
+        assert!(err.contains("describe"), "a stored placeholder is un-described too: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_refuses_an_undescribed_change_under_no_snapshot_too() {
+        // `--no-snapshot` skips the capture, not the signature — the change it
+        // seals is just as un-described (#174).
+        let dir = std::env::temp_dir().join(format!("loot-174-no-snap-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+
+        std::fs::write(dir.join("work.txt"), b"unreviewed").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
+        let err = ws.finalize_capturing(&[], true).unwrap_err();
+        assert!(err.contains("describe"), "--no-snapshot still refuses: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_new_on_a_clean_tree_is_still_a_no_op_not_a_refusal() {
+        // The #174 refusal must fire on *unreviewed work*, never on the empty
+        // capture a bare `loot new` makes on a clean tree — that path mints no
+        // signed change and so has no subject to get wrong.
+        let dir = std::env::temp_dir().join(format!("loot-174-bare-new-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+
+        std::fs::write(dir.join("work.txt"), b"described").unwrap();
+        ws.snapshot("work: the first change").unwrap();
+        ws.finalize_capturing(&[], false).unwrap();
+
+        // Clean tree, no working change: `new` again finalizes nothing.
+        assert_eq!(ws.finalize_capturing(&[], false).unwrap(), None, "nothing to finalize");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
