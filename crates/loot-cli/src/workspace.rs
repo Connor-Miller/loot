@@ -1651,6 +1651,14 @@ impl Workspace {
             (None, Some(o)) if o == target || self.graph().is_ancestor(target, o) => {
                 Ok(BTreeMap::new())
             }
+            // The git target is a version our line has *superseded* (ADR 0032/
+            // 0033): a landed change reopened and amended while its old commit is
+            // still the git tip. A superseded version is dead — never merge into
+            // it (that resurrects what the amend removed); keep our line and let
+            // projection thread the amend onto the stale tip (a fast-forward
+            // downstream). This is the reconcile twin of dock-merge's
+            // `supersedes` short-circuit and converge's superseded-head drop.
+            (None, Some(o)) if self.repo.supersedes(o, target) => Ok(BTreeMap::new()),
             (None, Some(o)) if self.graph().is_ancestor(o, target) => {
                 self.reconcile_adopt(target)?;
                 Ok(BTreeMap::new())
@@ -1832,6 +1840,13 @@ impl Graph<'_> {
 
     pub fn parents(&self, id: &Oid) -> Vec<Oid> {
         self.repo.parents_of(id)
+    }
+
+    /// The version ids this change supersedes (ADR 0032): non-empty only on an
+    /// amend. Drives the bridge's predecessor-conditional git threading
+    /// (ADR 0033) and the `Loot-Predecessors` trailer.
+    pub fn predecessors(&self, id: &Oid) -> Vec<Oid> {
+        self.repo.change_predecessors(id)
     }
 
     pub fn tree(&self, id: &Oid) -> Option<BTreeMap<PathBuf, (Oid, Visibility)>> {
