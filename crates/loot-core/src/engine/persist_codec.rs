@@ -22,8 +22,6 @@ use std::path::{Path, PathBuf};
 use super::change_graph::{ChangeGraph, ChangeNode};
 use super::object_store::ObjectStore;
 
-const OBJECTS_DIR: &str = "objects";
-
 fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
     out.extend_from_slice(&c.id.0);
     put_u32(out, c.parents.len());
@@ -83,14 +81,15 @@ fn decode_object(b: &[u8]) -> Result<SealedObject, RepoError> {
     })
 }
 
-/// Write every object as a loose, content-addressed file under `dir/objects/`.
+/// Write every object as a loose, content-addressed file under `obj_dir`.
 /// Idempotent and incremental: an object whose file already exists is skipped
 /// (its bytes are immutable, keyed by content address), so a save writes only
 /// the new objects (ADR 0012). Writes are atomic (temp file + rename).
-pub fn save_objects_loose(dir: &Path, objects: &ObjectStore) -> Result<(), RepoError> {
+/// The directory's location is the caller's concern — `RepoStore::objects_dir`
+/// is the single owner of the layout (ADR 0017).
+pub fn save_objects_loose(obj_dir: &Path, objects: &ObjectStore) -> Result<(), RepoError> {
     let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-    let obj_dir = dir.join(OBJECTS_DIR);
-    std::fs::create_dir_all(&obj_dir).map_err(io)?;
+    std::fs::create_dir_all(obj_dir).map_err(io)?;
     for (addr, obj) in objects.iter() {
         let dest = obj_dir.join(crate::hex::encode(&addr.0));
         if dest.exists() {
@@ -103,13 +102,12 @@ pub fn save_objects_loose(dir: &Path, objects: &ObjectStore) -> Result<(), RepoE
     Ok(())
 }
 
-/// Load every loose object file under `dir/objects/` back into an ObjectStore.
+/// Load every loose object file under `obj_dir` back into an ObjectStore.
 /// Missing directory yields an empty store (a fresh repo persists nothing until
 /// its first object). A file whose name is not a 64-char hex address is skipped.
-pub fn load_objects_loose(dir: &Path) -> Result<ObjectStore, RepoError> {
+pub fn load_objects_loose(obj_dir: &Path) -> Result<ObjectStore, RepoError> {
     let mut objects = ObjectStore::new();
-    let obj_dir = dir.join(OBJECTS_DIR);
-    let entries = match std::fs::read_dir(&obj_dir) {
+    let entries = match std::fs::read_dir(obj_dir) {
         Ok(e) => e,
         Err(_) => return Ok(objects),
     };
@@ -126,7 +124,7 @@ pub fn load_objects_loose(dir: &Path) -> Result<ObjectStore, RepoError> {
     Ok(objects)
 }
 
-/// Delete loose object files under `dir/objects/` whose address is not in
+/// Delete loose object files under `obj_dir` whose address is not in
 /// `keep`, returning `(count, total_bytes)` of the files pruned. With `dry_run`,
 /// the files are only counted and sized — nothing is deleted. Files whose name
 /// is not a 64-char hex address (e.g. a leftover `*.tmp` from an interrupted
@@ -134,13 +132,12 @@ pub fn load_objects_loose(dir: &Path) -> Result<ObjectStore, RepoError> {
 /// directory yields `(0, 0)`. This is the on-disk half of `gc` (ADR 0012); the
 /// caller supplies the referenced set from the change graph.
 pub fn prune_orphaned_objects_loose(
-    dir: &Path,
+    obj_dir: &Path,
     keep: &BTreeSet<Oid>,
     dry_run: bool,
 ) -> Result<(usize, u64), RepoError> {
     let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-    let obj_dir = dir.join(OBJECTS_DIR);
-    let entries = match std::fs::read_dir(&obj_dir) {
+    let entries = match std::fs::read_dir(obj_dir) {
         Ok(e) => e,
         Err(_) => return Ok((0, 0)),
     };

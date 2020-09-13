@@ -741,7 +741,8 @@ impl DagRepo {
     /// `.loot/` directory passed to [`Self::save`]/[`Self::load`].
     pub fn gc(&mut self, dir: &Path, dry_run: bool) -> Result<GcReport, RepoError> {
         let live = self.referenced_oids();
-        let (pruned, bytes) = persist_codec::prune_orphaned_objects_loose(dir, &live, dry_run)?;
+        let (pruned, bytes) =
+            persist_codec::prune_orphaned_objects_loose(&RepoStore::new(dir).objects_dir(), &live, dry_run)?;
         if !dry_run {
             self.objects.retain(&live);
         }
@@ -774,8 +775,9 @@ impl DagRepo {
         let dir = store.dot();
         std::fs::create_dir_all(dir).map_err(io)?;
         std::fs::write(store.identity(), self.identity.as_bytes()).map_err(io)?;
-        // Objects: loose, content-addressed, incremental (ADR 0012).
-        persist_codec::save_objects_loose(dir, &self.objects)?;
+        // Objects: loose, content-addressed, incremental (ADR 0012); the
+        // directory comes from the store — the layout's single owner (ADR 0017).
+        persist_codec::save_objects_loose(&store.objects_dir(), &self.objects)?;
 
         // Shared finalized graph: union of what is already on disk (other docks'
         // lineages) with our finalized nodes; working changes are excluded and
@@ -1567,10 +1569,9 @@ impl DagRepo {
     /// treat the whole shared graph as the default dock's lineage (back-compat).
     pub fn load_from(store: &RepoStore, root: PathBuf) -> Result<Self, RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-        let dir = store.dot();
         let identity = String::from_utf8(std::fs::read(store.identity()).map_err(io)?)
             .map_err(|e| RepoError::Backend(e.to_string()))?;
-        let objects = persist_codec::load_objects_loose(dir)?;
+        let objects = persist_codec::load_objects_loose(&store.objects_dir())?;
 
         // Build the candidate node pool: shared finalized nodes plus this dock's
         // own working change (which lives outside the shared graph).
@@ -2328,7 +2329,7 @@ mod tests {
         let a = repo.put(b"first\n", Visibility::Public).unwrap();
         repo.save(&dir).unwrap();
 
-        let obj_dir = dir.join("objects");
+        let obj_dir = RepoStore::new(&dir).objects_dir();
         let path_a = obj_dir.join(crate::hex::encode(&a.0));
         assert!(path_a.exists(), "object A should be a loose file named by its address");
         let a_bytes_first = std::fs::read(&path_a).unwrap();
@@ -2480,7 +2481,7 @@ mod tests {
         let orphan = repo.put(b"unreferenced orphan bytes\n", Visibility::Public).unwrap();
         repo.save(&dir).unwrap();
 
-        let obj_dir = dir.join("objects");
+        let obj_dir = RepoStore::new(&dir).objects_dir();
         let kept_path = obj_dir.join(crate::hex::encode(&kept.0));
         let orphan_path = obj_dir.join(crate::hex::encode(&orphan.0));
         assert!(kept_path.exists() && orphan_path.exists());
@@ -2513,7 +2514,7 @@ mod tests {
         let orphan = repo.put(b"unreferenced\n", Visibility::Public).unwrap();
         repo.save(&dir).unwrap();
 
-        let obj_dir = dir.join("objects");
+        let obj_dir = RepoStore::new(&dir).objects_dir();
         let kept_path = obj_dir.join(crate::hex::encode(&kept.0));
         let orphan_path = obj_dir.join(crate::hex::encode(&orphan.0));
 
@@ -2571,7 +2572,7 @@ mod tests {
         let report = repo.gc(&dir, false).unwrap();
         assert_eq!(report.pruned, 1, "only the orphan is pruned");
 
-        let obj_dir = dir.join("objects");
+        let obj_dir = RepoStore::new(&dir).objects_dir();
         assert!(
             obj_dir.join(crate::hex::encode(&old_oid.0)).exists(),
             "object referenced only by a non-HEAD change must be retained"
