@@ -120,6 +120,7 @@ usage:
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
   loot dock <name> [--at <dir>]             create/switch a dock (isolated tree over the shared store, ADR 0022)
   loot dock merge <name> [--porcelain|--json]  merge another dock's finalized tip into the current dock (local, CA2)
+  loot dock rm <name>                       remove a dock: drop its parked unsigned WIP + pointers; undoable (#212)
   loot docks                                list docks with their working tip
                                             (convention: a dock named `harbor` is the shared integration dock)
   loot manifest                             show the grant audit trail (and attestations)
@@ -1021,17 +1022,31 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
 
 fn cmd_dock(args: &[String]) -> Result<(), String> {
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    // Subcommand form: `loot dock merge <name>` collapses another dock's tip
-    // into this one locally (CA2). Everything else is create/switch.
+    // Subcommand forms: `loot dock merge <name>` collapses another dock's tip
+    // into this one locally (CA2); `loot dock rm <name>` removes a dock
+    // (#212). Everything else is create/switch.
     if positional.first().map(|s| s.as_str()) == Some("merge") {
         let name = positional
             .get(1)
             .ok_or("usage: loot dock merge <name>")?;
         return cmd_dock_merge(name, args);
     }
+    if positional.first().map(|s| s.as_str()) == Some("rm") {
+        let name = positional.get(1).ok_or("usage: loot dock rm <name>")?;
+        let mut ws = Workspace::open()?;
+        let parked = ws.remove_dock(name)?;
+        match parked {
+            Some(w) => println!(
+                "removed dock '{name}' — dropped its parked working change {} (unsigned, never travelled); `loot undo` brings both back",
+                short(&w)
+            ),
+            None => println!("removed dock '{name}' — its pointers only; signed history is untouched"),
+        }
+        return Ok(());
+    }
     let name = positional
         .first()
-        .ok_or("usage: loot dock <name> [--at <dir>]  |  loot dock merge <name>")?;
+        .ok_or("usage: loot dock <name> [--at <dir>]  |  loot dock merge <name>  |  loot dock rm <name>")?;
     let at = flag(args, "--at").map(std::path::PathBuf::from);
     let mut ws = Workspace::open()?;
     ws.create_dock(name, at.as_deref())?;

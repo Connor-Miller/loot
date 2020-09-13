@@ -281,6 +281,14 @@ impl RepoStore {
         std::fs::create_dir_all(self.docks_dir().join(name))
     }
 
+    /// Remove a named dock's directory and its pointer files (`loot dock rm`,
+    /// #212). Pointer bookkeeping only — graph nodes and objects are never
+    /// touched here, and the op view captures every dock's files, so a restore
+    /// recreates the directory. Home has no directory and is never removable.
+    pub fn remove_dock_dir(&self, name: &str) -> std::io::Result<()> {
+        std::fs::remove_dir_all(self.docks_dir().join(name))
+    }
+
     /// True if `name` is the home dock or an existing named dock.
     pub fn dock_exists(&self, name: &str) -> bool {
         name == HOME_DOCK || self.docks_dir().join(name).is_dir()

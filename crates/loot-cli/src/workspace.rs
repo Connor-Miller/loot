@@ -1352,6 +1352,47 @@ impl Workspace {
         Ok(())
     }
 
+    /// `loot dock rm <name>`: remove a named dock — pointer bookkeeping, not
+    /// graph surgery (#212, amending ADR 0022). The dock's **parked unsigned
+    /// working change** (if any) is dropped from the live heads — nothing
+    /// signed, nothing travelled, the same rationale as abandoning a docking
+    /// PR — and its node leaves the working-change blob on the next save. The
+    /// dock's pinned **tip is just a pointer**: signed work lives in the
+    /// shared graph regardless of dock pointers (which is why no "only copy
+    /// of signed work" refusal exists — there is no such state), so a
+    /// finalized unmerged head simply stays a live head, still mergeable
+    /// later. `.loot/docks/<name>/` is deleted. One **undoable** operation
+    /// (ADR 0031): the op view captures the heads file, the working-change
+    /// blob, and every dock's pointer files, and restore recreates the
+    /// directory. A worktree bound to the dock via `--at` is not tracked
+    /// here; removing its dock leaves that worktree's `.loot` pointer
+    /// dangling (opening it then errors) — the directory is the caller's to
+    /// delete. Refuses the ambient dock (switch away first) and home.
+    /// Returns the dropped parked working change, if there was one.
+    pub fn remove_dock(&mut self, name: &str) -> Result<Option<Oid>, String> {
+        if name == HOME_DOCK {
+            return Err(format!("'{HOME_DOCK}' is the default dock — it always exists"));
+        }
+        if name == self.dock {
+            return Err(format!(
+                "'{name}' is the ambient dock — `loot dock <other>` first, then remove it"
+            ));
+        }
+        if !self.store.dock_exists(name) {
+            return Err(format!("no such dock '{name}' (see `loot docks`)"));
+        }
+        let parked = self.store.read_working(opt(name));
+        if let Some(w) = &parked {
+            self.repo.drop_working(w); // unsigned WIP: drop from live heads
+        }
+        self.store
+            .remove_dock_dir(name)
+            .map_err(|e| format!("remove dock '{name}': {e}"))?;
+        self.persist()?;
+        self.record_op("dock rm", &format!("remove dock {name}"), false);
+        Ok(parked)
+    }
+
     /// Merge dock `name`'s finalized tip into the current dock, in process (CA2,
     /// ADR 0022). Docks share one object store and graph, so this is a local fork
     /// collapse — no relay, no bundle file. Reuses the ADR 0001 convergence rule
@@ -3648,6 +3689,94 @@ mod tests {
         assert!(outcomes.is_empty(), "a parked base never becomes the merge side");
         assert_eq!(ws.repo().log_detailed().len(), nodes_before, "still no merge node");
         assert!(ws.repo().heads().contains(&parked), "the parked head survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_rm_reaps_a_parked_working_head_and_is_undoable() {
+        // #212: the bd926e81 shape — a dock switched away from mid-work parks
+        // its unsigned working change as a live head. `dock rm` drops the
+        // parked head + the dock's pointers (bookkeeping, not graph surgery),
+        // and one undo brings both back.
+        let (dir, mut ws) = dock_repo("dockrm");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        ws.record_op("new", "finalize base", false); // the undo floor
+
+        ws.dock_goto("stale").unwrap();
+        ws.record_op("dock", "dock stale", false); // as cmd_dock records
+        std::fs::write(dir.join("wip.txt"), b"parked").unwrap();
+        ws.snapshot("stale wip").unwrap();
+        ws.dock_goto("main").unwrap();
+        ws.record_op("dock", "dock main", false);
+        let base = ws.anchor().expect("main sits on the finalized base");
+        let parked = ws.store().read_working(Some("stale")).expect("wip parked");
+        assert!(ws.repo().heads().contains(&parked), "precondition: the parked WIP is a head");
+
+        let dropped = ws.remove_dock("stale").unwrap();
+        assert_eq!(dropped, Some(parked.clone()), "the parked working change is reported");
+        assert!(!ws.repo().heads().contains(&parked), "the parked head is gone");
+        assert_eq!(
+            ws.repo().heads(),
+            vec![base],
+            "the base the WIP forked from is the sole head again"
+        );
+        assert!(!ws.store().dock_exists("stale"), "the dock's directory is gone");
+        assert!(
+            !ws.dock_list().iter().any(|d| d.name == "stale"),
+            "the dock left the listing"
+        );
+
+        // One undo restores the dock, its pointers, and the parked head.
+        ws.undo().unwrap();
+        assert!(ws.store().dock_exists("stale"), "undo recreated the dock");
+        assert_eq!(ws.store().read_working(Some("stale")), Some(parked.clone()));
+        assert!(ws.repo().heads().contains(&parked), "undo restored the parked head");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_rm_without_parked_wip_removes_pointers_only() {
+        // The proof-amend-divergence shape: a dock idle on a finalized tip
+        // that is an ancestor of another line. Removal is pure bookkeeping —
+        // heads and graph are untouched.
+        let (dir, mut ws) = dock_repo("dockrm-idle");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        ws.dock_goto("idle").unwrap();
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("more.txt"), b"more").unwrap();
+        ws.snapshot("more").unwrap();
+        ws.finalize_working().unwrap();
+        let heads_before = ws.repo().heads();
+        let nodes_before = ws.repo().log_detailed().len();
+
+        let dropped = ws.remove_dock("idle").unwrap();
+        assert_eq!(dropped, None, "nothing was parked, nothing dropped");
+        assert_eq!(ws.repo().heads(), heads_before, "heads untouched");
+        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "graph untouched");
+        assert!(!ws.store().dock_exists("idle"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_rm_refuses_home_ambient_and_unknown() {
+        let (dir, mut ws) = dock_repo("dockrm-guard");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        let err = ws.remove_dock("main").unwrap_err();
+        assert!(err.contains("default dock"), "unexpected: {err}");
+
+        ws.dock_goto("here").unwrap();
+        let err = ws.remove_dock("here").unwrap_err();
+        assert!(err.contains("ambient dock"), "unexpected: {err}");
+
+        let err = ws.remove_dock("nope").unwrap_err();
+        assert!(err.contains("no such dock"), "unexpected: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

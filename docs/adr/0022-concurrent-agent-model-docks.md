@@ -48,6 +48,22 @@ named noun. There is deliberately **no tag primitive**: a git tag is an
 immutable pointer at frozen history, which is not what a live workspace needs,
 and a mutable named ref is a branch by another name.
 
+> **Amended 2026-07-12 (#212): docks are removable — `loot dock rm <name>`.**
+> Removal is **pointer bookkeeping, never graph surgery**: the dock's
+> `.loot/docks/<name>/` pointer files are deleted, and its parked *unsigned*
+> working change (if any) is dropped from the live heads — nothing signed,
+> nothing travelled, the same rationale as abandoning a docking PR's review
+> lane. The dock's pinned tip needs no special handling: signed work lives in
+> the shared graph regardless of dock pointers, so there is no "only copy of
+> signed work" state to refuse on — a finalized unmerged head simply stays a
+> live head, still mergeable later. Refusals: the ambient dock (switch away
+> first) and home. One **undoable** operation (ADR 0031): the op view already
+> captures the heads file, the shared working-change blob, and every dock's
+> pointer files, so `loot undo` recreates the directory and restores the
+> parked head. A `--at` worktree is not tracked by the store; removing its
+> dock leaves the worktree's `.loot` pointer dangling (opening it errors) —
+> that directory is the operator's to delete.
+
 ### Reconciliation is direct and local; the harbor is a convention
 
 `loot dock merge <name>` applies one dock's tip onto another's working change
