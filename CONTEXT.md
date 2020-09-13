@@ -447,7 +447,16 @@ so `--allow-demote` is a global on any snapshotting verb (`new`, `describe`,
 `grant`, `maroon`, `migrate`), not a `status`-only flag — `status` is read-only
 and never demotes, so it does **not** take the flag (and refuses it since #67).
 Widening a Restricted identity set is not guarded — `grant`/`maroon` own that
-audit trail.
+audit trail. A third safeguard is decided and being built (ADR 0038, map #339):
+the **mis-seal gate** — a path matching a built-in secret-shaped name set
+(`.env*`, `*.pem`, `*.key`, …) that resolves Public *via fallthrough* (the
+default or a catch-all, not an explicit rule naming it) refuses at the signing
+verbs, per-path overridable; finalize also prints a **first-seal summary**
+(each never-before-sealed path with its resolved visibility). An explicit rule
+is consent; falling through is not — the gate exists because a typo'd rule
+(`.evn restricted=alice`) sails a secret to the public default, which the
+demotion guard cannot see (a new path has no prior visibility). The cure side
+is [[Burn]].
 
 **`.lootignore`** *(#64, 2026-07-09)* — a gitignore-style file excluding paths
 from [[Snapshot (reconcile)]]: one glob per line, `#` comments, the **same
@@ -576,6 +585,8 @@ none).
 - *Hard maroon* (`loot maroon --hard <path> <identity>`) — forward maroon plus a published purge event signaling all cooperating peers to remove the marooned identity's Keyring entry for the affected OID. Best-effort operational guarantee: cooperating machines purge; offline or modified-binary peers cannot be forced. Models the "person left the org" case. Implemented (ADR 0009, ADR 0010).
 
 **Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + maroon over the affected identity set: promoting `Restricted` → `Public` re-seals under a new ANYONE-granted key; demoting `Public` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and maroon working correctly — not a separate primitive.
+
+**Burn** *(decided 2026-07-18, ADR 0038, map #339 ticket #63 — being built)* — the remedy for a mis-sealed secret in finalized history: `loot burn <path>` **destroys the object's bytes and records a signed tombstone** in the **burn log**, while the change graph is never touched (every node, change id, signature stays intact — the invariants of ADR 0018/0029/0034 hold). Absence becomes legible: `verify` reads a burn-logged oid's absence as deliberate, `surface` labels the path *burned* in old changes, and sync (`apply`/negotiation/`stow`) **permanently refuses to re-accept a burned oid** — a later pull can never resurrect the bytes from a relay that still holds them. A non-undoable operation barrier (ADR 0031, the `push`/`grant`/`maroon` class). Two honesty tiers, split by the disclosure barrier: never-pushed → the destruction is complete (the true remedy); already-pushed → the tombstone travels as a purge event ([[Maroon]]'s best-effort model) and burn prints rotate-the-secret guidance. The git mirror is detect-and-guide, never auto-rewritten (ADR 0038 §4; fix the git tip *first*, then burn — ferry re-ingests tip content under a fresh oid the burn log cannot match). Prevention is the companion **mis-seal gate**: see [[`.lootattributes`]]. _Avoid_: purge (that's the keyring/hard-maroon lane), delete, rewrite.
 
 **Relay** — a node that stores and forwards sealed content it cannot read (the non-keyholder role from ADR 0001). It holds **no restricted keys** — those never travel in a sync bundle (ADR 0003), so a relay can never read restricted content. It does forward public keys (non-secret by definition) so downstream peers receive readable public content. **A host is a relay that never sleeps** — a laptop, a `loot serve` box, and a future hosted service are the same protocol role, differing only in uptime. This makes a loot host a *zero-knowledge code host*: it physically cannot read private code, the thing a plaintext host like GitHub structurally cannot offer. Services that need plaintext (CI, server-side diff/search) are not ambient repo permissions but explicit, audited [[Grant]]s to a service Identity.
 
