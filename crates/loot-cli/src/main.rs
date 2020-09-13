@@ -1394,23 +1394,25 @@ fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
         }
     }
 
+    // The machine shapes (porcelain/JSON) are the frozen ADR 0025 contract and
+    // encode in loot_core::verdict::BuoyVerdict — one tested home beside the
+    // reconciliation shapes. Human rendering stays here (it needs the peer
+    // registry for attester names). `None`'s porcelain is deliberately empty:
+    // the exit code carries that outcome.
+    use loot_core::verdict::BuoyVerdict;
+    let emit = |v: BuoyVerdict| match fmt {
+        OutFmt::Porcelain => print!("{}", v.porcelain()),
+        OutFmt::Json => println!("{}", v.json()),
+        OutFmt::Human => unreachable!("human arms render inline"),
+    };
     match result {
         loot_core::buoy::BuoyResult::Resolved { change, attesters } => {
             match fmt {
-                OutFmt::Porcelain => {
-                    print!("B\t{}\t{role}\n", loot_core::hex::encode(&change.0));
-                }
-                OutFmt::Json => {
-                    let attesters_json: Vec<String> =
-                        attesters.iter().map(|pk| loot_core::hex::encode(pk)).collect();
-                    println!(
-                        "{{\"contract\":{},\"role\":{role_json},\"status\":\"resolved\",\"buoy\":\"{hex}\",\"attesters\":[{atts}]}}",
-                        loot_core::format::FORMAT_MAJOR,
-                        role_json = json_str(role),
-                        hex = loot_core::hex::encode(&change.0),
-                        atts = attesters_json.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(","),
-                    );
-                }
+                OutFmt::Porcelain | OutFmt::Json => emit(BuoyVerdict::Resolved {
+                    role: role.to_string(),
+                    change,
+                    attesters,
+                }),
                 OutFmt::Human => {
                     let attester_names: Vec<String> =
                         attesters.iter().map(|pk| resolve_pubkey_name(&reg, pk)).collect();
@@ -1426,31 +1428,10 @@ fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
         }
         loot_core::buoy::BuoyResult::Ambiguous { candidates } => {
             match fmt {
-                OutFmt::Porcelain => {
-                    for c in &candidates {
-                        print!("A\t{}\t{role}\n", loot_core::hex::encode(&c.change.0));
-                    }
-                }
-                OutFmt::Json => {
-                    let cands_json: Vec<String> = candidates
-                        .iter()
-                        .map(|c| {
-                            let atts: Vec<String> =
-                                c.attesters.iter().map(|pk| format!("\"{}\"", loot_core::hex::encode(pk))).collect();
-                            format!(
-                                "{{\"change\":\"{}\",\"attesters\":[{}]}}",
-                                loot_core::hex::encode(&c.change.0),
-                                atts.join(","),
-                            )
-                        })
-                        .collect();
-                    println!(
-                        "{{\"contract\":{},\"role\":{role_json},\"status\":\"ambiguous\",\"candidates\":[{cands}]}}",
-                        loot_core::format::FORMAT_MAJOR,
-                        role_json = json_str(role),
-                        cands = cands_json.join(","),
-                    );
-                }
+                OutFmt::Porcelain | OutFmt::Json => emit(BuoyVerdict::Ambiguous {
+                    role: role.to_string(),
+                    candidates: candidates.into_iter().map(|c| (c.change, c.attesters)).collect(),
+                }),
                 OutFmt::Human => {
                     println!("ambiguous: {role} is attested on {} concurrent changes — attest one to resolve:", candidates.len());
                     for c in &candidates {
@@ -1465,16 +1446,7 @@ fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
         }
         loot_core::buoy::BuoyResult::None => {
             match fmt {
-                OutFmt::Porcelain => {
-                    // No lines — the exit code carries the signal.
-                }
-                OutFmt::Json => {
-                    println!(
-                        "{{\"contract\":{},\"role\":{role_json},\"status\":\"none\"}}",
-                        loot_core::format::FORMAT_MAJOR,
-                        role_json = json_str(role),
-                    );
-                }
+                OutFmt::Porcelain | OutFmt::Json => emit(BuoyVerdict::None { role: role.to_string() }),
                 OutFmt::Human => {
                     println!("no buoy for role '{role}'");
                 }
@@ -1482,11 +1454,6 @@ fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::from(2))
         }
     }
-}
-
-/// Minimal JSON string escaping for role values (role is a free-form String).
-fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> String {

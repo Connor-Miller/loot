@@ -224,6 +224,94 @@ pub fn status_json(
     s
 }
 
+// --- buoy encoders (the resolver — a distinct, per-verb frozen shape) ---
+
+/// The buoy resolver's outcome, lifted to a serializable value so its frozen
+/// machine contract (ADR 0025) has one tested encoder home beside the
+/// reconciliation and status shapes, sharing the escaping and contract-version
+/// plumbing. The *shape* is ADR 0025's and deliberately not the merge table:
+/// `B`/`A` rows, exit codes 0/2/3/1 carried by the CLI. Human rendering stays
+/// with the CLI (it needs the peer registry for attester names).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuoyVerdict {
+    /// Exactly one maximal candidate — the buoy.
+    Resolved { role: String, change: Oid, attesters: Vec<[u8; 32]> },
+    /// More than one maximal candidate (concurrent attested changes).
+    Ambiguous { role: String, candidates: Vec<(Oid, Vec<[u8; 32]>)> },
+    /// No candidate for the role.
+    None { role: String },
+}
+
+impl BuoyVerdict {
+    /// Porcelain (ADR 0025, frozen): `B \t change-id-hex \t role` when resolved,
+    /// one `A \t change-id-hex \t role` row per candidate when ambiguous, and
+    /// **no rows** when there is no buoy — the exit code carries that outcome.
+    pub fn porcelain(&self) -> String {
+        match self {
+            BuoyVerdict::Resolved { role, change, .. } => {
+                format!("B\t{}\t{role}\n", hex::encode(&change.0))
+            }
+            BuoyVerdict::Ambiguous { role, candidates } => {
+                let mut out = String::new();
+                for (change, _) in candidates {
+                    out.push_str(&format!("A\t{}\t{role}\n", hex::encode(&change.0)));
+                }
+                out
+            }
+            BuoyVerdict::None { .. } => String::new(),
+        }
+    }
+
+    /// JSON (ADR 0025, frozen): `{"contract":<n>,"role":...,"status":"resolved",
+    /// "buoy":"<hex>","attesters":[...]}` / `"status":"ambiguous","candidates":
+    /// [{"change":"<hex>","attesters":[...]},...]` / `"status":"none"`.
+    pub fn json(&self) -> String {
+        let mut s = String::new();
+        s.push_str("{\"contract\":");
+        s.push_str(&VERDICT_CONTRACT.to_string());
+        s.push_str(",\"role\":");
+        match self {
+            BuoyVerdict::Resolved { role, change, attesters } => {
+                json_string(role, &mut s);
+                s.push_str(",\"status\":\"resolved\",\"buoy\":");
+                json_string(&hex::encode(&change.0), &mut s);
+                s.push_str(",\"attesters\":[");
+                json_attesters(attesters, &mut s);
+                s.push_str("]}");
+            }
+            BuoyVerdict::Ambiguous { role, candidates } => {
+                json_string(role, &mut s);
+                s.push_str(",\"status\":\"ambiguous\",\"candidates\":[");
+                for (i, (change, attesters)) in candidates.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str("{\"change\":");
+                    json_string(&hex::encode(&change.0), &mut s);
+                    s.push_str(",\"attesters\":[");
+                    json_attesters(attesters, &mut s);
+                    s.push_str("]}");
+                }
+                s.push_str("]}");
+            }
+            BuoyVerdict::None { role } => {
+                json_string(role, &mut s);
+                s.push_str(",\"status\":\"none\"}");
+            }
+        }
+        s
+    }
+}
+
+fn json_attesters(attesters: &[[u8; 32]], out: &mut String) {
+    for (i, pk) in attesters.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_string(&hex::encode(pk), out);
+    }
+}
+
 // --- minimal JSON string encoding (dependency-free; loot-core carries no serde) ---
 
 fn json_opt_addr(oid: Option<Oid>, out: &mut String) {
@@ -384,6 +472,75 @@ mod tests {
         assert!(out.contains("\"visibility\":\"public\""));
         assert!(out.contains(&format!("\"change\":\"{}\"", hex::encode(&[0xAB; 16]))));
         assert!(out.contains(&format!("\"version\":\"{}\"", hex::encode(&[0x3f; 32]))));
+    }
+
+    #[test]
+    fn buoy_porcelain_rows_are_the_frozen_contract() {
+        // ADR 0025: `B`/`A` rows, tab-separated, change id as full hex; no rows
+        // for `None` (the exit code carries that outcome).
+        let resolved = BuoyVerdict::Resolved {
+            role: "reviewed".into(),
+            change: oid(0xab),
+            attesters: vec![[1; 32]],
+        };
+        assert_eq!(resolved.porcelain(), format!("B\t{}\treviewed\n", hex::encode(&[0xab; 32])));
+
+        let ambiguous = BuoyVerdict::Ambiguous {
+            role: "base".into(),
+            candidates: vec![(oid(1), vec![[1; 32]]), (oid(2), vec![[2; 32]])],
+        };
+        assert_eq!(
+            ambiguous.porcelain(),
+            format!("A\t{}\tbase\nA\t{}\tbase\n", hex::encode(&[1u8; 32]), hex::encode(&[2u8; 32]))
+        );
+
+        assert_eq!(BuoyVerdict::None { role: "reviewed".into() }.porcelain(), "");
+    }
+
+    #[test]
+    fn buoy_json_shapes_and_contract_tag() {
+        let resolved = BuoyVerdict::Resolved {
+            role: "reviewed".into(),
+            change: oid(0xab),
+            attesters: vec![[1; 32], [2; 32]],
+        };
+        assert_eq!(
+            resolved.json(),
+            format!(
+                "{{\"contract\":{VERDICT_CONTRACT},\"role\":\"reviewed\",\"status\":\"resolved\",\"buoy\":\"{}\",\"attesters\":[\"{}\",\"{}\"]}}",
+                hex::encode(&[0xab; 32]),
+                hex::encode(&[1u8; 32]),
+                hex::encode(&[2u8; 32])
+            )
+        );
+
+        let ambiguous = BuoyVerdict::Ambiguous {
+            role: "base".into(),
+            candidates: vec![(oid(1), vec![[1; 32]])],
+        };
+        assert_eq!(
+            ambiguous.json(),
+            format!(
+                "{{\"contract\":{VERDICT_CONTRACT},\"role\":\"base\",\"status\":\"ambiguous\",\"candidates\":[{{\"change\":\"{}\",\"attesters\":[\"{}\"]}}]}}",
+                hex::encode(&[1u8; 32]),
+                hex::encode(&[1u8; 32])
+            )
+        );
+
+        assert_eq!(
+            BuoyVerdict::None { role: "reviewed".into() }.json(),
+            format!("{{\"contract\":{VERDICT_CONTRACT},\"role\":\"reviewed\",\"status\":\"none\"}}")
+        );
+    }
+
+    #[test]
+    fn buoy_json_escapes_adversarial_roles() {
+        // Roles are free-form Strings (ADR 0025); quotes and control chars must
+        // not corrupt the JSON envelope.
+        let v = BuoyVerdict::None { role: "re\"view\ned".into() };
+        let j = v.json();
+        assert!(j.contains("re\\\"view\\ned"), "escaped role: {j}");
+        assert!(!j.contains('\n'), "no raw control bytes: {j}");
     }
 
     #[test]
