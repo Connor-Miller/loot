@@ -15,10 +15,12 @@
 //! (#325) holds the pure decision half of `Workspace::reconcile_onto` — a
 //! `View -> Plan` table the executor in `workspace.rs` matches on.
 
+pub mod blame;
 pub mod emit;
 pub mod error;
 pub mod ferry;
 pub mod flags;
+pub mod grep;
 mod kv;
 pub mod ledger;
 mod policy;

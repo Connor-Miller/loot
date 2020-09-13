@@ -56,6 +56,12 @@ pub struct View {
     /// abandon` brings the dropped version back as a live divergent version.
     abandoned: Option<Vec<u8>>,
     docks: Vec<DockView>,
+    /// The in-progress `loot bisect` session (`.loot/bisect`, #390), so undoing
+    /// a bisect step (`good`/`bad`/`skip`) restores the prior search state — and
+    /// the CLI re-materializes the midpoint that state names. Encoded as a
+    /// **trailing section** (see [`encode`]) so an op log written before #390
+    /// still decodes: an absent section reads as `None`, unchanged behavior.
+    bisect: Option<Vec<u8>>,
 }
 
 impl View {
@@ -83,6 +89,7 @@ impl View {
             dock_pointer: read(store.dock_pointer()),
             abandoned: read(store.abandoned()),
             docks,
+            bisect: read(store.bisect()),
         }
     }
 
@@ -96,6 +103,7 @@ impl View {
         put_file(&store.conflicts(), self.conflicts.as_deref())?;
         put_file(&store.dock_pointer(), self.dock_pointer.as_deref())?;
         put_file(&store.abandoned(), self.abandoned.as_deref())?;
+        put_file(&store.bisect(), self.bisect.as_deref())?;
         for d in &self.docks {
             // Named `.loot/docks/` are retired (#253/ADR 0034): only the home
             // position restores. A named entry can only come from an op log
@@ -358,6 +366,14 @@ fn encode(ops: &[Operation]) -> Vec<u8> {
         out.push(op.barrier as u8);
         encode_view(&mut out, &op.view);
     }
+    // Trailing bisect section (#390), appended after the fixed-shape op stream so
+    // a reader from before #390 stops cleanly at the last op and never sees it —
+    // and a reader from before #390 that decodes a *new* log simply ignores these
+    // bytes. The count mirrors `ops.len()`, one optional blob per op in order.
+    put_u32(&mut out, ops.len());
+    for op in ops {
+        put_opt(&mut out, op.view.bisect.as_deref());
+    }
     out
 }
 
@@ -404,6 +420,18 @@ fn decode(bytes: &[u8]) -> Result<Vec<Operation>, RepoError> {
         let view = decode_view(&mut c)?;
         ops.push(Operation { index, pos, time, command, dock, description, barrier, view });
     }
+    // Trailing bisect section (#390), present only in logs written since #390. An
+    // older log ends at the last op, so guard on remaining bytes and default the
+    // per-op bisect blob to `None` (the pre-#390 shape) when it is absent.
+    if c.i < c.b.len() {
+        let m = c.u32()?;
+        for k in 0..m {
+            let blob = take_opt(&mut c)?;
+            if let Some(op) = ops.get_mut(k) {
+                op.view.bisect = blob;
+            }
+        }
+    }
     Ok(ops)
 }
 
@@ -423,7 +451,9 @@ fn decode_view(c: &mut Cursor) -> Result<View, RepoError> {
         let next_change = take_opt(c)?;
         docks.push(DockView { name, working, tip, tree_hash, next_change });
     }
-    Ok(View { heads, working_change, conflicts, dock_pointer, abandoned, docks })
+    // `bisect` rides the trailing section (#390), filled in by `decode` after the
+    // op stream; default it absent here so a pre-#390 log decodes unchanged.
+    Ok(View { heads, working_change, conflicts, dock_pointer, abandoned, docks, bisect: None })
 }
 
 fn take_opt(c: &mut Cursor) -> Result<Option<Vec<u8>>, RepoError> {
@@ -531,6 +561,45 @@ mod tests {
         assert!(s.ops().exists(), "the oplog exists on disk");
         let after = repo.bundle(&[]).unwrap().0;
         assert_eq!(before, after, "bundle bytes are independent of the local oplog");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bisect_session_is_captured_and_restored_like_any_view_file() {
+        let (s, dir) = store("bisect");
+        write_view(&s, &[1; 32]);
+        // Op 1: a bisect session is present on disk.
+        std::fs::write(s.bisect(), b"bisect-session-bytes").unwrap();
+        record(&s, "bisect", "main", "start", false, 1).unwrap();
+        // Op 2: the session is gone (a `reset`).
+        std::fs::remove_file(s.bisect()).unwrap();
+        write_view(&s, &[1; 32]);
+        record(&s, "bisect", "main", "reset", false, 2).unwrap();
+
+        // Undo the reset: op 1's view returns, bringing the session file back.
+        undo(&s, "main", 3).unwrap();
+        assert_eq!(std::fs::read(s.bisect()).unwrap(), b"bisect-session-bytes");
+        // Redo forward to op 2: the session is removed again.
+        restore(&s, "main", 2, 4).unwrap();
+        assert!(!s.bisect().exists(), "restore reproduces the absent session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pre_390_log_without_the_trailing_bisect_section_still_decodes() {
+        let (s, dir) = store("bcompat");
+        write_view(&s, &[1; 32]);
+        record(&s, "new", "main", "a", false, 1).unwrap();
+        record(&s, "new", "main", "b", false, 2).unwrap();
+        let full = std::fs::read(s.ops()).unwrap();
+        // Strip the #390 trailing section — a u32 count plus one presence byte
+        // per op (all `None` here) — to reproduce a log written before #390.
+        let n = 2usize;
+        let old = &full[..full.len() - (4 + n)];
+        let ops = decode(old).expect("an older log still decodes");
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1].description, "b");
+        assert!(ops[0].view.bisect.is_none(), "absent section reads as no session");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

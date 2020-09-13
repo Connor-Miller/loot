@@ -191,6 +191,9 @@ const CONFIG: &str = "config";
 const GIT_MIRROR: &str = "git-mirror";
 const OPS: &str = "ops";
 const ABANDONED: &str = "abandoned";
+/// The in-progress `loot bisect` session (#390). Lane-owned positional state,
+/// like `ops`/`abandoned`: a bisect walk is per-position and never bundled.
+const BISECT: &str = "bisect";
 /// Acknowledged-lost content addresses (#335). Shared-store-rooted; see
 /// [`RepoStore::lost`].
 const LOST: &str = "lost";
@@ -367,6 +370,14 @@ impl RepoStore {
     // node from the graph or object store), captured by the oplog so abandon is
     // undoable. Never bundled, like `ops`/the git marks. Lane-owned (ADR 0034).
     pub fn abandoned(&self) -> PathBuf { self.lane.join(ABANDONED) }
+
+    // --- bisect session (#390) ---
+    //
+    // Local-only, lane-owned state for an in-progress `loot bisect` walk: the
+    // known-good/known-bad changes, any skipped ones, the midpoint currently
+    // materialized, and the change to restore on `reset`. Captured by the oplog
+    // (like `abandoned`) so a bisect step is undoable, and never bundled.
+    pub fn bisect(&self) -> PathBuf { self.lane.join(BISECT) }
 
     /// The set of abandoned version ids (each 32 raw bytes), or empty if none.
     /// A malformed/short file reads as empty (best-effort; the oplog can rebuild).
