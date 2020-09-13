@@ -1808,6 +1808,79 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_merge_does_not_resurrect_files_deleted_on_the_spine() {
+        // The #288 live incident, in miniature: a file deleted long ago on the
+        // spine — every line involved forked AFTER the deletion — reappeared in
+        // a ferry reconcile merge ("ferry: reconcile git main", d3ca4b8) and
+        // was published to origin/main. Neither merge parent held it; the
+        // merge did. Root cause: loot-core computed a tip's tree by unioning
+        // every ancestor's manifest child-wins (delta semantics), but every
+        // recorded change carries a FULL manifest — so a path deleted anywhere
+        // in the ancestry re-entered `tree_at` forever, and `merge_tips` fed
+        // those polluted trees to the converge classifier.
+        let (mut ws, dir, mirror) = setup("resurrect-288");
+        put_file(&dir, "a.txt", "keep\n");
+        put_file(&dir, "b.txt", "doomed\n");
+        seal_change(&mut ws, "base: a and b");
+        ferry(&mut ws, &mirror);
+
+        // A later landed change deletes b — ancient history on the spine…
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        seal_change(&mut ws, "delete b");
+        ferry(&mut ws, &mirror);
+        // …and the spine moves on, so the eventual fork base sits well after
+        // the deletion (as in the incident: months after).
+        put_file(&dir, "spacer.txt", "later\n");
+        seal_change(&mut ws, "spacer");
+        ferry(&mut ws, &mirror);
+
+        let git = git2::Repository::open(&mirror).unwrap();
+        assert!(
+            !tree_paths(&git, &main_commit(&git).tree().unwrap()).contains(&"b.txt".to_string()),
+            "precondition: the deletion landed"
+        );
+
+        // A concurrent land moves git main (theirs) while this line holds its
+        // own new work (ours) — the #281-land shape that minted d3ca4b8.
+        git_native_commit(
+            &git,
+            &[("c.txt", "from git\n")],
+            ("Bob", "bob@example.com"),
+            "concurrent land",
+        );
+        put_file(&dir, "d.txt", "local\n");
+        ws.snapshot("local work").unwrap();
+
+        // The pass ingests the git commit and reconciles by merging.
+        let report = ferry_wip(&mut ws, &mirror);
+        assert_eq!(report.ingested, 1);
+
+        // The merged loot manifest must NOT re-raise b.txt…
+        let anchor = ws.finalized_anchor().unwrap();
+        let tree = ws.repo().change_tree(&anchor).unwrap();
+        assert!(
+            !tree.contains_key(Path::new("b.txt")),
+            "merge manifest resurrected b.txt (#288): {:?}",
+            tree.keys().collect::<Vec<_>>()
+        );
+        assert!(tree.contains_key(Path::new("a.txt")));
+        assert!(tree.contains_key(Path::new("c.txt")), "their side folded in");
+        assert!(tree.contains_key(Path::new("d.txt")), "our side kept");
+
+        // …and neither must the projected merge commit's git tree.
+        let paths = tree_paths(&git, &main_commit(&git).tree().unwrap());
+        assert!(
+            !paths.contains(&"b.txt".to_string()),
+            "projected merge resurrected b.txt (#288): {paths:?}"
+        );
+        assert!(paths.contains(&"c.txt".to_string()));
+        assert!(paths.contains(&"d.txt".to_string()));
+
+        // The deleted file must not rematerialize on disk either.
+        assert!(!dir.join("b.txt").exists(), "b.txt rematerialized on disk");
+    }
+
+    #[test]
     fn pulled_content_is_not_recaptured() {
         let (mut ws, dir, mirror) = setup("colo");
         put_file(&dir, "a.txt", "base\n");
