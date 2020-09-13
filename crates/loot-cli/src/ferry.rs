@@ -424,6 +424,52 @@ pub fn run(
     Ok(report)
 }
 
+// --- release tags (#256) ---
+
+/// Mint an annotated tag in the git mirror pointing at the projected `main`
+/// tip — the sealed-free commit `loot ferry` publishes (ADR 0028). This is the
+/// mirror-side half of the tag-push ferry verb (#256): it creates the tag
+/// *object* in the local harbor mirror; the single-ref push that carries it to
+/// GitHub (so cargo-dist's `release.yml` fires) lives in `loot-first`, because
+/// loot itself never talks to GitHub (workflow.md invariant).
+///
+/// The tag can only ever point at `refs/heads/main`, which projection builds
+/// sealed-free (sealed paths are omitted from every projected commit), so a
+/// pushed release tag never widens the public boundary — it references bytes
+/// already published on `main`. Refuses when the mirror or its `main` is absent
+/// (nothing has been projected yet), or when a tag of this name already exists
+/// (a release tag is never clobbered). Returns the tagged commit sha.
+pub fn tag_projected_main(ws: &Workspace, name: &str, message: &str) -> Result<String, String> {
+    let cfg = parse_kv(&read_or_empty(&ws.store().git_config()));
+    let git_dir = resolve_gitdir(
+        cfg.get("gitdir")
+            .ok_or("no mirror bound — run `loot ferry` to project main before tagging")?,
+        ws.store().dot(),
+    );
+    let git = git2::Repository::open(&git_dir)
+        .map_err(|e| format!("open git mirror {git_dir}: {e}"))?;
+    let main_oid = git
+        .find_reference(MAIN_REF)
+        .ok()
+        .and_then(|r| r.target())
+        .ok_or("mirror main has no tip — run `loot ferry` to project a change first")?;
+    let tag_ref = format!("refs/tags/{name}");
+    if git.find_reference(&tag_ref).is_ok() {
+        return Err(format!(
+            "tag '{name}' already exists in the mirror — pick a fresh version, \
+             or delete the tag if you are re-cutting it"
+        ));
+    }
+    let target = git
+        .find_object(main_oid, Some(git2::ObjectType::Commit))
+        .map_err(|e| format!("resolve main commit {main_oid}: {e}"))?;
+    let (name_, email) = self_name_email(ws, &git);
+    let tagger = git2::Signature::now(&name_, &email).map_err(|e| e.to_string())?;
+    git.tag(name, &target, &tagger, message, /* force */ false)
+        .map_err(|e| format!("create tag '{name}': {e}"))?;
+    Ok(main_oid.to_string())
+}
+
 // --- ingest ---
 
 /// The mirrored branch's commits not yet known to the bridge, parents first.
@@ -1393,6 +1439,49 @@ mod tests {
 
         // Deterministic dates: BASE_EPOCH + generation.
         assert_eq!(commit.time().seconds(), bridge::commit_timestamp(0));
+    }
+
+    #[test]
+    fn tag_projects_an_annotated_tag_onto_sealed_free_main() {
+        let (mut ws, dir, mirror) = setup("tag");
+        put_file(&dir, ".lootattributes", "secret/** restricted=bob\n");
+        put_file(&dir, "readme.md", "hello\n");
+        put_file(&dir, "secret/pitch.md", "the plan\n");
+        seal_change(&mut ws, "first");
+        ferry(&mut ws, &mirror);
+
+        let target = super::tag_projected_main(&ws, "v0.1.0", "loot v0.1.0").unwrap();
+
+        let git = git2::Repository::open(&mirror).unwrap();
+        // The annotated tag exists and peels to the projected main commit.
+        let tag_oid = git.find_reference("refs/tags/v0.1.0").unwrap().target().unwrap();
+        let tag = git.find_tag(tag_oid).unwrap();
+        assert_eq!(tag.target_id().to_string(), target, "tag targets the returned sha");
+        assert_eq!(target, main_commit(&git).id().to_string(), "…which is the projected main tip");
+        assert_eq!(tag.message().unwrap().trim(), "loot v0.1.0");
+
+        // The tagged commit is the sealed-free projection — the secret path that
+        // projection omitted is absent from the tree a pushed tag would carry.
+        let tagged = git.find_commit(git2::Oid::from_str(&target).unwrap()).unwrap();
+        let paths = tree_paths(&git, &tagged.tree().unwrap());
+        assert!(paths.contains(&"readme.md".to_string()));
+        assert!(
+            !paths.iter().any(|p| p.contains("secret") || p.contains("pitch")),
+            "sealed path never rides a release tag: {paths:?}"
+        );
+
+        // A release tag is never clobbered: a second mint of the same name refuses.
+        let err = super::tag_projected_main(&ws, "v0.1.0", "again").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn tag_refuses_before_anything_is_projected() {
+        // No ferry pass has run, so the mirror is unbound — tagging must refuse
+        // rather than mint a tag pointing at nothing.
+        let (ws, _dir, _mirror) = setup("tag-unbound");
+        let err = super::tag_projected_main(&ws, "v0.1.0", "loot v0.1.0").unwrap_err();
+        assert!(err.contains("no mirror bound") || err.contains("no tip"), "{err}");
     }
 
     #[test]

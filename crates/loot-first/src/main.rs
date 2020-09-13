@@ -4,6 +4,7 @@
 //! ```text
 //! loot-first review [--title <t>] [--dry-run]   project WIP → PR
 //! loot-first land --pr <n> [--skip-tests] [--dry-run]   land an approved PR
+//! loot-first tag <version> [-m <message>]       push a release tag → release.yml
 //! loot-first status                             show in-flight review lanes
 //! ```
 //!
@@ -49,6 +50,19 @@ fn run(args: &[String]) -> Result<(), String> {
             let forge = gh_forge(&ws);
             orchestrator::land(&mut ws, &forge, pr, skip_tests, dry_run)
         }
+        "tag" => {
+            let name = rest
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .cloned()
+                .ok_or("usage: loot-first tag <version> [-m <message>]")?;
+            let message = flag_value(rest, "-m")
+                .or_else(|| flag_value(rest, "--message"))
+                .unwrap_or_else(|| format!("loot {name}"));
+            let mut ws = Workspace::open()?;
+            let forge = gh_forge(&ws);
+            orchestrator::tag(&mut ws, &forge, &name, &message)
+        }
         "status" => {
             let ws = Workspace::open()?;
             orchestrator::status(&ws)
@@ -62,7 +76,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command '{other}' (try: review, land, status, init-hook)"
+            "unknown command '{other}' (try: review, land, tag, status, init-hook)"
         )),
     }
 }
@@ -88,6 +102,7 @@ fn print_help() {
          USAGE:\n\
          \x20 loot-first review [--title <t>] [--dry-run]\n\
          \x20 loot-first land --pr <n> [--skip-tests] [--dry-run]\n\
+         \x20 loot-first tag <version> [-m <message>]\n\
          \x20 loot-first status\n\
          \x20 loot-first init-hook\n\n\
          loot itself never talks to GitHub; every gh/push call lives here.\n\

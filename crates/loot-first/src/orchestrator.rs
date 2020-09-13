@@ -457,6 +457,69 @@ pub fn land(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// tag — the tag-push ferry verb (#256, loot-site epic step 5)
+// ---------------------------------------------------------------------------
+
+/// Cut a release tag the loot way: project `main`, mint an annotated tag on it,
+/// and push the tag to GitHub so cargo-dist's `release.yml` fires. It rides the
+/// same rails as [`land`] — warn-if-drifted, then hold the harbor lock (ADR
+/// 0036) across the whole git-main-critical section (project → main FF push →
+/// tag push) so a concurrent land and this tag can never race the projection.
+/// The tag only ever points at the sealed-free projected `main`, and the push
+/// carries a single tag ref, so the public boundary is never widened. No raw
+/// git: every GitHub push goes through the [`Forge`] seam.
+pub fn tag(ws: &mut Workspace, forge: &dyn Forge, name: &str, message: &str) -> Result<(), String> {
+    // A tag onto a drifted mirror would point at a `main` that is not origin's
+    // (the #243 hazard); warn loudly up front, but let the operator decide.
+    warn_if_drifted(ws);
+
+    println!(">>> harbor: acquiring the land lock (tag)");
+    let harbor = HarborLock::acquire(ws.store().harbor_lock(), HARBOR_WAIT, HARBOR_STALE)?;
+
+    // Project the tracked dock's tip → mirror main (the reconcile path), so the
+    // tag lands on the current projection rather than a stale one. Idempotent
+    // when main is already current — this cuts a tag, it lands no new change.
+    println!(">>> loot ferry  (project → main)");
+    let fr = ferry::run(ws, None, None, /* with_wip */ false)?;
+    for note in &fr.notes {
+        println!("  {note}");
+    }
+
+    let target = ferry::tag_projected_main(ws, name, message)?;
+    println!(">>> tag {name} -> main {}", &target[..target.len().min(8)]);
+
+    execute_tag_push(forge, name)?;
+    // The tag is published; free the harbor for the next land.
+    harbor.release();
+
+    println!("tagged: {name} main={target} pushed=origin (release.yml fires on the tag)");
+    Ok(())
+}
+
+/// Publish a freshly-minted release tag: fast-forward GitHub `main` so it holds
+/// the tagged commit, *then* push the tag ref itself. Split out (like
+/// [`execute_landing`]) so the intent stream is testable against a fake forge.
+/// Both pushes are non-force: a diverged `main` or a tag that already exists on
+/// origin makes this refuse rather than clobber — and because main goes first,
+/// a diverged main aborts before the tag is ever pushed.
+pub fn execute_tag_push(forge: &dyn Forge, name: &str) -> Result<(), String> {
+    // Ensure origin main holds the tagged commit before the tag references it.
+    forge
+        .push_ref("refs/heads/main:refs/heads/main", false)
+        .map_err(|e| {
+            format!(
+                "publish main before tagging failed ({e}) — GitHub main may have diverged; \
+                 reconcile with `loot ferry` (or land the pending work) and retry the tag"
+            )
+        })?;
+    let tag_ref = format!("refs/tags/{name}");
+    forge
+        .push_ref(&format!("{tag_ref}:{tag_ref}"), false)
+        .map_err(|e| format!("push tag '{name}' failed ({e}) — does it already exist on origin?"))?;
+    Ok(())
+}
+
 /// The #195 guard, as a pure decision: did this land actually move git-main?
 /// `before` is the mirror tip captured before ferry; `after` the tip after. A
 /// land that leaves them equal never integrated its change into the harbor and
@@ -809,5 +872,33 @@ mod tests {
         let st = execute_landing(&f, 218, "deadbeef", "ferry", "abc1234567", 3, &mut s).unwrap();
         assert_eq!(st, LandingStatus::ClosedWithPointer);
         assert!(f.calls().iter().any(|c| c.starts_with("close_pr #218")));
+    }
+
+    #[test]
+    fn tag_push_publishes_main_then_the_tag_ref() {
+        let f = FakeForge::new();
+        execute_tag_push(&f, "v0.1.0").unwrap();
+        // main is fast-forwarded first, then the tag ref rides on top — both
+        // non-force single-ref pushes.
+        assert_eq!(
+            f.calls(),
+            vec![
+                "push refs/heads/main:refs/heads/main force=false".to_string(),
+                "push refs/tags/v0.1.0:refs/tags/v0.1.0 force=false".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_push_refuses_on_diverged_main_without_pushing_the_tag() {
+        let f = FakeForge::new().failing_push("refs/heads/main:refs/heads/main");
+        let err = execute_tag_push(&f, "v0.1.0").unwrap_err();
+        assert!(err.contains("diverged"), "{err}");
+        // main went first and failed, so the tag ref was never pushed.
+        assert!(
+            !f.calls().iter().any(|c| c.contains("refs/tags/")),
+            "a diverged main must abort before the tag is pushed: {:?}",
+            f.calls()
+        );
     }
 }
