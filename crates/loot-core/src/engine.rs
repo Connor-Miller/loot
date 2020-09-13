@@ -1431,11 +1431,13 @@ impl DagRepo {
     /// as is an unknown change id.
     ///
     /// Judges the two changes' **recorded manifests** (each change carries its
-    /// complete tree, deletion = absence — [`Self::change_tree`]), NOT the
-    /// ancestry overlay `tree_at` builds: that union keeps an ancestor's entry
-    /// for a path the child deleted, so a deletion-only change would compare
+    /// complete tree, deletion = absence — [`Self::change_tree`]). `tree_at`
+    /// used to build an ancestry-union overlay that kept an ancestor's entry
+    /// for a path the child deleted, so a deletion-only change compared
     /// identical to its parent — which silently dropped a described
-    /// deletion-only working change at finalize (#289).
+    /// deletion-only working change at finalize (#289). #288 retired the
+    /// overlay (`tree_at` IS the manifest now); reading the nodes directly
+    /// here keeps the judgment self-evidently deletion-aware.
     pub fn same_tree_content(&self, a: &Oid, b: &Oid, now: u64) -> bool {
         let (Some(na), Some(nb)) = (self.graph.get(a), self.graph.get(b)) else {
             return false;
@@ -1592,10 +1594,10 @@ impl DagRepo {
     /// plaintext + visibility and nothing openable was added or removed. Sealed
     /// tip paths this identity cannot read carry forward untouched and are not
     /// this caller's pending delta, so they are ignored. With no `tip`, empty
-    /// means no files at all. The tip's own manifest — not the `tree_at`
-    /// ancestry overlay, which resurrects paths an ancestor held but the tip
-    /// deleted and would read a clean tree as dirty forever after a deletion
-    /// lands (#289).
+    /// means no files at all. The tip's own manifest — the pre-#288 `tree_at`
+    /// ancestry overlay resurrected paths an ancestor held but the tip
+    /// deleted, and would have read a clean tree as dirty forever after a
+    /// deletion landed (#289).
     pub fn working_preview(
         &self,
         tip: Option<&Oid>,
@@ -3413,6 +3415,72 @@ mod tests {
     }
 
     #[test]
+    fn merge_tips_does_not_resurrect_a_path_deleted_before_the_fork() {
+        // #288: a path deleted on the spine long before either merge side
+        // forked must NOT reappear in the merge change's tree. The old
+        // ancestry-union `tree_at` re-raised every deleted path into both
+        // merge inputs, and the classifier — seeing the same stale address on
+        // both sides — kept it.
+        let vis = Visibility::Public;
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let keep = repo.put(b"keep\n", vis.clone()).unwrap();
+        let gone = repo.put(b"doomed\n", vis.clone()).unwrap();
+        let mut t0 = BTreeMap::new();
+        t0.insert(PathBuf::from("keep.txt"), (keep.clone(), vis.clone()));
+        t0.insert(PathBuf::from("gone.txt"), (gone, vis.clone()));
+        let root = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "root".into(), tree: t0 })
+            .unwrap();
+
+        // The deletion: a full manifest without gone.txt.
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("keep.txt"), (keep.clone(), vis.clone()));
+        let spine = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![root],
+                message: "delete gone.txt".into(),
+                tree: t1.clone(),
+            })
+            .unwrap();
+
+        // Two lines fork AFTER the deletion; neither manifest holds gone.txt.
+        let x = repo.put(b"x\n", vis.clone()).unwrap();
+        let mut ta = t1.clone();
+        ta.insert(PathBuf::from("x.txt"), (x, vis.clone()));
+        let tip_a = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![spine.clone()],
+                message: "a".into(),
+                tree: ta,
+            })
+            .unwrap();
+        let y = repo.put(b"y\n", vis.clone()).unwrap();
+        let mut tb = t1.clone();
+        tb.insert(PathBuf::from("y.txt"), (y, vis.clone()));
+        let tip_b = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![spine],
+                message: "b".into(),
+                tree: tb,
+            })
+            .unwrap();
+
+        let (merge_id, _) = repo.merge_tips(&tip_a, &tip_b, "merge", 0).unwrap();
+        let tree = repo.graph.get(&merge_id).unwrap().tree.clone();
+        assert!(
+            !tree.contains_key(&PathBuf::from("gone.txt")),
+            "merge resurrected a path both lines deleted long ago (#288): {:?}",
+            tree.keys().collect::<Vec<_>>()
+        );
+        assert!(tree.contains_key(&PathBuf::from("keep.txt")));
+        assert!(tree.contains_key(&PathBuf::from("x.txt")));
+        assert!(tree.contains_key(&PathBuf::from("y.txt")));
+    }
+
+    #[test]
     fn snapshot_with_base_forks_isolated_lines_over_one_store() {
         // The dock primitive (ADR 0022, CA1): two snapshots forked from a common
         // base tip produce independent heads that do NOT see each other's writes,
@@ -3423,11 +3491,32 @@ mod tests {
             .unwrap();
 
         // Fork A adds a.txt on top of base; fork B adds b.txt on top of base.
+        // `entries` is the WHOLE visible tree (an absent visible path is a
+        // deletion — #288), so each fork's snapshot carries the base file too;
+        // unchanged content keeps its sealed address (#98).
         let a = repo
-            .snapshot(Some(&base), None, &[entry("a.txt", b"A", Visibility::Public)], "fork a", 0)
+            .snapshot(
+                Some(&base),
+                None,
+                &[
+                    entry("shared.txt", b"base", Visibility::Public),
+                    entry("a.txt", b"A", Visibility::Public),
+                ],
+                "fork a",
+                0,
+            )
             .unwrap();
         let b = repo
-            .snapshot(Some(&base), None, &[entry("b.txt", b"B", Visibility::Public)], "fork b", 0)
+            .snapshot(
+                Some(&base),
+                None,
+                &[
+                    entry("shared.txt", b"base", Visibility::Public),
+                    entry("b.txt", b"B", Visibility::Public),
+                ],
+                "fork b",
+                0,
+            )
             .unwrap();
 
         // Both are live heads — a local fork of the DAG, same shape as a remote push.
