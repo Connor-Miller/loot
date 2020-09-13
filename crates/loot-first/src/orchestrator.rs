@@ -29,9 +29,23 @@ const HARBOR_WAIT: Duration = Duration::from_secs(120);
 /// harbor can never wedge permanently.
 const HARBOR_STALE: Duration = Duration::from_secs(600);
 
-/// The local-only ledger/mirror paths under `.loot/git-mirror/`.
+/// The local-only ledger/mirror paths under `.loot/git-mirror/`, plus the two
+/// working directories a land straddles — which are the SAME directory on the
+/// primary and different ones from a lane (#287, the same shared-vs-position
+/// confusion as the #229 mirror-gitdir and gh-cwd dogfood fixes).
 struct Paths {
-    root: PathBuf,
+    /// The landing *position's* own tree (`Workspace::root()`): the lane dir
+    /// from a lane, the checkout from the primary. Where anything that must see
+    /// the tree about to land runs — the pre-land `cargo test` gate, and the
+    /// relay `loot push` cwd (a lane's `.loot` points at the shared store, so
+    /// push resolves the same store from here while recording its op in this
+    /// position's oplog, per ADR 0034 single-writer).
+    position: PathBuf,
+    /// The primary git checkout (the shared store's `.loot` parent): the only
+    /// position with a `.git`, so it is where the drift guard's origin reads
+    /// and the pre-commit hook live. Deliberately NOT `position` — a lane has
+    /// no `.git`, and deriving everything from here is what #287 fixed.
+    checkout: PathBuf,
     mirror: PathBuf,
     pr_map: PathBuf,
     wip: PathBuf,
@@ -39,12 +53,13 @@ struct Paths {
 
 fn paths(ws: &Workspace) -> Paths {
     let mirror_dir = ws.store().git_mirror_dir();
-    let root = ws.dot().parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let checkout = ws.dot().parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     Paths {
         pr_map: ws.store().git_pr_map(),
         wip: ws.store().git_wip(),
         mirror: mirror_dir.join("mirror.git"),
-        root,
+        position: ws.root().to_path_buf(),
+        checkout,
     }
 }
 
@@ -421,7 +436,10 @@ pub fn land(
         PreLand::Skip => println!("pre-land cargo test SKIPPED (--skip-tests break-glass)"),
         PreLand::RunTests => {
             println!(">>> cargo test  (pre-land gate: the landed commit must build)");
-            run_pre_land_tests(&p.root)?;
+            // In the landing position's tree (#287): from a lane, the shared
+            // root is the primary's — possibly stale — checkout, and a gate run
+            // there proves nothing about the commit this land is about to sign.
+            run_pre_land_tests(&p.position)?;
         }
     }
 
@@ -489,7 +507,7 @@ pub fn land(
     harbor.release();
 
     println!(">>> loot push  (relay)");
-    if let Err(e) = relay_push(&p.root) {
+    if let Err(e) = relay_push(&p.position) {
         eprintln!("warning: relay push failed ({e}); the land stands — retry `loot push`.");
     }
 
@@ -638,8 +656,11 @@ pub enum OriginRef {
 pub fn mirror_drift(ws: &Workspace, origin_ref: OriginRef) -> Option<String> {
     let p = paths(ws);
     let mirror = git_rev_parse(&p.mirror, "refs/heads/main")?;
-    let origin = origin_main(&p.root, origin_ref)?;
-    let ancestry = mirror_ancestry(&p.root, &p.mirror, &mirror, &origin);
+    // The guard's git reads run in the *checkout*, never the position (#287):
+    // only the primary has a `.git` with the origin/main tracking ref — a lane
+    // dir would make every probe fail and silently mute the guard.
+    let origin = origin_main(&p.checkout, origin_ref)?;
+    let ancestry = mirror_ancestry(&p.checkout, &p.mirror, &mirror, &origin);
     mirror_drift_warning(&mirror, &origin, ancestry)
 }
 
@@ -780,11 +801,13 @@ fn mirror_main_sha(mirror: &Path) -> Result<String, String> {
     Ok(sha)
 }
 
-/// The pre-land gate: `cargo test` over the whole workspace, from the checkout.
-fn run_pre_land_tests(root: &Path) -> Result<(), String> {
+/// The pre-land gate: `cargo test` over the whole workspace, run in the landing
+/// *position's* tree (#287) — the lane dir from a lane, the checkout from the
+/// primary. It must test the tree about to be signed, not the shared root.
+fn run_pre_land_tests(position: &Path) -> Result<(), String> {
     let status = std::process::Command::new("cargo")
         .arg("test")
-        .current_dir(root)
+        .current_dir(position)
         .status()
         .map_err(|e| format!("cargo test: spawn failed: {e}"))?;
     if !status.success() {
@@ -794,13 +817,29 @@ fn run_pre_land_tests(root: &Path) -> Result<(), String> {
 }
 
 /// The relay sync (`loot push`) — not a policy decision, so it shells out to the
-/// release binary rather than re-implementing the loot-net client here.
-fn relay_push(root: &Path) -> Result<(), String> {
+/// `loot` binary rather than re-implementing the loot-net client here.
+///
+/// Runs in the landing position's tree (#287): `loot push` discovers `.loot`
+/// from its cwd, and a lane's `.loot` points at the shared store, so the push
+/// ships the same store either way — but from here the position guard
+/// (`has_unsigned_tip`) reads the tip this land just signed, and the push op
+/// lands in *this* position's oplog rather than the primary's (ADR 0034: no
+/// mutable file has two writers).
+fn relay_push(position: &Path) -> Result<(), String> {
     let bin = if cfg!(windows) { "loot.exe" } else { "loot" };
-    let loot = root.join("target").join("release").join(bin);
+    // The `loot` built beside this running `loot-first` — the pair come from
+    // one `cargo build`, and a lane tree holds no `target/release` of its own
+    // (#287: the old position-blind path only worked because it always pointed
+    // at the primary's). Fall back to the position's release build for a
+    // loot-first invoked outside its build tree.
+    let loot = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join(bin)))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| position.join("target").join("release").join(bin));
     let status = std::process::Command::new(loot)
         .arg("push")
-        .current_dir(root)
+        .current_dir(position)
         .status()
         .map_err(|e| format!("loot push: spawn failed: {e}"))?;
     if !status.success() {
@@ -839,7 +878,7 @@ pub fn status(ws: &Workspace) -> Result<(), String> {
 /// loot). Successor to the ps1's `init-hook`, so the guard survives the ps1's
 /// deletion. ASCII body, `\n`-only, matching the ps1's install.
 pub fn init_hook(ws: &Workspace) -> Result<(), String> {
-    let hook_dir = paths(ws).root.join(".git").join("hooks");
+    let hook_dir = paths(ws).checkout.join(".git").join("hooks");
     if !hook_dir.exists() {
         return Err(format!("no .git/hooks at {}", hook_dir.display()));
     }
@@ -1127,6 +1166,65 @@ mod tests {
         let origin_sha = git(&checkout, &["rev-parse", "HEAD"]);
         let ghost = "d15f24799f5a1a91f5f821f14190625143e829e5";
         assert_eq!(mirror_ancestry(&checkout, &mirror, ghost, &origin_sha), Ancestry::Diverged);
+    }
+
+    // -----------------------------------------------------------------------
+    // paths — position root vs. shared-store checkout (#287)
+    // -----------------------------------------------------------------------
+
+    /// A keyed primary with one finalized change plus a spawned lane — the
+    /// smallest real Workspace pair that reproduces #287. Built entirely inside
+    /// `scratch`, via explicit `open_at` paths (never a cwd walk, so the test
+    /// can never touch a real `.loot`).
+    fn primary_and_lane(tag: &str) -> (PathBuf, Workspace, PathBuf, Workspace) {
+        let base = scratch(tag);
+        let primary = base.join("primary");
+        Workspace::init_at(&primary, "connor").unwrap();
+        loot_identity::generate_and_save(&primary.join(".loot"), "connor@loot").unwrap();
+        let mut ws = Workspace::open_at(&primary).unwrap();
+        ws.start_fresh_change().unwrap();
+        std::fs::write(primary.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let spawned = ws.spawn_lane(None, Some(&base.join("t287"))).unwrap();
+        let lane_dir = spawned.dir.clone();
+        let lane_ws = Workspace::open_at(&lane_dir).unwrap();
+        (primary, ws, lane_dir, lane_ws)
+    }
+
+    fn canon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|e| panic!("canonicalize {}: {e}", p.display()))
+    }
+
+    #[test]
+    fn the_pre_land_gate_runs_in_the_landing_positions_tree_not_the_shared_stores() {
+        // #287: `ws.dot()` is the SHARED store's `.loot`, so deriving the gate
+        // root from it made `run_pre_land_tests` compile-and-test the primary
+        // checkout's (possibly stale) tree when landing from a lane — the #284
+        // land was validated only because the operator had run the suite in the
+        // lane by hand. The gate (and the relay push cwd) must be the landing
+        // position's own tree.
+        let (primary, _ws, lane_dir, lane_ws) = primary_and_lane("287-gate-root");
+        let p = paths(&lane_ws);
+        assert_eq!(
+            canon(&p.position),
+            canon(&lane_dir),
+            "the pre-land gate must run in the lane tree, not the primary checkout"
+        );
+        // The checkout stays the primary on purpose: it is the only position
+        // with a `.git`, and the drift guard's origin reads and the pre-commit
+        // hook live there.
+        assert_eq!(canon(&p.checkout), canon(&primary), "git/gh reads stay on the checkout");
+    }
+
+    #[test]
+    fn on_the_primary_the_position_and_the_checkout_are_the_same_directory() {
+        // The primary is the degenerate case: its tree IS the checkout, so the
+        // #287 split must not move anything for a primary land.
+        let (primary, ws, _lane_dir, _lane_ws) = primary_and_lane("287-primary");
+        let p = paths(&ws);
+        assert_eq!(canon(&p.position), canon(&primary));
+        assert_eq!(canon(&p.checkout), canon(&primary));
     }
 
     fn view(decision: ReviewDecision, author: &str, state: PrState) -> PrView {

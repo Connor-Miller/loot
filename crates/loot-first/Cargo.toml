@@ -19,3 +19,8 @@ path = "src/main.rs"
 [dependencies]
 loot-cli.workspace = true
 loot-core.workspace = true
+
+[dev-dependencies]
+# Tests build a *keyed* primary so `spawn_lane` works (only signed changes
+# cross a lane's seal) — the #287 regression test needs a real lane Workspace.
+loot-identity.workspace = true
