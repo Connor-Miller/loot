@@ -13,8 +13,8 @@ use loot_core::{
 };
 use loot_identity as identity;
 use render::{
-    change_col, delta_line, outcome_rows, render_buoy_human, render_history, short,
-    short_change,
+    change_col, delta_line, outcome_rows, render_buoy_human, render_grant_status, render_history,
+    short, short_change,
 };
 use std::fmt::Write as _;
 use std::process::ExitCode;
@@ -120,9 +120,11 @@ const COMMANDS: &[Verb] = &[
     verb("lanes", &[], OUT, cmd_lane_list),
     verb("log", &[], &[], cmd_log),
     verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
+    verb("verify", &[], &[], |_| cmd_verify()),
     verb("bundle", &[], &[], cmd_bundle),
     verb("apply", &[], OUT, cmd_apply),
     verb("grant", &["--relay", "--allow-demote"], SKIP, cmd_grant),
+    verb("grant-status", &[], &[], cmd_grant_status),
     verb("maroon", DEMOTE, &["--hard", "--no-snapshot", "--ignore-working-copy"], cmd_maroon),
     verb("migrate", DEMOTE, SKIP, cmd_migrate),
     verb("manifest", &[], &[], |_| cmd_manifest()),
@@ -142,6 +144,7 @@ const COMMANDS: &[Verb] = &[
     verb("config", &[], &[], cmd_config),
     verb("id", &[], &[], cmd_id),
     verb("ferry", &["--git-dir", "--dock"], &["--with-wip", "--porcelain", "--json"], cmd_ferry),
+    verb("completions", &[], &[], cmd_completions),
 ];
 
 /// `buoy`'s flag spec. It dispatches ahead of [`COMMANDS`] (it returns its own
@@ -174,10 +177,12 @@ usage:
   loot surface                              materialize what the current identity may see
   loot log [<selector>]                     show change history, or the ancestry of one point in it; selectors: @, HEAD, HEAD~<n>, id prefix
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
+  loot verify                               integrity-check the object store: rehash every object, find missing ones (exits 1 on problems)
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
   loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
+  loot grant-status <path>                  list current grantees for <path> — grantor, delivery method, granted_at (sanity check before `loot maroon`, #5)
   loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
@@ -207,6 +212,7 @@ usage:
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
   loot pull [<url>] [--remote <name>] [--no-surface] [--porcelain|--json]  fetch, merge, converge, and surface changes from a relay
   loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip also projects the ambient dock's unfinalized WIP to review/<lane-id> (review/<dock> on the primary; map #148, #281)
+  loot completions <bash|zsh|fish>          print a shell completion script to stdout (no repo needed) — pipe it into your shell config, e.g. loot completions zsh > ~/.zsh/completions/_loot
 
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
 first (ADR 0030) — no manual `loot status` needed. Two globals ride them:
@@ -770,6 +776,34 @@ fn cmd_gc(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `loot verify` — integrity-check the loose object store (#19). Read-only:
+/// every object file is decoded and re-hashed against its filename (the
+/// content address), and every address a change references must have a file.
+/// A clean store exits 0; any corrupt or missing object is reported by full
+/// address and the command errors (exit 1), so CI can gate on it. Deliberately
+/// never opens the Workspace: a corrupt store fails to load, and the store
+/// that fails to load is the one this command exists to diagnose.
+fn cmd_verify() -> Result<(), String> {
+    let dot = workspace::resolve_store_dot(std::path::Path::new("."))?;
+    let report = loot_core::DagRepo::verify(&dot).map_err(|e| e.to_string())?;
+    if report.is_clean() {
+        println!("all objects OK — {} object(s) verified", report.ok);
+        return Ok(());
+    }
+    for addr in &report.corrupt {
+        println!("corrupt: {}", loot_core::hex::encode(&addr.0));
+    }
+    for addr in &report.missing {
+        println!("missing: {}", loot_core::hex::encode(&addr.0));
+    }
+    Err(format!(
+        "object store failed verification: {} corrupt, {} missing ({} OK)",
+        report.corrupt.len(),
+        report.missing.len(),
+        report.ok
+    ))
+}
+
 /// Render a byte count as a compact human-readable size (B / KiB / MiB / GiB).
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
@@ -1045,6 +1079,25 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     println!("  recipient runs `loot pull-grants` to receive it");
     // Sealed grant delivered to the relay — a one-way disclosure (ADR 0031).
     snap.record_op("grant", &format!("grant {path} → {grantee} (sealed)"), true);
+    Ok(())
+}
+
+/// `loot grant-status <path>` (#5): who currently holds a grant for `path`,
+/// read straight from the Manifest — a sanity check before `loot maroon`.
+/// Read-only (no snapshot, ADR 0030 — this inspects existing history, it
+/// doesn't record any).
+fn cmd_grant_status(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("grant-status requires <path>")?;
+    let ws = Workspace::open()?;
+    let reg = identity::PeerRegistry::load(ws.dot());
+
+    let oid = ws
+        .current_tree_oid(std::path::Path::new(path))
+        .map_err(|_| format!("path '{path}' not found in current change"))?;
+
+    let entries = ws.manifest().grants_for(&oid);
+    let name_of = |pk: &[u8; 32]| resolve_pubkey_name(&reg, pk);
+    print!("{}", render_grant_status(std::path::Path::new(path), &entries, &name_of));
     Ok(())
 }
 
@@ -1999,6 +2052,157 @@ fn cmd_remote(args: &[String]) -> Result<(), String> {
         }
         other => Err(format!("unknown remote subcommand '{other}': use add | remove | list")),
     }
+}
+
+// --- shell completions (#23) ---
+//
+// Generated, not hand-maintained: the verb list comes straight off
+// [`COMMANDS`] (plus `buoy`/`help`, dispatched outside the table), so a new
+// top-level verb is picked up the moment it's added there — no second list to
+// keep in sync (the #66 failure class this whole table exists to avoid).
+// A handful of verbs dispatch multi-word leaves by hand (`peer add`, `lane
+// gc`, …) rather than through a `FlagSpec`, so those live in the small
+// [`SUBCOMMANDS`] map below instead of being re-derived from parsing.
+
+/// Multi-word subcommands the flag-spec table doesn't carry on its own — the
+/// `cmd_*` handlers dispatch these by matching `args.first()` directly (only
+/// `loot lane`'s leaves are declared as their own [`FlagSpec`]s, see
+/// [`LANE_SUBS`]). Add a leaf here once and every generated shell offers it.
+const SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("lane", &["new", "list", "merge", "name", "rm", "gc"]),
+    ("peer", &["add", "remove", "list"]),
+    ("remote", &["add", "remove", "list"]),
+    ("id", &["export", "import"]),
+    ("config", &["set", "unset", "list"]),
+    ("op", &["log", "restore"]),
+];
+
+/// Every top-level verb name completions should offer: [`COMMANDS`] plus
+/// `buoy` (dispatched ahead of the table — its own `ExitCode`) and `help`.
+/// Sorted so the generated scripts — and the tests pinning their shape — are
+/// deterministic.
+fn completion_verb_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = COMMANDS.iter().map(|v| v.spec.name).collect();
+    names.push("buoy");
+    names.push("help");
+    names.sort_unstable();
+    names
+}
+
+/// `loot completions bash` — a `_loot_completions` function registered with
+/// `complete -F`. Verb names complete at word 1; [`SUBCOMMANDS`] completes
+/// each multi-word verb's leaves at word 2. Built with plain string literals
+/// (not `format!`) wherever the text is literal shell syntax like `${cur}`,
+/// so nothing needs brace-escaping.
+fn bash_completions() -> String {
+    let verbs = completion_verb_names().join(" ");
+    let mut s = String::new();
+    s.push_str("# loot shell completion (bash) — generated by `loot completions bash`; do not edit by hand\n");
+    s.push_str("_loot_completions() {\n");
+    s.push_str("    local cur\n");
+    s.push_str("    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n");
+    s.push('\n');
+    s.push_str("    if [[ ${COMP_CWORD} -eq 1 ]]; then\n");
+    s.push_str("        COMPREPLY=( $(compgen -W \"");
+    s.push_str(&verbs);
+    s.push_str("\" -- \"${cur}\") )\n");
+    s.push_str("        return 0\n");
+    s.push_str("    fi\n");
+    s.push('\n');
+    s.push_str("    case \"${COMP_WORDS[1]}\" in\n");
+    for (verb, subs) in SUBCOMMANDS {
+        // The leading `(` before the pattern is POSIX-legal (optional on
+        // every case arm) — used here so each arm's label parenthesizes
+        // itself instead of leaving its label `)` unmatched.
+        s.push_str("        (");
+        s.push_str(verb);
+        s.push_str(") COMPREPLY=( $(compgen -W \"");
+        s.push_str(&subs.join(" "));
+        s.push_str("\" -- \"${cur}\") ) ;;\n");
+    }
+    s.push_str("    esac\n");
+    s.push_str("}\n");
+    s.push_str("complete -F _loot_completions loot\n");
+    s
+}
+
+/// `loot completions zsh` — a `#compdef loot` function. Verb names complete
+/// at word 2 (`$CURRENT == 2`); [`SUBCOMMANDS`] completes leaves at word 3
+/// once the verb is known.
+fn zsh_completions() -> String {
+    let verbs = completion_verb_names().join(" ");
+    let mut s = String::new();
+    s.push_str("#compdef loot\n");
+    s.push_str("# loot shell completion (zsh) — generated by `loot completions zsh`; do not edit by hand\n");
+    s.push('\n');
+    s.push_str("_loot() {\n");
+    s.push_str("    local -a verbs\n");
+    s.push_str("    verbs=(");
+    s.push_str(&verbs);
+    s.push_str(")\n");
+    s.push('\n');
+    s.push_str("    if (( CURRENT == 2 )); then\n");
+    s.push_str("        compadd -- \"${verbs[@]}\"\n");
+    s.push_str("        return\n");
+    s.push_str("    fi\n");
+    s.push('\n');
+    s.push_str("    local verb=\"${words[2]}\"\n");
+    s.push_str("    case \"$verb\" in\n");
+    for (verb, subs) in SUBCOMMANDS {
+        // Same leading-`(` trick as the bash generator (POSIX-legal, avoids
+        // an unmatched case-label `)`).
+        s.push_str("        (");
+        s.push_str(verb);
+        s.push_str(") compadd -- ");
+        s.push_str(&subs.join(" "));
+        s.push_str(" ;;\n");
+    }
+    s.push_str("    esac\n");
+    s.push_str("}\n");
+    s.push('\n');
+    s.push_str("_loot \"$@\"\n");
+    s
+}
+
+/// `loot completions fish` — `complete -c loot` lines. Verb names complete
+/// when no subcommand has been seen yet; [`SUBCOMMANDS`] adds one
+/// `__fish_seen_subcommand_from <verb>`-gated line per multi-word verb.
+fn fish_completions() -> String {
+    let verbs = completion_verb_names().join(" ");
+    let mut s = String::new();
+    s.push_str("# loot shell completion (fish) — generated by `loot completions fish`; do not edit by hand\n");
+    s.push('\n');
+    s.push_str("complete -c loot -f\n");
+    s.push_str("complete -c loot -n '__fish_use_subcommand' -a '");
+    s.push_str(&verbs);
+    s.push_str("'\n");
+    s.push('\n');
+    for (verb, subs) in SUBCOMMANDS {
+        s.push_str("complete -c loot -n '__fish_seen_subcommand_from ");
+        s.push_str(verb);
+        s.push_str("' -a '");
+        s.push_str(&subs.join(" "));
+        s.push_str("'\n");
+    }
+    s
+}
+
+/// `loot completions <bash|zsh|fish>` (#23) — print a shell completion script
+/// to stdout for the caller to pipe into their shell config. No repo needed
+/// (like `--help`/`--version`); an unknown or missing shell name is a clear
+/// usage error rather than a silent no-op.
+fn cmd_completions(args: &[String]) -> Result<(), String> {
+    let script = match args.first().map(String::as_str) {
+        Some("bash") => bash_completions(),
+        Some("zsh") => zsh_completions(),
+        Some("fish") => fish_completions(),
+        Some(other) => {
+            return Err(format!("unknown shell '{other}' — usage: loot completions <bash|zsh|fish>"))
+        }
+        None => return Err("usage: loot completions <bash|zsh|fish>".into()),
+    };
+    print!("{script}");
+    Ok(())
 }
 
 // --- network sync (ADR 0011) ---
@@ -3100,5 +3304,149 @@ mod tests {
         assert_eq!(bob.heads(), heads, "nothing new ingested");
         assert!(bob.working_id().is_none(), "a no-op pull mints no working change");
         assert_eq!(std::fs::read(dir_b.join("doc.txt")).unwrap(), b"v1");
+    }
+
+    // --- #23: `loot completions <bash|zsh|fish>` ---
+    //
+    // No shell to actually source on this machine, so these tests cover what's
+    // checkable without one: every verb and multi-word subcommand shows up in
+    // each generated script, basic structural validity (paired braces/parens/
+    // quotes), and the overall shape of each script (snapshot-style anchors —
+    // not the full text, so cosmetic rewording doesn't break the suite).
+
+    /// A crude but real structural check: every opening brace/paren and every
+    /// quote character has a matching close, counted over the whole script
+    /// (not stack-based — "balanced where feasible", per the ticket, and the
+    /// generators never nest unmatched delimiters inside a string literal).
+    fn assert_balanced(shell: &str, s: &str) {
+        let braces = s.chars().filter(|&c| c == '{').count() as i64
+            - s.chars().filter(|&c| c == '}').count() as i64;
+        let parens = s.chars().filter(|&c| c == '(').count() as i64
+            - s.chars().filter(|&c| c == ')').count() as i64;
+        let dquotes = s.chars().filter(|&c| c == '"').count();
+        let squotes = s.chars().filter(|&c| c == '\'').count();
+        assert_eq!(braces, 0, "{shell}: unbalanced braces:\n{s}");
+        assert_eq!(parens, 0, "{shell}: unbalanced parens:\n{s}");
+        assert_eq!(dquotes % 2, 0, "{shell}: unbalanced double quotes:\n{s}");
+        assert_eq!(squotes % 2, 0, "{shell}: unbalanced single quotes:\n{s}");
+    }
+
+    /// Word-boundary containment — `contains` alone would let `"op"` match
+    /// inside an unrelated word like `"stop"`; splitting on anything that
+    /// isn't alphanumeric/hyphen and comparing whole tokens catches that.
+    fn contains_word(haystack: &str, word: &str) -> bool {
+        haystack.split(|c: char| !(c.is_alphanumeric() || c == '-')).any(|tok| tok == word)
+    }
+
+    fn all_scripts() -> [(&'static str, String); 3] {
+        [("bash", bash_completions()), ("zsh", zsh_completions()), ("fish", fish_completions())]
+    }
+
+    /// The generation contract: every script is built from [`COMMANDS`], so a
+    /// verb added to the dispatch table is offered by every shell without
+    /// touching this file (the whole point of generating rather than
+    /// hand-maintaining a second command list).
+    #[test]
+    fn every_script_covers_every_top_level_verb() {
+        for (shell, script) in all_scripts() {
+            for name in completion_verb_names() {
+                assert!(
+                    contains_word(&script, name),
+                    "{shell} completion is missing top-level verb `{name}`"
+                );
+            }
+        }
+    }
+
+    /// The [`SUBCOMMANDS`] supplement: multi-word leaves (`peer add`, `lane
+    /// gc`, …) that the flag-spec table alone doesn't carry.
+    #[test]
+    fn every_script_covers_every_multi_word_subcommand() {
+        for (shell, script) in all_scripts() {
+            for (verb, subs) in SUBCOMMANDS {
+                for sub in *subs {
+                    assert!(
+                        contains_word(&script, sub),
+                        "{shell} completion for `{verb}` is missing subcommand `{sub}`"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_script_is_structurally_balanced() {
+        for (shell, script) in all_scripts() {
+            assert_balanced(shell, &script);
+        }
+    }
+
+    /// Snapshot-style shape checks — the anchors a real completion file for
+    /// each shell must carry, not the full text (so rewording a comment can't
+    /// break the suite).
+    #[test]
+    fn bash_completion_has_the_expected_shape() {
+        let s = bash_completions();
+        assert!(s.starts_with("# loot shell completion (bash)"));
+        assert!(s.contains("_loot_completions() {"));
+        assert!(s.contains("complete -F _loot_completions loot"));
+        assert!(s.contains("COMP_WORDS"));
+    }
+
+    #[test]
+    fn zsh_completion_has_the_expected_shape() {
+        let s = zsh_completions();
+        assert!(s.starts_with("#compdef loot"));
+        assert!(s.contains("_loot() {"));
+        assert!(s.contains("compadd"));
+        assert!(s.trim_end().ends_with("_loot \"$@\""));
+    }
+
+    #[test]
+    fn fish_completion_has_the_expected_shape() {
+        let s = fish_completions();
+        assert!(s.starts_with("# loot shell completion (fish)"));
+        assert!(s.contains("complete -c loot -f"));
+        assert!(s.contains("__fish_use_subcommand"));
+        assert!(s.contains("__fish_seen_subcommand_from lane"));
+    }
+
+    /// `loot completions` is a real dispatched verb, documented like every
+    /// other (the #66 guard already asserts this generally; pinned here too
+    /// so the intent is legible beside the rest of the completions tests).
+    #[test]
+    fn completions_verb_is_dispatched_and_documented() {
+        assert!(COMMANDS.iter().any(|v| v.spec.name == "completions"));
+        assert!(USAGE.contains("loot completions <bash|zsh|fish>"));
+    }
+
+    /// The acceptance bar: a bare or unknown shell name is a clear usage
+    /// error, never a silent no-op or a panic.
+    #[test]
+    fn cmd_completions_rejects_missing_or_unknown_shell() {
+        let err = cmd_completions(&args(&[])).unwrap_err();
+        assert!(err.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
+
+        let err = cmd_completions(&args(&["powershell"])).unwrap_err();
+        assert!(err.contains("unknown shell 'powershell'"), "{err}");
+        assert!(err.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
+    }
+
+    /// Each supported shell name is accepted and dispatch never opens a
+    /// workspace — `completions` needs no repo, so this stays a plain
+    /// in-process check (no controlled-cwd hazard, #322).
+    #[test]
+    fn cmd_completions_accepts_each_supported_shell() {
+        for shell in ["bash", "zsh", "fish"] {
+            assert!(cmd_completions(&args(&[shell])).is_ok(), "loot completions {shell}");
+        }
+    }
+
+    /// The flag gate still applies: `completions` takes no flags, so a stray
+    /// one is refused rather than silently accepted (#67).
+    #[test]
+    fn completions_takes_no_flags() {
+        assert_eq!(check("completions", &["bash"]), Ok(FlagCheck::Proceed));
+        assert!(check("completions", &["--bogus"]).is_err());
     }
 }

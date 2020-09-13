@@ -72,6 +72,26 @@ pub struct GcReport {
     pub bytes: u64,
 }
 
+/// Returned by `verify` (#19): the loose object store's integrity census.
+/// Clean means every object file's content re-hashes to its filename and every
+/// referenced address has a file on disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// Object files whose re-hashed content matches their address.
+    pub ok: usize,
+    /// Addresses whose file exists but is undecodable or re-hashes to a
+    /// different address (bit rot, truncation, tampering).
+    pub corrupt: Vec<Oid>,
+    /// Addresses referenced by a change but with no file on disk.
+    pub missing: Vec<Oid>,
+}
+
+impl VerifyReport {
+    pub fn is_clean(&self) -> bool {
+        self.corrupt.is_empty() && self.missing.is_empty()
+    }
+}
+
 /// One change in a [`LogGraph`]: its id, message, and which heads can reach it
 /// (as indices into [`LogGraph::heads`]). A change reachable from exactly one
 /// head is unique to that head's lineage; one reachable from several is shared
@@ -494,38 +514,46 @@ impl DagRepo {
     pub fn gc(&mut self, dir: &Path, dry_run: bool) -> Result<GcReport, RepoError> {
         let store = RepoStore::new(dir);
         let mut live = self.referenced_oids();
-        for node in read_shared_graph(&store)? {
-            for (oid, _vis) in node.tree.values() {
-                live.insert(oid.clone());
-            }
-        }
-        for entry in store.list_lane_entries() {
-            // Strict read, absent-is-empty: a lane with no WIP roots nothing,
-            // but an unreadable or torn blob must FAIL the gc — treating it as
-            // empty silently shrinks the root set, and gc then over-prunes:
-            // the exact loss class this walk exists to prevent.
-            let blob = match read_replaced(&store.lane_view(&entry).working_change()) {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(RepoError::Backend(format!(
-                        "gc: read lane '{}' working change: {e}",
-                        entry.id
-                    )))
-                }
-            };
-            for node in persist_codec::decode_nodes(&blob)? {
-                for (oid, _vis) in node.tree.values() {
-                    live.insert(oid.clone());
-                }
-            }
-        }
+        live.extend(disk_rooted_oids(&store)?);
         let (pruned, bytes) =
             persist_codec::prune_orphaned_objects_loose(&store.objects_dir(), &live, dry_run)?;
         if !dry_run {
             self.objects.retain(&live);
         }
         Ok(GcReport { pruned, bytes })
+    }
+
+    /// Integrity-check the loose object store (#19). Deliberately an
+    /// *associated* function over the on-disk store, never a method on a loaded
+    /// repo: a corrupt store is exactly the store `load` dies on (the object
+    /// decode fails), so verify must not require a successful load. Read-only:
+    /// re-decodes every file under `objects/`, re-hashes its content against
+    /// the filename (the content address, [`sealed::SealedObject::address`] —
+    /// corruption is exact, never heuristic), then confirms every address
+    /// rooted on disk — [`disk_rooted_oids`] plus the primary's own
+    /// working-change blob — has a file. Useful after a disk incident or
+    /// suspicious relay behaviour. Unresolved conflict sides need no extra
+    /// root: both sides' changes are recorded in the graph (ADR 0001).
+    pub fn verify(dir: &Path) -> Result<VerifyReport, RepoError> {
+        let store = RepoStore::new(dir);
+        let mut rooted = disk_rooted_oids(&store)?;
+        // The primary is lane #0 and not in the registry; its in-progress
+        // working change lives at the shared root's own `working-change`.
+        if let Some(blob) = store.read_working_change() {
+            for node in persist_codec::decode_nodes(&blob)? {
+                for (oid, _vis) in node.tree.values() {
+                    rooted.insert(oid.clone());
+                }
+            }
+        }
+        let scan = persist_codec::scan_objects_loose(&store.objects_dir())?;
+        let missing: Vec<Oid> =
+            rooted.into_iter().filter(|oid| !scan.present.contains(oid)).collect();
+        Ok(VerifyReport {
+            ok: scan.present.len() - scan.corrupt.len(),
+            corrupt: scan.corrupt,
+            missing,
+        })
     }
 
     /// Make a landed-but-unadopted lineage visible to this position (#265):
@@ -1999,6 +2027,43 @@ fn read_shared_graph(store: &RepoStore) -> Result<Vec<ChangeNode>, RepoError> {
     }
 }
 
+/// Every content address rooted *on disk* in the shared store: the shared
+/// graph file's nodes (every position's finalized changes, #263/#265) plus
+/// every registered lane's working-change blob (an unsigned change's objects
+/// are already sealed into the shared store). gc unions this with the loaded
+/// repo's own [`DagRepo::referenced_oids`]; verify (#19) adds the primary's
+/// working-change blob and treats the union as the referenced set.
+fn disk_rooted_oids(store: &RepoStore) -> Result<BTreeSet<Oid>, RepoError> {
+    let mut live = BTreeSet::new();
+    for node in read_shared_graph(store)? {
+        for (oid, _vis) in node.tree.values() {
+            live.insert(oid.clone());
+        }
+    }
+    for entry in store.list_lane_entries() {
+        // Strict read, absent-is-empty: a lane with no WIP roots nothing, but
+        // an unreadable or torn blob must FAIL the walk — treating it as empty
+        // silently shrinks the root set, and gc then over-prunes: the exact
+        // loss class this walk exists to prevent.
+        let blob = match read_replaced(&store.lane_view(&entry).working_change()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(RepoError::Backend(format!(
+                    "read lane '{}' working change: {e}",
+                    entry.id
+                )))
+            }
+        };
+        for node in persist_codec::decode_nodes(&blob)? {
+            for (oid, _vis) in node.tree.values() {
+                live.insert(oid.clone());
+            }
+        }
+    }
+    Ok(live)
+}
+
 fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let Some(author) = node.author else {
@@ -2757,6 +2822,109 @@ mod tests {
         assert_eq!(report.pruned, 0, "a live lane's WIP objects are rooted");
         let obj = RepoStore::new(&dir).objects_dir().join(crate::hex::encode(&wip_oid.0));
         assert!(obj.exists(), "the lane's uncommitted object survives the prune");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- verify: loose-object integrity check (#19) ---
+
+    /// A healthy store verifies clean: every object file re-hashes to its
+    /// address and every referenced address has a file. A leftover `*.tmp`
+    /// stage is not an object and never counts against integrity.
+    #[test]
+    fn verify_reports_clean_on_a_healthy_store() {
+        let dir = std::env::temp_dir().join(format!("loot-verify-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let kept = repo.put(b"healthy\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (kept, Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+        repo.save(&dir).unwrap();
+        // An interrupted write's leftover stage must be ignored, as in load/gc.
+        std::fs::write(RepoStore::new(&dir).objects_dir().join("deadbeef.1.2.tmp"), b"junk")
+            .unwrap();
+
+        let report = DagRepo::verify(&dir).unwrap();
+        assert!(report.is_clean(), "healthy store must verify clean: {report:?}");
+        assert!(report.ok >= 1, "the referenced object counts as verified");
+        assert!(report.corrupt.is_empty() && report.missing.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Corruption is exact, not heuristic: a file whose bytes no longer decode,
+    /// and a decodable file sitting at the wrong address (its content re-hashes
+    /// elsewhere), are both reported corrupt by address. The wrongly-named
+    /// file's true address is then missing — present-at-the-wrong-address is
+    /// not present.
+    #[test]
+    fn verify_reports_corrupt_objects_by_address() {
+        let dir = std::env::temp_dir().join(format!("loot-verify-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let smashed = repo.put(b"will be overwritten with garbage\n", Visibility::Public).unwrap();
+        let moved = repo.put(b"will be renamed to a wrong address\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (smashed.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("b.txt"), (moved.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = RepoStore::new(&dir).objects_dir();
+        // Bit rot / truncation: the file exists but no longer decodes.
+        std::fs::write(obj_dir.join(crate::hex::encode(&smashed.0)), b"garbage").unwrap();
+        // Wrong address: valid object bytes filed under an address their
+        // content does not hash to.
+        let bogus = Oid([0xEE; 32]);
+        std::fs::rename(
+            obj_dir.join(crate::hex::encode(&moved.0)),
+            obj_dir.join(crate::hex::encode(&bogus.0)),
+        )
+        .unwrap();
+
+        // The corrupt store is exactly the one that fails to LOAD — verify
+        // must diagnose it anyway, which is why it never loads the repo.
+        assert!(
+            DagRepo::load(&dir, dir.join("work")).is_err(),
+            "a store with an undecodable object cannot load"
+        );
+        let report = DagRepo::verify(&dir).unwrap();
+        assert!(!report.is_clean());
+        assert!(report.corrupt.contains(&smashed), "undecodable file is corrupt");
+        assert!(report.corrupt.contains(&bogus), "hash-mismatched file is corrupt");
+        assert!(report.missing.contains(&moved), "the renamed-away address is missing");
+        assert!(!report.missing.contains(&smashed), "corrupt is present, never also missing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An address the change graph references but no file backs is missing —
+    /// the after-a-disk-incident case the command exists for.
+    #[test]
+    fn verify_reports_missing_referenced_objects() {
+        let dir = std::env::temp_dir().join(format!("loot-verify-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let lost = repo.put(b"referenced then deleted\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (lost.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = RepoStore::new(&dir).objects_dir();
+        std::fs::remove_file(obj_dir.join(crate::hex::encode(&lost.0))).unwrap();
+
+        let report = DagRepo::verify(&dir).unwrap();
+        assert!(!report.is_clean());
+        assert_eq!(report.missing, vec![lost], "the deleted referenced object is missing");
+        assert!(report.corrupt.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

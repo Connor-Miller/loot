@@ -3179,6 +3179,24 @@ const REFUSE_UNCAPTURED_TREE: &str =
 pub const UNDESCRIBED_MESSAGE: &str = "(working change)";
 
 /// Does `message` name the change, or is it still the un-described placeholder?
+/// Resolve the shared store's `.loot/` from `dir` **without loading the repo**
+/// — the `loot verify` path (#19): a corrupt store is exactly the store
+/// [`Workspace::open`] dies on (the object decode fails mid-load), so the
+/// integrity check must find the store by layout alone. Follows a spawned
+/// lane's `store` pointer to the shared root, and applies `open`'s
+/// not-a-repo check (the `identity` file is the store's birthmark).
+pub fn resolve_store_dot(dir: &Path) -> Result<PathBuf, String> {
+    let loot = dir.join(DOT);
+    let dot = RepoStore::read_store_pointer(&loot).unwrap_or(loot);
+    if !RepoStore::new(&dot).identity().exists() {
+        return Err(format!(
+            "not a loot repo at {} (no .loot/). Run `loot init` first.",
+            dir.display()
+        ));
+    }
+    Ok(dot)
+}
+
 /// The one seam every consumer crosses — the rule is never re-derived at a call
 /// site, so the refusal in [`Workspace::finalize_capturing`] and the PR-title
 /// fallback in `loot-first` cannot drift apart (#174).
