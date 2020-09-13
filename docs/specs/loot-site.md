@@ -105,9 +105,17 @@ v1 (dev-facing). `docs/pitch/zk-host.md` is **private inspiration only**.
   `install-path = ~/.loot/bin`, deliberately not CARGO_HOME). The generated
   `.github/workflows/release.yml` is checked in so an upstream stall can't strand
   us.
-- **v1 target matrix:** win x64/arm64 (MSVC) · mac arm64/x64 · linux x64/arm64
-  (**gnu**). Unified release tag **`v0.1.0`** (loot-cli bumped 0.0.0→0.1.0,
-  `publish = false` + `[metadata.dist] dist = true`).
+- **v1 target matrix — 5 native triples, as shipped in `v0.1.0`:** win x64 (MSVC)
+  · mac arm64/x64 · linux x64/arm64 (**gnu**). Unified release tag **`v0.1.0`**
+  (loot-cli bumped 0.0.0→0.1.0, `publish = false` + `[metadata.dist] dist = true`).
+  **Win arm64 is served, not built:** the matrix originally chartered 6 triples,
+  but `aarch64-pc-windows-msvc` was dropped at the v0.1.0 cut (#258) — dist 0.32
+  cross-builds it on a Linux container via cargo-xwin, where ring's ARM assembly
+  won't compile (an upstream cc-rs/xwin interaction, not a loot defect). dist maps
+  that triple onto the x64 zip in the ps1 installer, so ARM64 Windows still
+  installs and runs **under x64 emulation**. A *native* arm64 binary is #270.
+  **The Install page must not claim a native win-arm64 download until #270 lands**
+  — the all-platforms listing has 5 native entries, not 6.
 - **Artifact contract:** `loot-cli-{triple}.{tar.xz|zip}` + `loot-cli-installer.{sh,ps1}`
   + unified `sha256.sum` + `dist-manifest.json`, from GitHub Releases (public repo
   → anonymous downloads work).
