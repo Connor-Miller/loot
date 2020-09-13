@@ -5223,6 +5223,13 @@ impl GlobalConfig {
         self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
     }
 
+    /// The resolved on-disk path this config loads from / saves to (XDG-derived).
+    /// Exposed so a read-only self-check (`loot doctor`, #22) can report and
+    /// re-inspect the file without re-deriving the base-dir convention.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
