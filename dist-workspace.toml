@@ -9,8 +9,18 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-pc-windows-msvc", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# aarch64-pc-windows-msvc (Windows ARM64) is deliberately NOT here for v0.1.0.
+# dist 0.32 cross-builds that triple in a Linux container via cargo-xwin, where
+# ring's ARM assembly fails to compile: cc-rs hands clang MSVC-style `/imsvc`
+# include flags, which clang reads as a positional path
+# (`clang: error: no such file or directory: '/imsvc'`), so the build dies before
+# loot.exe exists. Not a loot defect — an upstream cc-rs/xwin interaction. The
+# v0.1.0 tag's first run proved the other five triples build clean, so we ship
+# those rather than block the release on the least-critical desktop target.
+# Windows ARM64 users are NOT stranded: dist maps that triple onto the x64 zip in
+# the ps1 installer, so the one-liner still installs and runs under x64 emulation.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in. NOT CARGO_HOME (dist's default):
 # that silently assumes a Rust dev (~/.cargo/bin) and is already on PATH for them,
 # so it never exercises the installer's PATH-edit path — wrong for a
