@@ -1,0 +1,178 @@
+=== loot amend-divergence demo (wayfinder map #169) ===
+run started (utc): 2026-07-12 01:48:17Z
+work dir:          C:\Users\conno\AppData\Local\Temp\loot-amend-1783820897
+
+>>> building loot (release)
+
+>>> starting local relay: loot serve --dir <tmp> --addr 127.0.0.1:47543
+    relay is up.
+
+############################################################
+# ACT 1 -- CONTROL: solo amend => clean supersession (ADR 0032)
+############################################################
+
+>>> dev: init, write doc.txt = v1, finalize + push
+    initialized empty loot repo at ., identity = dev
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtoB+nQ4PQ7WrladLjb/mSjQ3iQPyRpeSr3Fr5Hvufv dev@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=dev`
+    remote 'origin' → http://127.0.0.1:47543
+
+>>> dev: loot new -m 'write doc' (finalize the base) + push
+    finalized working change ab8182ed; started fresh change zukksvnt
+    pushed 1 new object(s) to http://127.0.0.1:47543 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+    [control change_id = pxpzumlw]
+
+>>> agent: clone the relay as a DISTINCT identity 'agent'
+    initialized empty loot repo at C:\Users\conno\AppData\Local\Temp\loot-amend-1783820897\agent, identity = agent
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFfPzXjfg/fAvME+BmgdH4C+QkciDis4COb9D9GEK65Z agent@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=agent`
+    pulled 1 change(s) from http://127.0.0.1:47543
+    cloned http://127.0.0.1:47543 → C:\Users\conno\AppData\Local\Temp\loot-amend-1783820897\agent
+    run `loot status` to see the working tree
+
+>>> agent: surface + read doc.txt (has dev's v1)
+      doc.txt                          public
+    surfaced ab8182ed as agent
+PASS: agent clones dev's base change (doc.txt = v1)
+
+>>> dev: loot edit pxpzumlw (reopen the landed change)
+    editing change pxpzumlw — reopened version ab8182ed as the working change
+      finalize (`loot new`) to supersede ab8182ed with your amended version; `loot undo` walks this back
+
+>>> dev: finalize the amend (loot new) + push
+    finalized working change 2bdc944e; started fresh change xvnvrkul
+    pushed 1 new object(s) to http://127.0.0.1:47543 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent: loot pull (expect clean supersession, no divergence)
+    pulled from http://127.0.0.1:47543 as agent:
+      doc.txt                  merged
+    converged onto one line; run `loot surface` to materialize what you may see
+
+>>> agent: loot surface
+      doc.txt                          public
+    surfaced 2bdc944e as agent
+
+>>> agent: loot log (the control -- no bang marker on the change)
+    change     version   message                        vis          author
+    pxpzumlw   2bdc944e  write doc                                   eb6807e9…
+    lszqmowk   —         (working change, empty)                     agent
+PASS: CONTROL: no divergence marker (!) after a solo amend (clean supersession)
+PASS: CONTROL: log does not report a diverged fork
+PASS: CONTROL: agent's doc.txt is dev's amended version (replacement)
+PASS: CONTROL: no content-merge of the old and new lines (converge dropped the superseded head)
+
+############################################################
+# ACT 2 -- DIVERGENCE from concurrent amends (! / abandon / undo)
+############################################################
+
+>>> dev: write feat.txt = base, finalize + push
+    finalized working change e244a953; started fresh change kzmyurqs
+    pushed 1 new object(s) to http://127.0.0.1:47543 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+    [divergent change_id = xvnvrkul]
+
+>>> agent: pull the base change (both peers now share it, single version)
+    pulled from http://127.0.0.1:47543 as agent:
+      doc.txt                  merged
+      feat.txt                 converged
+    converged onto one line; run `loot surface` to materialize what you may see
+      doc.txt                          public
+      feat.txt                         public
+    surfaced e244a953 as agent
+PASS: agent shares the base change (feat.txt present, one version)
+
+>>> dev: loot edit xvnvrkul, feat.txt = dev's take, finalize + push
+    editing change xvnvrkul — reopened version e244a953 as the working change
+      finalize (`loot new`) to supersede e244a953 with your amended version; `loot undo` walks this back
+
+>>> dev: finalize dev's amend + push (relay tip 1)
+    finalized working change b38f4b62; started fresh change rmktzrvx
+    pushed 1 new object(s) to http://127.0.0.1:47543 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent: loot edit xvnvrkul (its own line, from the shared base)
+    editing change xvnvrkul — reopened version e244a953 as the working change
+      finalize (`loot new`) to supersede e244a953 with your amended version; `loot undo` walks this back
+
+>>> agent: finalize agent's amend + push (relay tip 2 -> two versions of one handle)
+    finalized working change 2fffd634; started fresh change rksslttp
+    pushed 1 new object(s) to http://127.0.0.1:47543 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent: loot pull (dev's amend lands next to agent's -> DIVERGENCE)
+    pulled from http://127.0.0.1:47543 as agent:
+      doc.txt                  merged
+      feat.txt                 conflict (needs resolution)
+    converged onto one line; run `loot surface` to materialize what you may see
+
+>>> agent: loot log (the ! divergence marker, flat listing)
+    change     version   message                        vis          author
+    vszlpqyr   6a22aa40  converge diverged head into 'main'              agent
+    xvnvrkul!  b38f4b62  add feat                                    eb6807e9…
+    xvnvrkul!  2fffd634  add feat                                    agent
+    pxpzumlw   2bdc944e  write doc                                   eb6807e9…
+    mxyryqzl   —         (working change, empty)                     agent
+
+>>> agent: loot status (agrees: the working change's handle is divergent)
+    working change mxyryqzl is empty (no changes since the last `new`)
+
+>>> agent: loot conflicts (the per-PATH conflict, orthogonal to the per-cid divergence)
+    conflict at feat.txt
+      ours:   b72650af
+      theirs: 56148662
+PASS: DIVERGENCE: log renders the ! marker on the divergent change_id
+PASS: DIVERGENCE: it is a flat divergent listing, not a 'run apply' fork
+PASS: DIVERGENCE: two live versions listed under one durable handle (b38f4b62, 2fffd634)
+
+>>> agent: loot abandon b38f4b62 (collapse the divergence -- keep agent's side)
+    abandoned version b38f4b62 — its change id keeps the remaining live version(s)
+      nothing was deleted; `loot undo` brings it back (see `loot op log`)
+
+>>> agent: loot log (collapsed -- one live version, no bang)
+    change     version   message                        vis          author
+    vszlpqyr   6a22aa40  converge diverged head into 'main'              agent
+    xvnvrkul   2fffd634  add feat                                    agent
+    pxpzumlw   2bdc944e  write doc                                   eb6807e9…
+    mxyryqzl   —         (working change, empty)                     agent
+PASS: ABANDON: the ! marker is gone -- divergence collapsed to one live version
+PASS: ABANDON: the change_id survives with its remaining live version
+
+>>> agent: loot conflicts (FINDING: still conflicted -- abandon settles the handle, not the tree)
+    conflict at feat.txt
+      ours:   b72650af
+      theirs: 56148662
+PASS: FINDING: abandon collapses the divergence marker; converge's per-path feat.txt conflict is a separate, still-open state
+
+>>> agent: loot undo (walk the abandon back)
+    undid op 8 (abandon) — now at op 7, head 6a22aa40
+
+>>> agent: loot log (divergence restored -- the bang is back)
+    change     version   message                        vis          author
+    vszlpqyr   6a22aa40  converge diverged head into 'main'              agent
+    xvnvrkul!  b38f4b62  add feat                                    eb6807e9…
+    xvnvrkul!  2fffd634  add feat                                    agent
+    pxpzumlw   2bdc944e  write doc                                   eb6807e9…
+    mxyryqzl   —         (working change, empty)                     agent
+PASS: UNDO: the divergence is restored -- the ! marker returns (nothing was destroyed)
+
+================  RESULT  ================
+Divergence arises from ORDINARY WORK, no white-box construction:
+  Act 1 (control): a solo 'loot edit' amend travels the relay as a clean
+         supersession -- the peer sees a replacement, no bang marker, no
+         content-merge (converge drops the superseded head). ADR 0032's
+         supersession-travels property.
+  Act 2 (divergence): two identities each 'loot edit' the SAME change_id
+         and finalize different amends; one pull puts both live versions
+         in one graph; 'loot log'/'status' render the ! marker; 'loot abandon'
+         collapses it; 'loot undo' restores it. Divergence is cross-STORE
+         (two docks in one store cannot produce it, #171).
+
+Honesty (ADR 0026): one machine, one OS user; two keyring-separated
+identities cooperating over a hermetic local relay.
+
+ALL CHECKS PASSED -- divergence from ordinary work proven, both acts.
+run finished (utc): 2026-07-12 01:48:56Z
