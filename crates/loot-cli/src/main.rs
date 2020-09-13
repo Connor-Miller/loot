@@ -5,10 +5,7 @@
 //! All ambient state (`.loot/` home, identity, clock, persistence, working-change
 //! id) is owned by the [`Workspace`]; commands are thin verbs over it.
 
-mod ferry;
-mod render;
-mod workspace;
-
+use loot_cli::{ferry, render, workspace};
 use loot_core::{
     verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Visibility,
 };
