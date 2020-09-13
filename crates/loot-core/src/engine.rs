@@ -233,6 +233,14 @@ impl DagRepo {
             .ok_or(RepoError::NotFound(Oid([0; 32])))
     }
 
+    /// The most recently recorded `(oid, visibility)` for `path`, across all
+    /// of history — not just the current tree (`loot embargo-status`, #15).
+    /// A path that predates a deletion, or one this dock's heads don't (yet)
+    /// carry, is still explainable rather than a bare "not found".
+    pub fn path_history_entry(&self, path: &Path) -> Option<(Oid, Visibility)> {
+        self.graph.path_in_history(path)
+    }
+
 }
 
 /// The fallback subject `resolve` mints when no ours-line subject is
@@ -3966,6 +3974,55 @@ mod tests {
     // 0010) tests moved to `engine::custody`'s own test module (#323) — they
     // exercise the custody verbs and fields directly. `stow`'s purge-forwarding
     // tests below stay here: they exercise the Reconcile face's relay ingest.
+
+    // --- path history (`loot embargo-status`, #15) ---
+
+    /// `path_history_entry` is a thin public wrapper over
+    /// `ChangeGraph::path_in_history` (unit-tested directly there); this pins
+    /// the wiring through the real `DagRepo::record` path with a genuine
+    /// embargoed object, both for a path still in the current tree and for
+    /// one deleted off it (the "not in the working tree" AC).
+    #[test]
+    fn path_history_entry_finds_a_live_embargoed_path_and_survives_its_deletion() {
+        let mut repo = DagRepo::init(tmp(), "alice").unwrap();
+        let vis = Visibility::Embargoed { reveal_at: 500 };
+        let oid = repo.put(b"cve fix\n", vis.clone()).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("plans.md"), (oid.clone(), vis.clone()));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+
+        let (found_oid, found_vis) = repo
+            .path_history_entry(Path::new("plans.md"))
+            .expect("path is live");
+        assert_eq!(found_oid, oid);
+        assert_eq!(found_vis, vis);
+
+        // Delete the path on a child change; the live tree no longer carries
+        // it, but the object's full history still explains it.
+        let empty_tree = BTreeMap::new();
+        repo.record(Change {
+            id: Oid([1; 32]),
+            parents: repo.graph.heads(),
+            message: "delete".into(),
+            tree: empty_tree,
+        })
+        .unwrap();
+        assert!(
+            repo.current_tree_oid(Path::new("plans.md")).is_err(),
+            "precondition: gone from the live tree"
+        );
+        let (_, vis_after_delete) = repo
+            .path_history_entry(Path::new("plans.md"))
+            .expect("still explainable via history");
+        assert_eq!(vis_after_delete, vis);
+    }
+
+    #[test]
+    fn path_history_entry_is_none_for_a_path_never_recorded() {
+        let repo = DagRepo::init(tmp(), "alice").unwrap();
+        assert!(repo.path_history_entry(Path::new("never.md")).is_none());
+    }
 
     // --- conflicts (ADR 0001) ---
 
