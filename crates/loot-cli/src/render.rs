@@ -11,7 +11,7 @@
 //! Anything registry-coupled (resolving a pubkey to a peer name) stays with
 //! the caller and arrives as a closure — rendering knows names, not keyrings.
 
-use crate::workspace::{HistoryRow, HistoryView, WorkingRow};
+use crate::workspace::{EditReport, HistoryRow, HistoryView, WorkingRow};
 use loot_core::{MergeOutcome, Oid};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -52,6 +52,24 @@ pub fn seal_hint(total: usize, restricted: usize, embargoed: usize) -> String {
 /// **digits**. The two alphabets disambiguate the ids at a glance.
 pub fn short_change(cid: &[u8; 16]) -> String {
     loot_core::hex::short_letters(cid, 4)
+}
+
+/// The `loot edit` confirmation (ADR 0032): the durable handle stays, the named
+/// version is superseded once the amend finalizes, and undo walks it back.
+pub fn edit_done(r: &EditReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "editing change {} — reopened version {} as the working change",
+        short_change(&r.change_id),
+        short(&r.superseded),
+    );
+    let _ = writeln!(
+        out,
+        "  finalize (`loot new`) to supersede {} with your amended version; `loot undo` walks this back",
+        short(&r.superseded),
+    );
+    out
 }
 
 /// The change-id column for `log`/`status` (ADR 0029/0030): the reverse-hex

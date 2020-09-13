@@ -940,6 +940,13 @@ impl DagRepo {
         let carried_change_id = working
             .and_then(|w| self.graph.get(w).and_then(|n| n.change_id))
             .or(assign);
+        // Carry the working node's `predecessors` too (ADR 0032): a reopened
+        // change (`loot edit`) records "supersedes X" on its working node, and
+        // every re-snapshot must keep that claim so the eventually finalized
+        // version carries it. An ordinary working change carries the empty list.
+        let carried_predecessors = working
+            .and_then(|w| self.graph.get(w).map(|n| n.predecessors.clone()))
+            .unwrap_or_default();
 
         // Drop the prior working change so we reconcile against finalized history,
         // not against our own last snapshot.
@@ -1012,7 +1019,7 @@ impl DagRepo {
             message: message.to_string(),
             tree,
         };
-        self.record_carrying(change, carried_change_id)
+        self.record_superseding(change, carried_change_id, carried_predecessors)
     }
 }
 
@@ -1070,20 +1077,45 @@ impl DagRepo {
         self.author.map(|_| mint_change_id())
     }
 
-    /// The **divergent** change ids in this dock's graph (S3, ADR 0029): a change
-    /// id carried by more than one **live** version node — where a version is
-    /// live iff it is in the graph and not in `abandoned`. Divergence is per
-    /// change id, *not* head-counting: two versions of one change id can sit under
-    /// a single graph head (e.g. as the two parents of a merge), and their trees
-    /// may even be identical — so this scans every node, never just the heads.
+    /// The **superseded** version ids in this dock's graph (v7, ADR 0032): every
+    /// version some same-change-id version names in its `predecessors`. The
+    /// naming version's own abandoned/superseded state is deliberately ignored —
+    /// the graph is append-only, so a direct claim, once made, stands forever:
+    /// abandoning your amend *kills* the change, it never resurrects the version
+    /// the amend replaced (abandon means kill, not revert). Superseded joins
+    /// abandoned as a liveness filter: live = in-graph ∧ ¬abandoned ∧ ¬superseded.
+    pub fn superseded_versions(&self) -> std::collections::BTreeSet<Oid> {
+        let mut superseded = std::collections::BTreeSet::new();
+        for node in self.graph.in_order() {
+            let Some(cid) = node.change_id else { continue };
+            for p in &node.predecessors {
+                // Defensive: a predecessors entry only supersedes a version of
+                // the SAME change id — a cross-change claim is meaningless.
+                if self.graph.get(p).is_some_and(|t| t.change_id == Some(cid)) {
+                    superseded.insert(p.clone());
+                }
+            }
+        }
+        superseded
+    }
+
+    /// The **divergent** change ids in this dock's graph (S3, ADR 0029/0032): a
+    /// change id carried by more than one **live** version node — where a version
+    /// is live iff it is in the graph, not in `abandoned`, and not superseded
+    /// (ADR 0032). Divergence is per change id, *not* head-counting: two versions
+    /// of one change id can sit under a single graph head (e.g. as the two
+    /// parents of a merge), and their trees may even be identical — so this scans
+    /// every node, never just the heads. A solo amend is therefore never
+    /// divergent (its predecessor is superseded), anywhere: the claim travels.
     /// Legacy/keyless nodes (`change_id = None`) can never be divergent.
     pub fn divergent_change_ids(
         &self,
         abandoned: &std::collections::BTreeSet<Oid>,
     ) -> std::collections::BTreeSet<[u8; 16]> {
+        let superseded = self.superseded_versions();
         let mut by_change: BTreeMap<[u8; 16], usize> = BTreeMap::new();
         for node in self.graph.in_order() {
-            if abandoned.contains(&node.id) {
+            if abandoned.contains(&node.id) || superseded.contains(&node.id) {
                 continue;
             }
             if let Some(cid) = node.change_id {
@@ -1094,17 +1126,23 @@ impl DagRepo {
     }
 
     /// The live version ids (graph nodes) carrying `change_id`, skipping any in
-    /// `abandoned`. `loot abandon` resolves its target among these, and refuses to
-    /// touch a change that is not divergent (would leave zero live versions).
+    /// `abandoned` or superseded (ADR 0032). `loot abandon` resolves its target
+    /// among these, and refuses to touch a change that is not divergent (would
+    /// leave zero live versions); `loot edit` reopens the single live version.
     pub fn versions_of_change(
         &self,
         change_id: &[u8; 16],
         abandoned: &std::collections::BTreeSet<Oid>,
     ) -> Vec<Oid> {
+        let superseded = self.superseded_versions();
         self.graph
             .in_order()
             .into_iter()
-            .filter(|n| n.change_id.as_ref() == Some(change_id) && !abandoned.contains(&n.id))
+            .filter(|n| {
+                n.change_id.as_ref() == Some(change_id)
+                    && !abandoned.contains(&n.id)
+                    && !superseded.contains(&n.id)
+            })
             .map(|n| n.id.clone())
             .collect()
     }
@@ -1129,6 +1167,54 @@ impl DagRepo {
     /// on when its working change is finalized away (ADR 0022).
     pub fn parents_of(&self, id: &Oid) -> Vec<Oid> {
         self.graph.get(id).map(|n| n.parents.clone()).unwrap_or_default()
+    }
+
+    /// Whether any change in this dock's graph names `id` as a parent — the
+    /// tip/childless guard for `loot edit` (ADR 0032): v1 refuses to amend a
+    /// change with descendants (they'd keep building on the superseded tree).
+    pub fn has_children(&self, id: &Oid) -> bool {
+        self.graph.in_order().into_iter().any(|n| n.parents.contains(id))
+    }
+
+    /// Whether the line at `tip` carries a version that **supersedes** `version`
+    /// (ADR 0032): some ancestor of `tip` (inclusive) with the same change id
+    /// names `version` in its `predecessors`. This is the fork-collapse test —
+    /// "their tip replaces ours" is only true when the replacement is actually
+    /// on their line, not merely somewhere in the shared store.
+    pub fn supersedes(&self, tip: &Oid, version: &Oid) -> bool {
+        let Some(cid) = self.graph.get(version).and_then(|n| n.change_id) else {
+            return false;
+        };
+        self.ancestors_of(tip).iter().any(|a| {
+            self.graph
+                .get(a)
+                .is_some_and(|n| n.change_id == Some(cid) && n.predecessors.contains(version))
+        })
+    }
+
+    /// The versions a change supersedes (v7, ADR 0032), or empty if unknown —
+    /// the finalize paths sign over these alongside the two ids.
+    pub fn change_predecessors(&self, id: &Oid) -> Vec<Oid> {
+        self.graph.get(id).map(|n| n.predecessors.clone()).unwrap_or_default()
+    }
+
+    /// Reopen finalized version `version` as a fresh **working change** that
+    /// supersedes it (`loot edit`, ADR 0032): a *sibling* node — parents =
+    /// `version`'s parents (clean parentage, never a child of its own prior
+    /// version), tree = `version`'s tree carried address-for-address (no
+    /// re-sealing), change id carried, and `predecessors = [version]` so the
+    /// replacement travels as signed data once finalized. The prior version is
+    /// untouched (ADR 0018). The caller guards liveness/divergence/descendants
+    /// and cleanliness — this is just the reopen. Errors on an unknown version.
+    pub fn reopen_change(&mut self, version: &Oid) -> Result<Oid, RepoError> {
+        let node = self
+            .graph
+            .get(version)
+            .ok_or_else(|| RepoError::NotFound(version.clone()))?;
+        let (parents, message, tree, cid) =
+            (node.parents.clone(), node.message.clone(), node.tree.clone(), node.change_id);
+        let change = Change { id: Oid([0; 32]), parents, message, tree };
+        self.record_superseding(change, cid, vec![version.clone()])
     }
 
     /// A change's message, or `None` if unknown. Lets an auto-snapshot preserve
@@ -1183,10 +1269,26 @@ impl DagRepo {
         change: Change,
         carried: Option<[u8; 16]>,
     ) -> Result<Oid, RepoError> {
+        self.record_superseding(change, carried, Vec::new())
+    }
+
+    /// `record_carrying` that also names the versions this one **supersedes**
+    /// (v7, ADR 0032) — the general form behind `loot edit`: the reopened
+    /// working change carries the edited change's handle AND a `predecessors`
+    /// entry naming its version, and every re-snapshot carries both forward.
+    /// Predecessors are stored canonically (sorted, deduped) and folded into
+    /// the version id, so a no-op amend still mints a distinct version.
+    pub fn record_superseding(
+        &mut self,
+        change: Change,
+        carried: Option<[u8; 16]>,
+        predecessors: Vec<Oid>,
+    ) -> Result<Oid, RepoError> {
         // Fold this repo's author pubkey (if set) into the id, so authorship is
         // intrinsic (ADR 0018). The signature is attached later, at finalization
         // (`attach_signature`), not on every working-change rewrite.
-        let id = compute_change_id(self.author.as_ref(), &change);
+        let predecessors = change_graph::canonical_predecessors(&predecessors);
+        let id = compute_change_id(self.author.as_ref(), &change, &predecessors);
         let change_id = match carried {
             Some(cid) => Some(cid),
             None => self.author.map(|_| mint_change_id()),
@@ -1199,13 +1301,14 @@ impl DagRepo {
             author: self.author,
             signature: None,
             change_id,
+            predecessors,
         };
         self.graph.insert(node);
         Ok(id)
     }
 
     pub fn record_unauthored(&mut self, change: Change) -> Result<Oid, RepoError> {
-        let id = compute_change_id(None, &change);
+        let id = compute_change_id(None, &change, &[]);
         let node = ChangeNode {
             id: id.clone(),
             parents: change.parents,
@@ -1215,8 +1318,10 @@ impl DagRepo {
             signature: None,
             // Unauthored (bridge-ingested) changes carry no durable handle: an
             // unsigned change gets none, and whether the git bridge should mint
-            // or map one is deferred fog (ADR 0028/0029).
+            // or map one is deferred fog (ADR 0028/0029). They likewise carry
+            // no predecessors (ADR 0032).
             change_id: None,
+            predecessors: Vec::new(),
         };
         self.graph.insert(node);
         Ok(id)
@@ -1413,7 +1518,10 @@ impl DagRepo {
             message: message.to_string(),
             tree: tree.clone(),
         };
-        let version = compute_change_id(self.author.as_ref(), &change);
+        // The preview fingerprint ignores predecessors: it hashes "content right
+        // now", and the durable handle — not this id — is the working change's
+        // name (ADR 0030). A reopened change's preview moving on edit is enough.
+        let version = compute_change_id(self.author.as_ref(), &change, &[]);
 
         let empty = match tip {
             Some(t) => {
@@ -1966,11 +2074,12 @@ fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
     };
     let vk = VerifyingKey::from_bytes(&author)
         .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))?;
-    // The signature covers `version_id ‖ change_id` (ADR 0029), so a relay or
-    // peer cannot relabel signed content under a different change id. A legacy
-    // change (`change_id = None`) signs over the version id alone, so its pre-v6
-    // signature still verifies through the same call.
-    let message = change_signing_message(&node.id, &node.change_id);
+    // The signature covers `version_id ‖ change_id ‖ predecessors` (ADR
+    // 0029/0032), so a relay or peer cannot relabel signed content under a
+    // different change id, nor strip or forge a supersession claim. A legacy
+    // change (`change_id = None`, no predecessors) signs over the version id
+    // alone, so its pre-v6 signature still verifies through the same call.
+    let message = change_signing_message(&node.id, &node.change_id, &node.predecessors);
     vk.verify(&message, &Signature::from_bytes(&sig))
         .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))
 }
@@ -3448,7 +3557,7 @@ mod tests {
         // as the workspace does — an authored change now carries a minted change id.
         let add_cid = alice.change_change_id(&add_id);
         alice
-            .attach_signature(&add_id, sk.sign(&change_signing_message(&add_id, &add_cid)).to_bytes())
+            .attach_signature(&add_id, sk.sign(&change_signing_message(&add_id, &add_cid, &[])).to_bytes())
             .unwrap();
 
         let res = alice.maroon_hard(Path::new("s.txt"), "bob", 0).unwrap();
@@ -3462,7 +3571,7 @@ mod tests {
         alice
             .attach_signature(
                 &res.change_id,
-                sk.sign(&change_signing_message(&res.change_id, &res_cid)).to_bytes(),
+                sk.sign(&change_signing_message(&res.change_id, &res_cid, &[])).to_bytes(),
             )
             .unwrap();
         assert!(
@@ -4005,6 +4114,7 @@ mod tests {
             author: Some(author),
             signature,
             change_id: None,
+            predecessors: Vec::new(),
         }
     }
 
@@ -4025,9 +4135,9 @@ mod tests {
         let change = Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree };
         let (_s1, pk1) = test_signer(1);
         let (_s2, pk2) = test_signer(2);
-        let id_legacy = compute_change_id(None, &change);
-        let id1 = compute_change_id(Some(&pk1), &change);
-        let id2 = compute_change_id(Some(&pk2), &change);
+        let id_legacy = compute_change_id(None, &change, &[]);
+        let id1 = compute_change_id(Some(&pk1), &change, &[]);
+        let id2 = compute_change_id(Some(&pk2), &change, &[]);
         assert_ne!(id1, id2, "same edit by two authors must yield different ids");
         assert_ne!(id1, id_legacy, "authored id must differ from the legacy (unauthored) id");
     }
@@ -4052,7 +4162,7 @@ mod tests {
         let cid = Some([0xAB; 16]);
         let mut node = authored_change(id.clone(), pk, None);
         node.change_id = cid;
-        node.signature = Some(sk.sign(&change_signing_message(&id, &cid)).to_bytes());
+        node.signature = Some(sk.sign(&change_signing_message(&id, &cid, &[])).to_bytes());
         let mut bob = DagRepo::init(tmp(), "bob").unwrap();
         assert!(bob.apply(&bundle_of(node), 0).is_ok(), "a change signed over both ids must apply");
     }
@@ -4068,12 +4178,124 @@ mod tests {
         let signed_cid = Some([0xAB; 16]);
         let mut node = authored_change(id.clone(), pk, None);
         // Signed over change_id 0xAB…, but the node now carries a different one.
-        node.signature = Some(sk.sign(&change_signing_message(&id, &signed_cid)).to_bytes());
+        node.signature = Some(sk.sign(&change_signing_message(&id, &signed_cid, &[])).to_bytes());
         node.change_id = Some([0xCD; 16]);
         assert!(matches!(
             DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(node), 0),
             Err(RepoError::BadChangeSignature(_))
         ));
+    }
+
+    #[test]
+    fn apply_rejects_predecessors_stripped_or_forged_after_signing() {
+        // The signature covers the predecessors (ADR 0032): a peer that keeps
+        // the signed bytes but strips the supersession claim (resurrecting the
+        // superseded version at every downstream peer) — or forges one onto a
+        // change that never made it — must be rejected.
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(7);
+        let id = Oid([5; 32]);
+        let cid = Some([0xAB; 16]);
+        let preds = vec![Oid([3; 32])];
+
+        // Signed WITH the claim, shipped without it.
+        let mut stripped = authored_change(id.clone(), pk, None);
+        stripped.change_id = cid;
+        stripped.signature = Some(sk.sign(&change_signing_message(&id, &cid, &preds)).to_bytes());
+        assert!(matches!(
+            DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(stripped), 0),
+            Err(RepoError::BadChangeSignature(_))
+        ));
+
+        // Signed WITHOUT a claim, shipped with one forged on.
+        let mut forged = authored_change(id.clone(), pk, None);
+        forged.change_id = cid;
+        forged.signature = Some(sk.sign(&change_signing_message(&id, &cid, &[])).to_bytes());
+        forged.predecessors = preds.clone();
+        assert!(matches!(
+            DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(forged), 0),
+            Err(RepoError::BadChangeSignature(_))
+        ));
+
+        // The honest node — signed over what it ships — applies.
+        let mut honest = authored_change(id.clone(), pk, None);
+        honest.change_id = cid;
+        honest.predecessors = preds.clone();
+        honest.signature = Some(sk.sign(&change_signing_message(&id, &cid, &preds)).to_bytes());
+        assert!(DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(honest), 0).is_ok());
+    }
+
+    #[test]
+    fn predecessors_fold_into_the_version_id_canonically() {
+        // ADR 0032: a no-op amend (same author/message/parents/tree) must still
+        // mint a DISTINCT version — otherwise "X′ supersedes X" collapses into X
+        // superseding itself — and two writers naming the same set in different
+        // orders must agree on the id.
+        let change = Change {
+            id: Oid([0; 32]),
+            parents: vec![],
+            message: "m".into(),
+            tree: BTreeMap::new(),
+        };
+        let (_s, pk) = test_signer(1);
+        let plain = compute_change_id(Some(&pk), &change, &[]);
+        let a = Oid([1; 32]);
+        let b = Oid([2; 32]);
+        let ab = compute_change_id(Some(&pk), &change, &[a.clone(), b.clone()]);
+        let ba = compute_change_id(Some(&pk), &change, &[b, a.clone()]);
+        let just_a = compute_change_id(Some(&pk), &change, &[a]);
+        assert_ne!(plain, just_a, "a superseding version differs from its no-op twin");
+        assert_ne!(just_a, ab, "the claimed set is part of the id");
+        assert_eq!(ab, ba, "predecessors hash canonically (order-independent)");
+    }
+
+    #[test]
+    fn a_superseded_version_leaves_the_live_view_but_stays_addressable() {
+        // ADR 0032 liveness: live = in-graph ∧ ¬abandoned ∧ ¬superseded. A solo
+        // amend (one live successor naming its predecessor) is NOT divergence;
+        // abandoning the successor kills the change rather than resurrecting the
+        // predecessor (abandon means kill, never revert).
+        let mut repo = DagRepo::init(tmp(), "alice").unwrap();
+        let cid = [7u8; 16];
+        let x = repo
+            .record_carrying(
+                Change { id: Oid([0; 32]), parents: vec![], message: "X".into(), tree: Default::default() },
+                Some(cid),
+            )
+            .unwrap();
+        let x2 = repo
+            .record_superseding(
+                Change { id: Oid([0; 32]), parents: vec![], message: "X".into(), tree: Default::default() },
+                Some(cid),
+                vec![x.clone()],
+            )
+            .unwrap();
+        assert_ne!(x, x2, "the amend minted a distinct sibling version");
+        assert!(repo.superseded_versions().contains(&x));
+        let none = std::collections::BTreeSet::new();
+        assert!(repo.divergent_change_ids(&none).is_empty(), "a solo amend is not divergence");
+        assert_eq!(repo.versions_of_change(&cid, &none), vec![x2.clone()], "one live version");
+
+        // Abandoning the amend leaves ZERO live versions — X stays superseded.
+        let mut abandoned = std::collections::BTreeSet::new();
+        abandoned.insert(x2);
+        assert!(
+            repo.versions_of_change(&cid, &abandoned).is_empty(),
+            "abandon kills the change; it never resurrects the superseded version"
+        );
+
+        // Two live successors naming the same predecessor — the concurrent
+        // amend — IS divergence, and exactly between the two amends.
+        let x3 = repo
+            .record_superseding(
+                Change { id: Oid([0; 32]), parents: vec![], message: "X other".into(), tree: Default::default() },
+                Some(cid),
+                vec![x.clone()],
+            )
+            .unwrap();
+        assert!(repo.divergent_change_ids(&none).contains(&cid));
+        let live = repo.versions_of_change(&cid, &none);
+        assert!(!live.contains(&x) && live.len() == 2 && live.contains(&x3));
     }
 
     #[test]
@@ -4263,6 +4485,7 @@ mod tests {
             author: None,
             signature: None,
             change_id: None,
+            predecessors: Vec::new(),
         }
     }
 

@@ -92,13 +92,20 @@ impl<'a> Cursor<'a> {
 ///   `change_id = None`, and its signature — over the 32-byte version id alone —
 ///   still verifies, because the signed message only grows when a change id is
 ///   present.
+/// - v7 (ADR 0032, #171) added the per-change `predecessors` list — the version
+///   ids this version **supersedes** (`loot edit`): amending mints a sibling
+///   version under the same change id, and supersession travels as signed data.
+///   The list is folded into the version-id computation and the finalize
+///   signature widens to cover it. Additive: a v≤6 change decodes as
+///   predecessors-empty, and an empty list adds nothing to either hash or
+///   signature, so every existing id and signature is unchanged.
 ///
 /// Each was a change an older reader cannot parse, so each bumped the major. A
-/// v6 reader still reads v1–v5 artifacts (missing fields default to absent;
+/// v7 reader still reads v1–v6 artifacts (missing fields default to absent;
 /// a v4 escrow section is parsed for cursor correctness but its plaintext keys
 /// are DROPPED, never filed); an older reader cleanly rejects a newer major
 /// rather than mis-parsing.
-pub const FORMAT_MAJOR: u8 = 6;
+pub const FORMAT_MAJOR: u8 = 7;
 /// The compatible revision this build writes.
 pub const FORMAT_MINOR: u8 = 0;
 /// Bytes the version marker occupies at the front of an artifact.
@@ -213,6 +220,32 @@ pub fn read_change_id(c: &mut Cursor, major: u8) -> Result<Option<[u8; 16]>, Rep
     } else {
         Ok(None)
     }
+}
+
+/// Write a change's `predecessors` — the version ids it supersedes (v7, ADR
+/// 0032) — as a u32 count followed by each 32-byte version id. Rides after the
+/// change id, shared by the bundle and durable graph codecs. An ordinary change
+/// writes the empty list (count 0).
+pub fn put_predecessors(out: &mut Vec<u8>, predecessors: &[crate::Oid]) {
+    out.extend_from_slice(&(predecessors.len() as u32).to_le_bytes());
+    for p in predecessors {
+        out.extend_from_slice(&p.0);
+    }
+}
+
+/// Read a change's `predecessors` list. From v7 on it follows the change id; an
+/// older `major` predates supersession, so the change loads with the empty list
+/// — the "newer reads older" path (ADR 0019/0032), with no backfill.
+pub fn read_predecessors(c: &mut Cursor, major: u8) -> Result<Vec<crate::Oid>, RepoError> {
+    if major < 7 {
+        return Ok(Vec::new());
+    }
+    let n = c.u32()?;
+    let mut preds = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        preds.push(crate::Oid(c.arr32()?));
+    }
+    Ok(preds)
 }
 
 #[cfg(test)]

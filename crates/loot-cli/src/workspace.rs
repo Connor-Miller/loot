@@ -207,7 +207,10 @@ impl Workspace {
         let working = self.live_working_row()?;
         let working_node = self.working.clone();
         let divergent = self.divergent_change_ids();
-        let abandoned = self.abandoned_versions();
+        // Superseded versions (ADR 0032) leave the live view exactly like
+        // abandoned ones: an amended change renders once, as its live version.
+        let mut abandoned = self.abandoned_versions();
+        abandoned.extend(self.repo.superseded_versions());
 
         let row_of = |id: &Oid, message: &str, total: usize, restricted: usize, embargoed: usize| HistoryRow {
             version: id.clone(),
@@ -602,10 +605,13 @@ impl Workspace {
         // working change is ephemeral until now (rewritten on each `status`), so
         // we sign exactly once, here. A keyless repo finalizes unsigned (legacy).
         if let (Some(signer), Some(working)) = (&self.signer, self.working.clone()) {
-            // Sign over `version_id ‖ change_id` (ADR 0029) so the durable handle
-            // is bound to this exact version and cannot be relabelled on the wire.
+            // Sign over `version_id ‖ change_id ‖ predecessors` (ADR 0029/0032)
+            // so the durable handle is bound to this exact version and a
+            // supersession claim cannot be relabelled or stripped on the wire.
             let change_id = self.repo.change_change_id(&working);
-            let sig = signer.sign(&loot_core::change_signing_message(&working, &change_id));
+            let preds = self.repo.change_predecessors(&working);
+            let sig =
+                signer.sign(&loot_core::change_signing_message(&working, &change_id, &preds));
             self.repo
                 .attach_signature(&working, sig)
                 .map_err(|e| e.to_string())?;
@@ -642,9 +648,10 @@ impl Workspace {
     pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), String> {
         if let Some(signer) = &self.signer {
             // Same finalize signature as `finalize_working`: over
-            // `version_id ‖ change_id` (ADR 0029).
+            // `version_id ‖ change_id ‖ predecessors` (ADR 0029/0032).
             let cid = self.repo.change_change_id(change_id);
-            let sig = signer.sign(&loot_core::change_signing_message(change_id, &cid));
+            let preds = self.repo.change_predecessors(change_id);
+            let sig = signer.sign(&loot_core::change_signing_message(change_id, &cid, &preds));
             self.repo
                 .attach_signature(change_id, sig)
                 .map_err(|e| e.to_string())?;
@@ -1017,6 +1024,102 @@ impl Workspace {
         Ok(())
     }
 
+    /// `loot edit <change-id>`: reopen a finalized change as the working change,
+    /// **superseding** it (ADR 0032). The reopened change is a *sibling* of the
+    /// edited version — parents = its parents, tree = its tree, durable handle
+    /// carried — with `predecessors` naming it, so once finalized (`loot new`)
+    /// the replacement is signed data that travels: peers drop the superseded
+    /// version instead of rendering a false divergence. Three refusals, no
+    /// magic: an in-progress working change or uncaptured edits (edit *replaces*
+    /// the working change — the documented ADR 0030 exception: it never
+    /// implicit-captures), a divergent handle (abandon a version first), and a
+    /// change with descendants (v1 amends only a tip/childless change). One
+    /// undoable operation (ADR 0031).
+    pub fn edit(&mut self, prefix: &str) -> Result<EditReport, String> {
+        // Refuse rather than capture (ADR 0032/0030): capture-first would
+        // strand the WIP as an unsigned stray head, and carrying it would mix
+        // in-flight work into the reopened change's content.
+        if self.working.is_some() {
+            return Err(
+                "a working change is in progress — finalize it (`loot new`) or walk it back \
+                 (`loot undo`) first; `edit` replaces the working change"
+                    .into(),
+            );
+        }
+        let (entries, _) = self.read_working_tree()?;
+        let anchor = self.anchor();
+        let (_, clean) = self.repo.working_preview(anchor.as_ref(), &entries, "", self.now);
+        if !clean {
+            return Err(
+                "the tree has uncaptured edits — describe or finalize your work first; \
+                 `edit` replaces the working change"
+                    .into(),
+            );
+        }
+
+        // Resolve the reverse-hex letters prefix to one durable handle.
+        let mut cids: std::collections::BTreeSet<[u8; 16]> = std::collections::BTreeSet::new();
+        for v in self.version_ids() {
+            if let Some(cid) = self.repo.change_change_id(&v) {
+                if loot_core::hex::letters(&cid).starts_with(prefix) {
+                    cids.insert(cid);
+                }
+            }
+        }
+        let cid = match cids.len() {
+            0 => return Err(format!("no change id matching '{prefix}'")),
+            1 => cids.into_iter().next().unwrap(),
+            n => return Err(format!("ambiguous change id '{prefix}' ({n} matches) — give more letters")),
+        };
+        let handle = loot_core::hex::short_letters(&cid, 4);
+
+        // One live version to reopen: a divergent handle is refused with its
+        // truthful remedy (ADR 0032) rather than a guess or a disambiguator.
+        let live = self.repo.versions_of_change(&cid, &self.abandoned_versions());
+        let target = match live.len() {
+            0 => return Err(format!("change {handle} has no live version (abandoned or superseded)")),
+            1 => live.into_iter().next().unwrap(),
+            _ => {
+                return Err(format!(
+                    "change {handle} is divergent (!) — `loot abandon` a version first, then edit"
+                ))
+            }
+        };
+        if self.repo.change_signature(&target).is_none() {
+            return Err(format!("change {handle} is not finalized — edit reopens signed changes"));
+        }
+        if self.repo.has_children(&target) {
+            return Err(format!(
+                "change {handle} has descendants — v1 edits only a tip (childless) change"
+            ));
+        }
+
+        // Reopen: the engine mints the superseding sibling working node; the
+        // dock re-anchors on the edited change's parent so re-snapshots keep
+        // the sibling parentage (the working change forks from the tip, ADR
+        // 0006 — after `edit`, the tip is the parent and the working change is
+        // the reopened version). The cleanliness guard proved the disk already
+        // shows the target's tree, so nothing materializes.
+        let reopened = self.repo.reopen_change(&target).map_err(|e| e.to_string())?;
+        let parent = self.repo.parents_of(&target).into_iter().next();
+        self.working = Some(reopened.clone());
+        if self.docks_active() {
+            self.tip = parent;
+            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        }
+        // Prime the snapshot-idempotence hash for the reopened content so the
+        // next command doesn't spuriously re-record an unchanged tree.
+        let msg = self.repo.change_message(&reopened).unwrap_or_default();
+        let _ = self.store.write_tree_hash(self.dock_opt(), &hash_tree(&entries, &msg));
+        self.persist()?;
+        self.record_op(
+            "edit",
+            &format!("edit change {handle} (reopen {} for amend)", short_version(&target)),
+            false,
+        );
+        Ok(EditReport { change_id: cid, superseded: target })
+    }
+
     /// The named-remote registry (`.loot/config`, ADR 0013) as one small value —
     /// the four Workspace forwarders it replaces were interface padding (#177).
     pub fn remotes(&self) -> Remotes {
@@ -1113,6 +1216,24 @@ impl Workspace {
             .and_then(|w| self.repo.change_message(w))
             .unwrap_or_else(|| "(working change)".to_string());
         self.snapshot(&msg)?;
+        // Drop an empty/tip-duplicate capture, exactly as `finalize_capturing`
+        // does: an idle dock must not park a stray "(working change)" child on
+        // its tip — it pollutes the tip's descendants (blocking `loot edit`'s
+        // childless guard, ADR 0032) and a later merge would carry the
+        // superseded tip's content against an amend.
+        if let Some(id) = self.working.clone() {
+            let anchor = self.anchor();
+            let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
+            let duplicate = empty
+                || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &id, self.now));
+            if duplicate {
+                self.repo.drop_working(&id);
+                self.working = None;
+                // Persist while this dock is still ambient, so its working
+                // pointer clears and the graph saves without the dropped node.
+                self.persist()?;
+            }
+        }
         let from = self.working.clone().or_else(|| self.tip.clone());
 
         // 2. Pin the outgoing home dock's tip before it stops being the lone dock,
@@ -1270,6 +1391,26 @@ impl Workspace {
             return Ok((name.to_string(), BTreeMap::new()));
         }
 
+        // Supersession-aware fork collapse (ADR 0032). If their line *amended*
+        // our tip, merging would content-merge a version with its own
+        // replacement — resurrecting what the amend removed. Adopt the amend
+        // instead: fast-forward this dock onto their tip. Symmetrically, a
+        // their-tip our own line already superseded has nothing left to offer.
+        // Both tests demand the replacement sit ON the other line — a
+        // supersession elsewhere in the shared store proves nothing here.
+        if self.repo.supersedes(&ours, &their) {
+            return Ok((name.to_string(), BTreeMap::new()));
+        }
+        if self.repo.supersedes(&their, &ours) {
+            self.repo
+                .materialize(Some(&ours), &their, &self.identity, self.now)
+                .map_err(|e| e.to_string())?;
+            self.tip = Some(their.clone());
+            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            self.persist()?;
+            return Ok((name.to_string(), BTreeMap::new()));
+        }
+
         // Reconcile the two lines into a merge change (reuses converge), then sign
         // it and make it this dock's tip.
         let msg = format!("merge dock '{name}' into '{}'", self.dock);
@@ -1303,21 +1444,58 @@ impl Workspace {
     /// head, or an in-progress working change (the caller's to finalize first —
     /// `pull`/`apply` have none), is a no-op. Returns the per-path merge outcomes.
     pub fn converge_heads(&mut self, base: Option<&Oid>) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        if self.working.is_some() {
+            return Ok(BTreeMap::new());
+        }
+        // Drop **superseded** heads before collapsing forks (ADR 0032): a solo
+        // amend arriving from a peer must land as a clean replacement — never
+        // content-merged with the version it superseded (which would resurrect
+        // exactly what the amend removed). The dropped head stays in the store;
+        // it just stops being live, like an abandoned version.
+        let superseded = self.repo.superseded_versions();
+        let stale: Vec<Oid> = self
+            .repo
+            .heads()
+            .into_iter()
+            .filter(|h| superseded.contains(h))
+            .collect();
+        for h in &stale {
+            self.repo.abandon_head(h);
+        }
         let heads = self.repo.heads();
-        if heads.len() <= 1 || self.working.is_some() {
+        if heads.len() <= 1 {
+            // Nothing left to merge — but if dropping superseded heads moved
+            // the dock off its old tip (the solo-amend case), adopt the
+            // survivor: re-point the tip and materialize its tree.
+            if let (Some(survivor), true) = (heads.first().cloned(), !stale.is_empty()) {
+                let from = base.cloned().or_else(|| self.anchor());
+                if from.as_ref() != Some(&survivor) {
+                    if self.docks_active() {
+                        self.tip = Some(survivor.clone());
+                        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+                    }
+                    self.repo
+                        .materialize(from.as_ref(), &survivor, &self.identity, self.now)
+                        .map_err(|e| e.to_string())?;
+                    self.persist()?;
+                }
+            }
             return Ok(BTreeMap::new());
         }
         let ours = base
             .cloned()
             .filter(|b| heads.contains(b))
-            .or_else(|| self.anchor())
+            .or_else(|| self.anchor().filter(|a| heads.contains(a)))
             .or_else(|| heads.first().cloned())
             .ok_or("nothing to converge onto")?;
         let others: Vec<Oid> = heads.into_iter().filter(|h| h != &ours).collect();
         if others.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let from = ours.clone();
+        // Materialize diffs from what the DISK currently shows — the caller's
+        // pre-pull base even if it was just dropped as superseded — not from
+        // whichever head the merge starts on.
+        let from = base.cloned().unwrap_or_else(|| ours.clone());
         let mut acc = ours;
         let mut all: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
         for h in others {
@@ -1362,10 +1540,12 @@ impl Workspace {
         // nothing to sign and the resolution (and every descendant) was
         // stranded as untravelable working history.
         if let Some(signer) = &self.signer {
-            // Finalize over `version_id ‖ change_id` (ADR 0029), like every other
-            // finalize path — `resolve` mints a durable change id for the change.
+            // Finalize over `version_id ‖ change_id ‖ predecessors` (ADR
+            // 0029/0032), like every other finalize path — `resolve` mints a
+            // durable change id for the change (and no predecessors).
             let cid = self.repo.change_change_id(&change_id);
-            let sig = signer.sign(&loot_core::change_signing_message(&change_id, &cid));
+            let preds = self.repo.change_predecessors(&change_id);
+            let sig = signer.sign(&loot_core::change_signing_message(&change_id, &cid, &preds));
             self.repo
                 .attach_signature(&change_id, sig)
                 .map_err(|e| e.to_string())?;
@@ -1881,6 +2061,16 @@ pub struct WorkingRow {
     pub message: String,
     pub entries: Vec<(PathBuf, Visibility)>,
     pub empty: bool,
+}
+
+/// What `loot edit` did, for CLI reporting (ADR 0032).
+#[derive(Debug)]
+pub struct EditReport {
+    /// The durable handle the reopened change keeps.
+    pub change_id: [u8; 16],
+    /// The finalized version that was reopened — superseded when the amend
+    /// finalizes (`loot new`).
+    pub superseded: Oid,
 }
 
 /// What a completed `undo`/`op restore` did, for CLI reporting (ADR 0031).
@@ -3057,6 +3247,210 @@ mod tests {
             outcomes.contains_key(&PathBuf::from("their.txt")),
             "the collapse reports the peer's file as a merge outcome"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- ADR 0032: amend via `loot edit` — supersession ---
+
+    /// An authored repo with a two-change line on the home dock: `base` then
+    /// `target` (the amend candidate), tree = `a.txt`. Returns the target's
+    /// version id and durable handle.
+    fn amendable_ws(tag: &str) -> (PathBuf, Workspace, Oid, [u8; 16]) {
+        let dir = std::env::temp_dir().join(format!("loot-edit-{tag}-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("a.txt"), b"target").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let x = ws.repo().heads()[0].clone();
+        let cid = ws.repo().change_change_id(&x).unwrap();
+        (dir, ws, x, cid)
+    }
+
+    #[test]
+    fn edit_reopens_a_change_and_finalize_supersedes_it() {
+        let (dir, mut ws, x, cid) = amendable_ws("e2e");
+        let report = ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        assert_eq!(report.superseded, x);
+        assert_eq!(report.change_id, cid);
+        let reopened = ws.working_id().cloned().expect("the reopen is the working change");
+        assert_eq!(ws.repo().change_change_id(&reopened), Some(cid), "handle carried");
+        assert_eq!(ws.repo().change_predecessors(&reopened), vec![x.clone()]);
+        assert!(ws.repo().superseded_versions().contains(&x), "the claim is live from the reopen");
+        assert!(!ws.divergent_change_ids().contains(&cid), "an amend is not divergence");
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"target",
+            "the tree already showed the target — edit materializes nothing"
+        );
+
+        // Amend and finalize: a NEW signed version under the SAME handle.
+        std::fs::write(dir.join("a.txt"), b"target amended").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let live = ws.repo().versions_of_change(&cid, &Default::default());
+        assert_eq!(live.len(), 1, "one live version — no divergence, no resurrection");
+        let x2 = live.into_iter().next().unwrap();
+        assert_ne!(x2, x, "the amend minted a new version id");
+        assert_eq!(ws.repo().change_change_id(&x2), Some(cid), "…under the same change id");
+        assert_eq!(ws.repo().change_predecessors(&x2), vec![x.clone()], "…naming what it supersedes");
+        assert!(ws.repo().change_signature(&x2).is_some(), "…and signed, so the claim travels");
+        // The live view shows exactly one row for the change; the superseded
+        // version is hidden the way an abandoned one is.
+        let hist = ws.history().unwrap();
+        let showing: Vec<&HistoryRow> =
+            hist.rows.iter().filter(|r| r.change_id == Some(cid)).collect();
+        assert_eq!(showing.len(), 1, "the superseded version left the live view");
+        assert_eq!(showing[0].version, x2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_refuses_descendants_dirt_wip_and_divergence() {
+        use loot_core::Change;
+        let (dir, mut ws, x, cid) = amendable_ws("guards");
+        let letters = loot_core::hex::letters(&cid);
+
+        // A change with descendants (the base under the target) is not editable.
+        let base = ws.repo().parents_of(&x).into_iter().next().unwrap();
+        let base_cid = ws.repo().change_change_id(&base).unwrap();
+        let err = ws.edit(&loot_core::hex::letters(&base_cid)).unwrap_err();
+        assert!(err.contains("descendants"), "unexpected: {err}");
+
+        // Uncaptured edits on disk: edit refuses instead of capturing (the ADR
+        // 0030 exception class) — the e6fde8e sweep must be impossible here.
+        std::fs::write(dir.join("b.txt"), b"uncaptured").unwrap();
+        let err = ws.edit(&letters).unwrap_err();
+        assert!(err.contains("uncaptured"), "unexpected: {err}");
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+
+        // An in-progress working change: same refusal family.
+        std::fs::write(dir.join("a.txt"), b"wip").unwrap();
+        ws.snapshot("wip").unwrap();
+        let err = ws.edit(&letters).unwrap_err();
+        assert!(err.contains("working change is in progress"), "unexpected: {err}");
+        ws.finalize_working().unwrap();
+
+        // A divergent handle: refuse with the abandon-first remedy. Seed two
+        // live versions of one handle below the current head (the S3 amend
+        // primitive, as the abandon tests do).
+        let head = ws.repo().heads()[0].clone();
+        let dcid = [9u8; 16];
+        ws.with_repo(|repo| {
+            for msg in ["A", "B"] {
+                repo.record_carrying(
+                    Change {
+                        id: Oid([0; 32]),
+                        parents: vec![head.clone()],
+                        message: msg.into(),
+                        tree: Default::default(),
+                    },
+                    Some(dcid),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(ws.divergent_change_ids().contains(&dcid), "precondition: divergent");
+        let err = ws.edit(&loot_core::hex::letters(&dcid)).unwrap_err();
+        assert!(err.contains("divergent"), "unexpected: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_is_one_undoable_operation() {
+        let (dir, mut ws, x, cid) = amendable_ws("undo");
+        ws.record_op("new", "finalize target", false); // the undo floor
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap(); // records its own op
+        assert!(ws.working_id().is_some(), "the reopen is in progress");
+
+        let r = ws.undo().unwrap();
+        let _ = r;
+        assert!(ws.working_id().is_none(), "undo closed the reopen");
+        assert_eq!(ws.repo().heads(), vec![x.clone()], "the view is back on the target");
+        assert!(
+            ws.repo().superseded_versions().is_empty(),
+            "the unfinalized claim left the view with the reopen"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"target",
+            "the tree is untouched — edit never materialized anything to walk back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shared setup for the collapse tests: main holds `target` (a.txt =
+    /// "target"); an `amender` dock reopens it and finalizes an amended version.
+    /// Returns main's pre-amend tip `x` and the amend `x2`, with `ws` on main.
+    fn amended_on_a_dock(tag: &str) -> (PathBuf, Workspace, Oid, Oid) {
+        let (dir, mut ws, x, cid) = amendable_ws(tag);
+        ws.dock_goto("amender").unwrap();
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir.join("a.txt"), b"target amended").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let x2 = ws
+            .repo()
+            .versions_of_change(&cid, &Default::default())
+            .into_iter()
+            .next()
+            .unwrap();
+        ws.dock_goto("main").unwrap();
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"target", "main still pre-amend");
+        (dir, ws, x, x2)
+    }
+
+    #[test]
+    fn dock_merge_adopts_an_amend_as_a_fast_forward() {
+        // ADR 0032: merging a dock whose line SUPERSEDES our tip must not
+        // content-merge the two versions (that would resurrect what the amend
+        // removed) — it adopts the amend.
+        let (dir, mut ws, _x, x2) = amended_on_a_dock("dockff");
+        let nodes_before = ws.repo().log_detailed().len();
+        let (_name, outcomes) = ws.merge_dock("amender").unwrap();
+        assert!(outcomes.is_empty(), "a supersession adopts — no merge outcomes");
+        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "no merge node minted");
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"target amended",
+            "main adopted the amend"
+        );
+        assert!(ws.divergent_change_ids().is_empty(), "a solo amend never renders divergence");
+        // And the mirror case: merging main back into the amender is a no-op —
+        // our superseded tip has nothing to offer their line.
+        ws.dock_goto("amender").unwrap();
+        let (_n, back) = ws.merge_dock("main").unwrap();
+        assert!(back.is_empty(), "the superseded direction is a no-op");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"target amended");
+        let _ = x2;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn converge_heads_drops_a_superseded_head_without_merging() {
+        // The peer-side pull path (ADR 0032): a solo amend arrives as a sibling
+        // head; converge must DROP the superseded side and adopt the amend —
+        // never fold the two into a content merge.
+        let (dir, mut ws, x, x2) = amended_on_a_dock("convdrop");
+        let nodes_before = ws.repo().log_detailed().len();
+        let outcomes = ws.converge_heads(Some(&x)).unwrap();
+        assert!(outcomes.is_empty(), "dropping a superseded head is not a merge");
+        assert_eq!(
+            ws.repo().log_detailed().len(),
+            nodes_before - 1,
+            "the superseded head left the live view; no merge node was minted"
+        );
+        assert_eq!(ws.repo().heads(), vec![x2.clone()], "the amend is the sole head");
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"target amended",
+            "the amend materialized"
+        );
+        assert!(ws.divergent_change_ids().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -39,6 +39,8 @@ fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
     format::put_author_sig(out, &c.author, &c.signature);
     // v6: the durable change_id follows (ADR 0029).
     format::put_change_id(out, &c.change_id);
+    // v7: the superseded predecessors follow (ADR 0032).
+    format::put_predecessors(out, &c.predecessors);
 }
 
 fn encode_object(obj: &SealedObject) -> Vec<u8> {
@@ -220,6 +222,7 @@ pub fn decode_nodes(b: &[u8]) -> Result<Vec<ChangeNode>, RepoError> {
         }
         let (author, signature) = format::read_author_sig(&mut c, major)?;
         let change_id = format::read_change_id(&mut c, major)?;
+        let predecessors = format::read_predecessors(&mut c, major)?;
         nodes.push(ChangeNode {
             id,
             parents,
@@ -228,6 +231,7 @@ pub fn decode_nodes(b: &[u8]) -> Result<Vec<ChangeNode>, RepoError> {
             author,
             signature,
             change_id,
+            predecessors,
         });
     }
     Ok(nodes)
@@ -464,6 +468,7 @@ mod tests {
             author: None,
             signature: None,
             change_id: None,
+            predecessors: Vec::new(),
         });
         g
     }
@@ -528,21 +533,31 @@ mod tests {
     }
 
     #[test]
-    fn golden_v6_graph_matches_and_round_trips() {
-        // v6 adds the durable change_id (ADR 0029). For this unauthored sample it
-        // appends a single change_id-absent byte after the author+signature bytes,
-        // so the expected v6 golden is the v4 body with the marker bumped and one
-        // trailing zero.
+    fn golden_v7_graph_matches_and_round_trips() {
+        // v6 added the durable change_id (ADR 0029); v7 adds the predecessors
+        // list (ADR 0032). For this unauthored sample they append a single
+        // change_id-absent byte and a 4-byte zero predecessors count after the
+        // author+signature bytes, so the expected v7 golden is the v4 body with
+        // the marker bumped and five trailing zeros. A v6 graph (one trailing
+        // zero) still decodes as predecessors-empty.
+        let mut golden_v7 = GOLDEN_GRAPH_V4.to_vec();
+        golden_v7[0] = format::FORMAT_MAJOR;
+        golden_v7.extend_from_slice(&[0, 0, 0, 0, 0]); // change_id absent + preds count 0
+        assert_eq!(encode_graph(&one_change_graph()), golden_v7, "v7 graph layout must not drift");
+        assert_eq!(decode_graph(&golden_v7).unwrap().in_order().len(), 1);
+
         let mut golden_v6 = GOLDEN_GRAPH_V4.to_vec();
-        golden_v6[0] = format::FORMAT_MAJOR;
+        golden_v6[0] = 6;
         golden_v6.push(0); // change_id absent
-        assert_eq!(encode_graph(&one_change_graph()), golden_v6, "v6 graph layout must not drift");
-        assert_eq!(decode_graph(&golden_v6).unwrap().in_order().len(), 1);
+        let g = decode_graph(&golden_v6).unwrap();
+        assert_eq!(g.in_order().len(), 1);
+        assert!(g.in_order()[0].predecessors.is_empty(), "pre-v7 change has no predecessors");
     }
 
     #[test]
-    fn durable_change_id_round_trips() {
-        // A present durable change_id survives encode/decode on disk (ADR 0029).
+    fn durable_change_id_and_predecessors_round_trip() {
+        // A present durable change_id (ADR 0029) and a supersession claim (ADR
+        // 0032) survive encode/decode on disk.
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from("a.txt"), (Oid([2; 32]), Visibility::Public));
         let mut g = ChangeGraph::new();
@@ -554,9 +569,11 @@ mod tests {
             author: Some([7; 32]),
             signature: None,
             change_id: Some([0xAB; 16]),
+            predecessors: vec![Oid([0xCD; 32])],
         });
         let back = decode_graph(&encode_graph(&g)).unwrap();
         assert_eq!(back.in_order()[0].change_id, Some([0xAB; 16]));
+        assert_eq!(back.in_order()[0].predecessors, vec![Oid([0xCD; 32])]);
     }
 
     #[test]

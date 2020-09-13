@@ -59,6 +59,7 @@ const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
     ("status", cmd_status),
     ("describe", cmd_describe),
     ("new", cmd_new),
+    ("edit", cmd_edit),
     ("abandon", cmd_abandon),
     ("undo", |_| cmd_undo()),
     ("op", cmd_op),
@@ -99,6 +100,7 @@ usage:
   loot status [--porcelain|--json]          show the working change read-only (live version id + durable change id; no snapshot)
   loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
+  loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
   loot abandon <version-id>                 drop a version from a divergent change (marked `!` in log), leaving one; undoable
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
@@ -388,6 +390,21 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
         None => println!("nothing to finalize; started fresh change {next}"),
     }
     ws.record_op("new", &desc, false);
+    Ok(())
+}
+
+/// `loot edit <change-id>` — reopen a finalized change as the working change,
+/// superseding it (ADR 0032): jj-parity `jj edit`. The reopened change keeps its
+/// durable handle; finalizing (`loot new`) signs a new version whose
+/// `predecessors` names the old one, so the replacement travels. Refuses on an
+/// in-progress working change or uncaptured edits (edit *replaces* the working
+/// change — it never implicit-captures), on a divergent handle, and on a change
+/// with descendants. One undoable operation (ADR 0031).
+fn cmd_edit(args: &[String]) -> Result<(), String> {
+    let prefix = first_positional(args).ok_or("usage: loot edit <change-id>")?;
+    let mut ws = Workspace::open()?;
+    let report = ws.edit(prefix)?;
+    print!("{}", render::edit_done(&report));
     Ok(())
 }
 

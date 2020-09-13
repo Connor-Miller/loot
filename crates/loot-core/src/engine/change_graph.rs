@@ -13,9 +13,10 @@ use std::path::PathBuf;
 /// A node in the change DAG.
 #[derive(Clone)]
 pub struct ChangeNode {
-    /// The **version id** (ADR 0029): `compute_change_id(author ‖ message ‖
-    /// parents ‖ tree)`. Content-and-author-derived, so it rewrites on every
-    /// snapshot; carries dedup, DAG parent edges, and sync addressing.
+    /// The **version id** (ADR 0029/0032): `compute_change_id(author ‖ message
+    /// ‖ parents ‖ tree ‖ predecessors)`. Content-and-author-derived, so it
+    /// rewrites on every snapshot; carries dedup, DAG parent edges, and sync
+    /// addressing.
     pub id: Oid,
     pub parents: Vec<Oid>,
     pub message: String,
@@ -35,17 +36,41 @@ pub struct ChangeNode {
     /// `id` — it is a label, not a graph edge. `None` for a legacy (pre-v6) or
     /// unauthored change.
     pub change_id: Option<[u8; 16]>,
+    /// The version ids this version **supersedes** (v7, ADR 0032): `loot edit`
+    /// reopens a finalized change as a sibling and names the reopened version
+    /// here, so "X′ replaces X" travels as signed data instead of a local-only
+    /// abandon. Unlike `change_id`, predecessors are authored content — they are
+    /// folded into `id` (like `parents`) and covered by the finalize signature.
+    /// Empty for an ordinary change and for legacy/unauthored/bridge nodes.
+    /// Canonically sorted (see [`canonical_predecessors`]).
+    pub predecessors: Vec<Oid>,
+}
+
+/// Canonicalize a predecessors list for hashing/signing (ADR 0032): sorted,
+/// deduplicated. Both the id computation and the signing message consume the
+/// canonical form, so two writers naming the same set agree byte-for-byte.
+pub fn canonical_predecessors(predecessors: &[Oid]) -> Vec<Oid> {
+    let mut p = predecessors.to_vec();
+    p.sort();
+    p.dedup();
+    p
 }
 
 /// Content-and-author-derived change id: hash of the author pubkey (when
-/// present), message, parents, and the path/address tree. Pure; identical
-/// changes get identical ids (idempotent commit/apply).
+/// present), message, parents, the path/address tree, and — when non-empty —
+/// the `predecessors` it supersedes (v7, ADR 0032). Pure; identical changes get
+/// identical ids (idempotent commit/apply).
 ///
 /// Folding the author in first makes authorship intrinsic (ADR 0018): the same
 /// edit by two identities yields distinct ids. `author = None` reproduces the
 /// pre-authorship id exactly, so legacy/unauthored changes are unchanged and
-/// "newer reads older" holds.
-pub fn compute_change_id(author: Option<&[u8; 32]>, change: &Change) -> Oid {
+/// "newer reads older" holds. Predecessors likewise hash only when present —
+/// behind a domain tag so they can never collide with tree bytes — so every
+/// pre-v7 id (and every ordinary v7 id) is byte-identical to before. Folding
+/// them in is load-bearing: a no-op amend (same author/message/parents/tree)
+/// must still mint a *distinct* version, or "X′ supersedes X" would collapse
+/// into X superseding itself.
+pub fn compute_change_id(author: Option<&[u8; 32]>, change: &Change, predecessors: &[Oid]) -> Oid {
     let mut h = blake3::Hasher::new();
     if let Some(a) = author {
         h.update(a);
@@ -58,6 +83,12 @@ pub fn compute_change_id(author: Option<&[u8; 32]>, change: &Change) -> Oid {
         h.update(path.to_string_lossy().as_bytes());
         h.update(&[0]);
         h.update(&oid.0);
+    }
+    if !predecessors.is_empty() {
+        h.update(b"\0predecessors\0");
+        for p in canonical_predecessors(predecessors) {
+            h.update(&p.0);
+        }
     }
     Oid(*h.finalize().as_bytes())
 }
@@ -74,18 +105,28 @@ pub fn mint_change_id() -> [u8; 16] {
     id
 }
 
-/// The message the finalize signature covers (ADR 0029): the **version id**,
-/// followed by the **change id** when one is present. A legacy change (`change_id
-/// = None`) signs over the 32-byte version id alone, so its pre-v6 signature
-/// still verifies unchanged; a v6 change binds "(this change id → this exact
-/// version, by this author)" by widening the signed message 16 bytes. The change
-/// id is never folded into the version-id hash — the signature is a proof *over*
-/// both ids, sitting beside the node.
-pub fn change_signing_message(version_id: &Oid, change_id: &Option<[u8; 16]>) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(48);
+/// The message the finalize signature covers (ADR 0029/0032): the **version
+/// id**, the **change id** when one is present, then the **predecessors** when
+/// any (v7). A legacy change (`change_id = None`) signs over the 32-byte
+/// version id alone, so its pre-v6 signature still verifies unchanged; a v6
+/// change binds "(this change id → this exact version, by this author)" by
+/// widening the signed message 16 bytes; a superseding change (ADR 0032)
+/// widens it again with each 32-byte predecessor. Predecessors are *also*
+/// folded into the version-id hash, but ingest trusts the id it received —
+/// covering them in the signed message directly is what makes stripping a
+/// supersession claim on the wire detectable without recomputing ids.
+pub fn change_signing_message(
+    version_id: &Oid,
+    change_id: &Option<[u8; 16]>,
+    predecessors: &[Oid],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(48 + 32 * predecessors.len());
     msg.extend_from_slice(&version_id.0);
     if let Some(cid) = change_id {
         msg.extend_from_slice(cid);
+    }
+    for p in canonical_predecessors(predecessors) {
+        msg.extend_from_slice(&p.0);
     }
     msg
 }
@@ -337,6 +378,7 @@ mod tests {
             author: None,
             signature: None,
             change_id: None,
+            predecessors: Vec::new(),
         }
     }
 
