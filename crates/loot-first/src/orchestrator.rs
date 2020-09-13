@@ -8,6 +8,7 @@
 //! [`crate::forge::FakeForge`] without a real Workspace or network.
 
 use crate::forge::{Forge, PrState};
+use crate::harbor::HarborLock;
 use loot_cli::ledger::{PrLane, PrMap};
 use crate::policy::{
     approval, dock_targeting, interpret_landing, parse_review_line, pre_land, review_currency,
@@ -16,6 +17,16 @@ use crate::policy::{
 use loot_cli::ferry::{self, WipState};
 use loot_cli::workspace::Workspace;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long a land waits for a concurrent land to release the harbor lock
+/// before giving up (ADR 0036). A land's git-main section is a few seconds, so
+/// a generous wait lets a queue of agents drain rather than erroring on the
+/// first contention.
+const HARBOR_WAIT: Duration = Duration::from_secs(120);
+/// A harbor lock older than this is presumed a crashed land and broken so the
+/// harbor can never wedge permanently.
+const HARBOR_STALE: Duration = Duration::from_secs(600);
 
 /// The local-only ledger/mirror paths under `.loot/git-mirror/`.
 struct Paths {
@@ -352,16 +363,61 @@ pub fn land(
     ws.finalize_capturing(&[], false)?;
     ws.record_op("new", "finalize (loot-first land)", false);
 
+    // The harbor (ADR 0036): one land projects to git-main at a time. Take the
+    // shared-store lock *after* the slow pre-land tests and the git-quiet
+    // finalize, and hold it only across the git-main-critical section below —
+    // ferry's projection, the fast-forward push, the PR-head collapse. A
+    // concurrent land from another lane waits here, then ferries against the
+    // main this one moved (ferry's ingest→reconcile converges the two lines; the
+    // lock removes only the *race*). RAII: every `?` below releases the harbor.
+    println!(">>> harbor: acquiring the land lock");
+    let harbor = HarborLock::acquire(ws.store().harbor_lock(), HARBOR_WAIT, HARBOR_STALE)?;
+    // The pre-ferry mirror tip — proof the land actually moved main (#195).
+    let main_before = mirror_main_sha(&p.mirror).ok();
+
     println!(">>> loot ferry  (project signed change → main, reap the lane)");
     let fr = ferry::run(ws, None, None, /* with_wip */ false)?;
     for note in &fr.notes {
         println!("  {note}");
     }
 
+    // Conflict-bounce (ADR 0036): if this change collided with work that landed
+    // on main while the lane worked, ferry holds the conflicted paths at their
+    // last clean state and never cleanly integrates the change. Do not push a
+    // partial land — bounce it back to this agent. The signed change is
+    // untouched in the store and nothing reached GitHub (the harbor drops here).
+    if !ws.conflicts().is_empty() {
+        let paths: Vec<String> = ws.conflicts().keys().map(|p| p.display().to_string()).collect();
+        return Err(format!(
+            "harbor bounce: this change conflicts with what landed on main while you worked \
+             ({}) — nothing was pushed and your signed change is safe. Reconcile each with \
+             `loot resolve <path> <file>`, then re-run `loot-first land --pr {pr}`.",
+            paths.join(", ")
+        ));
+    }
+
     let main_sha = mirror_main_sha(&p.mirror)?;
+    // #195 guard: a ferry that could not project this change to main (a lane
+    // never merged into the harbor) leaves main exactly where it was — yet the
+    // collapse-and-auto-close below would still emit a green `landed:`. Refuse
+    // loudly rather than land a lie. The first land ever (empty mirror before,
+    // so `main_before == None`) is unaffected — see [`harbor_moved_main`].
+    if !harbor_moved_main(main_before.as_deref(), &main_sha) {
+        return Err(format!(
+            "harbor: git-main did not move (still {}) — this lane's change was not integrated \
+             into the harbor, so there is nothing to collapse the PR onto (issue #195). \
+             Nothing was pushed; check the `loot ferry` output above.",
+            &main_sha[..main_sha.len().min(12)]
+        ));
+    }
+
     println!(">>> publish main + collapse PR head → {}", &main_sha[..main_sha.len().min(8)]);
     let mut sleep = || std::thread::sleep(std::time::Duration::from_secs(2));
     let status = execute_landing(forge, pr, &lane.change, &lane.dock, &main_sha, 10, &mut sleep)?;
+
+    // git-main is published; free the harbor before the relay push (independent
+    // of git-main) and the lane-landed bookkeeping so the next agent proceeds.
+    harbor.release();
 
     println!(">>> loot push  (relay)");
     if let Err(e) = relay_push(&p.root) {
@@ -390,6 +446,16 @@ pub fn land(
         }
     }
     Ok(())
+}
+
+/// The #195 guard, as a pure decision: did this land actually move git-main?
+/// `before` is the mirror tip captured before ferry; `after` the tip after. A
+/// land that leaves them equal never integrated its change into the harbor and
+/// must refuse, not false-report `landed:`. `before == None` (the empty mirror
+/// before the very first land) never equals a real post-ferry sha, so the first
+/// land always reads as moved.
+fn harbor_moved_main(before: Option<&str>, after: &str) -> bool {
+    before != Some(after)
 }
 
 fn landing_word(s: LandingStatus) -> &'static str {
@@ -603,6 +669,19 @@ mod tests {
 
     fn no_sleep() -> impl FnMut() {
         || {}
+    }
+
+    #[test]
+    fn harbor_guard_refuses_a_no_op_land() {
+        // #195: a ferry that leaves main where it was must read as "not moved".
+        assert!(!harbor_moved_main(Some("abc123"), "abc123"), "unchanged main = not integrated");
+    }
+
+    #[test]
+    fn harbor_guard_passes_when_main_advances() {
+        assert!(harbor_moved_main(Some("abc123"), "def456"), "advanced main = integrated");
+        // First land ever: empty mirror before can never match a real sha.
+        assert!(harbor_moved_main(None, "def456"), "first land is always a move");
     }
 
     #[test]

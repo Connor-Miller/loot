@@ -20,5 +20,6 @@
 //!   Workspace + ferry + Forge + ledgers + policy.
 
 pub mod forge;
+pub mod harbor;
 pub mod orchestrator;
 pub mod policy;
