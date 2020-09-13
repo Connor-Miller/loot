@@ -120,6 +120,10 @@ pub struct DagRepo {
     attestations: AttestationLog,
 }
 
+/// **Custody face** (R3, #179): key management as verbs — grant, sealed grant,
+/// maroon, migrate, escrow flush — plus the manifest/visibility reads that
+/// audit it. "Permissioning is key management" (ADR 0003/0007/0008/0010);
+/// everything that mints, hands over, or revokes a content key lives here.
 impl DagRepo {
     /// Whether this identity is entitled to hold the key for content with these
     /// grant ids — used to decide what to file into the local keyring.
@@ -439,12 +443,6 @@ impl DagRepo {
         &self.manifest
     }
 
-    /// The raw content key for `oid`, if held. Used by the CLI to seal the key
-    /// for relay delivery of grant bundles without pulling crypto into the engine.
-    pub fn content_key_for(&self, oid: &Oid) -> Option<[u8; 32]> {
-        self.keyring.key_for(oid)
-    }
-
     /// Every embargoed path in the current tree whose content key this repo
     /// holds — `(path, oid, reveal_at)`. The key may sit in the Keyring
     /// (reveal passed) or still in Escrow (originator staging, ADR 0007);
@@ -482,6 +480,12 @@ impl DagRepo {
             .ok_or(RepoError::NotFound(Oid([0; 32])))
     }
 
+}
+
+/// **Reconcile & relay face** (R3, #179): what happens when lines of history
+/// meet — the conflict set and its resolution, the relay's append-only `stow`,
+/// and the `apply_sync` machinery under the classifier (ADR 0001/0011).
+impl DagRepo {
     /// All unresolved conflicts from the last `apply`, keyed by path.
     /// Each value is `(our_oid, their_oid)`.
     pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
@@ -706,12 +710,18 @@ impl DagRepo {
         None
     }
 
+}
+
+/// **Persistence & gc face** (R3, #179): the `.loot/` round-trip — save/load
+/// via the RepoStore (the layout's single owner, ADR 0017), loose-object gc
+/// (ADR 0012). No policy: what a change means lives in the other faces.
+impl DagRepo {
     /// Every content address in the live set for `gc`: anything referenced by
     /// any change in the graph — across ALL changes, not just the current heads,
     /// and including working changes (every dock's in-progress node rides in the
     /// loaded graph, ADR 0022) — plus the sides of unresolved conflicts.
     /// Anything in the object store outside this set is unreachable (ADR 0012).
-    pub fn referenced_oids(&self) -> BTreeSet<Oid> {
+    fn referenced_oids(&self) -> BTreeSet<Oid> {
         let mut live = BTreeSet::new();
         for node in self.graph.in_order() {
             for (oid, _vis) in node.tree.values() {
@@ -823,7 +833,13 @@ impl DagRepo {
         std::fs::write(store.attestations(), encode_attestations(&self.attestations)).map_err(io)?;
         Ok(())
     }
+}
 
+/// **Snapshot face** (R3, #179): the working tree becomes the working change —
+/// visibility-aware reconcile against the base, in-place rewrite, unchanged-
+/// path reuse (#98), the demotion guard (#62), and the eager change-id
+/// assignment (ADR 0029/0030).
+impl DagRepo {
     /// Visibility-aware snapshot of a working tree into the working change
     /// (ADR 0006). `entries` is the tree the caller can see — `(path, bytes,
     /// intended visibility)` — typically every file the Workspace read from disk.
@@ -998,7 +1014,13 @@ impl DagRepo {
         };
         self.record_carrying(change, carried_change_id)
     }
+}
 
+/// **History & identity face** (R3, #179): the change graph as data —
+/// authorship and signatures (ADR 0018), durable change ids and divergence
+/// (ADR 0029), per-change reads, attestations (S4), log shapes, and the
+/// surface/materialize path that turns a tip back into a tree.
+impl DagRepo {
     /// Set this repo's author pubkey (S3, ADR 0018): the workspace calls this
     /// after loading the identity keypair, so new changes fold the author into
     /// their id and can be signed at finalization. Left unset, changes stay
@@ -1741,6 +1763,10 @@ impl Repo for DagRepo {
     }
 }
 
+/// **Sync-negotiation face** (R3, #179): the wire conversation — what we'd
+/// offer, what we lack, and the batched bundles for a want set (S5/S6,
+/// ADR 0021/0024). The 9-method `Repo` trait above is the narrow generic face
+/// loot-net and the bench consume; this is its object-level negotiation twin.
 impl DagRepo {
     /// Returns `true` if the repo has any authored-but-unsigned change (a working
     /// change the author has not yet signed). Such changes are excluded from
