@@ -118,7 +118,7 @@ const COMMANDS: &[Verb] = &[
     verb("surface", &[], &[], |_| cmd_surface()),
     verb("lane", &["--ticket", "--name", "--at", "--stale-hours"], OUT, cmd_lane),
     verb("lanes", &[], OUT, cmd_lane_list),
-    verb("log", &[], &[], cmd_log),
+    verb("log", &["--path"], &[], cmd_log),
     verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
     verb("verify", &[], &[], |_| cmd_verify()),
     verb("bundle", &[], &[], cmd_bundle),
@@ -175,7 +175,7 @@ usage:
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
   loot surface                              materialize what the current identity may see
-  loot log [<selector>]                     show change history, or the ancestry of one point in it; selectors: @, HEAD, HEAD~<n>, id prefix
+  loot log [<selector>] [--path <path>]     show change history, or the ancestry of one point in it; selectors: @, HEAD, HEAD~<n>, id prefix; --path filters to changes whose recorded tree includes <path> (#6) — combine both to intersect (the selector's ancestry AND the path)
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
   loot verify                               integrity-check the object store: rehash every object, find missing ones (exits 1 on problems)
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
@@ -226,7 +226,7 @@ info flags (no repo needed):
   -V, --version           print the loot version and exit
 
 a flag a verb does not accept is an error, never ignored (#67) — a typo like
-  `loot log --path x` refuses instead of printing the unfiltered log as if the
+  `loot log --verbose` refuses instead of printing the unfiltered log as if the
   filter had run. That holds within a verb too (#278): `loot lane new
   --stale-hours 12` refuses (`--stale-hours` belongs to `lane gc`) rather than
   reading as accepted and doing nothing.";
@@ -285,6 +285,26 @@ fn out_fmt(args: &[String]) -> OutFmt {
 /// most one positional.
 fn first_positional(args: &[String]) -> Option<&str> {
     args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
+}
+
+/// `loot log`'s selector positional (#6): like [`first_positional`], but
+/// skips `--path`'s own value, so `loot log --path a.txt HEAD` and `loot log
+/// HEAD --path a.txt` both resolve the selector to `HEAD` — never mistaking
+/// the path filter's argument for the selector (mirrors `positionals()`'s
+/// treatment of `--allow-demote <path>`).
+fn log_selector(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--path" {
+            i += 2; // skip the flag and its value
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            return Some(a);
+        }
+    }
+    None
 }
 
 /// Parse the two snapshotting-verb globals (ADR 0030) — `--allow-demote <path>`
@@ -820,17 +840,18 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// `loot log [<selector>]` — with no argument, unchanged: the full history
-/// (rows newest-first, abandoned versions dropped, the working node rendered
-/// once as the live row, routed flat-vs-branch by distinct change lines, ADR
-/// 0029). With a selector (#305/#315 — `@`, `HEAD`, `HEAD~<n>`, a version or
-/// change-id prefix, the same grammar `loot diff`/`loot attest`/`loot abandon`
-/// speak), the view scopes to that version's **ancestry**
-/// ([`Workspace::ancestors_of`], a full multi-parent walk): rows and, in the
-/// diverged case, each head's lane and the shared section are filtered down to
-/// ids reachable from the selector. The live working row only survives the
-/// filter when the selector names it directly (`loot log @`) — otherwise it is
-/// "now", not history up to the selector, and is dropped.
+/// `loot log [<selector>] [--path <path>]` — with no argument, unchanged: the
+/// full history (rows newest-first, abandoned versions dropped, the working
+/// node rendered once as the live row, routed flat-vs-branch by distinct
+/// change lines, ADR 0029). With a selector (#305/#315 — `@`, `HEAD`,
+/// `HEAD~<n>`, a version or change-id prefix, the same grammar `loot
+/// diff`/`loot attest`/`loot abandon` speak), the view scopes to that
+/// version's **ancestry** ([`Workspace::ancestors_of`], a full multi-parent
+/// walk): rows and, in the diverged case, each head's lane and the shared
+/// section are filtered down to ids reachable from the selector. The live
+/// working row only survives the filter when the selector names it directly
+/// (`loot log @`) — otherwise it is "now", not history up to the selector,
+/// and is dropped.
 ///
 /// This is deliberately the minimal honest scoping, not a general revision-walk
 /// subsystem (#315 scope note): a selector picks the *point*, ancestry answers
@@ -838,6 +859,13 @@ fn human_bytes(bytes: u64) -> String {
 /// membership — `g.heads` still lists every live head exactly as the unscoped
 /// view would, even if a head's own lane renders empty because none of its
 /// rows are in the requested ancestry.
+///
+/// `--path <path>` (#6) narrows independently: a change survives only if its
+/// own recorded tree includes `path` ([`Workspace::filter_history_to_path`]).
+/// It composes with a selector as an intersection — `loot log <selector>
+/// --path <path>` shows the ancestry of `<selector>` filtered to changes that
+/// also touched `<path>` — applied here as two sequential retains, in either
+/// order, over the same view.
 fn cmd_log(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let identity = ws.identity().to_string();
@@ -846,7 +874,11 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
     // once, as the live row), routed flat-vs-branch by distinct change lines
     // (ADR 0029). This function only renders.
     let mut view = ws.history()?;
-    if let Some(sel) = first_positional(args) {
+    // `--path`'s own value is skipped when hunting the selector positional,
+    // so `loot log --path a.txt HEAD` and `loot log HEAD --path a.txt` both
+    // resolve the selector to `HEAD`, not `a.txt` (mirrors `positionals()`'s
+    // treatment of `--allow-demote <path>`).
+    if let Some(sel) = log_selector(args) {
         let target = ws.resolve_selector(sel)?;
         let ancestry = ws.ancestors_of(&target);
         view.rows.retain(|r| ancestry.contains(&r.version));
@@ -859,6 +891,9 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
         if view.working.as_ref().map(|w| &w.version) != Some(&target) {
             view.working = None;
         }
+    }
+    if let Some(p) = flag(args, "--path") {
+        ws.filter_history_to_path(&mut view, std::path::Path::new(p));
     }
     if view.is_empty() {
         println!("no changes yet");
@@ -2622,16 +2657,33 @@ mod tests {
         assert!(err.unwrap_err().contains("stdin was empty"));
     }
 
-    /// The finding itself (pilot finding 11): `loot log --path README.md`
-    /// printed the whole unfiltered log, which reads as "the filter ran and
-    /// matched everything". A flag loot does not implement must fail loudly.
+    /// The finding itself (pilot finding 11): a flag loot does not implement
+    /// must fail loudly instead of silently reading as "the filter ran and
+    /// matched everything". `--path` used to be exactly this trap on `log`
+    /// (it now IS implemented, #6 — see `log_path_flag_is_wired` below) but
+    /// the regression class it guards against is general, so this keeps
+    /// proving it on a flag `log` still does not have.
     #[test]
     fn unknown_flag_is_rejected_not_ignored() {
-        let err = check("log", &["--path", "README.md"]).unwrap_err();
-        assert!(err.contains("--path"), "the error names the offending flag: {err}");
-        assert!(err.contains("takes no flags"), "`loot log` has none to offer: {err}");
+        let err = check("log", &["--verbose", "x"]).unwrap_err();
+        assert!(err.contains("--verbose"), "the error names the offending flag: {err}");
+        assert!(err.contains("accepts: --path"), "`loot log` names --path as its one flag: {err}");
         // A flag that is real elsewhere in the CLI is still unknown here.
         assert!(check("log", &["--porcelain"]).is_err());
+    }
+
+    /// #6: `--path` must be a declared flag on `log` (else the #67 gate would
+    /// reject it, like `--path` itself used to before this ticket), and it
+    /// composes with the existing selector positional (#315) without either
+    /// swallowing the other's argument.
+    #[test]
+    fn log_path_flag_is_wired() {
+        assert_eq!(check("log", &["--path", "README.md"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("log", &["--path", "README.md", "HEAD"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("log", &["HEAD", "--path", "README.md"]), Ok(FlagCheck::Proceed));
+        assert_eq!(log_selector(&args(&["--path", "README.md", "HEAD"])), Some("HEAD"));
+        assert_eq!(log_selector(&args(&["HEAD", "--path", "README.md"])), Some("HEAD"));
+        assert_eq!(log_selector(&args(&["--path", "README.md"])), None, "no selector, just a path filter");
     }
 
     /// The #66 guard, extended from verbs to their flags (#67): every flag the
@@ -2695,6 +2747,7 @@ mod tests {
         assert_eq!(check("lanes", &["--porcelain"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("gc", &["--dry-run"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("gc", &["-n"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("log", &["--path", "a.txt"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("apply", &["b.bundle", "--json"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("grant", &["--relay", "origin", "p", "bob"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("maroon", &["p", "bob", "--hard", "--allow-demote", "a"]), Ok(FlagCheck::Proceed));
