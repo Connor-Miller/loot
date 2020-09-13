@@ -8,7 +8,7 @@
 use loot_cli::emit::{self, Emit, OutFmt};
 use loot_cli::error::CliError;
 use loot_cli::flags::{FlagCheck, FlagSpec};
-use loot_cli::{dup, ferry, grep, pick, render, workspace};
+use loot_cli::{dup, ferry, grep, history, pick, render, workspace};
 use loot_core::{
     verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Visibility,
 };
@@ -153,6 +153,8 @@ const COMMANDS: &[Verb] = &[
     verb("describe", &["-m", "--message", "--allow-demote", "--allow-reveal"], &["--json"], cmd_describe),
     verb("new", &["-m", "--message", "--allow-demote", "--allow-reveal"], NEW_BARE, cmd_new),
     verb("edit", &[], &[], cmd_edit),
+    verb("split", &["-m", "--message"], &[], history::cmd_split),
+    verb("squash", &["--into", "-m", "--message"], &[], history::cmd_squash),
     verb("abandon", &[], &["--head"], cmd_abandon),
     verb("adopt", &[], &["--discard-wip", "--seal-wip"], cmd_adopt),
     verb("cherry-pick", &[], OUT, pick::cmd_cherry_pick),
@@ -217,6 +219,8 @@ usage:
   loot describe -m <message> [--allow-demote <path>]... [--allow-reveal <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
+  loot split -m <subject> <path...>         move the named paths out of the working change into a NEW finalized change BELOW it (ADR 0032 supersede — the lower change keeps the handle, records the original as predecessor); the remainder stays the working change on top; sealed paths split by path (whole-object, no hunk decrypt); the finalized change needs -m (#395)
+  loot squash [--into <selector>] [-m <subject>]  fold the working change's delta UP into its immediate parent, or into an ancestor with --into (walks the parent chain); the target is re-finalized with the combined tree, intervening changes re-anchored onto it, the source abandoned; a clash with an intervening change records conflicts and stops like `apply`; -m renames the target (#396)
   loot abandon <selector>                   drop a version from a divergent change (marked `!` in log), leaving one; undoable; selectors: @, HEAD, HEAD~<n>, id prefix
   loot abandon --head <selector>            drop an independent live head (a whole fork tip); undoable
   loot adopt                                catch this position up to landed main by merging it in (keeps the local line); undoable

@@ -366,6 +366,18 @@ impl DagRepo {
         &self.conflicts
     }
 
+    /// Record a set of unresolved conflicts (path -> `(ours, theirs)`) so
+    /// `loot conflicts`/`loot resolve` see them, exactly as the apply/merge
+    /// paths do. `loot squash --into` (#396) uses this when a path it would
+    /// fold into an ancestor was also touched by an intervening change: the
+    /// fold cannot skip past that edit unambiguously, so it records the clash
+    /// and stops, minting nothing (like `apply`).
+    pub fn record_conflicts(&mut self, conflicts: BTreeMap<PathBuf, (Oid, Oid)>) {
+        for (path, pair) in conflicts {
+            self.conflicts.insert(path, pair);
+        }
+    }
+
     /// Resolve a conflict at `path` by providing the resolution bytes. Seals the
     /// resolution under `vis`, records a resolution change, and removes the path
     /// from the conflict set. Returns `(resolution change id, resolution content

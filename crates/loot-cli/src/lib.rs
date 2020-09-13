@@ -24,6 +24,7 @@ pub mod evolog;
 pub mod ferry;
 pub mod flags;
 pub mod grep;
+pub mod history;
 mod kv;
 pub mod ledger;
 pub mod pick;

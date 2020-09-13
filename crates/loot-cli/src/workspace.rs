@@ -36,7 +36,8 @@ pub use lanes::{LaneStatus, SpawnedLane, SweepOutcome};
 mod reports;
 pub use reports::{
     AdoptCatchupReport, AdoptReport, BurnReport, ConflictSide, ConflictView, DeltaClass,
-    DeltaReport, DuplicateReport, EditReport, PathDelta, PullReport, StepReport, WorkingRow,
+    DeltaReport, DuplicateReport, EditReport, PathDelta, PullReport, SplitReport, SquashReport,
+    StepReport, WorkingRow,
 };
 
 const DOT: &str = ".loot";
@@ -2640,6 +2641,347 @@ impl Workspace {
         Ok(EditReport { change_id: cid, superseded: target })
     }
 
+    /// The shared history-mutation primitive behind `split` and `squash`: record
+    /// `original` afresh as an ADR-0032 **superseding version** whose tree is
+    /// `tree`, parented on `parents`, described by `message`, and **finalize
+    /// (sign) it**. The new version carries `original`'s durable change id and
+    /// `predecessors = [original]`, so `original` reads superseded (never
+    /// deleted) and the replacement travels as signed data — exactly the shape
+    /// [`edit`](Self::edit) produces, reused here so neither verb reinvents
+    /// superseding. `split` moves a path subset DOWN into a new lower change;
+    /// `squash` moves the working delta UP into an ancestor; both cross this one
+    /// seam. Returns the new (signed) version id.
+    fn supersede_with_tree(
+        &mut self,
+        original: &Oid,
+        parents: Vec<Oid>,
+        tree: BTreeMap<PathBuf, (Oid, Visibility)>,
+        message: String,
+    ) -> Result<Oid, CliError> {
+        let carried = self.repo.change_change_id(original);
+        let change = loot_core::Change { id: Oid([0; 32]), parents, message, tree };
+        let version = self
+            .repo
+            .record_superseding(change, carried, vec![original.clone()])
+            .map_err(CliError::from)?;
+        // Sign it at the seam (as `duplicate`/`maroon` sign their recorded
+        // changes) so the moved content is finalized, travelling history.
+        self.sign_change(&version)?;
+        Ok(version)
+    }
+
+    /// `loot split <path...>` (#395, AFK/path-based) — move the named paths out
+    /// of the current working change into a NEW change placed BELOW it. The
+    /// lower **first split** change carries the moved paths and is FINALIZED
+    /// (signed) with `subject`; the **remainder** stays as the working change on
+    /// top, holding the rest.
+    ///
+    /// Predecessor/parent wiring (ADR 0032): the first split change SUPERSEDES
+    /// the original working version — it keeps the original's durable change id
+    /// and records it as its predecessor — and parents on the original's parent
+    /// (the anchor). The remainder gets a FRESH change id and parents on the
+    /// first split. So the original working draft (unsigned, never travelled) is
+    /// abandoned in favour of its two successors, and history reads: anchor ←
+    /// first-split (finalized, the moved paths) ← remainder (working, the rest).
+    ///
+    /// Sealed paths split by path: the entry (sealed oid + visibility) moves
+    /// whole, so no key is needed and no hunk is decrypted. The finalized change
+    /// is signed history, so `subject` must name it (#174) — hunk-level /
+    /// interactive selection is a deliberate future HITL extension, not here.
+    pub fn split(&mut self, paths: &[String], subject: &str) -> Result<SplitReport, CliError> {
+        // A finalized change is permanent, signed history — it must be named,
+        // exactly as `loot new` refuses an un-described change (#174).
+        if is_undescribed(subject) {
+            return Err(REFUSE_SPLIT_UNDESCRIBED.into());
+        }
+        if paths.is_empty() {
+            return Err("usage: loot split -m <subject> <path...>".into());
+        }
+        // Capture the working tree into the working change first (ADR 0030), so
+        // the version we split IS the full on-disk manifest.
+        let msg = self.working_message_or_placeholder();
+        self.snapshot_allowing(&msg, &[])?;
+        let working = self
+            .working
+            .clone()
+            .ok_or("nothing to split — there is no working change (make some edits first)")?;
+        let working_tree = self.repo.change_tree(&working).unwrap_or_default();
+
+        // The anchor the first split parents on: the working change's parent(s).
+        let parents = self.repo.parents_of(&working);
+        let anchor_tree = parents
+            .first()
+            .and_then(|a| self.repo.change_tree(a))
+            .unwrap_or_default();
+
+        // Layer the moved paths onto the anchor's tree. Each named path must be
+        // present in the working change's tree; its entry moves whole (a sealed
+        // entry too — no decrypt).
+        let mut first_tree = anchor_tree.clone();
+        let mut moved: Vec<PathBuf> = Vec::new();
+        for p in paths {
+            let path = PathBuf::from(p);
+            match working_tree.get(&path) {
+                Some(entry) => {
+                    first_tree.insert(path.clone(), entry.clone());
+                }
+                None => {
+                    return Err(format!(
+                        "cannot split '{}' — it is not in the working change",
+                        path.display()
+                    )
+                    .into())
+                }
+            }
+            moved.push(path);
+        }
+        if first_tree == anchor_tree {
+            return Err(
+                "the named paths carry no change over the parent — nothing to split out".into(),
+            );
+        }
+
+        // The first split: a superseding version of the working change (keeps
+        // its handle, records it as predecessor), parented on the anchor, signed.
+        let first =
+            self.supersede_with_tree(&working, parents.clone(), first_tree, subject.to_string())?;
+        let first_change_id = self.repo.change_change_id(&first);
+
+        // The remainder: the new working change on top of the first split — a
+        // FRESH handle, the full tree, carrying the working change's own message.
+        let remainder_msg = self
+            .repo
+            .change_message(&working)
+            .unwrap_or_else(|| UNDESCRIBED_MESSAGE.to_string());
+        let remainder_change = loot_core::Change {
+            id: Oid([0; 32]),
+            parents: vec![first.clone()],
+            message: remainder_msg.clone(),
+            tree: working_tree,
+        };
+        let remainder = self
+            .repo
+            .record_carrying(remainder_change, None)
+            .map_err(CliError::from)?;
+        let remainder_change_id = self.repo.change_change_id(&remainder);
+
+        // Abandon the original unsigned working draft: it never travelled, and
+        // both its successors are recorded, so drop it as a head (its parent is
+        // already the first split's parent — no dangling live head remains).
+        self.repo.drop_working(&working);
+
+        self.working = Some(remainder.clone());
+        self.position.advance(&self.store, Some(first.clone()));
+        // Prime the snapshot-idempotence hash for the remainder's tree so the
+        // next command does not spuriously re-record the unchanged working tree.
+        let (entries, _) = self.read_working_tree()?;
+        let _ = self
+            .store
+            .write_tree_hash(self.dock_opt(), &hash_tree(&entries, &remainder_msg));
+        self.persist()?;
+        self.record_op(
+            "split",
+            &format!(
+                "split {} path(s) out of {} into {}",
+                moved.len(),
+                short_version(&working),
+                short_version(&first)
+            ),
+            false,
+        );
+        Ok(SplitReport {
+            first,
+            first_change_id,
+            remainder,
+            remainder_change_id,
+            moved,
+        })
+    }
+
+    /// `loot squash [--into <selector>]` (#396) — fold the working change's delta
+    /// UP into an ancestor as an ADR-0032 superseding version, re-anchoring any
+    /// intervening changes onto the new ancestor.
+    ///
+    /// No `into`: fold into the IMMEDIATE parent (the `edit`+snapshot+`new`
+    /// case). With `into`: fold into an arbitrary ancestor found by walking the
+    /// first-parent chain — a conflict is possible if an intervening change
+    /// touched a path the fold would move, in which case the clash is recorded
+    /// in the conflicts map and the fold stops (like `apply`), minting nothing.
+    ///
+    /// On a clean fold the target ancestor is re-finalized with the combined
+    /// tree (its own content plus the working delta), each intervening change is
+    /// carried onto it (same delta applied so every manifest stays consistent),
+    /// and the source working draft is abandoned. `message` (`-m`) renames the
+    /// target; otherwise it keeps its subject — and an un-described result is
+    /// refused (#174). Visibility: the folded content re-seals under whatever
+    /// address/visibility the working change already recorded for each path.
+    pub fn squash(
+        &mut self,
+        into: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<SquashReport, CliError> {
+        // Capture the working tree first (ADR 0030) so the delta we fold is the
+        // full on-disk one.
+        let msg = self.working_message_or_placeholder();
+        self.snapshot_allowing(&msg, &[])?;
+        let source = self
+            .working
+            .clone()
+            .ok_or("nothing to squash — there is no working change (make some edits first)")?;
+        let source_tree = self.repo.change_tree(&source).unwrap_or_default();
+
+        let parent = self
+            .repo
+            .parents_of(&source)
+            .into_iter()
+            .next()
+            .ok_or("the working change has no parent to squash into")?;
+        let parent_tree = self.repo.change_tree(&parent).unwrap_or_default();
+
+        // The working change's own delta (what it introduced over its parent).
+        let source_delta = tree_delta(&parent_tree, &source_tree);
+        if source_delta.is_empty() {
+            return Err("the working change is empty — nothing to squash".into());
+        }
+
+        // The fold target: an explicit `--into <selector>`, else the immediate
+        // parent. It must be a finalized ancestor.
+        let target = match into {
+            Some(sel) => self.resolve_selector(sel)?,
+            None => parent.clone(),
+        };
+        if target == source {
+            return Err("cannot squash a change into itself".into());
+        }
+        if self.repo.change_signature(&target).is_none() {
+            return Err(format!(
+                "squash target {} is not finalized — squash folds into a signed ancestor",
+                short_version(&target)
+            )
+            .into());
+        }
+
+        // Walk the first-parent chain from the source down to the target,
+        // collecting the changes strictly between them (source-side first). v1
+        // is linear: a merge on the path refuses rather than guess a parent.
+        let mut intervening: Vec<Oid> = Vec::new();
+        let mut cur = source.clone();
+        loop {
+            let parents = self.repo.parents_of(&cur);
+            if parents.len() > 1 {
+                return Err(format!(
+                    "squash: {} is a merge — v1 folds along a linear chain only",
+                    short_version(&cur)
+                )
+                .into());
+            }
+            let p = parents.into_iter().next().ok_or_else(|| {
+                CliError::from(format!(
+                    "squash: {} is not an ancestor of the working change (reached the root first)",
+                    short_version(&target)
+                ))
+            })?;
+            if p == target {
+                break;
+            }
+            intervening.push(p.clone());
+            cur = p;
+        }
+
+        let target_tree = self.repo.change_tree(&target).unwrap_or_default();
+
+        // A conflict: a path the fold would move that an intervening change also
+        // touched relative to the target — folding past that edit is ambiguous.
+        // The combined intervening effect is `target_tree` vs `parent_tree`.
+        let intervening_delta = tree_delta(&target_tree, &parent_tree);
+        let mut clash: BTreeMap<PathBuf, (Oid, Oid)> = BTreeMap::new();
+        for path in source_delta.keys() {
+            if intervening_delta.contains_key(path) {
+                let ours = parent_tree
+                    .get(path)
+                    .map(|(o, _)| o.clone())
+                    .unwrap_or(Oid([0; 32]));
+                let theirs = source_tree
+                    .get(path)
+                    .map(|(o, _)| o.clone())
+                    .unwrap_or(Oid([0; 32]));
+                clash.insert(path.clone(), (ours, theirs));
+            }
+        }
+        if !clash.is_empty() {
+            let paths: Vec<PathBuf> = clash.keys().cloned().collect();
+            self.repo.record_conflicts(clash);
+            self.persist()?;
+            self.record_op(
+                "squash",
+                &format!(
+                    "squash into {} stopped on {} conflict(s)",
+                    short_version(&target),
+                    paths.len()
+                ),
+                false,
+            );
+            return Ok(SquashReport {
+                folded_into: None,
+                conflicts: paths,
+                rebased: 0,
+            });
+        }
+
+        // The re-finalized target's message: keep its subject unless `-m`
+        // renames it. Signed history — refuse an un-described result (#174).
+        let target_msg = match message {
+            Some(m) => m.to_string(),
+            None => self.repo.change_message(&target).unwrap_or_default(),
+        };
+        if is_undescribed(&target_msg) {
+            return Err(REFUSE_SQUASH_UNDESCRIBED.into());
+        }
+
+        // Fold: apply the working delta onto the target, re-finalized as a
+        // superseding version.
+        let mut combined = target_tree;
+        apply_delta(&mut combined, &source_delta);
+        let target_parents = self.repo.parents_of(&target);
+        let folded_into = self.supersede_with_tree(&target, target_parents, combined, target_msg)?;
+
+        // Carry each intervening change onto the new target, applying the same
+        // delta so its manifest stays consistent (none of them touched the moved
+        // paths — checked above). Oldest (target-side) first.
+        let mut cur_parent = folded_into.clone();
+        let rebased = intervening.len();
+        for id in intervening.iter().rev() {
+            let mut tree = self.repo.change_tree(id).unwrap_or_default();
+            apply_delta(&mut tree, &source_delta);
+            let node_msg = self.repo.change_message(id).unwrap_or_default();
+            cur_parent = self.supersede_with_tree(id, vec![cur_parent.clone()], tree, node_msg)?;
+        }
+
+        // The source's content now lives entirely in the new tip; abandon the
+        // unsigned working draft and start a fresh working change on the tip.
+        self.repo.drop_working(&source);
+        self.working = None;
+        self.position.seed(&self.store, Some(cur_parent.clone()));
+        self.store.clear_tree_hash(self.dock_opt());
+        self.next_change_id = self.repo.mint_next_change_id();
+        self.persist()?;
+        self.record_op(
+            "squash",
+            &format!(
+                "squash {} into {} ({} rebased)",
+                short_version(&source),
+                short_version(&folded_into),
+                rebased
+            ),
+            false,
+        );
+        Ok(SquashReport {
+            folded_into: Some(folded_into),
+            conflicts: Vec::new(),
+            rebased,
+        })
+    }
+
     /// The named-remote registry (`.loot/config`, ADR 0013) as one small value —
     /// the four Workspace forwarders it replaces were interface padding (#177).
     pub fn remotes(&self) -> Remotes {
@@ -3800,6 +4142,61 @@ const REFUSE_UNDESCRIBED: &str = "refusing to sign an un-described working chang
      becomes the permanent subject on git `main`\n  name it:        loot describe -m \"<subject>\"\n  \
      or in one step: loot new -m \"<subject>\"\n  (your edits are captured and safe — only the \
      signature was withheld)";
+
+/// The refusal [`Workspace::split`] prints rather than finalize an un-named
+/// first split change (#174/#395): its subject is signed history, so it must be
+/// given up front with `-m`.
+const REFUSE_SPLIT_UNDESCRIBED: &str =
+    "loot split finalizes the first (lower) change immediately — name it:\n  \
+     loot split -m \"<subject>\" <path...>";
+
+/// The refusal [`Workspace::squash`] prints when the fold target would be
+/// re-finalized with no subject (#174/#396) — name it with `-m`.
+const REFUSE_SQUASH_UNDESCRIBED: &str =
+    "the squash target has no subject and re-finalizing signs it — name it:\n  \
+     loot squash [--into <selector>] -m \"<subject>\"";
+
+/// The path-level delta between two full-manifest trees: every path whose entry
+/// differs maps to `Some(entry)` (added or modified — the new side's entry) or
+/// `None` (deleted — present in `base`, absent from `new`). The shared shape
+/// `squash` uses to name what the working change introduced and what the
+/// intervening changes touched (#396).
+fn tree_delta(
+    base: &BTreeMap<PathBuf, (Oid, Visibility)>,
+    new: &BTreeMap<PathBuf, (Oid, Visibility)>,
+) -> BTreeMap<PathBuf, Option<(Oid, Visibility)>> {
+    let mut delta = BTreeMap::new();
+    for (path, entry) in new {
+        if base.get(path) != Some(entry) {
+            delta.insert(path.clone(), Some(entry.clone()));
+        }
+    }
+    for path in base.keys() {
+        if !new.contains_key(path) {
+            delta.insert(path.clone(), None);
+        }
+    }
+    delta
+}
+
+/// Apply a [`tree_delta`] onto a full-manifest tree in place: `Some(entry)`
+/// sets the path, `None` removes it. `squash` folds the working delta onto the
+/// target and each carried intervening change this way (#396).
+fn apply_delta(
+    tree: &mut BTreeMap<PathBuf, (Oid, Visibility)>,
+    delta: &BTreeMap<PathBuf, Option<(Oid, Visibility)>>,
+) {
+    for (path, entry) in delta {
+        match entry {
+            Some(e) => {
+                tree.insert(path.clone(), e.clone());
+            }
+            None => {
+                tree.remove(path);
+            }
+        }
+    }
+}
 
 /// The follow-up-round recovery recipe (#418, map #354): what to do once a
 /// described working change has been sealed into a signed line no PR carried —
@@ -7751,6 +8148,236 @@ mod tests {
         assert!(ws.divergent_change_ids().contains(&dcid), "precondition: divergent");
         let err = ws.edit(&loot_core::hex::letters(&dcid)).unwrap_err();
         assert!(err.message.contains("divergent"), "unexpected: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #395 loot split / #396 loot squash: move/fold change content ---
+
+    /// The shared setup: an authored repo with a finalized anchor (`a.txt =
+    /// base`) and a working change on top that edits `a.txt` and adds `b.txt`.
+    fn splittable_ws(tag: &str) -> (PathBuf, Workspace) {
+        let dir = std::env::temp_dir().join(format!("loot-hist-{tag}-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("a.txt"), b"edited").unwrap();
+        std::fs::write(dir.join("b.txt"), b"brand new").unwrap();
+        ws.snapshot("work in progress").unwrap();
+        (dir, ws)
+    }
+
+    #[test]
+    fn split_moves_a_path_into_a_finalized_lower_change_leaving_the_remainder_on_top() {
+        let (dir, mut ws) = splittable_ws("split-e2e");
+
+        // The working version we split, its handle, and the anchor beneath it.
+        let orig = ws.working_id().cloned().unwrap();
+        let orig_cid = ws.repo().change_change_id(&orig).unwrap();
+        let orig_tree = ws.repo().change_tree(&orig).unwrap();
+        let anchor = ws.repo().parents_of(&orig).into_iter().next().unwrap();
+        let anchor_tree = ws.repo().change_tree(&anchor).unwrap();
+
+        let report = ws.split(&["b.txt".to_string()], "carve out b").unwrap();
+
+        // The first split is finalized BELOW, carrying only the moved path over
+        // the anchor, superseding the original working version (ADR 0032): same
+        // handle, the original recorded as predecessor, parented on the anchor.
+        assert_eq!(report.moved, vec![PathBuf::from("b.txt")]);
+        assert_eq!(report.first_change_id, Some(orig_cid), "the lower change keeps the handle");
+        assert_eq!(
+            ws.repo().change_predecessors(&report.first),
+            vec![orig.clone()],
+            "…and records the original working version as predecessor"
+        );
+        assert_eq!(
+            ws.repo().parents_of(&report.first),
+            vec![anchor.clone()],
+            "…parented on the anchor, not the working draft"
+        );
+        assert!(ws.repo().change_signature(&report.first).is_some(), "the lower change is signed");
+        let first_tree = ws.repo().change_tree(&report.first).unwrap();
+        assert_eq!(first_tree.len(), 2, "anchor's a.txt plus the moved b.txt");
+        assert_eq!(
+            first_tree.get(&PathBuf::from("a.txt")).unwrap().0,
+            anchor_tree.get(&PathBuf::from("a.txt")).unwrap().0,
+            "a.txt stays the anchor's version — only b.txt moved down"
+        );
+        assert_eq!(
+            first_tree.get(&PathBuf::from("b.txt")).unwrap().0,
+            orig_tree.get(&PathBuf::from("b.txt")).unwrap().0,
+            "b.txt is the working change's version, moved whole"
+        );
+
+        // The remainder is the new working change on top: a FRESH handle,
+        // parented on the first split, holding the full tree.
+        assert_eq!(ws.working_id(), Some(&report.remainder), "the remainder is the working change");
+        assert_eq!(
+            ws.repo().parents_of(&report.remainder),
+            vec![report.first.clone()],
+            "the remainder parents on the first split"
+        );
+        assert_ne!(report.remainder_change_id, Some(orig_cid), "the remainder is a NEW change");
+        assert_eq!(ws.repo().change_tree(&report.remainder).unwrap(), orig_tree, "…with the full tree");
+
+        // No divergence: each handle has exactly one live version, and the
+        // original working draft left the live view.
+        assert_eq!(ws.liveness().live_of(&orig_cid).len(), 1, "the handle has one live version");
+        assert!(!ws.divergent_change_ids().contains(&orig_cid), "a split is not divergence");
+
+        // The working tree on disk is untouched — split rewrites history only.
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"edited");
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"brand new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_refuses_without_a_subject_and_on_an_absent_path() {
+        let (dir, mut ws) = splittable_ws("split-guards");
+        let err = ws.split(&["b.txt".to_string()], "").unwrap_err();
+        assert!(err.message.contains("-m"), "an un-named finalized change is refused: {err}");
+        let err = ws.split(&["nope.txt".to_string()], "s").unwrap_err();
+        assert!(err.message.contains("not in the working change"), "unexpected: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A three-change line `T <- I <- source` (each adding its own file) with the
+    /// source left as the working change — the setup both squash-into-ancestor
+    /// tests share. Returns the target `T` and intervening `I` handles.
+    fn stacked_ws(tag: &str) -> (PathBuf, Workspace, [u8; 16], [u8; 16]) {
+        let dir = std::env::temp_dir().join(format!("loot-squash-{tag}-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("t.txt"), b"t").unwrap();
+        ws.snapshot("target T").unwrap();
+        ws.finalize_working().unwrap();
+        let t = ws.repo().heads()[0].clone();
+        let t_cid = ws.repo().change_change_id(&t).unwrap();
+
+        std::fs::write(dir.join("i.txt"), b"i").unwrap();
+        ws.snapshot("intervening I").unwrap();
+        ws.finalize_working().unwrap();
+        let i = ws.repo().heads()[0].clone();
+        let i_cid = ws.repo().change_change_id(&i).unwrap();
+
+        std::fs::write(dir.join("s.txt"), b"s").unwrap();
+        ws.snapshot("source S").unwrap();
+        (dir, ws, t_cid, i_cid)
+    }
+
+    #[test]
+    fn squash_folds_the_working_change_into_its_immediate_parent() {
+        let dir = std::env::temp_dir().join(format!("loot-squash-imm-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("a.txt"), b"second").unwrap();
+        ws.snapshot("second change").unwrap();
+        ws.finalize_working().unwrap();
+        let parent = ws.repo().heads()[0].clone();
+        let parent_cid = ws.repo().change_change_id(&parent).unwrap();
+
+        // The working change edits a.txt again.
+        std::fs::write(dir.join("a.txt"), b"third").unwrap();
+        ws.snapshot("wip").unwrap();
+        let source = ws.working_id().cloned().unwrap();
+        let source_cid = ws.repo().change_change_id(&source).unwrap();
+        let source_tree = ws.repo().change_tree(&source).unwrap();
+
+        let report = ws.squash(None, None).unwrap();
+
+        // The immediate parent is re-finalized with the combined tree (which, for
+        // the immediate case, is the working tree), superseding the old parent.
+        let folded = report.folded_into.expect("a clean immediate-parent fold");
+        assert_eq!(report.rebased, 0, "no intervening changes to re-anchor");
+        assert_eq!(ws.repo().change_change_id(&folded), Some(parent_cid), "keeps the parent's handle");
+        assert_eq!(ws.repo().change_predecessors(&folded), vec![parent.clone()], "…superseding it");
+        assert_eq!(ws.repo().change_message(&folded).unwrap(), "second change", "…keeping its subject");
+        assert_eq!(
+            ws.repo().change_tree(&folded).unwrap(),
+            source_tree,
+            "the fold carries the working change's tree"
+        );
+        assert!(ws.repo().change_signature(&folded).is_some(), "the fold is finalized");
+
+        // The source is abandoned and a fresh working change starts on the tip.
+        assert!(ws.working_id().is_none(), "a fresh working change, nothing in progress");
+        assert!(ws.liveness().live_of(&source_cid).is_empty(), "the source handle has no live version");
+        assert_eq!(ws.liveness().live_of(&parent_cid).len(), 1, "the parent handle has one live version");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"third", "disk is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn squash_into_an_ancestor_rebases_the_intervening_change() {
+        let (dir, mut ws, t_cid, i_cid) = stacked_ws("into");
+        let source = ws.working_id().cloned().unwrap();
+        let source_cid = ws.repo().change_change_id(&source).unwrap();
+
+        // Fold the source (s.txt) down into the target ancestor T, jumping over I.
+        let report = ws.squash(Some(&loot_core::hex::letters(&t_cid)), None).unwrap();
+
+        let folded = report.folded_into.expect("a clean fold into the ancestor");
+        assert_eq!(report.rebased, 1, "the one intervening change is re-anchored");
+
+        // T' supersedes T and now carries s.txt, but NOT i.txt.
+        assert_eq!(ws.repo().change_change_id(&folded), Some(t_cid), "keeps T's handle");
+        let t_prime_tree = ws.repo().change_tree(&folded).unwrap();
+        assert!(t_prime_tree.contains_key(&PathBuf::from("t.txt")), "T's own file stays");
+        assert!(t_prime_tree.contains_key(&PathBuf::from("s.txt")), "the folded file arrives in T'");
+        assert!(!t_prime_tree.contains_key(&PathBuf::from("i.txt")), "I's file did not move down");
+
+        // I is re-anchored onto T' as a superseding version, its manifest carrying
+        // the folded s.txt so it stays consistent.
+        let i_live = ws.liveness().live_of(&i_cid);
+        assert_eq!(i_live.len(), 1, "I has one live (rebased) version");
+        let i_prime = i_live.into_iter().next().unwrap();
+        assert_eq!(ws.repo().parents_of(&i_prime), vec![folded.clone()], "I' parents on T'");
+        let i_pred = ws.repo().change_predecessors(&i_prime);
+        assert_eq!(i_pred.len(), 1, "I' supersedes exactly one prior version");
+        assert_eq!(ws.repo().change_change_id(&i_pred[0]), Some(i_cid), "…the old I");
+        let i_prime_tree = ws.repo().change_tree(&i_prime).unwrap();
+        assert!(i_prime_tree.contains_key(&PathBuf::from("s.txt")), "the fold propagated through I'");
+        assert!(i_prime_tree.contains_key(&PathBuf::from("i.txt")), "I' keeps its own file");
+
+        // The source is abandoned; the live tip is I'.
+        assert!(ws.liveness().live_of(&source_cid).is_empty(), "the source handle is gone");
+        assert!(ws.working_id().is_none(), "a fresh working change on the new tip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn squash_into_an_ancestor_records_conflicts_and_stops_when_an_intervening_change_clashes() {
+        // T <- I <- source where I and source BOTH edit shared.txt: folding the
+        // source's edit down past I's edit is ambiguous.
+        let dir = std::env::temp_dir().join(format!("loot-squash-conflict-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("shared.txt"), b"v0").unwrap();
+        ws.snapshot("T").unwrap();
+        ws.finalize_working().unwrap();
+        let t = ws.repo().heads()[0].clone();
+        let t_cid = ws.repo().change_change_id(&t).unwrap();
+
+        std::fs::write(dir.join("shared.txt"), b"v1").unwrap();
+        ws.snapshot("I").unwrap();
+        ws.finalize_working().unwrap();
+
+        std::fs::write(dir.join("shared.txt"), b"v2").unwrap();
+        ws.snapshot("S").unwrap();
+        let source = ws.working_id().cloned().unwrap();
+
+        let report = ws.squash(Some(&loot_core::hex::letters(&t_cid)), None).unwrap();
+
+        assert!(report.folded_into.is_none(), "the fold stopped, minting nothing");
+        assert_eq!(report.conflicts, vec![PathBuf::from("shared.txt")]);
+        assert!(
+            ws.conflicts().contains_key(&PathBuf::from("shared.txt")),
+            "the clash is recorded for `loot resolve`"
+        );
+        // Nothing was folded: the target is unchanged and the source is still the
+        // working change.
+        assert_eq!(ws.liveness().live_of(&t_cid).len(), 1, "T is untouched");
+        assert_eq!(ws.working_id(), Some(&source), "the source is still the working change");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -57,6 +57,44 @@ pub struct DuplicateReport {
     pub parent: Option<Oid>,
 }
 
+/// What `loot split` did, for CLI reporting (#395). The working change is cut
+/// into two: `first` is the finalized, signed partial change placed BELOW that
+/// carries the moved paths (it supersedes the original working version per ADR
+/// 0032, keeping the original durable handle); `remainder` is the new working
+/// change on top of `first`, carrying a fresh handle and the rest of the tree.
+#[derive(Debug)]
+pub struct SplitReport {
+    /// The finalized partial change (version id) that took the moved paths.
+    pub first: Oid,
+    /// The durable handle `first` carries — the ORIGINAL working change's
+    /// handle, since `first` supersedes it (`None` on a keyless repo).
+    pub first_change_id: Option<[u8; 16]>,
+    /// The new working-change version id holding the remainder, on top.
+    pub remainder: Oid,
+    /// The remainder's fresh durable handle (`None` on a keyless repo).
+    pub remainder_change_id: Option<[u8; 16]>,
+    /// The paths moved down into `first`, in argument order.
+    pub moved: Vec<PathBuf>,
+}
+
+/// What `loot squash` did, for CLI reporting (#396). The working change's delta
+/// is folded UP into `folded_into` — its immediate parent (no args) or an
+/// ancestor (`--into`) — as an ADR-0032 superseding version; any intervening
+/// changes are re-anchored onto it. A clash with an intervening change records
+/// conflicts and stops (`folded_into` is `None`, `conflicts` non-empty).
+#[derive(Debug)]
+pub struct SquashReport {
+    /// The re-finalized target version (superseding the ancestor it folded
+    /// into). `None` when the fold conflicted and stopped.
+    pub folded_into: Option<Oid>,
+    /// Paths where an intervening change touched what the fold would move —
+    /// recorded for `loot resolve`; non-empty exactly when the fold stopped.
+    pub conflicts: Vec<PathBuf>,
+    /// How many intervening changes were re-anchored onto the new target
+    /// (0 for an immediate-parent squash).
+    pub rebased: usize,
+}
+
 /// The delta class of one path across two trees: added, modified, or deleted
 /// (#306). `#7`'s first-change-in-repo case renders every path `Added`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
