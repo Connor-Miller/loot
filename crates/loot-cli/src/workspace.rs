@@ -3308,6 +3308,53 @@ impl Graph<'_> {
         self.repo.get(oid, self.identity, self.now)
     }
 
+    /// The two sides of the conflict recorded at `path` (`loot diff --conflict`,
+    /// #13): `ours` and `theirs`, each with its stored visibility and — when the
+    /// ambient identity holds the key — its decrypted content. A side the caller
+    /// cannot decrypt comes back with `content: None`, so the renderer degrades
+    /// it to the bare content address per the #306 contract. Errors when `path`
+    /// is not currently in conflict, and propagates a genuine read failure rather
+    /// than passing it off as sealed.
+    pub fn conflict_at(&self, path: &Path) -> Result<ConflictView, String> {
+        let (our_oid, their_oid) = self.conflicts().get(path).ok_or_else(|| {
+            format!("no conflict at {} — run `loot conflicts` to list them", path.display())
+        })?;
+        Ok(ConflictView {
+            path: path.to_path_buf(),
+            ours: self.conflict_side(our_oid)?,
+            theirs: self.conflict_side(their_oid)?,
+        })
+    }
+
+    /// One side of a conflict: try to open it as the ambient identity. The
+    /// key-not-held fallback is *specifically* "can't decrypt" — `Unauthorized`
+    /// (not a recipient) or `Embargoed` (key still in escrow, ADR 0007) — which
+    /// yields `content: None` and the OID fallback. A genuinely missing or
+    /// corrupt local object is a real failure and propagates, rather than
+    /// masquerading as `(sealed — no key)`. The visibility *class* is metadata
+    /// that survives even when the content can't be opened, so a sealed side
+    /// still shows its class (#306).
+    ///
+    /// When is a side actually unreadable here? A `Conflict` is only *recorded*
+    /// when the merger held both keys (an unreadable side becomes
+    /// `RelayedUnmerged`, ADR 0001), so in the merger's own workspace both sides
+    /// decrypt. The sealed branch is for loot's shared-store model: a
+    /// non-keyholder opening `.loot/conflicts` and inspecting a conflict a
+    /// keyholding peer recorded (concurrent.md) sees that peer's restricted side
+    /// sealed.
+    fn conflict_side(&self, oid: &Oid) -> Result<ConflictSide, String> {
+        let content = match self.content(oid) {
+            Ok(bytes) => Some(bytes),
+            Err(loot_core::RepoError::Unauthorized(_) | loot_core::RepoError::Embargoed(_)) => None,
+            Err(e) => return Err(format!("cannot read conflict side: {e}")),
+        };
+        Ok(ConflictSide {
+            oid: oid.clone(),
+            visibility: self.repo.visibility_of(oid).unwrap_or(Visibility::Public),
+            content,
+        })
+    }
+
     /// Is `ancestor` reachable from `descendant` through parent edges?
     pub fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> bool {
         let mut stack = vec![descendant.clone()];
@@ -3580,6 +3627,30 @@ pub struct PathDelta {
     pub sealed: bool,
     pub visibility: Visibility,
     pub prev_visibility: Option<Visibility>,
+}
+
+/// One side of a conflict — the value [`conflict_at`](Graph::conflict_at)
+/// produces and [`crate::render::conflict_sides`] renders (#13). `oid` is the
+/// side's content address and `visibility` its stored class. `content` is `Some`
+/// only when the ambient identity holds the key; `None` means the side is sealed
+/// to this caller, and the renderer shows the OID in place of plaintext — the
+/// same key-not-held fallback #1 uses (#306). Sealed is thus exactly
+/// `content.is_none()`, so it is derived at render time rather than stored.
+#[derive(Debug)]
+pub struct ConflictSide {
+    pub oid: Oid,
+    pub visibility: Visibility,
+    pub content: Option<Vec<u8>>,
+}
+
+/// A conflict at one path, both sides packaged for rendering (#13). `ours` is
+/// the side kept on disk after the conflicted merge; `theirs` the incoming side
+/// preserved in the recorded conflict.
+#[derive(Debug)]
+pub struct ConflictView {
+    pub path: PathBuf,
+    pub ours: ConflictSide,
+    pub theirs: ConflictSide,
 }
 
 /// What `loot adopt <version>` did, for CLI reporting (#244).
@@ -6104,6 +6175,41 @@ mod tests {
         // Ours is kept on disk; theirs is preserved in the recorded conflict and
         // via the merge change's second parent — no side dropped.
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"home side\n");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn conflict_at_reads_both_sides_of_a_recorded_conflict() {
+        // #13: after a same-path conflict, `conflict_at` surfaces both sides with
+        // their content. Both blobs are public here, so both decrypt (key held).
+        let (area, dir, mut ws) = lane_setup("conflict-at");
+        lane_with_change(&mut ws, &area, "feature", &[("a.txt", b"feature side\n")], "feat");
+        let mut ws = Workspace::open_at(&dir).unwrap();
+
+        std::fs::write(dir.join("a.txt"), b"home side\n").unwrap();
+        ws.snapshot("home").unwrap();
+        ws.finalize_working().unwrap();
+        let (_src, outcomes) = ws.merge_lane("feature").unwrap();
+        assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
+
+        let view = ws.graph().conflict_at(Path::new("a.txt")).unwrap();
+        assert_eq!(view.path, PathBuf::from("a.txt"));
+        assert_eq!(view.ours.content.as_deref(), Some(&b"home side\n"[..]), "ours = the kept side");
+        assert_eq!(
+            view.theirs.content.as_deref(),
+            Some(&b"feature side\n"[..]),
+            "theirs = the incoming side"
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn conflict_at_errors_when_the_path_is_not_in_conflict() {
+        // #13: a clear, actionable error rather than an empty/None result.
+        let (area, _dir, ws) = lane_setup("conflict-at-none");
+        let err = ws.graph().conflict_at(Path::new("nope.txt")).unwrap_err();
+        assert!(err.contains("no conflict"), "{err}");
+        assert!(err.contains("loot conflicts"), "points at the listing verb: {err}");
         let _ = std::fs::remove_dir_all(&area);
     }
 

@@ -105,7 +105,7 @@ const OUT: &[&str] = &["--porcelain", "--json"];
 const COMMANDS: &[Verb] = &[
     verb("init", &["--identity"], &[], cmd_init),
     verb("status", &[], OUT, cmd_status),
-    verb("diff", &[], &[], cmd_diff),
+    verb("diff", &["--conflict"], &[], cmd_diff),
     verb("describe", &["-m", "--message", "--allow-demote"], &[], cmd_describe),
     verb("new", &["-m", "--message", "--allow-demote"], SKIP, cmd_new),
     verb("edit", &[], &[], cmd_edit),
@@ -158,6 +158,7 @@ usage:
   loot config [set <key> <val>] [unset <key>] [list]  manage global config (~/.config/loot/config)
   loot status [--porcelain|--json]          show the working change read-only (live version id + durable change id; no snapshot)
   loot diff [<from>] [<to>]                 show which paths changed between two changes (defaults: HEAD vs @ working); selectors: @, HEAD, HEAD~<n>, id prefix
+  loot diff --conflict <path>               inspect both sides (ours/theirs) of a recorded conflict; decrypts when the key is held, else shows the OIDs
   loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
@@ -445,6 +446,15 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
 /// arg diffs that change vs the working change, two diffs the pair. Output is
 /// the #306 shared path-delta line, one row per changed path.
 fn cmd_diff(args: &[String]) -> Result<(), String> {
+    // `--conflict <path>` is a distinct mode (#13): inspect both sides of a
+    // recorded conflict rather than diff two changes. It takes no from/to.
+    if has_flag(args, "--conflict") {
+        let path = flag(args, "--conflict").ok_or("usage: loot diff --conflict <path>")?;
+        let ws = Workspace::open()?;
+        let view = ws.graph().conflict_at(std::path::Path::new(path))?;
+        print!("{}", render::conflict_sides(&view));
+        return Ok(());
+    }
     let pos = positionals(args);
     let (from, to) = match pos.as_slice() {
         [] => ("HEAD", "@"),
@@ -2334,6 +2344,7 @@ mod tests {
         assert_eq!(check("init", &["--identity", "alice"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("clone", &["url", "dir", "--identity", "alice"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("status", &["--porcelain"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("diff", &["--conflict", "a.txt"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("describe", &["-m", "subject", "--allow-demote", "a"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("new", &["--message", "s", "--no-snapshot"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("new", &["--ignore-working-copy"]), Ok(FlagCheck::Proceed));

@@ -11,7 +11,10 @@
 //! Anything registry-coupled (resolving a pubkey to a peer name) stays with
 //! the caller and arrives as a closure — rendering knows names, not keyrings.
 
-use crate::workspace::{EditReport, HistoryRow, HistoryView, PathDelta, WorkingRow};
+use crate::workspace::{
+    ConflictSide, ConflictView, DeltaClass, EditReport, HistoryRow, HistoryView, PathDelta,
+    WorkingRow,
+};
 use loot_core::{verdict, MergeOutcome, Oid, Visibility};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -272,6 +275,51 @@ fn civil_date(unix_secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The human `loot diff --conflict <path>` view (#13): both sides of a
+/// conflict, each rendered through the shared #306 [`delta_line`] so the
+/// path/visibility/sealed-fallback shape matches `diff` and `status`, followed
+/// by the side's decrypted content when the key is held. A sealed side shows
+/// only its `delta_line` — the content address stands in for the plaintext it
+/// cannot open, which is the #306 key-not-held fallback (and AC "show both
+/// OIDs").
+pub fn conflict_sides(view: &ConflictView) -> String {
+    let mut out = format!("conflict at {}\n", view.path.display());
+    for (label, side) in [("ours", &view.ours), ("theirs", &view.theirs)] {
+        let _ = write!(out, "\n  {label}:\n{}\n", delta_line(&side_delta(view, side)));
+        if let Some(bytes) = &side.content {
+            out.push_str(&indented_content(bytes));
+        }
+    }
+    out
+}
+
+/// Cast one conflict side as a [`PathDelta`] so it renders through the shared
+/// #306 line. A conflict is two competing writes to one path, so each side reads
+/// as `Modified`; `prev_visibility` stays `None` — the two sides are
+/// alternatives, not a before/after transition.
+fn side_delta(view: &ConflictView, side: &ConflictSide) -> PathDelta {
+    PathDelta {
+        class: DeltaClass::Modified,
+        path: view.path.clone(),
+        oid: side.oid.clone(),
+        // A side the caller can't decrypt has no content — that is the #306
+        // sealed case, so the address stands in for the name.
+        sealed: side.content.is_none(),
+        visibility: side.visibility.clone(),
+        prev_visibility: None,
+    }
+}
+
+/// A held side's content, indented under its label. Valid UTF-8 prints verbatim;
+/// binary is summarized rather than dumped as terminal-breaking bytes — this is
+/// a human inspection view, not a byte pipe (scripts use `loot conflicts`).
+fn indented_content(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.lines().map(|l| format!("    {l}\n")).collect(),
+        Err(_) => format!("    ({} bytes of binary content)\n", bytes.len()),
+    }
+}
+
 /// The human buoy report (CA4, ADR 0025) — the machine shapes live in
 /// `loot_core::verdict::BuoyVerdict`; this is only the prose.
 pub fn render_buoy_human(
@@ -308,7 +356,6 @@ pub fn render_buoy_human(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::DeltaClass;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -477,6 +524,58 @@ mod tests {
         assert!(line.contains(&short(&oid(0x3f))) && line.contains('…'), "{line}");
         assert!(line.contains("restricted") && !line.contains("alice"), "{line}");
         assert!(line.ends_with("(sealed — no key)"), "{line}");
+    }
+
+    fn conflict_side(vis: Visibility, content: Option<&[u8]>) -> ConflictSide {
+        ConflictSide { oid: oid(0x3f), visibility: vis, content: content.map(<[u8]>::to_vec) }
+    }
+
+    #[test]
+    fn conflict_sides_prints_both_sides_and_their_content_when_the_key_is_held() {
+        let view = ConflictView {
+            path: PathBuf::from("a.txt"),
+            ours: conflict_side(Visibility::Public, Some(b"home side\n")),
+            theirs: conflict_side(
+                Visibility::Restricted(vec!["alice".into()]),
+                Some(b"feature side\n"),
+            ),
+        };
+        let out = conflict_sides(&view);
+        assert!(out.contains("conflict at a.txt"), "{out}");
+        assert!(out.contains("ours:") && out.contains("theirs:"), "both sides labeled: {out}");
+        // Each side renders the shared #306 delta line (M gutter, path, token).
+        assert!(out.contains("  M  a.txt"), "the shared delta line: {out}");
+        assert!(out.contains("public") && out.contains("restricted=alice"), "{out}");
+        // ...and the decrypted content of both sides is shown, indented.
+        assert!(out.contains("    home side") && out.contains("    feature side"), "{out}");
+    }
+
+    #[test]
+    fn conflict_sides_falls_back_to_the_oid_when_a_side_is_sealed() {
+        let view = ConflictView {
+            path: PathBuf::from("secret.txt"),
+            ours: conflict_side(Visibility::Public, Some(b"readable\n")),
+            theirs: conflict_side(Visibility::Restricted(vec!["alice".into()]), None),
+        };
+        let out = conflict_sides(&view);
+        // Held side shows content; sealed side shows the OID + tag, never plaintext.
+        assert!(out.contains("readable"), "held side content shown: {out}");
+        assert!(out.contains(&short(&oid(0x3f))) && out.contains('…'), "sealed side OID: {out}");
+        assert!(out.contains("(sealed — no key)"), "{out}");
+        // The class survives; recipients never leak on the sealed side.
+        assert!(out.contains("restricted") && !out.contains("alice"), "{out}");
+    }
+
+    #[test]
+    fn conflict_sides_summarizes_binary_content_rather_than_dumping_bytes() {
+        let view = ConflictView {
+            path: PathBuf::from("blob.bin"),
+            ours: conflict_side(Visibility::Public, Some(&[0xff, 0xfe, 0x00, 0x01])),
+            theirs: conflict_side(Visibility::Public, Some(b"text\n")),
+        };
+        let out = conflict_sides(&view);
+        assert!(out.contains("4 bytes of binary content"), "{out}");
+        assert!(out.contains("    text"), "the text side still prints: {out}");
     }
 
     #[test]
