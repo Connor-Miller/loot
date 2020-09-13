@@ -20,6 +20,7 @@ pub mod emit;
 pub mod error;
 pub mod ferry;
 pub mod flags;
+pub mod grep;
 mod kv;
 pub mod ledger;
 mod policy;
