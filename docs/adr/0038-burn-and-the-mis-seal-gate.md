@@ -71,6 +71,18 @@ and `loot-first land` — runs it; the folding verbs' wip-signing steps
 (`fold_line_in`, ferry's reconcile) run it flagless, and `describe` keeps a
 pre-capture preflight.
 
+Audited chokepoints outside the seam (#369): `Workspace::resolve_conflict`
+still signs immediately without the gate — deliberately ungated, safe by
+construction: a conflicted path exists on both parent lines, so it is never a
+*first* seal, and the gate's first-seal scoping would keep it silent there
+anyway. Recorded so the seam-coverage claim above is not read as "every
+signing path runs the gate."
+
+Override ceremony gotcha (#369): `describe --allow-reveal` alone does not
+complete the ceremony — describe's preflight only *pre-checks*; the override
+must ride the verb that actually finalizes (`loot new --allow-reveal`), or the
+finalize-time gate refuses again.
+
 ### 2. `loot burn <path>` (the cure)
 
 Burn **destroys the object's bytes and records a signed tombstone** — the
