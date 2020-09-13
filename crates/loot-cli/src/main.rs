@@ -3124,9 +3124,21 @@ fn cmd_push(args: &[String]) -> Emitted {
 fn push_dry_run(ws: &Workspace) -> Emitted {
     let have: Vec<Oid> = Vec::new();
     let offered = ws.offered_objects(&have);
-    let bundle = ws.repo().bundle_wanted(&have, &offered).map_err(CliError::from)?;
-    let (changes, objects) = bundle_change_object_counts(&bundle)?;
-    let bytes = bundle.0.len();
+    // Mirror the live push's bundle construction (a single unbounded batch)
+    // without the relay round-trip. `bundle_wanted_batched` is the public path;
+    // `Workspace::repo()` is test-only, so production `push_dry_run` must not use
+    // it. Each batch repeats the change delta (attestations propagate per batch),
+    // so changes are counted once (max) while objects and bytes sum across batches.
+    let bundles = ws.bundle_wanted_batched(&have, &offered, usize::MAX, usize::MAX)?;
+    let mut changes = 0usize;
+    let mut objects = 0usize;
+    let mut bytes = 0usize;
+    for bundle in &bundles {
+        let (c, o) = bundle_change_object_counts(bundle)?;
+        changes = changes.max(c);
+        objects += o;
+        bytes += bundle.0.len();
+    }
 
     if changes == 0 && objects == 0 {
         // Distinguish "you have an unsigned working change" (the fixable case the
