@@ -286,8 +286,9 @@ fn civil_date(unix_secs: u64) -> String {
 
 /// `YYYY-MM-DD HH:MM:SS UTC` for a unix timestamp — [`civil_date`]'s
 /// time-of-day twin, for callers (`grant-status`, #5) that want a grant's
-/// `granted_at` at full precision rather than a bare calendar date.
-fn civil_datetime(unix_secs: u64) -> String {
+/// `granted_at` at full precision rather than a bare calendar date. `pub(crate)`
+/// so `evolog` (#397) renders a version's deterministic commit date the same way.
+pub(crate) fn civil_datetime(unix_secs: u64) -> String {
     let secs_of_day = unix_secs % 86_400;
     let h = secs_of_day / 3600;
     let m = (secs_of_day % 3600) / 60;

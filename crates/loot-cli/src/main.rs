@@ -163,6 +163,7 @@ const COMMANDS: &[Verb] = &[
     verb("lane", &["--ticket", "--name", "--at", "--stale-hours"], OUT, cmd_lane),
     verb("lanes", &[], OUT, cmd_lane_list),
     verb("log", &["--path"], &[], cmd_log),
+    verb("evolog", &[], OUT, loot_cli::evolog::run),
     verb("blame", &[], &[], loot_cli::blame::run),
     verb("grep", &[], &[], grep::cmd_grep),
     verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
@@ -226,6 +227,7 @@ usage:
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
   loot surface                              materialize what the current identity may see
   loot log [<selector>] [--path <path>]     show change history, or the ancestry of one point in it; selectors: @, HEAD, HEAD~<n>, id prefix; --path filters to changes whose recorded tree includes <path> (#6) — combine both to intersect (the selector's ancestry AND the path)
+  loot evolog <change-id> [--porcelain|--json]  show every version one change id has had (its evolution across amends, ADR 0032), newest-first (#397); read-only; <change-id> is a letters `k–z` prefix or any selector (@, HEAD, HEAD~<n>, hex version)
   loot blame <path> [<selector>]            annotate each line of <path> with the change and author that last modified it (#389); walks the lineage, decrypts via the key oracle (a version you can't open renders `<sealed>`), short-circuits unchanged content (#98); selector defaults to @ then HEAD
   loot grep <pattern> [<selector>]          search readable content for the literal <pattern> (fixed-string, case-sensitive), printing <path>:<line>:<match>; searches the current change, or the change named by <selector> (@, HEAD, HEAD~<n>, id prefix); decrypts via the key oracle, skips sealed paths this identity can't open, and reports the skipped count (#391)
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
