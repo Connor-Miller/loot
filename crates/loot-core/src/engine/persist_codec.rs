@@ -554,7 +554,7 @@ mod tests {
         let mut tree = BTreeMap::new();
         tree.insert(
             PathBuf::from("a.txt"),
-            (Oid([2; 32]), Visibility::Public),
+            (Oid([2; 32]), Visibility::Internal),
         );
         g.insert(ChangeNode {
             id: Oid([1; 32]),
@@ -576,7 +576,7 @@ mod tests {
         SealedObject {
             nonce: [9; 12],
             ciphertext: vec![0xAB, 0xCD],
-            vis: Visibility::Public,
+            vis: Visibility::Internal,
             grant_ids: vec!["*".into()],
             compressed: false,
         }
@@ -725,7 +725,7 @@ mod tests {
         // A present durable change_id (ADR 0029) and a supersession claim (ADR
         // 0032) survive encode/decode on disk.
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("a.txt"), (Oid([2; 32]), Visibility::Public));
+        tree.insert(PathBuf::from("a.txt"), (Oid([2; 32]), Visibility::Internal));
         let mut g = ChangeGraph::new();
         g.insert(ChangeNode {
             id: Oid([1; 32]),

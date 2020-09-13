@@ -66,10 +66,10 @@ fn fixture() -> Fixture {
     // The repo identity is "alice": she is the key oracle `visible()` consults.
     let mut repo = DagRepo::init(PathBuf::from("mem://revset-test"), "alice").unwrap();
 
-    let c0 = add(&mut repo, ALICE, vec![], "root: init", "root.txt", b"root\n", Visibility::Public, true);
-    let c1 = add(&mut repo, ALICE, vec![c0.clone()], "feature login", "login.rs", b"login\n", Visibility::Public, true);
-    let c2 = add(&mut repo, BOB, vec![c1.clone()], "fix parser bug", "parser.rs", b"parser\n", Visibility::Public, true);
-    let c3 = add(&mut repo, BOB, vec![c2.clone()], "feature logout", "logout.rs", b"logout\n", Visibility::Public, true);
+    let c0 = add(&mut repo, ALICE, vec![], "root: init", "root.txt", b"root\n", Visibility::Internal, true);
+    let c1 = add(&mut repo, ALICE, vec![c0.clone()], "feature login", "login.rs", b"login\n", Visibility::Internal, true);
+    let c2 = add(&mut repo, BOB, vec![c1.clone()], "fix parser bug", "parser.rs", b"parser\n", Visibility::Internal, true);
+    let c3 = add(&mut repo, BOB, vec![c2.clone()], "feature logout", "logout.rs", b"logout\n", Visibility::Internal, true);
     // Restricted to bob only: alice holds no key, so this change is invisible.
     let c4 = add(
         &mut repo,
@@ -82,7 +82,7 @@ fn fixture() -> Fixture {
         true,
     );
     // The working change: authored by alice, left UNSIGNED.
-    let w = add(&mut repo, ALICE, vec![c3.clone()], "wip refactor", "refactor.rs", b"wip\n", Visibility::Public, false);
+    let w = add(&mut repo, ALICE, vec![c3.clone()], "wip refactor", "refactor.rs", b"wip\n", Visibility::Internal, false);
 
     Fixture { repo, c0, c1, c2, c3, c4, w }
 }

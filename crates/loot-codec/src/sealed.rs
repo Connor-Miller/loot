@@ -160,7 +160,7 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], RepoError> {
 /// Grant ids implied by a visibility policy.
 pub fn grant_ids(vis: &Visibility) -> Vec<String> {
     match vis {
-        Visibility::Public | Visibility::Embargoed { .. } => vec![ANYONE.to_string()],
+        Visibility::Internal | Visibility::Embargoed { .. } => vec![ANYONE.to_string()],
         Visibility::Restricted(ids) => ids.clone(),
     }
 }
@@ -181,7 +181,7 @@ pub fn seal(bytes: &[u8], vis: &Visibility) -> Result<(Oid, SealedObject, Conten
     // compressibility/length side-channel appears on sensitive data — keying
     // this off visibility (already in the clear on the object) reveals nothing
     // new (S2, ADR 0020).
-    let compressed = matches!(vis, Visibility::Public);
+    let compressed = matches!(vis, Visibility::Internal);
     let payload = if compressed { compress(bytes)? } else { bytes.to_vec() };
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn public_round_trips_for_any_reader() {
-        let (oid, sealed, key) = seal(b"hello", &Visibility::Public).unwrap();
+        let (oid, sealed, key) = seal(b"hello", &Visibility::Internal).unwrap();
         let kr = keyring_with(oid.clone(), key);
         assert_eq!(open(&sealed, &oid, "anyone", &kr, 0).unwrap(), b"hello");
     }
@@ -339,14 +339,14 @@ mod tests {
     fn sealed_object_holds_no_key_material() {
         // Structural guarantee behind ADR 0003: nothing in a SealedObject is
         // the content key. We assert the key is unequal to every field's bytes.
-        let (_oid, sealed, key) = seal(b"x", &Visibility::Public).unwrap();
+        let (_oid, sealed, key) = seal(b"x", &Visibility::Internal).unwrap();
         assert_ne!(&sealed.ciphertext[..], &key[..]);
         assert_ne!(&sealed.nonce[..], &key[..12]);
     }
 
     #[test]
     fn address_is_ciphertext_hash() {
-        let (oid, sealed, _) = seal(b"abc", &Visibility::Public).unwrap();
+        let (oid, sealed, _) = seal(b"abc", &Visibility::Internal).unwrap();
         assert_eq!(oid, sealed.address());
     }
 
@@ -357,8 +357,8 @@ mod tests {
         // SAME plaintext must differ in every stored field (random key+nonce ->
         // different ciphertext, address, and nonce; identical grant_ids/vis are
         // policy, not content, so equal there is fine).
-        let (oid1, s1, _) = seal(b"same secret", &Visibility::Public).unwrap();
-        let (oid2, s2, _) = seal(b"same secret", &Visibility::Public).unwrap();
+        let (oid1, s1, _) = seal(b"same secret", &Visibility::Internal).unwrap();
+        let (oid2, s2, _) = seal(b"same secret", &Visibility::Internal).unwrap();
         assert_ne!(oid1, oid2, "addresses must differ for equal plaintext");
         assert_ne!(s1.ciphertext, s2.ciphertext, "ciphertext must differ");
         assert_ne!(s1.nonce, s2.nonce, "nonces must differ");
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn public_content_is_compressed_and_round_trips() {
         let data = b"the quick brown fox jumps over the lazy dog\n".repeat(50);
-        let (oid, sealed, key) = seal(&data, &Visibility::Public).unwrap();
+        let (oid, sealed, key) = seal(&data, &Visibility::Internal).unwrap();
         assert!(sealed.compressed, "public content must be compressed");
         let kr = keyring_with(oid.clone(), key);
         assert_eq!(open(&sealed, &oid, "anyone", &kr, 0).unwrap(), data);
@@ -400,7 +400,7 @@ mod tests {
         // so the difference is the compression win (S2 AC).
         let corpus = "fn main() { println!(\"hello, world\"); }\n".repeat(200);
         let bytes = corpus.as_bytes();
-        let (_o1, public, _k1) = seal(bytes, &Visibility::Public).unwrap();
+        let (_o1, public, _k1) = seal(bytes, &Visibility::Internal).unwrap();
         let (_o2, restricted, _k2) =
             seal(bytes, &Visibility::Restricted(vec!["alice".into()])).unwrap();
         assert!(public.compressed && !restricted.compressed);

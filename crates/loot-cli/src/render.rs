@@ -261,7 +261,7 @@ pub fn visibility_label(vis: &Visibility) -> String {
 /// read its recipients: `public` / `restricted` / `embargoed`.
 fn vis_class(vis: &Visibility) -> &'static str {
     match vis {
-        Visibility::Public => "public",
+        Visibility::Internal => "internal",
         Visibility::Restricted(_) => "restricted",
         Visibility::Embargoed { .. } => "embargoed",
     }
@@ -596,16 +596,16 @@ mod tests {
 
     #[test]
     fn delta_line_renders_added_modified_deleted_gutters() {
-        let added = delta_line(&delta(DeltaClass::Added, "README.md", Visibility::Public));
+        let added = delta_line(&delta(DeltaClass::Added, "README.md", Visibility::Internal));
         let modified = delta_line(&delta(
             DeltaClass::Modified,
             "src/main.rs",
             Visibility::Restricted(vec!["alice".into(), "bob".into()]),
         ));
-        let deleted = delta_line(&delta(DeltaClass::Deleted, "docs/old-notes.md", Visibility::Public));
-        assert_eq!(added, "  +  README.md              public");
+        let deleted = delta_line(&delta(DeltaClass::Deleted, "docs/old-notes.md", Visibility::Internal));
+        assert_eq!(added, "  +  README.md              internal");
         assert!(modified.starts_with("  M  src/main.rs") && modified.ends_with("restricted=alice,bob"));
-        assert!(deleted.starts_with("  -  docs/old-notes.md") && deleted.ends_with("public"));
+        assert!(deleted.starts_with("  -  docs/old-notes.md") && deleted.ends_with("internal"));
     }
 
     #[test]
@@ -626,17 +626,17 @@ mod tests {
             ".env",
             Visibility::Restricted(vec!["alice".into()]),
         );
-        d.prev_visibility = Some(Visibility::Public);
+        d.prev_visibility = Some(Visibility::Internal);
         let line = delta_line(&d);
-        assert!(line.ends_with("public → restricted=alice"), "{line}");
+        assert!(line.ends_with("internal → restricted=alice"), "{line}");
     }
 
     #[test]
     fn delta_line_with_equal_visibility_shows_no_transition() {
-        let mut d = delta(DeltaClass::Modified, "a.txt", Visibility::Public);
-        d.prev_visibility = Some(Visibility::Public);
+        let mut d = delta(DeltaClass::Modified, "a.txt", Visibility::Internal);
+        d.prev_visibility = Some(Visibility::Internal);
         let line = delta_line(&d);
-        assert!(line.ends_with("public") && !line.contains('→'), "{line}");
+        assert!(line.ends_with("internal") && !line.contains('→'), "{line}");
     }
 
     #[test]
@@ -663,8 +663,8 @@ mod tests {
     fn conflict_sides_prints_both_sides_and_their_content_when_the_key_is_held() {
         let view = ConflictView {
             path: PathBuf::from("a.txt"),
-            base: Some(conflict_side(Visibility::Public, Some(b"base side\n"))),
-            ours: conflict_side(Visibility::Public, Some(b"home side\n")),
+            base: Some(conflict_side(Visibility::Internal, Some(b"base side\n"))),
+            ours: conflict_side(Visibility::Internal, Some(b"home side\n")),
             theirs: conflict_side(
                 Visibility::Restricted(vec!["alice".into()]),
                 Some(b"feature side\n"),
@@ -677,7 +677,7 @@ mod tests {
         assert!(out.contains("base:") && out.contains("    base side"), "base side shown: {out}");
         // Each side renders the shared #306 delta line (M gutter, path, token).
         assert!(out.contains("  M  a.txt"), "the shared delta line: {out}");
-        assert!(out.contains("public") && out.contains("restricted=alice"), "{out}");
+        assert!(out.contains("internal") && out.contains("restricted=alice"), "{out}");
         // ...and the decrypted content of both sides is shown, indented.
         assert!(out.contains("    home side") && out.contains("    feature side"), "{out}");
     }
@@ -687,7 +687,7 @@ mod tests {
         let view = ConflictView {
             path: PathBuf::from("secret.txt"),
             base: None,
-            ours: conflict_side(Visibility::Public, Some(b"readable\n")),
+            ours: conflict_side(Visibility::Internal, Some(b"readable\n")),
             theirs: conflict_side(Visibility::Restricted(vec!["alice".into()]), None),
         };
         let out = conflict_sides(&view);
@@ -704,8 +704,8 @@ mod tests {
         let view = ConflictView {
             path: PathBuf::from("blob.bin"),
             base: None,
-            ours: conflict_side(Visibility::Public, Some(&[0xff, 0xfe, 0x00, 0x01])),
-            theirs: conflict_side(Visibility::Public, Some(b"text\n")),
+            ours: conflict_side(Visibility::Internal, Some(&[0xff, 0xfe, 0x00, 0x01])),
+            theirs: conflict_side(Visibility::Internal, Some(b"text\n")),
         };
         let out = conflict_sides(&view);
         assert!(out.contains("4 bytes of binary content"), "{out}");
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn embargo_status_reports_not_embargoed_for_public() {
-        let out = render_embargo_status(&PathBuf::from("readme.md"), &Visibility::Public, 0);
+        let out = render_embargo_status(&PathBuf::from("readme.md"), &Visibility::Internal, 0);
         assert_eq!(out, "readme.md: not embargoed\n");
     }
 

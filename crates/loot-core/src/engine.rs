@@ -1641,7 +1641,7 @@ impl DagRepo {
             match vis {
                 Visibility::Restricted(_) => restricted += 1,
                 Visibility::Embargoed { .. } => embargoed += 1,
-                Visibility::Public => {}
+                Visibility::Internal => {}
             }
         }
         (total, restricted, embargoed)
@@ -2543,8 +2543,8 @@ impl converge::KeyOracle for DagRepo {
 fn demotes(old: &Visibility, new: &Visibility) -> bool {
     matches!(
         (old, new),
-        (Visibility::Restricted(_), Visibility::Public)
-            | (Visibility::Embargoed { .. }, Visibility::Public)
+        (Visibility::Restricted(_), Visibility::Internal)
+            | (Visibility::Embargoed { .. }, Visibility::Internal)
             | (Visibility::Embargoed { .. }, Visibility::Restricted(_))
     )
 }
@@ -2749,7 +2749,7 @@ mod tests {
                 None,
                 &[
                     entry(".env", b"TOKEN=needle\n", Visibility::Restricted(vec!["alice".into()])),
-                    entry("README", b"hello needle\nworld\n", Visibility::Public),
+                    entry("README", b"hello needle\nworld\n", Visibility::Internal),
                 ],
                 "init",
                 0,
@@ -2786,11 +2786,11 @@ mod tests {
         let secret_oid = alice
             .put(b"TOKEN=supersecret\n", Visibility::Restricted(vec!["alice".into()]))
             .unwrap();
-        let pub_oid = alice.put(b"readme\n", Visibility::Public).unwrap();
+        let pub_oid = alice.put(b"readme\n", Visibility::Internal).unwrap();
 
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from(".env"), (secret_oid.clone(), Visibility::Restricted(vec!["alice".into()])));
-        tree.insert(PathBuf::from("README"), (pub_oid.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("README"), (pub_oid.clone(), Visibility::Internal));
         alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
             .unwrap();
@@ -2880,9 +2880,9 @@ mod tests {
 
         // Produce a real bundle so we have live object/key/change data to work with.
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let oid = alice.put(b"public\n", Visibility::Public).unwrap();
+        let oid = alice.put(b"public\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Internal));
         let change_id = alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
             .unwrap();
@@ -2953,9 +2953,9 @@ mod tests {
     fn public_content_round_trips_compressed_through_bundle_apply() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
         let doc = b"fn main() { println!(\"hi\"); }\n".repeat(64);
-        let oid = alice.put(&doc, Visibility::Public).unwrap();
+        let oid = alice.put(&doc, Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("main.rs"), (oid.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("main.rs"), (oid.clone(), Visibility::Internal));
         alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "add main".into(), tree })
             .unwrap();
@@ -2986,10 +2986,10 @@ mod tests {
             secret_oid = repo
                 .put(b"TOKEN=abc\n", Visibility::Restricted(vec!["alice".into()]))
                 .unwrap();
-            let pub_oid = repo.put(b"hi\n", Visibility::Public).unwrap();
+            let pub_oid = repo.put(b"hi\n", Visibility::Internal).unwrap();
             let mut tree = BTreeMap::new();
             tree.insert(PathBuf::from(".env"), (secret_oid.clone(), Visibility::Restricted(vec!["alice".into()])));
-            tree.insert(PathBuf::from("README"), (pub_oid, Visibility::Public));
+            tree.insert(PathBuf::from("README"), (pub_oid, Visibility::Internal));
             change_id = repo
                 .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
                 .unwrap();
@@ -3023,7 +3023,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let a = repo.put(b"first\n", Visibility::Public).unwrap();
+        let a = repo.put(b"first\n", Visibility::Internal).unwrap();
         repo.save(&dir).unwrap();
 
         let obj_dir = RepoStore::new(&dir).objects_dir();
@@ -3032,7 +3032,7 @@ mod tests {
         let a_bytes_first = std::fs::read(&path_a).unwrap();
 
         // Add a second object and save again.
-        let b = repo.put(b"second\n", Visibility::Public).unwrap();
+        let b = repo.put(b"second\n", Visibility::Internal).unwrap();
         repo.save(&dir).unwrap();
 
         // A's file is untouched (immutable); B's file now exists.
@@ -3242,13 +3242,13 @@ mod tests {
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
         // Referenced object: named by a change, so it is part of the live set.
-        let kept = repo.put(b"keep me\n", Visibility::Public).unwrap();
+        let kept = repo.put(b"keep me\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("keep.txt"), (kept.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("keep.txt"), (kept.clone(), Visibility::Internal));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
             .unwrap();
         // Orphan: stored but never referenced by any change.
-        let orphan = repo.put(b"unreferenced orphan bytes\n", Visibility::Public).unwrap();
+        let orphan = repo.put(b"unreferenced orphan bytes\n", Visibility::Internal).unwrap();
         repo.save(&dir).unwrap();
 
         let obj_dir = RepoStore::new(&dir).objects_dir();
@@ -3276,12 +3276,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let kept = repo.put(b"referenced\n", Visibility::Public).unwrap();
+        let kept = repo.put(b"referenced\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("a.txt"), (kept.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("a.txt"), (kept.clone(), Visibility::Internal));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
             .unwrap();
-        let orphan = repo.put(b"unreferenced\n", Visibility::Public).unwrap();
+        let orphan = repo.put(b"unreferenced\n", Visibility::Internal).unwrap();
         repo.save(&dir).unwrap();
 
         let obj_dir = RepoStore::new(&dir).objects_dir();
@@ -3317,16 +3317,16 @@ mod tests {
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
         // Parent change references old_oid.
-        let old_oid = repo.put(b"v1\n", Visibility::Public).unwrap();
+        let old_oid = repo.put(b"v1\n", Visibility::Internal).unwrap();
         let mut t1 = BTreeMap::new();
-        t1.insert(PathBuf::from("a.txt"), (old_oid.clone(), Visibility::Public));
+        t1.insert(PathBuf::from("a.txt"), (old_oid.clone(), Visibility::Internal));
         let parent = repo
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "v1".into(), tree: t1 })
             .unwrap();
         // Child change references new_oid on top of the parent.
-        let new_oid = repo.put(b"v2\n", Visibility::Public).unwrap();
+        let new_oid = repo.put(b"v2\n", Visibility::Internal).unwrap();
         let mut t2 = BTreeMap::new();
-        t2.insert(PathBuf::from("a.txt"), (new_oid.clone(), Visibility::Public));
+        t2.insert(PathBuf::from("a.txt"), (new_oid.clone(), Visibility::Internal));
         repo.record(Change {
             id: Oid([0; 32]),
             parents: vec![parent.clone()],
@@ -3336,7 +3336,7 @@ mod tests {
         .unwrap();
         assert!(!repo.heads().contains(&parent), "parent is no longer a head");
         // Orphan object.
-        let orphan = repo.put(b"orphan\n", Visibility::Public).unwrap();
+        let orphan = repo.put(b"orphan\n", Visibility::Internal).unwrap();
         repo.save(&dir).unwrap();
 
         let report = repo.gc(&dir, false).unwrap();
@@ -3363,17 +3363,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let a_oid = repo.put(b"a\n", Visibility::Public).unwrap();
+        let a_oid = repo.put(b"a\n", Visibility::Internal).unwrap();
         let mut t1 = BTreeMap::new();
-        t1.insert(PathBuf::from("a.txt"), (a_oid.clone(), Visibility::Public));
+        t1.insert(PathBuf::from("a.txt"), (a_oid.clone(), Visibility::Internal));
         let c1 = repo
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "adds a".into(), tree: t1 })
             .unwrap();
 
-        let b_oid = repo.put(b"b\n", Visibility::Public).unwrap();
+        let b_oid = repo.put(b"b\n", Visibility::Internal).unwrap();
         let mut t2 = BTreeMap::new();
-        t2.insert(PathBuf::from("a.txt"), (a_oid, Visibility::Public));
-        t2.insert(PathBuf::from("b.txt"), (b_oid, Visibility::Public));
+        t2.insert(PathBuf::from("a.txt"), (a_oid, Visibility::Internal));
+        t2.insert(PathBuf::from("b.txt"), (b_oid, Visibility::Internal));
         let c2 = repo
             .record(Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "adds b".into(), tree: t2 })
             .unwrap();
@@ -3398,9 +3398,9 @@ mod tests {
 
         // Primary: one change c1, persisted (its heads file names c1).
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let kept = repo.put(b"primary\n", Visibility::Public).unwrap();
+        let kept = repo.put(b"primary\n", Visibility::Internal).unwrap();
         let mut t1 = BTreeMap::new();
-        t1.insert(PathBuf::from("a.txt"), (kept, Visibility::Public));
+        t1.insert(PathBuf::from("a.txt"), (kept, Visibility::Internal));
         let c1 = repo
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
             .unwrap();
@@ -3413,9 +3413,9 @@ mod tests {
         std::fs::create_dir_all(lane_work.join(".loot")).unwrap();
         let lane_store = RepoStore::for_lane(&dir, lane_work.join(".loot"));
         let mut lane = DagRepo::load_from(&lane_store, lane_work.clone()).unwrap();
-        let landed = lane.put(b"landed\n", Visibility::Public).unwrap();
+        let landed = lane.put(b"landed\n", Visibility::Internal).unwrap();
         let mut t2 = BTreeMap::new();
-        t2.insert(PathBuf::from("b.txt"), (landed.clone(), Visibility::Public));
+        t2.insert(PathBuf::from("b.txt"), (landed.clone(), Visibility::Internal));
         lane.record(Change {
             id: Oid([0; 32]),
             parents: vec![c1.clone()],
@@ -3447,9 +3447,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let base = repo.put(b"base\n", Visibility::Public).unwrap();
+        let base = repo.put(b"base\n", Visibility::Internal).unwrap();
         let mut t1 = BTreeMap::new();
-        t1.insert(PathBuf::from("a.txt"), (base, Visibility::Public));
+        t1.insert(PathBuf::from("a.txt"), (base, Visibility::Internal));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
             .unwrap();
         repo.save(&dir).unwrap();
@@ -3462,7 +3462,7 @@ mod tests {
         let mut lane = DagRepo::load_from(&lane_store, lane_work.clone()).unwrap();
         lane.set_author(pk);
         let wip = lane
-            .snapshot(None, None, &[entry("wip.txt", b"lane wip", Visibility::Public)], "wip", 0)
+            .snapshot(None, None, &[entry("wip.txt", b"lane wip", Visibility::Internal)], "wip", 0)
             .unwrap();
         let wip_oid = lane.change_tree(&wip).unwrap()[&PathBuf::from("wip.txt")].0.clone();
         lane.save_to(&lane_store).unwrap();
@@ -3488,9 +3488,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let kept = repo.put(b"healthy\n", Visibility::Public).unwrap();
+        let kept = repo.put(b"healthy\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("a.txt"), (kept, Visibility::Public));
+        tree.insert(PathBuf::from("a.txt"), (kept, Visibility::Internal));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
             .unwrap();
         repo.save(&dir).unwrap();
@@ -3517,11 +3517,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let smashed = repo.put(b"will be overwritten with garbage\n", Visibility::Public).unwrap();
-        let moved = repo.put(b"will be renamed to a wrong address\n", Visibility::Public).unwrap();
+        let smashed = repo.put(b"will be overwritten with garbage\n", Visibility::Internal).unwrap();
+        let moved = repo.put(b"will be renamed to a wrong address\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("a.txt"), (smashed.clone(), Visibility::Public));
-        tree.insert(PathBuf::from("b.txt"), (moved.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("a.txt"), (smashed.clone(), Visibility::Internal));
+        tree.insert(PathBuf::from("b.txt"), (moved.clone(), Visibility::Internal));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
             .unwrap();
         repo.save(&dir).unwrap();
@@ -3568,9 +3568,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let lost = repo.put(b"referenced then deleted\n", Visibility::Public).unwrap();
+        let lost = repo.put(b"referenced then deleted\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("a.txt"), (lost.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("a.txt"), (lost.clone(), Visibility::Internal));
         let c1 = repo
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
             .unwrap();
@@ -3609,11 +3609,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let gone = repo.put(b"lost forever\n", Visibility::Public).unwrap();
-        let later = repo.put(b"damaged later\n", Visibility::Public).unwrap();
+        let gone = repo.put(b"lost forever\n", Visibility::Internal).unwrap();
+        let later = repo.put(b"damaged later\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("a.txt"), (gone.clone(), Visibility::Public));
-        tree.insert(PathBuf::from("b.txt"), (later.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("a.txt"), (gone.clone(), Visibility::Internal));
+        tree.insert(PathBuf::from("b.txt"), (later.clone(), Visibility::Internal));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
             .unwrap();
         repo.save(&dir).unwrap();
@@ -3705,11 +3705,11 @@ mod tests {
     fn snapshot_rewrites_working_change_in_place() {
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let w1 = repo
-            .snapshot(None, None, &[entry("a.txt", b"one", Visibility::Public)], "wip", 0)
+            .snapshot(None, None, &[entry("a.txt", b"one", Visibility::Internal)], "wip", 0)
             .unwrap();
         // Re-snapshot with new content -> same working slot, not a second change.
         let w2 = repo
-            .snapshot(None, Some(&w1), &[entry("a.txt", b"two", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w1), &[entry("a.txt", b"two", Visibility::Internal)], "wip", 0)
             .unwrap();
         assert_eq!(repo.log().len(), 1, "working change rewritten, not appended");
         assert!(repo.heads().contains(&w2));
@@ -3728,11 +3728,11 @@ mod tests {
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         repo.set_author(pk);
         let w1 = repo
-            .snapshot(None, None, &[entry("a.txt", b"one", Visibility::Public)], "wip", 0)
+            .snapshot(None, None, &[entry("a.txt", b"one", Visibility::Internal)], "wip", 0)
             .unwrap();
         let cid1 = repo.change_change_id(&w1).expect("an authored change mints a change id");
         let w2 = repo
-            .snapshot(None, Some(&w1), &[entry("a.txt", b"two", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w1), &[entry("a.txt", b"two", Visibility::Internal)], "wip", 0)
             .unwrap();
         assert_ne!(w1, w2, "the version id rewrites when content changes");
         assert_eq!(
@@ -3748,7 +3748,7 @@ mod tests {
         // matches legacy `None` (ADR 0029).
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let w = repo
-            .snapshot(None, None, &[entry("a.txt", b"x", Visibility::Public)], "wip", 0)
+            .snapshot(None, None, &[entry("a.txt", b"x", Visibility::Internal)], "wip", 0)
             .unwrap();
         assert!(repo.change_change_id(&w).is_none());
     }
@@ -3764,8 +3764,8 @@ mod tests {
                 None,
                 None,
                 &[
-                    entry("edited.txt", b"one", Visibility::Public),
-                    entry("stable.txt", b"same", Visibility::Public),
+                    entry("edited.txt", b"one", Visibility::Internal),
+                    entry("stable.txt", b"same", Visibility::Internal),
                 ],
                 "wip",
                 0,
@@ -3777,8 +3777,8 @@ mod tests {
                 None,
                 Some(&w1),
                 &[
-                    entry("edited.txt", b"two", Visibility::Public),
-                    entry("stable.txt", b"same", Visibility::Public),
+                    entry("edited.txt", b"two", Visibility::Internal),
+                    entry("stable.txt", b"same", Visibility::Internal),
                 ],
                 "wip",
                 0,
@@ -3806,7 +3806,7 @@ mod tests {
         // itself, not just behind the workspace's tree-hash short-circuit:
         // unchanged entries + same message => the same change id.
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
-        let entries = [entry("a.txt", b"body", Visibility::Public)];
+        let entries = [entry("a.txt", b"body", Visibility::Internal)];
         let w1 = repo.snapshot(None, None, &entries, "wip", 0).unwrap();
         let w2 = repo.snapshot(None, Some(&w1), &entries, "wip", 0).unwrap();
         assert_eq!(w1, w2, "unchanged tree must rewrite to the same change id");
@@ -3820,7 +3820,7 @@ mod tests {
         let restricted = Visibility::Restricted(vec!["alice".into()]);
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let w1 = repo
-            .snapshot(None, None, &[entry("a.txt", b"s", Visibility::Public)], "wip", 0)
+            .snapshot(None, None, &[entry("a.txt", b"s", Visibility::Internal)], "wip", 0)
             .unwrap();
         let t1 = repo.graph.tree_at(&w1);
         let w2 = repo
@@ -3869,7 +3869,7 @@ mod tests {
             .snapshot(None, None, &[entry(".env", b"s", restricted.clone())], "wip", 0)
             .unwrap();
         let err = repo
-            .snapshot(None, Some(&w1), &[entry(".env", b"s", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w1), &[entry(".env", b"s", Visibility::Internal)], "wip", 0)
             .unwrap_err();
         assert!(err.to_string().contains("demote"), "unexpected error: {err}");
         // The refusal happened before any mutation: the working head survives.
@@ -3880,14 +3880,14 @@ mod tests {
             .snapshot_allowing(
                 None,
                 Some(&w1),
-                &[entry(".env", b"s", Visibility::Public)],
+                &[entry(".env", b"s", Visibility::Internal)],
                 "wip",
                 0,
                 &[PathBuf::from(".env")],
             )
             .unwrap();
         let tree = repo.graph.tree_at(&w2);
-        assert!(matches!(tree[&PathBuf::from(".env")].1, Visibility::Public));
+        assert!(matches!(tree[&PathBuf::from(".env")].1, Visibility::Internal));
     }
 
     #[test]
@@ -3905,12 +3905,12 @@ mod tests {
             .is_err());
         // Embargoed -> Public: demotion.
         assert!(repo
-            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", Visibility::Internal)], "wip", 0)
             .is_err());
 
         // Promotion (Public -> Restricted) needs no ceremony.
         let w2 = repo
-            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", embargoed), entry("a.md", b"x", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", embargoed), entry("a.md", b"x", Visibility::Internal)], "wip", 0)
             .unwrap();
         assert!(repo
             .snapshot(None, Some(&w2), &[entry("fix.rs", b"cve", Visibility::Embargoed { reveal_at: 100 }), entry("a.md", b"x", restricted)], "wip", 0)
@@ -3924,17 +3924,17 @@ mod tests {
         // A change that added feature.txt over its parent, cherry-picked onto a
         // sibling line that never had it: the addition applies cleanly.
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
-        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Public)], "base", 0).unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Internal)], "base", 0).unwrap();
         let t = repo
             .snapshot(
                 Some(&b),
                 None,
-                &[entry("a.txt", b"base", Visibility::Public), entry("feature.txt", b"F", Visibility::Public)],
+                &[entry("a.txt", b"base", Visibility::Internal), entry("feature.txt", b"F", Visibility::Internal)],
                 "add feature",
                 0,
             )
             .unwrap();
-        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"base", Visibility::Public)], "wip", 0).unwrap();
+        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"base", Visibility::Internal)], "wip", 0).unwrap();
 
         let dm = repo.change_delta_merge(&w, &t, false, 0);
         assert!(!dm.conflicted, "a clean add never conflicts");
@@ -3952,12 +3952,12 @@ mod tests {
         // The inverse of a change that added feature.txt is a deletion of it,
         // applied onto a line that has it (the change's own line).
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
-        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Public)], "base", 0).unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Internal)], "base", 0).unwrap();
         let t = repo
             .snapshot(
                 Some(&b),
                 None,
-                &[entry("a.txt", b"base", Visibility::Public), entry("feature.txt", b"F", Visibility::Public)],
+                &[entry("a.txt", b"base", Visibility::Internal), entry("feature.txt", b"F", Visibility::Internal)],
                 "add feature",
                 0,
             )
@@ -3977,9 +3977,9 @@ mod tests {
         // The delta and the working line edited the same path differently — a
         // genuine conflict, recorded for `loot resolve`, with no action applied.
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
-        let b = repo.snapshot(None, None, &[entry("a.txt", b"base\n", Visibility::Public)], "base", 0).unwrap();
-        let t = repo.snapshot(Some(&b), None, &[entry("a.txt", b"target\n", Visibility::Public)], "t", 0).unwrap();
-        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"divergent\n", Visibility::Public)], "w", 0).unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base\n", Visibility::Internal)], "base", 0).unwrap();
+        let t = repo.snapshot(Some(&b), None, &[entry("a.txt", b"target\n", Visibility::Internal)], "t", 0).unwrap();
+        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"divergent\n", Visibility::Internal)], "w", 0).unwrap();
 
         let dm = repo.change_delta_merge(&w, &t, false, 0);
         assert!(dm.conflicted, "same-path divergence conflicts");
@@ -3997,17 +3997,17 @@ mod tests {
         // read — never fatal, and never applied.
         let embargoed = Visibility::Embargoed { reveal_at: 9_999_999_999 };
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
-        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Public)], "base", 0).unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Internal)], "base", 0).unwrap();
         let t = repo
             .snapshot(
                 Some(&b),
                 None,
-                &[entry("a.txt", b"base", Visibility::Public), entry("secret.txt", b"cve", embargoed)],
+                &[entry("a.txt", b"base", Visibility::Internal), entry("secret.txt", b"cve", embargoed)],
                 "add secret",
                 0,
             )
             .unwrap();
-        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"base", Visibility::Public)], "wip", 0).unwrap();
+        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"base", Visibility::Internal)], "wip", 0).unwrap();
 
         let dm = repo.change_delta_merge(&w, &t, false, 0);
         assert!(!dm.conflicted);
@@ -4020,8 +4020,8 @@ mod tests {
         // A root change (no parents) has its whole tree as the delta. Cherry-
         // picking it onto a disjoint line adopts every path it introduced.
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
-        let root = repo.snapshot(None, None, &[entry("r.txt", b"R", Visibility::Public)], "root", 0).unwrap();
-        let w = repo.snapshot(None, None, &[entry("other.txt", b"O", Visibility::Public)], "w", 0).unwrap();
+        let root = repo.snapshot(None, None, &[entry("r.txt", b"R", Visibility::Internal)], "root", 0).unwrap();
+        let w = repo.snapshot(None, None, &[entry("other.txt", b"O", Visibility::Internal)], "w", 0).unwrap();
 
         let dm = repo.change_delta_merge(&w, &root, false, 0);
         assert!(!dm.conflicted);
@@ -4036,7 +4036,7 @@ mod tests {
         // it); connor pulls. Bob never touched ctx.md since the base — the
         // pull must not report a conflict on it.
         let base_bytes: &[u8] = b"# context\nalpha\nbeta\n";
-        let vis = Visibility::Public;
+        let vis = Visibility::Internal;
 
         let mut connor = DagRepo::init(std::env::temp_dir(), "connor").unwrap();
         let c_ctx = connor.put(base_bytes, vis.clone()).unwrap();
@@ -4097,7 +4097,7 @@ mod tests {
     fn dock_merge_of_stale_side_does_not_conflict_on_untouched_paths() {
         // Same root cause through merge_tips (#65): tip B re-sealed ctx.md
         // without touching it while tip A modified a line.
-        let vis = Visibility::Public;
+        let vis = Visibility::Internal;
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let base_oid = repo.put(b"alpha\nbeta\n", vis.clone()).unwrap();
         let mut t = BTreeMap::new();
@@ -4141,7 +4141,7 @@ mod tests {
         // ancestry-union `tree_at` re-raised every deleted path into both
         // merge inputs, and the classifier — seeing the same stale address on
         // both sides — kept it.
-        let vis = Visibility::Public;
+        let vis = Visibility::Internal;
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let keep = repo.put(b"keep\n", vis.clone()).unwrap();
         let gone = repo.put(b"doomed\n", vis.clone()).unwrap();
@@ -4206,7 +4206,7 @@ mod tests {
         // the fork; the other never touches it. The reconcile merge must keep
         // it DELETED — not re-adopt it from the untouched side. This is the gap
         // the #288 fix (full manifests) left open in the converge classifier.
-        let vis = Visibility::Public;
+        let vis = Visibility::Internal;
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let keep = repo.put(b"keep\n", vis.clone()).unwrap();
         let doomed = repo.put(b"doomed\n", vis.clone()).unwrap();
@@ -4274,7 +4274,7 @@ mod tests {
         // #295: one line deletes a path since the fork, the other edits it. That
         // is a genuine conflict — it must surface (bounce), never silently pick
         // a winner.
-        let vis = Visibility::Public;
+        let vis = Visibility::Internal;
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let orig = repo.put(b"orig\n", vis.clone()).unwrap();
         let mut t0 = BTreeMap::new();
@@ -4315,7 +4315,7 @@ mod tests {
         // while sharing the object store for the base content.
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let base = repo
-            .snapshot(None, None, &[entry("shared.txt", b"base", Visibility::Public)], "base", 0)
+            .snapshot(None, None, &[entry("shared.txt", b"base", Visibility::Internal)], "base", 0)
             .unwrap();
 
         // Fork A adds a.txt on top of base; fork B adds b.txt on top of base.
@@ -4327,8 +4327,8 @@ mod tests {
                 Some(&base),
                 None,
                 &[
-                    entry("shared.txt", b"base", Visibility::Public),
-                    entry("a.txt", b"A", Visibility::Public),
+                    entry("shared.txt", b"base", Visibility::Internal),
+                    entry("a.txt", b"A", Visibility::Internal),
                 ],
                 "fork a",
                 0,
@@ -4339,8 +4339,8 @@ mod tests {
                 Some(&base),
                 None,
                 &[
-                    entry("shared.txt", b"base", Visibility::Public),
-                    entry("b.txt", b"B", Visibility::Public),
+                    entry("shared.txt", b"base", Visibility::Internal),
+                    entry("b.txt", b"B", Visibility::Internal),
                 ],
                 "fork b",
                 0,
@@ -4372,14 +4372,14 @@ mod tests {
         let mut repo = DagRepo::init(root.clone(), "alice").unwrap();
 
         let base = repo
-            .snapshot(None, None, &[entry("shared.txt", b"s", Visibility::Public)], "base", 0)
+            .snapshot(None, None, &[entry("shared.txt", b"s", Visibility::Internal)], "base", 0)
             .unwrap();
         // Real snapshots carry the full working tree, so shared.txt rides along.
         let a = repo
             .snapshot(
                 Some(&base),
                 None,
-                &[entry("shared.txt", b"s", Visibility::Public), entry("a.txt", b"A", Visibility::Public)],
+                &[entry("shared.txt", b"s", Visibility::Internal), entry("a.txt", b"A", Visibility::Internal)],
                 "a",
                 0,
             )
@@ -4388,7 +4388,7 @@ mod tests {
             .snapshot(
                 Some(&base),
                 None,
-                &[entry("shared.txt", b"s", Visibility::Public), entry("b.txt", b"B", Visibility::Public)],
+                &[entry("shared.txt", b"s", Visibility::Internal), entry("b.txt", b"B", Visibility::Internal)],
                 "b",
                 0,
             )
@@ -4414,8 +4414,8 @@ mod tests {
                 None,
                 None,
                 &[
-                    entry("keep.txt", b"k", Visibility::Public),
-                    entry("gone.txt", b"g", Visibility::Public),
+                    entry("keep.txt", b"k", Visibility::Internal),
+                    entry("gone.txt", b"g", Visibility::Internal),
                 ],
                 "wip",
                 0,
@@ -4423,7 +4423,7 @@ mod tests {
             .unwrap();
         // Re-snapshot with gone.txt removed from the tree -> it's deleted.
         let w2 = repo
-            .snapshot(None, Some(&w), &[entry("keep.txt", b"k", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w), &[entry("keep.txt", b"k", Visibility::Internal)], "wip", 0)
             .unwrap();
         let tree = repo.graph.current_tree();
         assert!(tree.contains_key(&PathBuf::from("keep.txt")));
@@ -4444,8 +4444,8 @@ mod tests {
                 None,
                 None,
                 &[
-                    entry("keep.txt", b"k", Visibility::Public),
-                    entry("gone.txt", b"g", Visibility::Public),
+                    entry("keep.txt", b"k", Visibility::Internal),
+                    entry("gone.txt", b"g", Visibility::Internal),
                 ],
                 "base",
                 0,
@@ -4453,7 +4453,7 @@ mod tests {
             .unwrap();
         // A deletion-only child: identical content minus gone.txt.
         let del = repo
-            .snapshot(Some(&base), None, &[entry("keep.txt", b"k", Visibility::Public)], "del", 0)
+            .snapshot(Some(&base), None, &[entry("keep.txt", b"k", Visibility::Internal)], "del", 0)
             .unwrap();
         assert!(!repo.same_tree_content(&base, &del, 0), "a deletion-only change ≠ its parent");
         assert!(!repo.same_tree_content(&del, &base, 0), "and the judgment is symmetric");
@@ -4462,7 +4462,7 @@ mod tests {
         // equal — the truly-redundant drop (bare `new`, co-located checkout after
         // a `git pull`) must keep working.
         let dup = repo
-            .snapshot(Some(&del), None, &[entry("keep.txt", b"k", Visibility::Public)], "dup", 0)
+            .snapshot(Some(&del), None, &[entry("keep.txt", b"k", Visibility::Internal)], "dup", 0)
             .unwrap();
         assert!(repo.same_tree_content(&del, &dup, 0), "identical manifests still compare equal");
     }
@@ -4479,7 +4479,7 @@ mod tests {
                 None,
                 &[
                     entry(".env", b"SECRET", Visibility::Restricted(vec!["alice".into()])),
-                    entry("README", b"hi", Visibility::Public),
+                    entry("README", b"hi", Visibility::Internal),
                 ],
                 "init",
                 0,
@@ -4497,7 +4497,7 @@ mod tests {
         bob.snapshot(
             None,
             None,
-            &[entry("README", b"hi edited by bob", Visibility::Public)],
+            &[entry("README", b"hi edited by bob", Visibility::Internal)],
             "bob edits readme",
             0,
         )
@@ -4606,22 +4606,22 @@ mod tests {
         let mut bob = DagRepo::init(tmp(), "bob").unwrap();
 
         // Shared base.
-        let oid_base = alice.put(b"base\n", Visibility::Public).unwrap();
+        let oid_base = alice.put(b"base\n", Visibility::Internal).unwrap();
         let mut base_tree = BTreeMap::new();
-        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Internal));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree }).unwrap();
         let seed = alice.bundle(&[]).unwrap();
         bob.apply(&seed, 0).unwrap();
 
         // Divergent edits.
-        let oid_alice = alice.put(b"alice edit\n", Visibility::Public).unwrap();
+        let oid_alice = alice.put(b"alice edit\n", Visibility::Internal).unwrap();
         let mut alice_tree = BTreeMap::new();
-        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Internal));
         alice.record(Change { id: Oid([0; 32]), parents: alice.graph.heads(), message: "alice".into(), tree: alice_tree }).unwrap();
 
-        let oid_bob = bob.put(b"bob edit\n", Visibility::Public).unwrap();
+        let oid_bob = bob.put(b"bob edit\n", Visibility::Internal).unwrap();
         let mut bob_tree = BTreeMap::new();
-        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob.clone(), Visibility::Public));
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob.clone(), Visibility::Internal));
         bob.record(Change { id: Oid([0; 32]), parents: bob.graph.heads(), message: "bob".into(), tree: bob_tree }).unwrap();
 
         // Bob applies alice's bundle.
@@ -4648,9 +4648,9 @@ mod tests {
         let mut bob = DagRepo::init(tmp(), "bob").unwrap();
 
         // Shared base carrying the handle.
-        let oid_base = alice.put(b"base\n", Visibility::Public).unwrap();
+        let oid_base = alice.put(b"base\n", Visibility::Internal).unwrap();
         let mut base_tree = BTreeMap::new();
-        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Internal));
         let x = alice
             .record_carrying(
                 Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree },
@@ -4662,9 +4662,9 @@ mod tests {
 
         // Concurrent amends of the SAME handle, same path: each supersedes the
         // base, neither the other.
-        let oid_alice = alice.put(b"alice's take\n", Visibility::Public).unwrap();
+        let oid_alice = alice.put(b"alice's take\n", Visibility::Internal).unwrap();
         let mut alice_tree = BTreeMap::new();
-        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Internal));
         alice
             .record_superseding(
                 Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "amend".into(), tree: alice_tree },
@@ -4673,9 +4673,9 @@ mod tests {
             )
             .unwrap();
 
-        let oid_bob = bob.put(b"bob's take\n", Visibility::Public).unwrap();
+        let oid_bob = bob.put(b"bob's take\n", Visibility::Internal).unwrap();
         let mut bob_tree = BTreeMap::new();
-        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob, Visibility::Public));
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob, Visibility::Internal));
         bob.record_superseding(
             Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "amend".into(), tree: bob_tree },
             Some(cid),
@@ -4713,9 +4713,9 @@ mod tests {
         let mut bob = DagRepo::init(tmp(), "bob").unwrap();
 
         let oid_base = alice.put(b"base
-", Visibility::Public).unwrap();
+", Visibility::Internal).unwrap();
         let mut base_tree = BTreeMap::new();
-        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Internal));
         let x = alice
             .record_carrying(
                 Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree },
@@ -4727,9 +4727,9 @@ mod tests {
 
         // Bob's own co-version (no supersession claim), then abandoned.
         let oid_bob = bob.put(b"bob's take
-", Visibility::Public).unwrap();
+", Visibility::Internal).unwrap();
         let mut bob_tree = BTreeMap::new();
-        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob, Visibility::Public));
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob, Visibility::Internal));
         let y = bob
             .record_carrying(
                 Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "take".into(), tree: bob_tree },
@@ -4743,9 +4743,9 @@ mod tests {
 
         // Alice amends X (supersedes it) and ships the amend.
         let oid_alice = alice.put(b"alice's take
-", Visibility::Public).unwrap();
+", Visibility::Internal).unwrap();
         let mut alice_tree = BTreeMap::new();
-        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Internal));
         alice
             .record_superseding(
                 Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "amend".into(), tree: alice_tree },
@@ -4809,9 +4809,9 @@ mod tests {
         // bundle (ADR 0003). A relay must retain that key and forward it, or a
         // downstream peer would receive unreadable public ciphertext.
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let oid = alice.put(b"readme\n", Visibility::Public).unwrap();
+        let oid = alice.put(b"readme\n", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("README"), (oid.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("README"), (oid.clone(), Visibility::Internal));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree }).unwrap();
 
         let mut relay = DagRepo::init(tmp(), "relay").unwrap();
@@ -4829,9 +4829,9 @@ mod tests {
         // graph holds both tips (a fork) and records no conflict — convergence
         // is the keyholders' job on pull, not the relay's.
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let base_oid = alice.put(b"base\n", Visibility::Public).unwrap();
+        let base_oid = alice.put(b"base\n", Visibility::Internal).unwrap();
         let mut base_tree = BTreeMap::new();
-        base_tree.insert(PathBuf::from("f.txt"), (base_oid, Visibility::Public));
+        base_tree.insert(PathBuf::from("f.txt"), (base_oid, Visibility::Internal));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree }).unwrap();
 
         let mut relay = DagRepo::init(tmp(), "relay").unwrap();
@@ -4842,14 +4842,14 @@ mod tests {
         bob.apply(&alice.bundle(&[]).unwrap(), 0).unwrap();
 
         // Divergent edits on the same path.
-        let a_oid = alice.put(b"alice\n", Visibility::Public).unwrap();
+        let a_oid = alice.put(b"alice\n", Visibility::Internal).unwrap();
         let mut a_tree = BTreeMap::new();
-        a_tree.insert(PathBuf::from("f.txt"), (a_oid, Visibility::Public));
+        a_tree.insert(PathBuf::from("f.txt"), (a_oid, Visibility::Internal));
         alice.record(Change { id: Oid([0; 32]), parents: alice.graph.heads(), message: "a".into(), tree: a_tree }).unwrap();
 
-        let b_oid = bob.put(b"bob\n", Visibility::Public).unwrap();
+        let b_oid = bob.put(b"bob\n", Visibility::Internal).unwrap();
         let mut b_tree = BTreeMap::new();
-        b_tree.insert(PathBuf::from("f.txt"), (b_oid, Visibility::Public));
+        b_tree.insert(PathBuf::from("f.txt"), (b_oid, Visibility::Internal));
         bob.record(Change { id: Oid([0; 32]), parents: bob.graph.heads(), message: "b".into(), tree: b_tree }).unwrap();
 
         // Relay stows both pushes. No merge, no conflict — just two tips.
@@ -4910,22 +4910,22 @@ mod tests {
         let mut bob = DagRepo::init(tmp(), "bob").unwrap();
 
         // Shared base.
-        let oid_base = alice.put(b"base\n", Visibility::Public).unwrap();
+        let oid_base = alice.put(b"base\n", Visibility::Internal).unwrap();
         let mut base_tree = BTreeMap::new();
-        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Internal));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree }).unwrap();
         let seed = alice.bundle(&[]).unwrap();
         bob.apply(&seed, 0).unwrap();
 
         // Divergent edits.
-        let oid_alice = alice.put(b"alice\n", Visibility::Public).unwrap();
+        let oid_alice = alice.put(b"alice\n", Visibility::Internal).unwrap();
         let mut alice_tree = BTreeMap::new();
-        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Internal));
         alice.record(Change { id: Oid([0; 32]), parents: alice.graph.heads(), message: "alice".into(), tree: alice_tree }).unwrap();
 
-        let oid_bob_edit = bob.put(b"bob\n", Visibility::Public).unwrap();
+        let oid_bob_edit = bob.put(b"bob\n", Visibility::Internal).unwrap();
         let mut bob_tree = BTreeMap::new();
-        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob_edit.clone(), Visibility::Public));
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob_edit.clone(), Visibility::Internal));
         bob.record(Change { id: Oid([0; 32]), parents: bob.graph.heads(), message: "bob".into(), tree: bob_tree }).unwrap();
 
         let alice_bundle = alice.bundle(&bob.heads()).unwrap();
@@ -4936,7 +4936,7 @@ mod tests {
 
         // Resolve.
         let resolution = b"resolved content\n";
-        let (_change, new_oid) = bob.resolve(None, Path::new("f.txt"), resolution, Visibility::Public, 0).unwrap();
+        let (_change, new_oid) = bob.resolve(None, Path::new("f.txt"), resolution, Visibility::Internal, 0).unwrap();
 
         // Conflict cleared.
         assert!(!bob.conflicts.contains_key(Path::new("f.txt")), "conflict must be cleared after resolve");
@@ -4949,7 +4949,7 @@ mod tests {
     #[test]
     fn resolve_unknown_path_errors() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let result = alice.resolve(None, Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
+        let result = alice.resolve(None, Path::new("no-conflict.txt"), b"resolution", Visibility::Internal, 0);
         assert!(matches!(result, Err(RepoError::Backend(_))), "unknown path must error");
     }
 
@@ -4965,7 +4965,7 @@ mod tests {
     /// `subject`) and theirs edit of the same `paths`, merged as the ferry
     /// does. Returns the repo and the conflicted merge id.
     fn bounced_merge(subject: &str, paths: &[&str]) -> (DagRepo, Oid) {
-        let vis = Visibility::Public;
+        let vis = Visibility::Internal;
         let mut repo = DagRepo::init(tmp(), "alice").unwrap();
         let mut base_tree = BTreeMap::new();
         let base_oid = repo.put(b"base\n", vis.clone()).unwrap();
@@ -5016,7 +5016,7 @@ mod tests {
         let subject = "loot grant-status <path>: list current grantees (#5)";
         let (mut repo, merge) = bounced_merge(subject, &["contested.txt"]);
         let (res, _) = repo
-            .resolve(Some(&merge), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .resolve(Some(&merge), Path::new("contested.txt"), b"resolved\n", Visibility::Internal, 0)
             .unwrap();
         assert_eq!(
             repo.graph.get(&res).unwrap().message,
@@ -5033,14 +5033,14 @@ mod tests {
         let subject = "wave subject (#23)";
         let (mut repo, merge) = bounced_merge(subject, &["a.txt", "d.txt"]);
         let (r1, _) = repo
-            .resolve(Some(&merge), Path::new("a.txt"), b"resolved a\n", Visibility::Public, 0)
+            .resolve(Some(&merge), Path::new("a.txt"), b"resolved a\n", Visibility::Internal, 0)
             .unwrap();
         assert_eq!(
             repo.graph.get(&r1).unwrap().message,
             format!("{subject} (conflict resolution: a.txt)")
         );
         let (r2, _) = repo
-            .resolve(Some(&r1), Path::new("d.txt"), b"resolved d\n", Visibility::Public, 0)
+            .resolve(Some(&r1), Path::new("d.txt"), b"resolved d\n", Visibility::Internal, 0)
             .unwrap();
         assert_eq!(
             repo.graph.get(&r2).unwrap().message,
@@ -5057,9 +5057,9 @@ mod tests {
         let (mut repo, merge) = bounced_merge(subject, &["contested.txt"]);
         // Splice a legacy placeholder change between the merge and resolve:
         // resolve builds on it, exactly like a pre-#337 partial reconcile.
-        let oid = repo.put(b"legacy\n", Visibility::Public).unwrap();
+        let oid = repo.put(b"legacy\n", Visibility::Internal).unwrap();
         let mut tree = repo.graph.tree_at(&merge);
-        tree.insert(PathBuf::from("other.txt"), (oid, Visibility::Public));
+        tree.insert(PathBuf::from("other.txt"), (oid, Visibility::Internal));
         let legacy = repo
             .record(Change {
                 id: Oid([0; 32]),
@@ -5069,7 +5069,7 @@ mod tests {
             })
             .unwrap();
         let (res, _) = repo
-            .resolve(Some(&legacy), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .resolve(Some(&legacy), Path::new("contested.txt"), b"resolved\n", Visibility::Internal, 0)
             .unwrap();
         assert_eq!(
             repo.graph.get(&res).unwrap().message,
@@ -5085,7 +5085,7 @@ mod tests {
         // (#316) keeps refusing it.
         let (mut repo, _merge) = bounced_merge("some subject", &["contested.txt"]);
         let (res, _) = repo
-            .resolve(None, Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .resolve(None, Path::new("contested.txt"), b"resolved\n", Visibility::Internal, 0)
             .unwrap();
         assert_eq!(
             repo.graph.get(&res).unwrap().message,
@@ -5102,9 +5102,9 @@ mod tests {
         // resolve placeholder.
         let subject = "the real subject (#42)";
         let (mut repo, merge) = bounced_merge(subject, &["contested.txt"]);
-        let oid = repo.put(b"wip\n", Visibility::Public).unwrap();
+        let oid = repo.put(b"wip\n", Visibility::Internal).unwrap();
         let mut tree = repo.graph.tree_at(&merge);
-        tree.insert(PathBuf::from("other.txt"), (oid, Visibility::Public));
+        tree.insert(PathBuf::from("other.txt"), (oid, Visibility::Internal));
         let undescribed = repo
             .record(Change {
                 id: Oid([0; 32]),
@@ -5114,7 +5114,7 @@ mod tests {
             })
             .unwrap();
         let (res, _) = repo
-            .resolve(Some(&undescribed), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .resolve(Some(&undescribed), Path::new("contested.txt"), b"resolved\n", Visibility::Internal, 0)
             .unwrap();
         assert_eq!(
             repo.graph.get(&res).unwrap().message,
@@ -5127,7 +5127,7 @@ mod tests {
     fn resolve_falls_back_when_the_walk_finds_no_subject() {
         // An ours line made only of placeholder subjects derives nothing —
         // fall back rather than inherit a placeholder.
-        let vis = Visibility::Public;
+        let vis = Visibility::Internal;
         let mut repo = DagRepo::init(tmp(), "alice").unwrap();
         let base_oid = repo.put(b"base\n", vis.clone()).unwrap();
         let mut t0 = BTreeMap::new();
@@ -5164,7 +5164,7 @@ mod tests {
             .unwrap();
         let (merge, _) = repo.merge_tips(&ours, &theirs, "ferry: reconcile git main", 0).unwrap();
         let (res, _) = repo
-            .resolve(Some(&merge), Path::new("contested.txt"), b"resolved\n", Visibility::Public, 0)
+            .resolve(Some(&merge), Path::new("contested.txt"), b"resolved\n", Visibility::Internal, 0)
             .unwrap();
         assert_eq!(
             repo.graph.get(&res).unwrap().message,
@@ -5367,7 +5367,7 @@ mod tests {
     #[test]
     fn author_is_part_of_change_id() {
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("f"), (Oid([9; 32]), Visibility::Public));
+        tree.insert(PathBuf::from("f"), (Oid([9; 32]), Visibility::Internal));
         let change = Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree };
         let (_s1, pk1) = test_signer(1);
         let (_s2, pk2) = test_signer(2);
@@ -5634,9 +5634,9 @@ mod tests {
         let (sk, pk) = test_signer(9);
         let mut repo = DagRepo::init(tmp(), "alice").unwrap();
         repo.set_author(pk);
-        let oid = repo.put(b"x", Visibility::Public).unwrap();
+        let oid = repo.put(b"x", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("f"), (oid, Visibility::Public));
+        tree.insert(PathBuf::from("f"), (oid, Visibility::Internal));
         let id = repo
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
             .unwrap();
@@ -5666,13 +5666,13 @@ mod tests {
         let mut repo = DagRepo::init(tmp(), "connor").unwrap();
         repo.set_author(pk);
         let handle = [0x5A; 16];
-        let entries = vec![(PathBuf::from("f"), b"one".to_vec(), Visibility::Public)];
+        let entries = vec![(PathBuf::from("f"), b"one".to_vec(), Visibility::Internal)];
         let v1 = repo
             .snapshot_assigning(None, None, &entries, "m", 0, &[], Some(handle))
             .unwrap();
         assert_eq!(repo.change_change_id(&v1), Some(handle), "assign lands on the fresh change");
 
-        let entries2 = vec![(PathBuf::from("f"), b"two".to_vec(), Visibility::Public)];
+        let entries2 = vec![(PathBuf::from("f"), b"two".to_vec(), Visibility::Internal)];
         let v2 = repo
             .snapshot_assigning(None, Some(&v1), &entries2, "m", 0, &[], Some([0x11; 16]))
             .unwrap();
@@ -5692,7 +5692,7 @@ mod tests {
         let (_sk, pk) = test_signer(4);
         let mut repo = DagRepo::init(tmp(), "connor").unwrap();
         repo.set_author(pk);
-        let entries = vec![(PathBuf::from("f"), b"hello".to_vec(), Visibility::Public)];
+        let entries = vec![(PathBuf::from("f"), b"hello".to_vec(), Visibility::Internal)];
         let tip = repo
             .snapshot_assigning(None, None, &entries, "m", 0, &[], Some([1; 16]))
             .unwrap();
@@ -5703,7 +5703,7 @@ mod tests {
         assert_eq!(v_a, v_b, "preview is a pure function of content");
         assert!(empty_a && empty_b, "no delta over the tip -> empty");
 
-        let changed = vec![(PathBuf::from("f"), b"hello world".to_vec(), Visibility::Public)];
+        let changed = vec![(PathBuf::from("f"), b"hello world".to_vec(), Visibility::Internal)];
         let (v_c, empty_c) = repo.working_preview(Some(&tip), &changed, "m", 0);
         assert!(!empty_c, "a delta over the tip is not empty");
         assert_ne!(v_a, v_c, "the live version moves with content");
@@ -5838,15 +5838,15 @@ mod tests {
     fn negotiation_transfers_only_missing_objects() {
         // Alice: two changes, each adding one public object (A then B).
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let a = alice.put(b"aaaa", Visibility::Public).unwrap();
+        let a = alice.put(b"aaaa", Visibility::Internal).unwrap();
         let mut t1 = BTreeMap::new();
-        t1.insert(PathBuf::from("a"), (a.clone(), Visibility::Public));
+        t1.insert(PathBuf::from("a"), (a.clone(), Visibility::Internal));
         let c1 = alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
             .unwrap();
-        let b = alice.put(b"bbbb", Visibility::Public).unwrap();
+        let b = alice.put(b"bbbb", Visibility::Internal).unwrap();
         let mut t2 = BTreeMap::new();
-        t2.insert(PathBuf::from("b"), (b.clone(), Visibility::Public));
+        t2.insert(PathBuf::from("b"), (b.clone(), Visibility::Internal));
         let c2 = alice
             .record(Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "c2".into(), tree: t2 })
             .unwrap();
@@ -5875,9 +5875,9 @@ mod tests {
     #[test]
     fn re_pull_with_nothing_new_transfers_zero_objects() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let a = alice.put(b"data", Visibility::Public).unwrap();
+        let a = alice.put(b"data", Visibility::Internal).unwrap();
         let mut t = BTreeMap::new();
-        t.insert(PathBuf::from("f"), (a, Visibility::Public));
+        t.insert(PathBuf::from("f"), (a, Visibility::Internal));
         alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree: t })
             .unwrap();
@@ -5900,15 +5900,15 @@ mod tests {
     fn interrupted_push_resumes_transferring_only_remaining() {
         // Alice: two changes, objects A then B.
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let a = alice.put(b"aaaa", Visibility::Public).unwrap();
+        let a = alice.put(b"aaaa", Visibility::Internal).unwrap();
         let mut t1 = BTreeMap::new();
-        t1.insert(PathBuf::from("a"), (a.clone(), Visibility::Public));
+        t1.insert(PathBuf::from("a"), (a.clone(), Visibility::Internal));
         let c1 = alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
             .unwrap();
-        let b = alice.put(b"bbbb", Visibility::Public).unwrap();
+        let b = alice.put(b"bbbb", Visibility::Internal).unwrap();
         let mut t2 = BTreeMap::new();
-        t2.insert(PathBuf::from("b"), (b.clone(), Visibility::Public));
+        t2.insert(PathBuf::from("b"), (b.clone(), Visibility::Internal));
         alice
             .record(Change { id: Oid([0; 32]), parents: vec![c1], message: "c2".into(), tree: t2 })
             .unwrap();
@@ -5935,9 +5935,9 @@ mod tests {
     #[test]
     fn re_stowing_a_delivered_bundle_is_idempotent() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let a = alice.put(b"data", Visibility::Public).unwrap();
+        let a = alice.put(b"data", Visibility::Internal).unwrap();
         let mut t = BTreeMap::new();
-        t.insert(PathBuf::from("f"), (a.clone(), Visibility::Public));
+        t.insert(PathBuf::from("f"), (a.clone(), Visibility::Internal));
         alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree: t })
             .unwrap();
@@ -6080,9 +6080,9 @@ mod tests {
         /// (dir, oid). The repo is authored-less (keyless) unless a signer is set.
         fn repo_with_secret(dir: &Path, path: &str, bytes: &[u8]) -> Oid {
             let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-            let oid = repo.put(bytes, Visibility::Public).unwrap();
+            let oid = repo.put(bytes, Visibility::Internal).unwrap();
             let mut tree = BTreeMap::new();
-            tree.insert(PathBuf::from(path), (oid.clone(), Visibility::Public));
+            tree.insert(PathBuf::from(path), (oid.clone(), Visibility::Internal));
             repo.record_unauthored(Change {
                 id: Oid([0; 32]),
                 parents: vec![],

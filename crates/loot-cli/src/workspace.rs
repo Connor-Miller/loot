@@ -1046,7 +1046,7 @@ impl Workspace {
             }
             first_seals.push((path.clone(), vis.clone()));
             if is_secret_name(&path)
-                && matches!(vis, Visibility::Public)
+                && matches!(vis, Visibility::Internal)
                 && fallthrough
                 && !allow_reveal.iter().any(|p| p == &path)
             {
@@ -4595,7 +4595,7 @@ impl Graph<'_> {
         };
         Ok(ConflictSide {
             oid: oid.clone(),
-            visibility: self.repo.visibility_of(oid).unwrap_or(Visibility::Public),
+            visibility: self.repo.visibility_of(oid).unwrap_or(Visibility::Internal),
             content,
         })
     }
@@ -5070,7 +5070,7 @@ fn hash_tree(entries: &[(PathBuf, Vec<u8>, Visibility)], message: &str) -> Vec<u
         h.update(&[0]);
         // Stable encoding: Public=0, Restricted=1+names, Embargoed=2+timestamp.
         match vis {
-            Visibility::Public => { h.update(&[0]); }
+            Visibility::Internal => { h.update(&[0]); }
             Visibility::Restricted(ids) => {
                 h.update(&[1]);
                 for id in ids {
@@ -6649,7 +6649,7 @@ mod tests {
         std::fs::write(dir.join(".lootattributes"), ".env public\n").unwrap();
         let seals = ws.seal_gate(&[]).expect("explicit rule is consent");
         assert!(
-            seals.iter().any(|(p, v)| p.ends_with(".env") && matches!(v, Visibility::Public)),
+            seals.iter().any(|(p, v)| p.ends_with(".env") && matches!(v, Visibility::Internal)),
             "the consented .env is a first seal: {seals:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -6773,7 +6773,7 @@ mod tests {
             "the amended tree carries the revealed path"
         );
         assert!(
-            seals.iter().any(|(p, v)| p.ends_with(".env") && matches!(v, Visibility::Public)),
+            seals.iter().any(|(p, v)| p.ends_with(".env") && matches!(v, Visibility::Internal)),
             "the first-seal summary names the deliberate reveal: {seals:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -6996,7 +6996,7 @@ mod tests {
         // The policy itself is versioned (travels to peers and clones).
         assert!(
             reported.iter().any(|(p, v)| p.ends_with(".lootattributes")
-                && matches!(v, Visibility::Public)),
+                && matches!(v, Visibility::Internal)),
             ".lootattributes must be snapshotted"
         );
 
@@ -7011,7 +7011,7 @@ mod tests {
         let (_, reported) =
             ws.snapshot_allowing("public now", &[PathBuf::from("secret.txt")]).unwrap();
         let vis = reported.iter().find(|(p, _)| p.ends_with("secret.txt")).unwrap();
-        assert!(matches!(vis.1, Visibility::Public));
+        assert!(matches!(vis.1, Visibility::Internal));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7024,8 +7024,8 @@ mod tests {
         std::fs::write(&p, text).unwrap();
         let attrs = Attributes::load(&p);
         assert!(matches!(attrs.visibility_for(".env"), Visibility::Restricted(ids) if ids == ["alice"]));
-        assert!(matches!(attrs.visibility_for("README.md"), Visibility::Public));
-        assert!(matches!(attrs.visibility_for("main.rs"), Visibility::Public));
+        assert!(matches!(attrs.visibility_for("README.md"), Visibility::Internal));
+        assert!(matches!(attrs.visibility_for("main.rs"), Visibility::Internal));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7066,8 +7066,8 @@ mod tests {
     fn hash_tree_is_stable() {
         use loot_core::Visibility;
         let entries: Vec<(PathBuf, Vec<u8>, Visibility)> = vec![
-            (PathBuf::from("a.txt"), b"hello".to_vec(), Visibility::Public),
-            (PathBuf::from("b.txt"), b"world".to_vec(), Visibility::Public),
+            (PathBuf::from("a.txt"), b"hello".to_vec(), Visibility::Internal),
+            (PathBuf::from("b.txt"), b"world".to_vec(), Visibility::Internal),
         ];
         let h1 = hash_tree(&entries, "msg");
         let h2 = hash_tree(&entries, "msg");
@@ -7075,7 +7075,7 @@ mod tests {
 
         // Different content -> different hash.
         let entries2: Vec<(PathBuf, Vec<u8>, Visibility)> = vec![
-            (PathBuf::from("a.txt"), b"different".to_vec(), Visibility::Public),
+            (PathBuf::from("a.txt"), b"different".to_vec(), Visibility::Internal),
         ];
         assert_ne!(hash_tree(&entries2, "msg"), h1);
 
@@ -8097,7 +8097,7 @@ mod tests {
         assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
 
         // Resolve — the resolution becomes the primary tip and lands on disk.
-        ws.resolve_conflict(Path::new("a.txt"), b"resolved\n", Visibility::Public).unwrap();
+        ws.resolve_conflict(Path::new("a.txt"), b"resolved\n", Visibility::Internal).unwrap();
         assert!(ws.repo().conflicts().is_empty(), "conflict cleared");
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"resolved\n", "resolution written to disk");
 
@@ -8158,7 +8158,7 @@ mod tests {
         std::fs::write(dir.join("c.txt"), b"uncommitted work\n").unwrap();
 
         // Resolve only a.txt.
-        ws.resolve_conflict(Path::new("a.txt"), b"resolved a\n", Visibility::Public).unwrap();
+        ws.resolve_conflict(Path::new("a.txt"), b"resolved a\n", Visibility::Internal).unwrap();
 
         // The resolved path landed on disk...
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"resolved a\n");
@@ -8177,7 +8177,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("d.txt")).unwrap(), b"home d\n");
 
         // Resolving the second conflict clears it and, again, leaves c.txt alone.
-        ws.resolve_conflict(Path::new("d.txt"), b"resolved d\n", Visibility::Public).unwrap();
+        ws.resolve_conflict(Path::new("d.txt"), b"resolved d\n", Visibility::Internal).unwrap();
         assert!(ws.repo().conflicts().is_empty(), "all conflicts resolved in one pass");
         assert_eq!(std::fs::read(dir.join("d.txt")).unwrap(), b"resolved d\n");
         assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"uncommitted work\n");
@@ -8219,7 +8219,7 @@ mod tests {
         );
 
         let (_oid, message) =
-            ws.resolve_conflict(Path::new("base.txt"), b"resolved\n", Visibility::Public).unwrap();
+            ws.resolve_conflict(Path::new("base.txt"), b"resolved\n", Visibility::Internal).unwrap();
         assert_eq!(
             message,
             "loot grant-status <path>: list current grantees (#5) (conflict resolution: base.txt)",
@@ -8765,27 +8765,27 @@ mod tests {
                         None,
                     )
                     .map_err(CliError::from)?;
-                let f2 = repo.put(b"L1\nL2\nL3\n", Visibility::Public).map_err(CliError::from)?;
+                let f2 = repo.put(b"L1\nL2\nL3\n", Visibility::Internal).map_err(CliError::from)?;
                 let a2 = repo
                     .record_carrying(
                         Change {
                             id: Oid([0; 32]),
                             parents: vec![a1.clone()],
                             message: "A2".into(),
-                            tree: tree(vec![("f", f2, Visibility::Public)]),
+                            tree: tree(vec![("f", f2, Visibility::Internal)]),
                         },
                         None,
                     )
                     .map_err(CliError::from)?;
                 let f3 =
-                    repo.put(b"L1\nL2\nL3\nL4\n", Visibility::Public).map_err(CliError::from)?;
+                    repo.put(b"L1\nL2\nL3\nL4\n", Visibility::Internal).map_err(CliError::from)?;
                 let a3 = repo
                     .record_carrying(
                         Change {
                             id: Oid([0; 32]),
                             parents: vec![a2.clone()],
                             message: "A3".into(),
-                            tree: tree(vec![("f", f3, Visibility::Public)]),
+                            tree: tree(vec![("f", f3, Visibility::Internal)]),
                         },
                         None,
                     )
@@ -9792,7 +9792,7 @@ mod tests {
         let d = deltas.iter().find(|d| d.path == Path::new("f.txt")).unwrap();
         assert!(matches!(d.visibility, Visibility::Restricted(_)), "new side is restricted");
         assert!(
-            matches!(d.prev_visibility, Some(Visibility::Public)),
+            matches!(d.prev_visibility, Some(Visibility::Internal)),
             "the old public side is carried as a transition"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -9870,11 +9870,11 @@ mod tests {
             "an unchanged path is not in the delta"
         );
         // A deleted path keeps its base-side visibility, exactly as `diff` does.
-        assert!(matches!(by_path("gone.txt").visibility, Visibility::Public));
+        assert!(matches!(by_path("gone.txt").visibility, Visibility::Internal));
         // The rows render through the shared #306 line: gutter, path, token.
         let line = crate::render::delta_line(by_path("new.txt"));
         assert!(line.starts_with("  +  new.txt"), "{line}");
-        assert!(line.ends_with("public"), "the visibility token trails: {line}");
+        assert!(line.ends_with("internal"), "the visibility token trails: {line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

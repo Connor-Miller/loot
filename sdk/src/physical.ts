@@ -98,7 +98,9 @@ interface SurfaceEntry {
 }
 
 function toVisibility(raw: string): Visibility {
-  return raw === "public" ? "public" : "private";
+  // The core's identity-plaintext tier is `internal` (ADR 0041); `public` is a
+  // back-compat alias. Either maps to the SDK's binary `public`.
+  return raw === "internal" || raw === "public" ? "public" : "private";
 }
 
 /** Stream a materialized file as byte chunks, mapping a missing file to NotFound. */

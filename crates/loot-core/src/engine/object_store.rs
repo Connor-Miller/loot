@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn put_then_get_round_trips() {
         let mut s = ObjectStore::new();
-        let (addr, obj, _k) = seal(b"hi", &Visibility::Public).unwrap();
+        let (addr, obj, _k) = seal(b"hi", &Visibility::Internal).unwrap();
         assert_eq!(s.put(addr.clone(), obj.clone()), Stored::New(addr.clone()));
         assert_eq!(s.get(&addr).unwrap().ciphertext, obj.ciphertext);
     }
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn same_address_dedups() {
         let mut s = ObjectStore::new();
-        let (addr, obj, _k) = seal(b"hi", &Visibility::Public).unwrap();
+        let (addr, obj, _k) = seal(b"hi", &Visibility::Internal).unwrap();
         s.put(addr.clone(), obj.clone());
         assert_eq!(s.put(addr.clone(), obj), Stored::Deduped(addr));
     }
@@ -137,8 +137,8 @@ mod tests {
         // addresses (random key+nonce) and MUST be stored as two distinct
         // objects. There is no plaintext comparison, so no equality oracle.
         let mut s = ObjectStore::new();
-        let (addr1, obj1, _) = seal(b"same", &Visibility::Public).unwrap();
-        let (addr2, obj2, _) = seal(b"same", &Visibility::Public).unwrap();
+        let (addr1, obj1, _) = seal(b"same", &Visibility::Internal).unwrap();
+        let (addr2, obj2, _) = seal(b"same", &Visibility::Internal).unwrap();
         assert_ne!(addr1, addr2);
         assert_eq!(s.put(addr1.clone(), obj1), Stored::New(addr1.clone()));
         assert_eq!(s.put(addr2.clone(), obj2), Stored::New(addr2.clone()));

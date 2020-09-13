@@ -417,7 +417,11 @@ attest <change> [role]`.
 
 **Visibility** — the access policy on a unit of content. One of:
 
-- *Public* — readable by anyone who can read the repo.
+- *Internal* — readable by anyone with repo access; plaintext, but not the
+  anonymous world. Renamed from *Public* (ADR 0041): the forge reserves
+  "Published" for the world-readable tier, so this identity-plaintext tier is
+  *Internal*. The `.lootattributes` keyword is `internal` (`public` stays a
+  back-compat alias); on the wire it is still tag `0`, so no format change.
 - *Restricted* — readable only by named identities (key holders).
 - *Embargoed* — encrypted to all; key withheld until a reveal time. Models
   embargoed security fixes and delayed-reveal merges. `loot embargo-status
@@ -434,7 +438,7 @@ loot identity via a **persistent clone**: its own repo directory + keypair +
 keyring, cloned from the relay, synced by `push`/`pull`. Ceremony happens once
 at minting (clone, `peer add`, relay allowlist line); an ephemeral session just
 starts in the clone directory — session ≠ identity. One agent identity to
-start, minted freely when more are needed. Bootstrap grants: none — public
+start, minted freely when more are needed. Bootstrap grants: none — internal
 content arrives with the clone; restricted keys are withheld by construction,
 and on-demand grant/maroon is the milestone's audit-trail evidence. The
 genuinely-sealed-from-agents path is `docs/pitch/` (restricted to the dev).
@@ -521,12 +525,12 @@ keypair/`peers` files by loot-identity (ADR 0014); RepoStore names their paths s
 the layout has one documented home.
 
 **`.lootattributes`** — a gitattributes-style file mapping path globs to
-visibility (`.env restricted=alice`, `*.md public`). The Workspace reads it on
-snapshot to seal each path; unmatched paths default to Public. This is the
+visibility (`.env restricted=alice`, `*.md internal`). The Workspace reads it on
+snapshot to seal each path; unmatched paths default to Internal. This is the
 user-facing surface of the thesis — where you declare a file private. Two
 safeguards (#62, 2026-07-09): the file is **versioned** like any other path
 (policy travels to peers and clones — a fresh keyholder clone without the
-rules would otherwise re-seal restricted content Public), and a snapshot that
+rules would otherwise re-seal restricted content Internal), and a snapshot that
 would **demote** a path's visibility (Restricted/Embargoed → wider than the
 tree already records) **refuses** (a typed `RepoError::Demotion`) unless that
 path is passed via the global **`--allow-demote <path>`**. Under implicit
@@ -538,7 +542,7 @@ Widening a Restricted identity set is not guarded — `grant`/`maroon` own that
 audit trail. A third safeguard shipped (ADR 0038 §1, map #339, #343): the
 **mis-seal gate** — a path whose basename matches a built-in secret-shaped name
 set (`.env*`, `*.pem`, `*.key`, `*credentials*`, `id_rsa`/`id_ed25519`, … — the
-`SECRET_NAMES` constant in `workspace.rs`) that resolves Public *via
+`SECRET_NAMES` constant in `workspace.rs`) that resolves Internal *via
 fallthrough* (the default or a catch-all glob, not an explicit rule naming it)
 and is being sealed for the **first time** (absent from the finalized anchor)
 refuses with a typed `RepoError::MisSeal` at every signing seam (#353): inside
@@ -552,7 +556,7 @@ rule or an explicit `loot new --allow-reveal` first). Finalize also prints
 a **first-seal summary** (each never-before-sealed path with its resolved
 visibility). An explicit rule is consent; falling through is not — the gate
 exists because a typo'd rule (`.evn restricted=alice`) sails a secret to the
-public default, which the demotion guard cannot see (a new path has no prior
+internal default, which the demotion guard cannot see (a new path has no prior
 visibility). First-seal scoping mirrors the demotion guard's history-relativity
 so the override is a one-time ceremony. The cure side is [[Burn]].
 
@@ -686,7 +690,7 @@ none).
 - *Forward maroon* (`loot maroon <path> <identity>`) — re-seals content under a new key, re-grants remaining authorized identities (each receives a targeted grant bundle), publishes a new Change. The CLI **finalizes (signs) that re-seal change**, so it propagates via push/bundle — an unsigned re-seal is treated as a working change and never travels (ADR 0018), which would strand the maroon on the originator. The marooned identity retains the key for any past versions they already hold. Natural for "you may read the old code but not future updates." Implemented (ADR 0010).
 - *Hard maroon* (`loot maroon --hard <path> <identity>`) — forward maroon plus a published purge event signaling all cooperating peers to remove the marooned identity's Keyring entry for the affected OID. Best-effort operational guarantee: cooperating machines purge; offline or modified-binary peers cannot be forced. Models the "person left the org" case. Implemented (ADR 0009, ADR 0010).
 
-**Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + maroon over the affected identity set: promoting `Restricted` → `Public` re-seals under a new ANYONE-granted key; demoting `Public` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and maroon working correctly — not a separate primitive.
+**Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + maroon over the affected identity set: promoting `Restricted` → `Internal` re-seals under a new ANYONE-granted key; demoting `Internal` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and maroon working correctly — not a separate primitive.
 
 **Burn** *(decided 2026-07-18, ADR 0038, map #339; cure `loot burn` shipped #344)* — the remedy for a mis-sealed secret in finalized history: `loot burn <path>` **destroys the object's bytes and records a signed tombstone** in the **burn log**, while the change graph is never touched (every node, change id, signature stays intact — the invariants of ADR 0018/0029/0034 hold). Absence becomes legible: `verify` reads a burn-logged oid's absence as deliberate, `surface` labels the path *burned* in old changes, and sync (`apply`/negotiation/`stow`) **permanently refuses to re-accept a burned oid** — a later pull can never resurrect the bytes from a relay that still holds them. A non-undoable operation barrier (ADR 0031, the `push`/`grant`/`maroon` class). Two honesty tiers, split by the disclosure barrier: never-pushed → the destruction is complete (the true remedy); already-pushed → the tombstone travels as a purge event ([[Maroon]]'s best-effort model) and burn prints rotate-the-secret guidance. The git mirror is detect-and-guide, never auto-rewritten (ADR 0038 §4; fix the git tip *first*, then burn — ferry re-ingests tip content under a fresh oid the burn log cannot match). Prevention is the companion **mis-seal gate**: see [[`.lootattributes`]]. _Avoid_: purge (that's the keyring/hard-maroon lane), delete, rewrite.
 

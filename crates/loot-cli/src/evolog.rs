@@ -314,7 +314,7 @@ mod tests {
     /// every production recorder writes).
     fn change(parents: &[Oid], message: &str, addr: u8) -> Change {
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("a.txt"), (oid(addr), loot_core::Visibility::Public));
+        tree.insert(PathBuf::from("a.txt"), (oid(addr), loot_core::Visibility::Internal));
         Change { id: oid(0), parents: parents.to_vec(), message: message.into(), tree }
     }
 

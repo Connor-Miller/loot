@@ -1063,7 +1063,7 @@ fn public_delta_tree<'g>(
             continue;
         }
         let (oid, vis) = entry;
-        if *vis != Visibility::Public {
+        if *vis != Visibility::Internal {
             skipped.push(rel);
             continue;
         }
@@ -1419,8 +1419,8 @@ fn rebuild_marks(ws: &Workspace, git: &git2::Repository) -> Result<MarkMap, Stri
 fn demotes(old: &Visibility, new: &Visibility) -> bool {
     matches!(
         (old, new),
-        (Visibility::Restricted(_), Visibility::Public)
-            | (Visibility::Embargoed { .. }, Visibility::Public)
+        (Visibility::Restricted(_), Visibility::Internal)
+            | (Visibility::Embargoed { .. }, Visibility::Internal)
             | (Visibility::Embargoed { .. }, Visibility::Restricted(_))
     )
 }
@@ -2377,7 +2377,7 @@ mod tests {
         // (and every descendant) is stranded as untravelable working history,
         // and the next projection dies on "parent has no mirrored commit"
         // (found live on the dogfood repo).
-        ws.resolve_conflict(Path::new("shared.txt"), b"resolved\n", Visibility::Public)
+        ws.resolve_conflict(Path::new("shared.txt"), b"resolved\n", Visibility::Internal)
             .unwrap();
         assert!(ws.repo().conflicts().is_empty());
         let heads = ws.repo().heads();
@@ -2559,7 +2559,7 @@ mod tests {
 
         // Resolve in-lane, then re-land: the resolution folds into the carried
         // change instead of trailing it as its own commit.
-        w2.resolve_conflict(Path::new("base.txt"), b"resolved\n", loot_core::Visibility::Public)
+        w2.resolve_conflict(Path::new("base.txt"), b"resolved\n", loot_core::Visibility::Internal)
             .unwrap();
         let r2 = run(&mut w2, None, None, false, true).unwrap();
         assert!(w2.conflicts().is_empty(), "nothing left to resolve");

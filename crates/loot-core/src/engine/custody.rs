@@ -1580,7 +1580,7 @@ mod tests {
             .unwrap();
 
         let result = alice
-            .migrate(Path::new("f.txt"), Visibility::Public, 0)
+            .migrate(Path::new("f.txt"), Visibility::Internal, 0)
             .unwrap();
         let new_oid = result.new_oid;
 
@@ -1592,9 +1592,9 @@ mod tests {
     #[test]
     fn migrate_public_to_restricted_gates_access() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let oid = alice.put(b"now secret", Visibility::Public).unwrap();
+        let oid = alice.put(b"now secret", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Internal));
         alice
             .record(Change {
                 id: Oid([0; 32]),
@@ -1620,9 +1620,9 @@ mod tests {
     #[test]
     fn migrate_produces_grants_for_restricted_identities() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let oid = alice.put(b"data", Visibility::Public).unwrap();
+        let oid = alice.put(b"data", Visibility::Internal).unwrap();
         let mut tree = BTreeMap::new();
-        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Internal));
         alice
             .record(Change {
                 id: Oid([0; 32]),
@@ -1650,7 +1650,7 @@ mod tests {
     #[test]
     fn migrate_unknown_path_is_not_found() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let result = alice.migrate(Path::new("nonexistent.txt"), Visibility::Public, 0);
+        let result = alice.migrate(Path::new("nonexistent.txt"), Visibility::Internal, 0);
         assert!(matches!(result, Err(RepoError::NotFound(_))));
     }
 

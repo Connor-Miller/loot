@@ -90,7 +90,7 @@ pub fn status_char(o: &MergeOutcome) -> char {
 /// `status` and its machine form share.
 pub fn visibility_token(vis: &Visibility) -> String {
     match vis {
-        Visibility::Public => "public".to_string(),
+        Visibility::Internal => "internal".to_string(),
         Visibility::Restricted(ids) => format!("restricted={}", ids.join(",")),
         Visibility::Embargoed { reveal_at } => format!("embargoed@{reveal_at}"),
     }
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn status_has_its_own_shape() {
         let entries = vec![
-            (PathBuf::from("README.md"), Visibility::Public),
+            (PathBuf::from("README.md"), Visibility::Internal),
             (PathBuf::from(".env"), Visibility::Restricted(vec!["alice".into(), "bob".into()])),
             (PathBuf::from("fix.patch"), Visibility::Embargoed { reveal_at: 42 }),
         ];
@@ -638,18 +638,18 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         // The `@` header carries the change id (hex) and live version id (hex).
         assert_eq!(lines[0], format!("@\t{}\t{}", hex::encode(&[0xAB; 16]), hex::encode(&[0x3f; 32])));
-        assert_eq!(lines[1], "~\tREADME.md\tpublic");
+        assert_eq!(lines[1], "~\tREADME.md\tinternal");
         assert_eq!(lines[2], "~\t.env\trestricted=alice,bob");
         assert_eq!(lines[3], "~\tfix.patch\tembargoed@42");
     }
 
     #[test]
     fn status_json_escapes_and_tags_contract() {
-        let entries = vec![(PathBuf::from("a\tb"), Visibility::Public)];
+        let entries = vec![(PathBuf::from("a\tb"), Visibility::Internal)];
         let out = status_json(Some([0xAB; 16]), Some(&oid(0x3f)), &entries);
         assert!(out.contains("\\t"), "path tab escaped: {out}");
         assert!(out.contains(&format!("\"contract\":{VERDICT_CONTRACT}")));
-        assert!(out.contains("\"visibility\":\"public\""));
+        assert!(out.contains("\"visibility\":\"internal\""));
         assert!(out.contains(&format!("\"change\":\"{}\"", hex::encode(&[0xAB; 16]))));
         assert!(out.contains(&format!("\"version\":\"{}\"", hex::encode(&[0x3f; 32]))));
     }

@@ -117,7 +117,7 @@ fn check_bundle(
     assert_eq!(changes[0]["id"], hex(&[1u8; 32]));
     assert_eq!(changes[0]["tree"][0]["path"], "readme.md");
     assert_eq!(changes[0]["tree"][0]["oid"], FROZEN_OBJ_ADDR);
-    assert_eq!(changes[0]["tree"][0]["visibility"], "public");
+    assert_eq!(changes[0]["tree"][0]["visibility"], "internal");
     assert_eq!(object, Some(vec![OBJ_BYTE; 16]));
     assert_eq!(nonce, Some(vec![OBJ_BYTE; 12]));
     assert_eq!(compressed, Some(false));
@@ -192,13 +192,13 @@ fn parity_native() {
     let obj = SealedObject {
         nonce: [OBJ_BYTE; 12],
         ciphertext: vec![OBJ_BYTE; 16],
-        vis: Visibility::Public,
+        vis: Visibility::Internal,
         grant_ids: vec!["*".into()],
         compressed: false,
     };
     let addr = obj.address();
     let mut tree = BTreeMap::new();
-    tree.insert(PathBuf::from("readme.md"), (addr.clone(), Visibility::Public));
+    tree.insert(PathBuf::from("readme.md"), (addr.clone(), Visibility::Internal));
     let change = ChangeNode {
         id: Oid([1u8; 32]),
         parents: vec![],

@@ -1,8 +1,8 @@
-# Per-content visibility (the thesis surface). Unmatched paths are Public.
+# Per-content visibility (the thesis surface). Unmatched paths are Internal.
 # docs/pitch/ is the genuinely-sealed-from-agents path (ADR 0026): the
 # zero-knowledge-host product notes, restricted to the dev identity.
 docs/pitch/** restricted=connor
-# The product site is deliberately, explicitly Public (already the default):
+# The product site is deliberately, explicitly Internal (already the default):
 # Vercel builds from the GitHub main projection, so sealed content can never
 # be a build input (spec docs/specs/loot-site.md §1).
-site/** public
+site/** internal

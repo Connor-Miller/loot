@@ -54,9 +54,9 @@ fn push_then_pull_syncs_public_content_through_a_keyless_relay() {
     let alice_id = alice_identity();
     let alice_dir = tmp("alice");
     let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
-    let oid = alice.put(b"shared\n", Visibility::Public).unwrap();
+    let oid = alice.put(b"shared\n", Visibility::Internal).unwrap();
     let mut tree = BTreeMap::new();
-    tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+    tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Internal));
     let change_id = alice
         .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
         .unwrap();
@@ -216,9 +216,9 @@ fn offer_then_fetch_negotiated_pull_round_trips() {
     let alice_dir = tmp("alice-offer");
     let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
     let oid = alice.put(b"negotiated
-", Visibility::Public).unwrap();
+", Visibility::Internal).unwrap();
     let mut tree = BTreeMap::new();
-    tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+    tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Internal));
     let change_id = alice
         .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
         .unwrap();
@@ -258,9 +258,9 @@ fn pull_with_up_to_date_have_returns_empty() {
     let alice_id = alice_identity();
     let alice_dir = tmp("alice2");
     let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
-    let oid = alice.put(b"x\n", Visibility::Public).unwrap();
+    let oid = alice.put(b"x\n", Visibility::Internal).unwrap();
     let mut tree = BTreeMap::new();
-    tree.insert(PathBuf::from("f.txt"), (oid, Visibility::Public));
+    tree.insert(PathBuf::from("f.txt"), (oid, Visibility::Internal));
     let change_id = alice
         .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
         .unwrap();

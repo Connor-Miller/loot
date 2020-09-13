@@ -139,7 +139,7 @@ fn visibility_mismatch(ws: &Workspace, ours: &Oid, theirs: &Oid) -> Option<Strin
 
 fn vis_label(v: &Visibility) -> &'static str {
     match v {
-        Visibility::Public => "public",
+        Visibility::Internal => "internal",
         Visibility::Restricted(_) => "restricted",
         Visibility::Embargoed { .. } => "embargoed",
     }
@@ -347,9 +347,9 @@ mod tests {
         seed_conflict(
             &mut ws,
             "a.txt",
-            Some((b"base\n", Visibility::Public)),
-            (b"ours side\n", Visibility::Public),
-            (b"theirs side\n", Visibility::Public),
+            Some((b"base\n", Visibility::Internal)),
+            (b"ours side\n", Visibility::Internal),
+            (b"theirs side\n", Visibility::Internal),
         );
 
         let scratch = std::env::temp_dir().join(format!("loot-mergetool-scratch-happy-{}", std::process::id()));
@@ -378,7 +378,7 @@ mod tests {
             &mut ws,
             "a.txt",
             None,
-            (b"ours side\n", Visibility::Public),
+            (b"ours side\n", Visibility::Internal),
             (b"secret\n", Visibility::Restricted(vec!["other".into()])),
         );
 

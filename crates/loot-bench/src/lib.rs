@@ -58,7 +58,7 @@ pub fn small_file_workload(n: usize, restricted_to: &str) -> Vec<Blob> {
             let vis = if i % 10 == 0 {
                 Visibility::Restricted(vec![restricted_to.to_string()])
             } else {
-                Visibility::Public
+                Visibility::Internal
             };
             Blob {
                 path: PathBuf::from(format!("src/file_{i:05}.rs")),
@@ -173,7 +173,7 @@ pub fn scenario_concurrent_converge<R: Repo>(
     let base_blobs = vec![Blob {
         path: PathBuf::from("shared.txt"),
         bytes: b"line1\n".to_vec(),
-        vis: Visibility::Public,
+        vis: Visibility::Internal,
     }];
     commit_blobs(&mut a, &base_blobs, vec![], "base")?;
     let seed = a.bundle(&[])?;
@@ -183,14 +183,14 @@ pub fn scenario_concurrent_converge<R: Repo>(
     let a_heads = a.heads();
     commit_blobs(
         &mut a,
-        &[Blob { path: "a_only.txt".into(), bytes: b"a".to_vec(), vis: Visibility::Public }],
+        &[Blob { path: "a_only.txt".into(), bytes: b"a".to_vec(), vis: Visibility::Internal }],
         a_heads,
         "a offline",
     )?;
     let b_heads = b.heads();
     commit_blobs(
         &mut b,
-        &[Blob { path: "b_only.txt".into(), bytes: b"b".to_vec(), vis: Visibility::Public }],
+        &[Blob { path: "b_only.txt".into(), bytes: b"b".to_vec(), vis: Visibility::Internal }],
         b_heads,
         "b offline",
     )?;
@@ -267,7 +267,7 @@ pub fn scenario_same_file_concurrent<R: Repo>(
     let base_blob = vec![Blob {
         path: PathBuf::from("shared.txt"),
         bytes: b"line A\nline B\nline C\n".to_vec(),
-        vis: Visibility::Public,
+        vis: Visibility::Internal,
     }];
     commit_blobs(&mut peers[0], &base_blob, vec![], "base")?;
     let seed = peers[0].bundle(&[])?;
@@ -283,7 +283,7 @@ pub fn scenario_same_file_concurrent<R: Repo>(
         let blob = vec![Blob {
             path: PathBuf::from("shared.txt"),
             bytes: edited.into_bytes(),
-            vis: Visibility::Public,
+            vis: Visibility::Internal,
         }];
         let heads = p.heads();
         commit_blobs(p, &blob, heads, &format!("peer{i} offline edit"))?;

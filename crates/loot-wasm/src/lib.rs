@@ -38,7 +38,8 @@ pub mod core {
 
     fn visibility_from(tag: &str) -> Result<Visibility, String> {
         match tag {
-            "public" => Ok(Visibility::Public),
+            // `internal` is canonical (ADR 0041); `public` stays a parse alias.
+            "internal" | "public" => Ok(Visibility::Internal),
             // Private content is `Restricted` with no named grants: the content
             // key never rides in the bundle (it is ECIES-wrapped to the author for
             // read-back, see [`ChangeBuilder::put`]), and the relay never serves a
@@ -71,7 +72,7 @@ pub mod core {
         let obj = SealedObject {
             nonce: *nonce,
             ciphertext: ciphertext.to_vec(),
-            vis: Visibility::Public,
+            vis: Visibility::Internal,
             grant_ids: Vec::new(),
             compressed: false,
         };
@@ -115,7 +116,7 @@ pub mod core {
         let obj = SealedObject {
             nonce: *nonce,
             ciphertext: ciphertext.to_vec(),
-            vis: Visibility::Public,
+            vis: Visibility::Internal,
             grant_ids: Vec::new(),
             compressed: false,
         };
@@ -139,7 +140,7 @@ pub mod core {
 
     fn vis_tag(v: &Visibility) -> &'static str {
         match v {
-            Visibility::Public => "public",
+            Visibility::Internal => "internal",
             Visibility::Restricted(_) => "restricted",
             Visibility::Embargoed { .. } => "embargoed",
         }
@@ -365,7 +366,7 @@ pub mod core {
             let vis = visibility_from(visibility)?;
             let (oid, sealed, key) = sealed::seal_uncompressed(plaintext, &vis).map_err(|e| e.to_string())?;
             match vis {
-                Visibility::Public => {
+                Visibility::Internal => {
                     self.keys.insert(oid.clone(), key);
                 }
                 _ => {

@@ -107,7 +107,9 @@ function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 function toVisibility(raw: string): Visibility {
-  return raw === "public" ? "public" : "private";
+  // The core's identity-plaintext tier is `internal` (ADR 0041); `public` is a
+  // back-compat alias. Either maps to the SDK's binary `public`.
+  return raw === "internal" || raw === "public" ? "public" : "private";
 }
 
 /** A 2xx relay response. */

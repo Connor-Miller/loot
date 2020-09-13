@@ -297,7 +297,7 @@ mod tests {
         let mut tree = BTreeMap::new();
         tree.insert(
             PathBuf::from(path),
-            (Oid([addr; 32]), Visibility::Public),
+            (Oid([addr; 32]), Visibility::Internal),
         );
         ChangeNode {
             id: Oid([id; 32]),
@@ -358,7 +358,7 @@ mod tests {
     fn manifest_node(id: u8, parents: &[u8], entries: &[(&str, u8)]) -> ChangeNode {
         let tree = entries
             .iter()
-            .map(|&(path, addr)| (PathBuf::from(path), (Oid([addr; 32]), Visibility::Public)))
+            .map(|&(path, addr)| (PathBuf::from(path), (Oid([addr; 32]), Visibility::Internal)))
             .collect();
         ChangeNode {
             id: Oid([id; 32]),
@@ -456,7 +456,7 @@ mod tests {
         g.insert(manifest_node(2, &[1], &[("a", 11)]));
         let (oid, vis) = g.path_in_history(&PathBuf::from("a")).expect("path is live");
         assert_eq!(oid, Oid([11; 32]));
-        assert_eq!(vis, Visibility::Public);
+        assert_eq!(vis, Visibility::Internal);
     }
 
     /// #15's core AC: a path deleted off the live line is still found by

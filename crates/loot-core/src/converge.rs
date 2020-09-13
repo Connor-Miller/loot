@@ -365,7 +365,7 @@ mod tests {
     fn tree(entries: &[(&str, Oid)]) -> Tree {
         entries
             .iter()
-            .map(|(p, o)| (PathBuf::from(p), (o.clone(), Visibility::Public)))
+            .map(|(p, o)| (PathBuf::from(p), (o.clone(), Visibility::Internal)))
             .collect()
     }
 
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn identical_address_converges() {
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Internal));
         let inc = tree(&[("a.txt", oid(1))]);
         let out = classify(&local, &inc, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(out[&PathBuf::from("a.txt")], MergeOutcome::Converged);
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn concurrent_without_key_relays() {
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Internal));
         let inc = tree(&[("a.txt", oid(2))]);
         // Oracle opens neither -> relay.
         let out = classify(&local, &inc, None, &FakeOracle(BTreeMap::new()), 0);
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn concurrent_with_keys_subset_merges() {
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Internal));
         let inc = tree(&[("a.txt", oid(2))]);
         let mut plain = BTreeMap::new();
         plain.insert(oid(1), b"x\n".to_vec());
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn concurrent_with_keys_divergent_conflicts() {
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Internal));
         let inc = tree(&[("a.txt", oid(2))]);
         let mut plain = BTreeMap::new();
         plain.insert(oid(1), b"left\n".to_vec());
@@ -431,7 +431,7 @@ mod tests {
         // base bytes under a fresh re-seal address. Two-way this line-conflicts
         // (modified line = no subset); with the base it is ours-wins Merged.
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Internal));
         let inc = tree(&[("ctx.md", oid(2))]);
         let base = tree(&[("ctx.md", oid(3))]);
         let mut plain = BTreeMap::new();
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn ours_untouched_since_base_adopts_theirs() {
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Internal));
         let inc = tree(&[("ctx.md", oid(2))]);
         let base = tree(&[("ctx.md", oid(3))]);
         let mut plain = BTreeMap::new();
@@ -469,7 +469,7 @@ mod tests {
         // The base only rescues an untouched side — a genuine double edit is
         // still a conflict for a human.
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Internal));
         let inc = tree(&[("ctx.md", oid(2))]);
         let base = tree(&[("ctx.md", oid(3))]);
         let mut plain = BTreeMap::new();
@@ -488,7 +488,7 @@ mod tests {
         // The base path exists but we can't open it (sealed to us) — behave
         // exactly as if no base were known.
         let mut local = BTreeMap::new();
-        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Internal));
         let inc = tree(&[("ctx.md", oid(2))]);
         let base = tree(&[("ctx.md", oid(9))]); // oid(9) not in the oracle
         let mut plain = BTreeMap::new();

@@ -111,7 +111,7 @@ impl Attributes {
                 return vis.clone();
             }
         }
-        Visibility::Public
+        Visibility::Internal
     }
 
     /// Does `path` resolve **Public via fallthrough** — the default (no rule
@@ -128,7 +128,7 @@ impl Attributes {
                 // First matching rule wins. It is a fallthrough only when it is
                 // a catch-all *and* resolves Public; an explicit (named) rule is
                 // consent, and any non-Public rule is not a public seal at all.
-                return is_catchall(&glob.pattern) && matches!(vis, Visibility::Public);
+                return is_catchall(&glob.pattern) && matches!(vis, Visibility::Internal);
             }
         }
         // No rule matched: the default Public — the plainest fallthrough.
@@ -187,8 +187,10 @@ pub(crate) fn is_secret_name(rel: &Path) -> bool {
 }
 
 fn parse_visibility(spec: &str) -> Option<Visibility> {
-    if spec == "public" {
-        Some(Visibility::Public)
+    // `internal` is canonical (ADR 0041); `public` stays a back-compat alias so
+    // existing `.lootattributes` files keep parsing to the same tier.
+    if spec == "internal" || spec == "public" {
+        Some(Visibility::Internal)
     } else if let Some(ids) = spec.strip_prefix("restricted=") {
         let ids: Vec<String> = ids.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
         if ids.is_empty() {
@@ -285,8 +287,8 @@ mod tests {
     fn attributes_first_matching_rule_wins() {
         let a = Attributes::parse(".env restricted=alice\n*.md public\n");
         assert!(matches!(a.visibility_for(".env"), Visibility::Restricted(_)));
-        assert!(matches!(a.visibility_for("README.md"), Visibility::Public));
-        assert!(matches!(a.visibility_for("unmatched.txt"), Visibility::Public)); // default
+        assert!(matches!(a.visibility_for("README.md"), Visibility::Internal));
+        assert!(matches!(a.visibility_for("unmatched.txt"), Visibility::Internal)); // default
     }
 
     #[test]
@@ -344,7 +346,7 @@ mod tests {
 
     #[test]
     fn parse_visibility_reads_the_three_specs() {
-        assert!(matches!(parse_visibility("public"), Some(Visibility::Public)));
+        assert!(matches!(parse_visibility("public"), Some(Visibility::Internal)));
         assert!(matches!(parse_visibility("restricted=a,b"), Some(Visibility::Restricted(ids)) if ids.len() == 2));
         assert!(matches!(parse_visibility("embargoed=1800000000"), Some(Visibility::Embargoed { reveal_at: 1800000000 })));
         assert!(parse_visibility("restricted=").is_none()); // empty id set

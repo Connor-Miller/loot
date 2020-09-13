@@ -571,7 +571,7 @@ fn pull_reports_a_converged_change_in_every_format() {
     assert_eq!(
         out_human,
         format!(
-            "pulled from {relay_url} as bob:\n  doc.txt                  converged\nconverged onto one line:\n  doc.txt                          public\nsurfaced {} as bob\n",
+            "pulled from {relay_url} as bob:\n  doc.txt                  converged\nconverged onto one line:\n  doc.txt                          internal\nsurfaced {} as bob\n",
             render::short(&head)
         )
     );

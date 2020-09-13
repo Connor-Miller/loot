@@ -253,7 +253,7 @@ usage:
   loot grants --trust <pubkey-hex>          register the sender as a peer and re-apply their quarantined grants (#12)
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay; quarantines any from an unregistered sender to `.loot/quarantine/`
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
-  loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
+  loot migrate <path> <vis-spec> [dir]      change a path's visibility (internal | restricted=a,b | embargoed=<ts>)
   loot burn <path> [--oid <hex>]            destroy every historical object of <path> and record a signed tombstone (ADR 0038): absence becomes legible, sync never resurrects it. Non-undoable. Prints the tier (never-pushed=complete / pushed=best-effort) + the rotate-the-secret and git-mirror guidance
   loot lane new [--ticket <n>] [--name <n>] [--at <dir>] [--porcelain|--json]  spawn a sealed ephemeral lane over the shared store (primary-only, keyed repos; ADR 0034); --ticket derives the handle (t<n>) for the claim-to-lane flow (#232)
   loot lanes [--porcelain|--json]           lane observability: id, name, path, tip, in-flight PR, dirty/clean, heartbeat, landed/stale — check before acting on shared state (alias: loot lane list)
@@ -542,11 +542,11 @@ fn init_repo(dir: &std::path::Path, id_name: &str) -> Emitted {
 fn lootattributes_quickstart() -> &'static str {
     "\
 # .lootattributes — control per-path visibility
-# public      — everyone can read
+# internal    — anyone with repo access can read
 # restricted  — only named identities
 # embargoed   — sealed until unix timestamp
 
-*.md          public
+*.md          internal
 .env          restricted=alice
 RELEASE.md    embargoed=1800000000"
 }
@@ -1679,8 +1679,9 @@ fn cmd_burn(args: &[String]) -> Emitted {
 
 
 fn parse_vis_spec(spec: &str) -> Result<Visibility, String> {
-    if spec == "public" {
-        Ok(Visibility::Public)
+    // `internal` is canonical (ADR 0041); `public` remains a back-compat alias.
+    if spec == "internal" || spec == "public" {
+        Ok(Visibility::Internal)
     } else if let Some(ids) = spec.strip_prefix("restricted=") {
         let ids: Vec<String> = ids.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
         if ids.is_empty() {
@@ -3380,8 +3381,7 @@ fn run_pull(
 
 fn mark(vis: &loot_core::Visibility) -> String {
     // One home for the visibility token, shared with the machine `status`
-    // output (CA3). Human phrasing is unchanged: public / restricted=a,b /
-    // embargoed@<ts>.
+    // output (CA3). Human phrasing: internal / restricted=a,b / embargoed@<ts>.
     verdict::visibility_token(vis)
 }
 
@@ -3826,7 +3826,7 @@ mod tests {
 
     #[test]
     fn mark_renders_visibility() {
-        assert_eq!(mark(&Visibility::Public), "public");
+        assert_eq!(mark(&Visibility::Internal), "internal");
         assert_eq!(mark(&Visibility::Restricted(vec!["a".into(), "b".into()])), "restricted=a,b");
         assert_eq!(mark(&Visibility::Embargoed { reveal_at: 5 }), "embargoed@5");
     }
@@ -3968,9 +3968,9 @@ mod tests {
     fn plan_ignores_non_embargoed_paths() {
         let dir = tmp("plan-public");
         let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-        let oid = repo.put(b"open\n", Visibility::Public).unwrap();
+        let oid = repo.put(b"open\n", Visibility::Internal).unwrap();
         let mut tree = std::collections::BTreeMap::new();
-        tree.insert(std::path::PathBuf::from("open.md"), (oid, Visibility::Public));
+        tree.insert(std::path::PathBuf::from("open.md"), (oid, Visibility::Internal));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
             .unwrap();
         assert!(plan_embargo_deposits(&repo.embargoed_paths(), repo.manifest(), &[peer("bob", 0xbb)], [0xaa; 32])
@@ -4179,7 +4179,7 @@ mod tests {
     fn lootattributes_quickstart_covers_all_three_modes() {
         let t = lootattributes_quickstart();
         // A comment line names and explains each mode.
-        for mode in ["public", "restricted", "embargoed"] {
+        for mode in ["internal", "restricted", "embargoed"] {
             assert!(
                 t.lines().any(|l| l.starts_with('#') && l.contains(mode)),
                 "no comment line explaining `{mode}`:\n{t}"
@@ -4188,7 +4188,7 @@ mod tests {
         // A concrete (non-comment) example line exercises each mode.
         let examples: Vec<&str> =
             t.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).collect();
-        assert!(examples.iter().any(|l| l.ends_with("public")), "no public example:\n{t}");
+        assert!(examples.iter().any(|l| l.ends_with("internal")), "no internal example:\n{t}");
         assert!(examples.iter().any(|l| l.contains("restricted=")), "no restricted example:\n{t}");
         assert!(examples.iter().any(|l| l.contains("embargoed=")), "no embargoed example:\n{t}");
         // It names the file it's meant to be pasted into.

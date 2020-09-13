@@ -35,8 +35,10 @@ pub struct Oid(pub [u8; 32]);
 /// visibility is a property of the *content*, not the repo.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Visibility {
-    /// Readable by anyone who can read the repo.
-    Public,
+    /// Readable by anyone with repo access — plaintext, but not the anonymous
+    /// world. Renamed from `Public` (ADR 0041): the forge reserves "Published"
+    /// for the world-readable tier, so this identity-plaintext tier is `Internal`.
+    Internal,
     /// Readable only by the listed identities (by key id).
     Restricted(Vec<String>),
     /// Encrypted to all, but the decryption key is withheld until `reveal_at`

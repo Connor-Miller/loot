@@ -33,7 +33,7 @@ pub fn put_attestation(out: &mut Vec<u8>, a: &Attestation) {
 }
 pub fn put_vis(out: &mut Vec<u8>, vis: &Visibility) {
     match vis {
-        Visibility::Public => out.push(0),
+        Visibility::Internal => out.push(0),
         Visibility::Restricted(ids) => {
             out.push(1);
             put_u32(out, ids.len());
@@ -51,7 +51,7 @@ pub fn put_vis(out: &mut Vec<u8>, vis: &Visibility) {
 impl<'a> Cursor<'a> {
     pub fn vis(&mut self) -> Result<Visibility, RepoError> {
         match self.take(1)?[0] {
-            0 => Ok(Visibility::Public),
+            0 => Ok(Visibility::Internal),
             1 => {
                 let n = self.u32()?;
                 let mut ids = Vec::with_capacity(n);
@@ -504,7 +504,7 @@ mod tests {
         SealedObject {
             nonce: [1; 12],
             ciphertext: vec![9, 9, 9],
-            vis: Visibility::Public,
+            vis: Visibility::Internal,
             grant_ids: vec!["*".into()],
             compressed,
         }

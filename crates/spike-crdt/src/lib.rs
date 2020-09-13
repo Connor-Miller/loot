@@ -102,7 +102,7 @@ impl CrdtRepo {
     /// Is `identity` authorized to read content under `vis`?
     fn authorized(identity: &str, vis: &Visibility) -> bool {
         match vis {
-            Visibility::Public => true,
+            Visibility::Internal => true,
             Visibility::Restricted(ids) => ids.iter().any(|i| i == identity),
             // Embargoed content is encrypted to all; the gate is *time*, not
             // identity, so anyone is "authorized" once revealed.
@@ -128,7 +128,7 @@ impl CrdtRepo {
 
     fn encode_vis(vis: &Visibility) -> String {
         match vis {
-            Visibility::Public => "public".to_string(),
+            Visibility::Internal => "public".to_string(),
             Visibility::Restricted(ids) => format!("restricted:{}", ids.join(",")),
             Visibility::Embargoed { reveal_at } => format!("embargoed:{reveal_at}"),
         }
@@ -136,7 +136,7 @@ impl CrdtRepo {
 
     fn decode_vis(s: &str) -> Visibility {
         if s == "public" {
-            Visibility::Public
+            Visibility::Internal
         } else if let Some(rest) = s.strip_prefix("restricted:") {
             let ids = if rest.is_empty() {
                 vec![]
@@ -149,7 +149,7 @@ impl CrdtRepo {
                 reveal_at: rest.parse().unwrap_or(0),
             }
         } else {
-            Visibility::Public
+            Visibility::Internal
         }
     }
 
@@ -539,7 +539,7 @@ impl Repo for CrdtRepo {
         // home: a peer without them becomes a relay (ADR 0001).
         let mut public_keys = Vec::new();
         for entry in self.all_entries()?.into_values() {
-            if matches!(entry.vis, Visibility::Public) {
+            if matches!(entry.vis, Visibility::Internal) {
                 if let Some(k) = self.keyring.get(&entry.oid) {
                     public_keys.push((entry.oid.clone(), *k));
                 }
@@ -581,7 +581,7 @@ impl Repo for CrdtRepo {
                 continue;
             }
             let both_sides = before.contains_key(path);
-            let can_read = self.holds_key(oid) || matches!(vis, Visibility::Public);
+            let can_read = self.holds_key(oid) || matches!(vis, Visibility::Internal);
             let outcome = if !can_read {
                 // Encrypted content we lack the key for: ADR 0001 -> we may
                 // only relay the ciphertext (which `merge` already carried in
