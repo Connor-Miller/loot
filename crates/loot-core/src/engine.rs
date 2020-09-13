@@ -1913,20 +1913,23 @@ impl DagRepo {
         self.graph
             .heads()
             .into_iter()
-            .filter(|h| {
-                // Completeness covers the head's whole reachable CLOSURE, not
-                // just its own tree: batch order is address order, so a
-                // historical object of an ancestor can be the one still
-                // missing while the head's tree happens to be whole — claiming
-                // the head would strand that object exactly the same way.
-                self.ancestors_of(h).iter().all(|a| {
-                    self.graph
-                        .tree_at(a)
-                        .values()
-                        .all(|(oid, _vis)| self.object(oid).is_ok())
-                })
-            })
+            .filter(|h| self.closure_complete(h))
             .collect()
+    }
+
+    /// Whether this repo holds every object in `id`'s whole reachable CLOSURE,
+    /// not just its own tree: batch order is address order, so a historical
+    /// object of an ancestor can be the one still missing while the tip's tree
+    /// happens to be whole. `false` means a transfer is still mid-flight (an
+    /// interrupted pull ingested the change node before all its object bytes,
+    /// S6/ADR 0024) — the working tree is not yet a materialization of `id`.
+    pub fn closure_complete(&self, id: &Oid) -> bool {
+        self.ancestors_of(id).iter().all(|a| {
+            self.graph
+                .tree_at(a)
+                .values()
+                .all(|(oid, _vis)| self.object(oid).is_ok())
+        })
     }
 
     /// The subset of `offered` addresses this repo does NOT already hold — the

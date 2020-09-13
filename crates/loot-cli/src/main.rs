@@ -607,10 +607,22 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
     let mut ws = Workspace::open()?;
     let identity = ws.identity().to_string();
+    // Capture-first (#219, ADR 0030 amendment): fold uncaptured disk edits into
+    // the working change before ingest, like every other mutating verb — so a
+    // later `loot surface` can never silently overwrite them.
+    let had_working = ws.working_id().is_some();
+    let captured = ws.capture_uncaptured_edits()?;
+    let newly_captured = captured.filter(|_| !had_working);
     let outcomes = ws.apply_bundle(bytes)?;
 
     match fmt {
         OutFmt::Human => {
+            if let Some(id) = &newly_captured {
+                println!(
+                    "captured working change {} (uncaptured edits) before applying",
+                    loot_core::hex::short(&id.0, 4)
+                );
+            }
             if outcomes.is_empty() {
                 println!("applied {infile}: nothing new (already up to date)");
             } else {
@@ -623,7 +635,9 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
         OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
         OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
     }
-    if !outcomes.is_empty() {
+    // Capture-first can create a working change even when the bundle brought
+    // nothing new (#219); record the op so that view change is undoable too.
+    if !outcomes.is_empty() || newly_captured.is_some() {
         ws.record_op("apply", &format!("apply {infile} ({} path(s))", outcomes.len()), false);
     }
     Ok(())
@@ -1769,23 +1783,35 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     // apply, post-pull converge, worst-folding — is `Workspace::pull_via`
     // (#217); this verb resolves the remote, adapts loot-net to the seam,
     // and renders.
-    let outcomes = ws.pull_via(&HttpTransport { url: url.clone() })?;
+    let report = ws.pull_via(&HttpTransport { url: url.clone() })?;
+    let outcomes = &report.outcomes;
 
     match fmt {
         OutFmt::Human => {
-            if outcomes.is_empty() {
+            if outcomes.is_empty() && report.deferred.is_none() {
                 println!("pulled from {url}: nothing new (already up to date)");
             } else {
                 println!("pulled from {url} as {identity}:");
-                print!("{}", outcome_rows(&outcomes));
-                println!("converged onto one line; run `loot surface` to materialize what you may see");
+                print!("{}", outcome_rows(outcomes));
+                match &report.deferred {
+                    // Capture-first (#219): a dirty tree was captured, so the
+                    // freshly ingested heads are left flat this pass.
+                    Some(id) => println!(
+                        "captured working change {}; heads left unconverged — finalize \
+                         (`loot new`) then re-run `loot pull` to converge",
+                        loot_core::hex::short(&id.0, 4)
+                    ),
+                    None => println!(
+                        "converged onto one line; run `loot surface` to materialize what you may see"
+                    ),
+                }
             }
         }
         // Machine output: the merge verdict rows only, no prose (empty -> no lines).
-        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
-        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
+        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(outcomes))),
+        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(outcomes))),
     }
-    if !outcomes.is_empty() {
+    if !outcomes.is_empty() || report.deferred.is_some() {
         ws.record_op("pull", &format!("pull from {url} ({} path(s))", outcomes.len()), false);
     }
     Ok(())

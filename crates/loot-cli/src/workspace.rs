@@ -960,6 +960,12 @@ impl Workspace {
     /// Materialize the (reloaded) ambient dock's tree to disk and prune any path
     /// in `old_paths` the restored tree no longer contains, so `undo` leaves a
     /// working tree the next auto-snapshot won't silently re-capture.
+    ///
+    /// This is the one tree write deliberately EXEMPT from the #219 capture
+    /// chokepoint ([`tree_is_dirty_over`](Self::tree_is_dirty_over)):
+    /// `undo`/`abandon` resurface exists precisely to rewrite the tree the
+    /// operator asked to walk back, so it never consults it — overwriting the
+    /// current disk is the point, not an accident.
     fn resurface(&mut self, old_paths: Vec<PathBuf>) -> Result<(), String> {
         self.repo.flush_escrow(self.now);
         let to = self
@@ -1538,6 +1544,62 @@ impl Workspace {
         Ok((name.to_string(), outcomes))
     }
 
+    /// Capture-first for pull/apply (#219, ADR 0030 amendment): fold any
+    /// uncaptured disk edits into the working change *before* an ingest/converge
+    /// touches the tree, exactly like every other mutating verb. A clean tree
+    /// captures nothing and leaves `working` absent — so a clean-tree pull still
+    /// converges; a dirty tree lands in the working change, and the
+    /// working-change guard in [`converge_heads`](Self::converge_heads) then
+    /// defers convergence for this pass (the heads stay flat until the operator
+    /// finalizes). Returns the working change id when the tree was dirty (or one
+    /// was already in progress), else `None`.
+    pub fn capture_uncaptured_edits(&mut self) -> Result<Option<Oid>, String> {
+        // An in-progress working change already holds the edits and converge
+        // defers on it; there is nothing new to capture.
+        if let Some(w) = &self.working {
+            return Ok(Some(w.clone()));
+        }
+        let anchor = self.anchor();
+        // Skip while a transfer is mid-flight (#217/#219): if the disk's
+        // reference head is not yet fully received (an interrupted pull ingested
+        // the change node before all its objects), the working tree is not a
+        // materialization of it, so a diff against it is not real dirt —
+        // capturing here would strand an empty working change over a fetch we
+        // are about to resume. This is the ONLY empty-disk special case: a
+        // genuine delete-all edit over a fully-held tip still captures below.
+        if let Some(a) = &anchor {
+            if !self.repo.closure_complete(a) {
+                return Ok(None);
+            }
+        }
+        let (entries, _) = self.read_working_tree()?;
+        let (_, clean) = self.repo.working_preview(anchor.as_ref(), &entries, "", self.now);
+        if clean {
+            return Ok(None);
+        }
+        // Implicit snapshot (ADR 0030): the demotion guard rides the default
+        // allowlist, matching a bare mutating verb.
+        let (id, _) = self.snapshot_allowing("(working change)", &[])?;
+        Ok(Some(id))
+    }
+
+    /// The one tree-write capture chokepoint (#219, ADR 0030 amendment): does
+    /// the working tree hold edits beyond `reflected` (the change it currently
+    /// mirrors — what a materialize diffs from)? A materialize over a dirty tree
+    /// would silently drop those edits, so the converge/adopt write paths
+    /// consult this and refuse ([`REFUSE_UNCAPTURED_TREE`]) rather than clobber.
+    /// It is evaluated ONCE at converge entry, before any head is dropped, so
+    /// the reference stays queryable and the no-op converge paths never trip it;
+    /// capture-first verbs (pull/apply) snapshot before converging, so by the
+    /// time a write runs this is false. `undo`/`abandon`
+    /// [`resurface`](Self::resurface) is the one deliberate exemption —
+    /// rewriting the tree is exactly what the operator asked for — and never
+    /// consults it.
+    fn tree_is_dirty_over(&mut self, reflected: Option<&Oid>) -> Result<bool, String> {
+        let (entries, _) = self.read_working_tree()?;
+        Ok(!self.repo.working_preview(reflected, &entries, "", self.now).1)
+    }
+
     /// Run the whole pull pipeline over a [`SyncTransport`] (#217, map #215):
     /// negotiate (offer → missing → wants), fetch in batches — each applied
     /// batch persists, so an interrupted pull resumes by re-negotiating and
@@ -1556,7 +1618,13 @@ impl Workspace {
     pub fn pull_via(
         &mut self,
         transport: &impl SyncTransport,
-    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+    ) -> Result<PullReport, String> {
+        // Capture-first (#219, ADR 0030 amendment): fold any uncaptured disk
+        // edits into the working change before we touch the tree. A dirty tree
+        // then holds a working change, so the ingest below still runs (graph
+        // append is always safe) but converge waits — it cannot fold heads
+        // under an in-progress working change without orphaning it.
+        let captured = self.capture_uncaptured_edits()?;
         // Negotiate with COMPLETE heads only (#217 find): an interrupted
         // batched pull already ingested change nodes whose object bytes never
         // arrived; claiming those heads would make the relay skip exactly the
@@ -1572,7 +1640,12 @@ impl Workspace {
         }
         let converged = self.converge_heads(None)?;
         fold_worst(&mut outcomes, converged);
-        Ok(outcomes)
+        // Converge is a no-op whenever capture-first left a working change in
+        // progress (the guard at the top of `converge_heads`). Report the defer
+        // only when it actually left a fork standing — a captured tree with no
+        // ingested co-head has nothing to converge, so no note is warranted.
+        let deferred = captured.filter(|_| self.repo.heads().len() > 1);
+        Ok(PullReport { outcomes, deferred })
     }
 
     /// Collapse a fork the ambient dock is sitting on into one materialized tip
@@ -1592,12 +1665,29 @@ impl Workspace {
     /// (the caller's pre-pull head); materialize is diffed from it so a stale
     /// side's untouched paths are not disturbed. On the home dock `anchor()` is
     /// ambiguous under divergence, which is why the caller must pass it. A single
-    /// head, or an in-progress working change (the caller's to finalize first —
-    /// `pull`/`apply` have none), is a no-op. Returns the per-path merge outcomes.
+    /// head, or an in-progress working change, is a no-op. Under capture-first
+    /// (#219) an in-progress working change is the ordinary dirty-tree case, not
+    /// an impossibility: pull/apply snapshot uncaptured edits before converging,
+    /// so a dirty pull leaves a working change here and convergence WAITS — the
+    /// heads stay flat until the operator finalizes (`loot new`) and re-pulls.
+    /// (The former "`pull`/`apply` have none" claim was an accident of ADR 0030
+    /// not yet reaching them, not a guarantee — ADR 0030 amendment.) Returns the
+    /// per-path merge outcomes.
     pub fn converge_heads(&mut self, base: Option<&Oid>) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        // You cannot fold heads under an in-progress working change without
+        // orphaning it, so converge defers whenever capture-first captured a
+        // dirty tree — ingest already ran; the operator finalizes then re-pulls.
         if self.working.is_some() {
             return Ok(BTreeMap::new());
         }
+        // Chokepoint (#219): evaluate dirtiness ONCE, up front — before any
+        // head is dropped, while `reflected` (the disk's pre-pull head) is still
+        // queryable. The write paths below consult `disk_dirty`; the no-op paths
+        // (divergent-flat, parked-base, superseded-with-nothing-to-adopt) return
+        // without ever reading it, so a deliberately foreign `base` never
+        // refuses a converge that touches nothing.
+        let reflected = base.cloned().or_else(|| self.anchor());
+        let disk_dirty = self.tree_is_dirty_over(reflected.as_ref())?;
         // The head partition (#216) decides everything converge may do; this
         // method only EXECUTES it: drop `stale` (superseded heads, ADR 0032 —
         // a solo amend lands as a clean replacement, never content-merged
@@ -1616,8 +1706,16 @@ impl Workspace {
             // the dock off its old tip (the solo-amend case), adopt the
             // survivor: re-point the tip and materialize its tree.
             if let (Some(survivor), true) = (heads.first().cloned(), !part.stale.is_empty()) {
-                let from = base.cloned().or_else(|| self.anchor());
+                // `reflected` (captured at entry, pre-drop) is the disk truth.
+                let from = reflected.clone();
                 if from.as_ref() != Some(&survivor) {
+                    // Chokepoint (#219): refuse before the adopt write if the
+                    // disk holds uncaptured edits. The in-memory stale-drop above
+                    // is not persisted on this error path, so the refusal is
+                    // atomic.
+                    if disk_dirty {
+                        return Err(REFUSE_UNCAPTURED_TREE.into());
+                    }
                     if self.docks_active() {
                         self.tip = Some(survivor.clone());
                         let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
@@ -1644,9 +1742,17 @@ impl Workspace {
         }
         // Materialize diffs from what the DISK currently shows — the caller's
         // pre-pull base even if it was just dropped as superseded — not from
-        // whichever head the merge starts on. With no base (pull_via, #217)
-        // the dock's anchor is the disk truth.
-        let from = base.cloned().or_else(|| self.anchor()).unwrap_or_else(|| ours.clone());
+        // whichever head the merge starts on. `reflected` is that disk truth
+        // (base, or the dock anchor for pull_via #217), captured at entry so a
+        // stale-head drop cannot move it off what the tree actually shows.
+        let from = reflected.clone().unwrap_or_else(|| ours.clone());
+        // Chokepoint (#219): refuse BEFORE the merge loop mutates the graph, so a
+        // dirty tree refuses atomically rather than stranding signed merge nodes
+        // with the disk left unmaterialized. Capture-first verbs snapshot first,
+        // so this passes; a direct caller that skipped capture is refused here.
+        if disk_dirty {
+            return Err(REFUSE_UNCAPTURED_TREE.into());
+        }
         let mut acc = ours;
         let mut all: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
         for h in others {
@@ -1942,6 +2048,13 @@ impl Workspace {
             .map_err(|e| format!("write next-change: {e}"))
     }
 }
+
+/// The refusal the tree-write chokepoint prints when a converge/adopt would
+/// materialize over uncaptured disk edits (#219, ADR 0030 amendment). Reachable
+/// only when a caller skipped capture-first; pull/apply never see it.
+const REFUSE_UNCAPTURED_TREE: &str =
+    "refusing to materialize over uncaptured working-tree edits — capture them first \
+     (`loot describe` or `loot new`), then retry";
 
 /// Resolve visibility for `path` under an explicit `.lootattributes` text.
 /// The bridge classifies ingested files under the *ingested commit's own*
@@ -2260,6 +2373,20 @@ pub struct EditReport {
     /// The finalized version that was reopened — superseded when the amend
     /// finalizes (`loot new`).
     pub superseded: Oid,
+}
+
+/// The outcome of a pull (#219). Carries the folded per-path merge outcomes,
+/// plus the working change id when capture-first *deferred* convergence — a
+/// dirty tree was captured and the working-change guard left the freshly
+/// ingested heads flat for this pass. `deferred: None` is the ordinary
+/// converged pull; `Some(id)` is the CLI's cue to print the "finalize then
+/// re-run" note (ADR 0030 amendment).
+#[derive(Debug)]
+pub struct PullReport {
+    /// The folded per-path merge outcomes, for rendering the verdict rows.
+    pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
+    /// The captured working change id when converge was deferred, else `None`.
+    pub deferred: Option<Oid>,
 }
 
 /// What a completed `undo`/`op restore` did, for CLI reporting (ADR 0031).
@@ -3721,8 +3848,9 @@ mod tests {
         let dir_b = std::env::temp_dir().join(format!("loot-pull-b-{}", std::process::id()));
         let mut bob = authored_ws(&dir_b);
 
-        let outcomes = bob.pull_via(&relay).unwrap();
-        assert!(!outcomes.is_empty(), "the pull reports per-path outcomes");
+        let report = bob.pull_via(&relay).unwrap();
+        assert!(!report.outcomes.is_empty(), "the pull reports per-path outcomes");
+        assert!(report.deferred.is_none(), "a clean-tree pull converges, not defers");
         assert_eq!(
             bob.heads(),
             alice.heads(),
@@ -3732,7 +3860,8 @@ mod tests {
 
         // A re-pull is a no-op: negotiation finds nothing missing.
         let again = bob.pull_via(&relay).unwrap();
-        assert!(again.is_empty(), "nothing new (already up to date)");
+        assert!(again.outcomes.is_empty(), "nothing new (already up to date)");
+        assert!(again.deferred.is_none());
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&relay_dir);
@@ -3776,9 +3905,10 @@ mod tests {
         bob.finalize_working().unwrap();
 
         // The divergent pull: alice's amend lands next to bob's.
-        let outcomes = bob.pull_via(&relay).unwrap();
+        let report = bob.pull_via(&relay).unwrap();
         assert!(
-            !outcomes
+            !report
+                .outcomes
                 .values()
                 .any(|o| matches!(o, MergeOutcome::Conflict { .. })),
             "no per-path conflict is minted for the co-version"
@@ -3871,6 +4001,193 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn pull_over_a_dirty_tree_captures_edits_and_defers_a_divergent_pull() {
+        // #219 done-when (1): a divergent pull run over a DIRTY tree captures
+        // the uncaptured edits into the working change FIRST (capture-first,
+        // ADR 0030 amendment), so ingest still lands the peer's co-version and
+        // the `!` divergence stays flat — but converge WAITS (the working-change
+        // guard), the tree is never clobbered, and `deferred` carries the note.
+        use loot_core::Repo as _;
+        let dir_a = std::env::temp_dir().join(format!("loot-219div-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("feat.txt"), b"feat: base").unwrap();
+        alice.snapshot("add feat").unwrap();
+        alice.finalize_working().unwrap();
+        let cid = alice.repo().change_change_id(&alice.heads()[0]).unwrap();
+        let (relay_dir, mut relay) = relay_holding("219div", &alice);
+
+        let dir_b = std::env::temp_dir().join(format!("loot-219div-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+        bob.pull_via(&relay).unwrap();
+        bob.surface().unwrap();
+
+        // Concurrent amends of the SAME handle; bob finalizes his own line.
+        alice.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir_a.join("feat.txt"), b"feat: alice's take").unwrap();
+        alice.snapshot("add feat").unwrap();
+        alice.finalize_working().unwrap();
+        relay.0.stow(&alice.repo().bundle(&[]).unwrap()).unwrap();
+
+        bob.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir_b.join("feat.txt"), b"feat: bob's take").unwrap();
+        bob.snapshot("add feat").unwrap();
+        bob.finalize_working().unwrap();
+
+        // Uncaptured edit on disk when the divergent pull arrives.
+        std::fs::write(dir_b.join("notes.txt"), b"scratch").unwrap();
+        let report = bob.pull_via(&relay).unwrap();
+
+        // Deferred: a working change captured the edit, heads left unconverged.
+        let captured = report.deferred.expect("the pull deferred convergence with a note");
+        assert_eq!(bob.working_id(), Some(&captured), "the edit landed in the working change");
+        assert_eq!(
+            bob.repo().change_tree(&captured).unwrap().keys().cloned().collect::<Vec<_>>(),
+            vec![PathBuf::from("feat.txt"), PathBuf::from("notes.txt")],
+            "notes.txt was captured, not clobbered"
+        );
+        // Ingest happened; the divergence renders flat, tree untouched on disk.
+        assert!(bob.divergent_change_ids().contains(&cid), "the ! marker state renders");
+        assert!(bob.repo().conflicts().is_empty(), "no per-path conflict is minted");
+        assert_eq!(std::fs::read(dir_b.join("feat.txt")).unwrap(), b"feat: bob's take");
+        assert_eq!(std::fs::read(dir_b.join("notes.txt")).unwrap(), b"scratch");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn pull_over_a_dirty_tree_ingests_without_converging_then_converges_after_finalize() {
+        // #219 done-when (2): a dirty-tree pull that brings an INDEPENDENT head
+        // ingests it (graph append is always safe) but does NOT converge — the
+        // captured working change defers the fold. After the operator finalizes
+        // (`loot new`) and re-pulls, the now-clean tree converges the two lines.
+        use loot_core::Repo as _;
+        let dir_a = std::env::temp_dir().join(format!("loot-219ind-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("shared.txt"), b"shared").unwrap();
+        alice.snapshot("shared").unwrap();
+        alice.finalize_working().unwrap();
+        let (relay_dir, mut relay) = relay_holding("219ind", &alice);
+
+        let dir_b = std::env::temp_dir().join(format!("loot-219ind-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+        bob.pull_via(&relay).unwrap();
+        bob.surface().unwrap();
+
+        // Bob advances his own line; alice advances an INDEPENDENT line (both
+        // fork from `shared`, so the two heads are a genuine two-writer fork).
+        std::fs::write(dir_b.join("bob.txt"), b"B").unwrap();
+        bob.snapshot("bob line").unwrap();
+        bob.finalize_working().unwrap();
+        std::fs::write(dir_a.join("alice.txt"), b"A").unwrap();
+        alice.snapshot("alice line").unwrap();
+        alice.finalize_working().unwrap();
+        relay.0.stow(&alice.repo().bundle(&[]).unwrap()).unwrap();
+
+        // Uncaptured edit, then the pull: it ingests alice's head but defers.
+        std::fs::write(dir_b.join("scratch.txt"), b"wip").unwrap();
+        let report = bob.pull_via(&relay).unwrap();
+        assert!(report.deferred.is_some(), "the dirty pull deferred the fold");
+        assert!(bob.working_id().is_some(), "the edit was captured");
+        assert_eq!(bob.heads().len(), 2, "alice's head ingested; the fork stands unconverged");
+        assert!(!dir_b.join("alice.txt").exists(), "converge waited — alice's file not yet materialized");
+        assert_eq!(std::fs::read(dir_b.join("scratch.txt")).unwrap(), b"wip", "the edit is intact");
+
+        // Finalize, then re-pull: the clean tree now converges the two lines.
+        bob.finalize_working().unwrap();
+        let report = bob.pull_via(&relay).unwrap();
+        assert!(report.deferred.is_none(), "a clean re-pull converges");
+        assert_eq!(bob.heads().len(), 1, "the independent lines folded onto one");
+        assert_eq!(std::fs::read(dir_b.join("alice.txt")).unwrap(), b"A", "alice's line materialized");
+        assert_eq!(std::fs::read(dir_b.join("bob.txt")).unwrap(), b"B", "bob's line kept");
+        assert_eq!(std::fs::read(dir_b.join("scratch.txt")).unwrap(), b"wip", "the captured edit carried");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn pull_captures_a_delete_all_edit_rather_than_refusing() {
+        // #219 regression: an empty disk is only "not dirt" when a transfer is
+        // mid-flight (the anchor's closure is incomplete). A genuine delete-all
+        // over a fully-held tip is a real uncaptured edit — it must CAPTURE (so
+        // the deletion is not lost) and DEFER, never refuse (refuse-on-dirt is
+        // rejected for pull/apply).
+        use loot_core::Repo as _;
+        let dir_a = std::env::temp_dir().join(format!("loot-219del-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("shared.txt"), b"shared").unwrap();
+        alice.snapshot("shared").unwrap();
+        alice.finalize_working().unwrap();
+        let (relay_dir, mut relay) = relay_holding("219del", &alice);
+
+        let dir_b = std::env::temp_dir().join(format!("loot-219del-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+        bob.pull_via(&relay).unwrap();
+        bob.surface().unwrap();
+        std::fs::write(dir_b.join("bob.txt"), b"B").unwrap();
+        bob.snapshot("bob line").unwrap();
+        bob.finalize_working().unwrap();
+
+        // Alice advances an independent line the pull will bring.
+        std::fs::write(dir_a.join("alice.txt"), b"A").unwrap();
+        alice.snapshot("alice line").unwrap();
+        alice.finalize_working().unwrap();
+        relay.0.stow(&alice.repo().bundle(&[]).unwrap()).unwrap();
+
+        // Delete every tracked file — an uncaptured edit — then pull.
+        std::fs::remove_file(dir_b.join("shared.txt")).unwrap();
+        std::fs::remove_file(dir_b.join("bob.txt")).unwrap();
+        let report = bob.pull_via(&relay).expect("a delete-all pull captures, never refuses");
+        let captured = report.deferred.expect("the deletion was captured and converge deferred");
+        assert!(
+            bob.repo().change_tree(&captured).unwrap().is_empty(),
+            "the working change records the delete-all (an empty tree)"
+        );
+        assert!(!dir_b.join("shared.txt").exists(), "the deletion was not clobbered back");
+        assert!(!dir_b.join("bob.txt").exists(), "…nor bob.txt");
+        assert!(!dir_b.join("alice.txt").exists(), "converge deferred — nothing re-materialized");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn converge_refuses_to_materialize_over_uncaptured_edits() {
+        // #219 done-when (3): the tree-write chokepoint. A converge that WOULD
+        // fold a fork refuses when the disk holds uncaptured edits rather than
+        // clobbering them — the backstop behind capture-first. The refusal is
+        // atomic: no side is merged, both heads survive.
+        let (dir, mut ws) = dock_repo("219choke");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        ws.dock_goto("peer").unwrap();
+        std::fs::write(dir.join("their.txt"), b"T").unwrap();
+        ws.snapshot("theirs").unwrap();
+        ws.finalize_working().unwrap();
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("ours.txt"), b"O").unwrap();
+        ws.snapshot("ours").unwrap();
+        ws.finalize_working().unwrap();
+        assert!(ws.repo().heads().len() >= 2, "precondition: a real two-writer fork");
+
+        // Skip capture-first (a direct converge): scribble an uncaptured edit.
+        let heads_before = ws.repo().heads().len();
+        std::fs::write(dir.join("ours.txt"), b"O edited but not captured").unwrap();
+        let ours = ws.anchor();
+        let err = ws.converge_heads(ours.as_ref()).unwrap_err();
+        assert!(err.contains("uncaptured"), "unexpected refusal: {err}");
+        assert_eq!(ws.repo().heads().len(), heads_before, "refusal is atomic — no side merged");
+        assert_eq!(
+            std::fs::read(dir.join("ours.txt")).unwrap(),
+            b"O edited but not captured",
+            "the uncaptured edit was not clobbered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

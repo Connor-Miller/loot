@@ -42,6 +42,28 @@ cheap and safe:
 The win: work cannot be lost between commands, and the mandatory `status -m`
 ceremony is gone.
 
+> **Amended 2026-07-12 (#219): capture-first extends to `pull`/`apply`, behind
+> one tree-write chokepoint.** `pull`/`apply` are mutating verbs, so they
+> capture uncaptured disk edits into the working change like every other one —
+> the earlier "`pull`/`apply` have none" assumption in `converge_heads` was an
+> accident of this ADR not yet reaching them, not a guarantee. A dirty pull
+> becomes: **ingest always** (graph append is always safe), **converge only when
+> clean**. The existing working-change guard makes convergence a **no-op for
+> that pass** — you cannot fold heads under an in-progress working change
+> without orphaning it — so the pull emits a loud note ("captured working change
+> `<id>`; heads left unconverged — finalize (`loot new`) then re-run pull/apply
+> to converge") and leaves the flat-heads state #203 made legal. Refuse-on-dirt
+> was rejected for pull/apply (it nags the mid-work-sync case); `loot edit`'s
+> refuse-on-dirt exception class is untouched. Underpinning both is **one
+> internal tree-write chokepoint**: every path that overwrites the working tree
+> from a change's content (the `converge`/adopt materializes) is gated by a
+> single invariant — *never write the tree over uncaptured dirt* — evaluated
+> before any head is dropped, so a caller that skipped capture is **refused**
+> rather than silently clobbered. `undo`/`abandon` resurface is exempt **by
+> intent** (rewriting the tree is what the operator asked for); a dock switch
+> already captures. This graduates map #169's fog item *"pull materializes over
+> uncaptured disk edits"* into a guarantee.
+
 ### `status` becomes a pure read-only report (the `-m` flag is dropped)
 
 `status` recomputes the pending working-tree delta **live** and prints it, and

@@ -17,9 +17,12 @@ visibility. Permissions attach here, not to the repo.
 *is* (JJ-style, ADR 0006). There is no separate "commit" step: `describe` names
 the working change and `new` finalizes it and starts a fresh one on top. Under
 implicit auto-snapshot (ADR 0030, #144) every **mutating** verb (`new`,
-`describe`, `grant`, `maroon`, `migrate`) captures the tree first, so edits are
-never lost between commands and no manual `loot status` is needed; read-only
-verbs never snapshot. (`status` still snapshots today — turning it read-only is
+`describe`, `grant`, `maroon`, `migrate`, and — since #219 — `pull`/`apply`)
+captures the tree first, so edits are never lost between commands and no manual
+`loot status` is needed; read-only verbs never snapshot. A dirty `pull`/`apply`
+captures into the working change, then convergence **waits** (the working-change
+guard) rather than overwriting the tree — one internal tree-write chokepoint
+enforces *never materialize over uncaptured dirt* (ADR 0030 amendment). (`status` still snapshots today — turning it read-only is
 S2 #145.) This kills git's add/commit ceremony.
 
 **Snapshot (reconcile)** — turning the current working tree into the working
