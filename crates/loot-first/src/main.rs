@@ -14,6 +14,7 @@
 
 use loot_first::forge::GhForge;
 use loot_first::orchestrator;
+use loot_cli::flags::{FlagCheck, FlagSpec};
 use loot_cli::workspace::Workspace;
 use std::process::ExitCode;
 
@@ -28,9 +29,38 @@ fn main() -> ExitCode {
     }
 }
 
+/// Each verb's flag spec (#67) — the same gate `loot` dispatches through, and
+/// the stakes here are higher: an ignored `--dryrun` typo doesn't print the
+/// wrong thing, it lands the PR for real. A verb absent from this table (`help`,
+/// or a typo) is left to `run`'s own reporting.
+const FLAGS: &[FlagSpec] = &[
+    spec("review", &["--title"], &["--dry-run"]),
+    spec("land", &["--pr"], &["--skip-tests", "--dry-run"]),
+    spec("tag", &["-m", "--message"], &[]),
+    spec("status", &[], &[]),
+    spec("init-hook", &[], &[]),
+];
+
+const fn spec(
+    name: &'static str,
+    valued: &'static [&'static str],
+    bare: &'static [&'static str],
+) -> FlagSpec {
+    FlagSpec { bin: "loot-first", name, valued, bare }
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let rest = &args[args.len().min(1)..];
+    // Gate the flags before the verb runs (#67) — `land` must never treat a
+    // misspelled `--dry-run` as consent to land. `--help` on any verb prints
+    // usage rather than running it.
+    if let Some(spec) = FLAGS.iter().find(|s| s.name == cmd) {
+        if spec.check(rest)? == FlagCheck::Help {
+            print_help();
+            return Ok(());
+        }
+    }
     match cmd {
         "review" => {
             let title = flag_value(rest, "--title");

@@ -5,6 +5,7 @@
 //! All ambient state (`.loot/` home, identity, clock, persistence, working-change
 //! id) is owned by the [`Workspace`]; commands are thin verbs over it.
 
+use loot_cli::flags::{FlagCheck, FlagSpec};
 use loot_cli::{ferry, render, workspace};
 use loot_core::{
     verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Visibility,
@@ -25,7 +26,17 @@ fn main() -> ExitCode {
 
     // `buoy` returns its own ExitCode (0/2/3/1) rather than the generic Ok/Err.
     if cmd == "buoy" {
-        return cmd_buoy(rest);
+        return match BUOY_FLAGS.check(rest) {
+            Ok(FlagCheck::Help) => {
+                print_help();
+                ExitCode::SUCCESS
+            }
+            Ok(FlagCheck::Proceed) => cmd_buoy(rest),
+            Err(e) => {
+                eprintln!("loot: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let result = match cmd {
@@ -37,8 +48,18 @@ fn main() -> ExitCode {
             println!("{}", version_line());
             Ok(())
         }
-        other => match COMMANDS.iter().find(|(name, _)| *name == other) {
-            Some((_, run)) => run(rest),
+        other => match COMMANDS.iter().find(|v| v.spec.name == other) {
+            // The flag gate runs *before* the verb (#67): a verb never sees an
+            // argument list holding a flag it does not understand, so a typo
+            // can't read as "no filter requested" and quietly do something else.
+            Some(v) => match v.spec.check(rest) {
+                Ok(FlagCheck::Help) => {
+                    print_help();
+                    Ok(())
+                }
+                Ok(FlagCheck::Proceed) => (v.run)(rest),
+                Err(e) => Err(e),
+            },
             None => Err(format!("unknown command '{other}'\n\n{USAGE}")),
         },
     };
@@ -52,51 +73,83 @@ fn main() -> ExitCode {
     }
 }
 
+/// A dispatchable verb: what it is called, which flags it accepts (#67, gated
+/// by [`FlagSpec::check`] before the verb runs), and how to run it.
+struct Verb {
+    spec: FlagSpec,
+    run: fn(&[String]) -> Result<(), String>,
+}
+
+const fn verb(
+    name: &'static str,
+    valued: &'static [&'static str],
+    bare: &'static [&'static str],
+    run: fn(&[String]) -> Result<(), String>,
+) -> Verb {
+    Verb { spec: FlagSpec { bin: "loot", name, valued, bare }, run }
+}
+
+/// The two globals every snapshotting verb carries (ADR 0030): `--allow-demote
+/// <path>` (repeatable) and the two spellings of the capture skip.
+const DEMOTE: &[&str] = &["--allow-demote"];
+const SKIP: &[&str] = &["--no-snapshot", "--ignore-working-copy"];
+/// The machine-output selectors (CA3, ADR 0023).
+const OUT: &[&str] = &["--porcelain", "--json"];
+
 /// Every dispatchable verb in one table the dispatcher and the usage test
 /// share, so a verb cannot silently vanish from the CLI while its usage line
 /// survives — the #66 regression class (`loot gc` dropped in a merge).
 /// `buoy` is dispatched separately (it returns its own ExitCode) and `help`
 /// is a match arm; everything else lives here.
-const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
-    ("init", cmd_init),
-    ("status", cmd_status),
-    ("describe", cmd_describe),
-    ("new", cmd_new),
-    ("edit", cmd_edit),
-    ("abandon", cmd_abandon),
-    ("adopt", cmd_adopt),
-    ("undo", |_| cmd_undo()),
-    ("op", cmd_op),
-    ("surface", |_| cmd_surface()),
-    ("dock", cmd_dock),
-    ("docks", |_| cmd_docks()),
-    ("lane", cmd_lane),
-    ("lanes", cmd_lane_list),
-    ("log", |_| cmd_log()),
-    ("gc", cmd_gc),
-    ("bundle", cmd_bundle),
-    ("apply", cmd_apply),
-    ("grant", cmd_grant),
-    ("maroon", cmd_maroon),
-    ("migrate", cmd_migrate),
-    ("manifest", |_| cmd_manifest()),
-    ("attest", cmd_attest),
-    ("conflicts", cmd_conflicts),
-    ("resolve", cmd_resolve),
-    ("remote", cmd_remote),
-    ("keygen", |_| cmd_keygen()),
-    ("whoami", |_| cmd_whoami()),
-    ("peer", cmd_peer),
-    ("serve", cmd_serve),
-    ("push", cmd_push),
-    ("pull", cmd_pull),
-    ("pull-grants", cmd_pull_grants),
-    ("grants", cmd_grants),
-    ("clone", cmd_clone),
-    ("config", cmd_config),
-    ("id", cmd_id),
-    ("ferry", cmd_ferry),
+const COMMANDS: &[Verb] = &[
+    verb("init", &["--identity"], &[], cmd_init),
+    verb("status", &[], OUT, cmd_status),
+    verb("describe", &["-m", "--message", "--allow-demote"], &[], cmd_describe),
+    verb("new", &["-m", "--message", "--allow-demote"], SKIP, cmd_new),
+    verb("edit", &[], &[], cmd_edit),
+    verb("abandon", &[], &["--head"], cmd_abandon),
+    verb("adopt", &[], &["--discard-wip"], cmd_adopt),
+    verb("undo", &[], &[], |_| cmd_undo()),
+    verb("op", &[], &[], cmd_op),
+    verb("surface", &[], &[], |_| cmd_surface()),
+    verb("dock", &["--at"], OUT, cmd_dock),
+    verb("docks", &[], &[], |_| cmd_docks()),
+    verb("lane", &["--ticket", "--name", "--at", "--stale-hours"], OUT, cmd_lane),
+    verb("lanes", &[], OUT, cmd_lane_list),
+    verb("log", &[], &[], |_| cmd_log()),
+    verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
+    verb("bundle", &[], &[], cmd_bundle),
+    verb("apply", &[], OUT, cmd_apply),
+    verb("grant", &["--relay", "--allow-demote"], SKIP, cmd_grant),
+    verb("maroon", DEMOTE, &["--hard", "--no-snapshot", "--ignore-working-copy"], cmd_maroon),
+    verb("migrate", DEMOTE, SKIP, cmd_migrate),
+    verb("manifest", &[], &[], |_| cmd_manifest()),
+    verb("attest", &[], &[], cmd_attest),
+    verb("conflicts", &[], OUT, cmd_conflicts),
+    verb("resolve", &[], &[], cmd_resolve),
+    verb("remote", &[], &[], cmd_remote),
+    verb("keygen", &[], &[], |_| cmd_keygen()),
+    verb("whoami", &[], &[], |_| cmd_whoami()),
+    verb("peer", &[], &[], cmd_peer),
+    verb("serve", &["--dir", "--addr", "--allow"], &[], cmd_serve),
+    verb("push", &["--remote"], &[], cmd_push),
+    verb("pull", &["--remote"], OUT, cmd_pull),
+    verb("pull-grants", &["--remote"], &[], cmd_pull_grants),
+    verb("grants", &["--remote"], &[], cmd_grants),
+    verb("clone", &["--identity"], &[], cmd_clone),
+    verb("config", &[], &[], cmd_config),
+    verb("id", &[], &[], cmd_id),
+    verb("ferry", &["--git-dir", "--dock"], &["--with-wip", "--porcelain", "--json"], cmd_ferry),
 ];
+
+/// `buoy`'s flag spec. It dispatches ahead of [`COMMANDS`] (it returns its own
+/// ExitCode), so its flags are declared here rather than in the table.
+const BUOY_FLAGS: FlagSpec = FlagSpec {
+    bin: "loot",
+    name: "buoy",
+    valued: &[],
+    bare: &["--verbose", "--porcelain", "--json"],
+};
 
 const USAGE: &str = "\
 usage:
@@ -158,13 +211,19 @@ usage:
   loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip also projects the ambient dock's unfinalized WIP to review/<dock> (map #148)
 
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
-first (ADR 0030) — no manual `loot status` needed. Two globals ride any of them:
+first (ADR 0030) — no manual `loot status` needed. Two globals ride them:
   --allow-demote <path>   permit this snapshot to re-seal <path> more readably (repeatable)
   --no-snapshot           act on the last recorded working change; skip the implicit capture
+                          (not on `describe` — recording the tree is its whole job)
 
 info flags (no repo needed):
-  -h, --help              show this usage
-  -V, --version           print the loot version and exit";
+  -h, --help              show this usage — rides any verb, and explains rather
+                          than runs it (`loot new --help` never finalizes)
+  -V, --version           print the loot version and exit
+
+a flag a verb does not accept is an error, never ignored (#67) — a typo like
+  `loot log --path x` refuses instead of printing the unfiltered log as if the
+  filter had run.";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -2163,7 +2222,7 @@ mod tests {
             .filter_map(|rest| rest.split_whitespace().next())
             .filter(|v| v.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
             .collect();
-        let mut dispatched: BTreeSet<&str> = COMMANDS.iter().map(|(n, _)| *n).collect();
+        let mut dispatched: BTreeSet<&str> = COMMANDS.iter().map(|v| v.spec.name).collect();
         dispatched.insert("buoy"); // dispatched before the table (own ExitCode)
         assert_eq!(
             documented, dispatched,
@@ -2184,6 +2243,118 @@ mod tests {
         let ver = line.split(' ').nth(1).unwrap();
         assert!(!ver.is_empty() && ver.contains('.'), "expected a semver tail, got {ver:?}");
         assert!(ver.chars().next().is_some_and(|c| c.is_ascii_digit()), "semver starts with a digit");
+    }
+
+    // --- #67: the dispatch table's flag specs ---
+    // The gate's own behavior is tested in `flags.rs`; these pin *this* table's
+    // wiring — the specs real verbs declare.
+
+    fn check(verb: &str, argv: &[&str]) -> Result<FlagCheck, String> {
+        let v = COMMANDS.iter().find(|v| v.spec.name == verb).expect("a dispatched verb");
+        v.spec.check(&args(argv))
+    }
+
+    /// The finding itself (pilot finding 11): `loot log --path README.md`
+    /// printed the whole unfiltered log, which reads as "the filter ran and
+    /// matched everything". A flag loot does not implement must fail loudly.
+    #[test]
+    fn unknown_flag_is_rejected_not_ignored() {
+        let err = check("log", &["--path", "README.md"]).unwrap_err();
+        assert!(err.contains("--path"), "the error names the offending flag: {err}");
+        assert!(err.contains("takes no flags"), "`loot log` has none to offer: {err}");
+        // A flag that is real elsewhere in the CLI is still unknown here.
+        assert!(check("log", &["--porcelain"]).is_err());
+    }
+
+    /// The #66 guard, extended from verbs to their flags (#67): every flag the
+    /// usage text shows on a verb's line must be one that verb accepts. The
+    /// specs are hand-declared beside the table, so without this a documented
+    /// flag could silently become a refusal — the mirror image of the bug #67
+    /// fixed, and worse, because it breaks a flag that used to work.
+    #[test]
+    fn every_documented_flag_is_accepted_by_its_verb() {
+        for line in USAGE.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("loot ") else { continue };
+            let Some(name) = rest.split_whitespace().next() else { continue };
+            let spec = match COMMANDS.iter().find(|v| v.spec.name == name) {
+                Some(v) => &v.spec,
+                None if name == "buoy" => &BUOY_FLAGS,
+                None => continue, // not a verb line (prose that mentions `loot`)
+            };
+            // Usage decorates flags with brackets and alternation:
+            // `[--porcelain|--json]`, `[-m <message>]`.
+            for token in rest.split(|c: char| c.is_whitespace() || "[]|()".contains(c)) {
+                if !token.starts_with('-') || token == "-" {
+                    continue;
+                }
+                assert!(
+                    spec.check(&args(&[token])).is_ok(),
+                    "usage documents `{token}` on `loot {name}`, but its spec rejects it"
+                );
+            }
+        }
+    }
+
+    /// Every flag the verbs actually read still passes its own gate — the
+    /// specs are hand-declared beside the table, so a missing entry would turn
+    /// a working flag into a refusal.
+    #[test]
+    fn every_declared_flag_passes_its_verbs_gate() {
+        assert_eq!(check("init", &["--identity", "alice"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("clone", &["url", "dir", "--identity", "alice"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("status", &["--porcelain"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("describe", &["-m", "subject", "--allow-demote", "a"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("new", &["--message", "s", "--no-snapshot"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("new", &["--ignore-working-copy"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("abandon", &["--head", "a3f9"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("adopt", &["a3f9", "--discard-wip"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("dock", &["merge", "x", "--json"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("dock", &["x", "--at", "dir"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("lane", &["new", "--ticket", "67", "--name", "n", "--at", "d", "--json"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("lane", &["gc", "--stale-hours", "12"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("lanes", &["--porcelain"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("gc", &["--dry-run"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("gc", &["-n"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("apply", &["b.bundle", "--json"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("grant", &["--relay", "origin", "p", "bob"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("maroon", &["p", "bob", "--hard", "--allow-demote", "a"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("migrate", &["p", "public", "--no-snapshot"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("conflicts", &["--json"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("serve", &["--dir", "d", "--addr", "a", "--allow", "k"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("push", &["--remote", "origin"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("pull", &["--remote", "origin", "--porcelain"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("pull-grants", &["--remote", "origin"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("grants", &["--remote", "origin"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("ferry", &["--git-dir", "g", "--dock", "main", "--with-wip", "--json"]), Ok(FlagCheck::Proceed));
+        assert_eq!(BUOY_FLAGS.check(&args(&["release", "--verbose", "--json"])), Ok(FlagCheck::Proceed));
+    }
+
+    /// The ADR 0030 globals ride exactly the verbs whose `cmd_*` reads them:
+    /// `--allow-demote` every snapshotting verb, the capture skip all but
+    /// `describe` (recording the tree is its whole job). `maroon` spells the
+    /// skip out rather than reusing `SKIP` (it adds `--hard`), so this is what
+    /// keeps the two in step.
+    #[test]
+    fn the_snapshot_globals_ride_their_verbs() {
+        for v in ["new", "grant", "maroon", "migrate"] {
+            for skip in SKIP {
+                assert_eq!(check(v, &[skip]), Ok(FlagCheck::Proceed), "`loot {v} {skip}`");
+            }
+        }
+        for v in ["new", "describe", "grant", "maroon", "migrate"] {
+            assert_eq!(check(v, &["--allow-demote", "a"]), Ok(FlagCheck::Proceed), "`loot {v}`");
+        }
+        // `describe` always records the tree, so the skip is meaningless there,
+        // and `status` is read-only — neither takes what it cannot honour.
+        assert!(check("describe", &["--no-snapshot"]).is_err());
+        assert!(check("status", &["--allow-demote", "a"]).is_err());
+    }
+
+    /// `buoy` dispatches ahead of the table; it is gated all the same.
+    #[test]
+    fn buoy_gates_its_flags_too() {
+        assert!(BUOY_FLAGS.check(&args(&["--rolel", "release"])).is_err());
+        assert_eq!(BUOY_FLAGS.check(&args(&["--help"])), Ok(FlagCheck::Help));
     }
 
     #[test]

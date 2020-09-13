@@ -5,11 +5,13 @@
 //!
 //! Only the modules the orchestrator needs are re-exported: [`workspace`] (the
 //! Workspace face over the engine, R1 #177), [`ferry`] (the git-interop
-//! reconcile pass, ADR 0028 / map #148), and [`ledger`] (the `pr-map` review
-//! ledger — written by the orchestrator, read by `loot lanes`, #232).
+//! reconcile pass, ADR 0028 / map #148), [`ledger`] (the `pr-map` review
+//! ledger — written by the orchestrator, read by `loot lanes`, #232), and
+//! [`flags`] (the argument gate both binaries dispatch through, #67).
 //! [`render`] rides along because `ferry` and the bin depend on it.
 
 pub mod ferry;
+pub mod flags;
 pub mod ledger;
 pub mod render;
 pub mod workspace;

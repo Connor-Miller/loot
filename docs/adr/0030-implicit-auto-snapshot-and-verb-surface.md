@@ -175,6 +175,40 @@ than silently widening exposure. Override with **`--allow-demote <path>`**, a
 inline without a verb detour. Escape hatches: global **`--ignore-working-copy`**
 / `--no-snapshot` skip the implicit snapshot entirely for one invocation.
 
+> **Amended 2026-07-15 (#67): "a global flag on any snapshotting verb" is now
+> enforced, not merely documented.** Both binaries scanned for the flags they
+> knew and **ignored the rest**, so a global read as accepted wherever you typed
+> it: `--allow-demote` on read-only `status`, or `--no-snapshot` on `describe`
+> (which always records the tree — recording it is the verb's whole job), did
+> nothing at all and said so. Each verb now **declares the flags it reads**, and
+> the dispatcher rejects the rest *before the verb runs*. So a global rides
+> exactly the verbs that honour it — `--allow-demote` the five snapshotting
+> verbs, the capture skip all but `describe`; `status` takes neither. See "An
+> unknown flag is an error" below.
+
+### An unknown flag is an error, never noise
+
+> **Amended 2026-07-15 (#67).** The rest of this ADR reconciles which verbs
+> exist and what they do; this settles what happens to an argument that names
+> none of them.
+
+An unknown flag is **refused**, on every verb of both binaries, before the verb
+runs. Ignoring it is not neutral — it *teaches a feature that isn't there*:
+`loot log --path README.md` printed the whole unfiltered log, which reads as a
+filter that ran and matched everything (#67, pilot finding 11). The refusal
+names the flag and lists what the verb does accept.
+
+The rule follows the grain of ADR 0005's dependency-light hand parsing (no
+clap): one gate, two dispatch tables. Two consequences worth stating:
+
+- **`-h`/`--help` rides every verb** and prints usage *instead of* running it.
+  Otherwise it would be the one flag still silently ignored — and it was the
+  dangerous one: `loot new --help` **finalized (signed) the working change**.
+- **Flags are declared per verb, not per subcommand** — `loot lane`'s set is the
+  union over `new`/`gc`/…. That catches every flag that exists nowhere in the
+  CLI (the reported class) without a second dispatch table to keep in step; a
+  flag real on a *sibling* subcommand is still ignored (#278).
+
 ### Parallel-agent safety: snapshot never finalizes or signs
 
 Auto-snapshot **only ever rewrites the working change** — it never adds a graph

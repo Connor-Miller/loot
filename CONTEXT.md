@@ -26,8 +26,9 @@ captures the tree first, so edits are never lost between commands and no manual
 `loot status` is needed; read-only verbs never snapshot. A dirty `pull`/`apply`
 captures into the working change, then convergence **waits** (the working-change
 guard) rather than overwriting the tree — one internal tree-write chokepoint
-enforces *never materialize over uncaptured dirt* (ADR 0030 amendment). (`status` still snapshots today — turning it read-only is
-S2 #145.) This kills git's add/commit ceremony.
+enforces *never materialize over uncaptured dirt* (ADR 0030 amendment).
+(`status` is read-only — it recomputes the pending delta live and records
+nothing, S2 #145.) This kills git's add/commit ceremony.
 
 **Snapshot (reconcile)** — turning the current working tree into the working
 change, *visibility-aware* (ADR 0006). Against the last change's full tree, at
@@ -399,8 +400,10 @@ tree already records) **refuses** (a typed `RepoError::Demotion`) unless that
 path is passed via the global **`--allow-demote <path>`**. Under implicit
 auto-snapshot (ADR 0030, #144) the guard rides every mutating verb's capture,
 so `--allow-demote` is a global on any snapshotting verb (`new`, `describe`,
-`grant`, `maroon`, `migrate`, `status`), not a `status`-only flag. Widening a
-Restricted identity set is not guarded — `grant`/`maroon` own that audit trail.
+`grant`, `maroon`, `migrate`), not a `status`-only flag — `status` is read-only
+and never demotes, so it does **not** take the flag (and refuses it since #67).
+Widening a Restricted identity set is not guarded — `grant`/`maroon` own that
+audit trail.
 
 **`.lootignore`** *(#64, 2026-07-09)* — a gitignore-style file excluding paths
 from [[Snapshot (reconcile)]]: one glob per line, `#` comments, the **same
