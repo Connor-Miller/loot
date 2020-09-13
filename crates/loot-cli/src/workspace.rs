@@ -2778,7 +2778,10 @@ impl Workspace {
     /// negotiate (offer → missing → wants), fetch in batches — each applied
     /// batch persists, so an interrupted pull resumes by re-negotiating and
     /// fetching only what's left (S6, ADR 0024) — then collapse any fork the
-    /// pull left us on (the keyholder fork-collapse of ADR 0011, #128).
+    /// pull left us on (the keyholder fork-collapse of ADR 0011, #128). An
+    /// empty `wants` still makes one metadata-only fetch (#370): change
+    /// deltas only travel in fetch responses, so a change whose objects we
+    /// already hold would otherwise never ingest.
     ///
     /// Two correctness points the pipeline owns (previously restated at the
     /// CLI): `have` is re-read after each batch so the relay's change-delta
@@ -2806,6 +2809,30 @@ impl Workspace {
         let offered = transport.offer(&self.repo.negotiation_have())?;
         let wants = self.missing_objects(&offered);
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
+        if wants.is_empty() {
+            // #370: the change delta only travels in fetch responses, and a
+            // remote change can introduce no objects we lack — a pure
+            // deletion adds none, and a grant pre-delivers its object's
+            // ciphertext before the carrying change is pulled. Zero fetch
+            // round-trips would strand such a change forever ("nothing new"
+            // while the relay is ahead). One metadata-only round-trip — the
+            // empty-wants bundle the server already serves — propagates it.
+            // The bundle also re-delivers every change the head-id
+            // negotiation cannot name as held (ancestors are never in
+            // `have`), and classifying those already-held changes emits
+            // per-path chatter; keep the outcomes only when the fetch
+            // actually moved our head set, so a genuinely up-to-date pull
+            // still reports "nothing new".
+            let heads_before: std::collections::BTreeSet<Oid> =
+                self.repo.heads().into_iter().collect();
+            let bytes = transport.fetch(&self.repo.negotiation_have(), &[])?;
+            let batch_outcomes = self.apply_bundle(bytes)?;
+            let heads_after: std::collections::BTreeSet<Oid> =
+                self.repo.heads().into_iter().collect();
+            if heads_after != heads_before {
+                fold_worst(&mut outcomes, batch_outcomes);
+            }
+        }
         for batch in wants.chunks(OBJECTS_PER_BATCH) {
             let current_have = self.repo.negotiation_have();
             let bytes = transport.fetch(&current_have, batch)?;
@@ -7622,6 +7649,93 @@ mod tests {
         let again = bob.pull_via(&relay).unwrap();
         assert!(again.outcomes.is_empty(), "nothing new (already up to date)");
         assert!(again.deferred.is_none());
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn pull_via_ingests_a_change_whose_object_a_grant_predelivered() {
+        // #370's live shape (hit in #340's evidence run): a grant hands bob
+        // the object ciphertext BEFORE he pulls the change that carries it,
+        // so negotiation offers nothing he lacks — `wants` is empty — yet the
+        // change delta only travels in fetch responses. The pull must still
+        // make one metadata-only round-trip and ingest the carrying change,
+        // not strand on "nothing new" forever.
+        use loot_core::Repo as _;
+        let dir_a = std::env::temp_dir().join(format!("loot-heldobj-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("doc.txt"), b"v1").unwrap();
+        alice.snapshot("doc").unwrap();
+        alice.finalize_working().unwrap();
+        let (relay_dir, mut relay) = relay_holding("heldobj", &alice);
+
+        let dir_b = std::env::temp_dir().join(format!("loot-heldobj-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+        bob.pull_via(&relay).unwrap();
+        bob.surface().unwrap();
+        assert_eq!(bob.heads(), alice.heads(), "bob shares the base");
+
+        std::fs::write(dir_a.join("notes.txt"), b"granted ahead of the pull").unwrap();
+        alice.snapshot("notes").unwrap();
+        alice.finalize_working().unwrap();
+        relay.0.stow(&alice.repo().bundle(&[]).unwrap()).unwrap();
+
+        // The pre-delivery: exactly the object bob's next negotiation would
+        // want, handed over as a grant bundle before the carrying change.
+        let wants = bob.missing_objects(&relay.0.offered_objects(&bob.heads()));
+        assert_eq!(wants.len(), 1, "the new change introduces one object bob lacks");
+        let grant = alice
+            .with_repo_mut(|r| r.grant(&wants[0], "bob", 100, None).map_err(|e| e.to_string()))
+            .unwrap();
+        bob.apply_bundle(grant.0).unwrap();
+        assert!(
+            bob.missing_objects(&relay.0.offered_objects(&bob.heads())).is_empty(),
+            "the grant pre-delivered the object — the pull's wants will be empty"
+        );
+
+        let report = bob.pull_via(&relay).unwrap();
+        assert_eq!(
+            bob.heads(),
+            alice.heads(),
+            "the carrying change ingested despite an empty wants list — bob is not stranded"
+        );
+        assert!(!report.outcomes.is_empty(), "the pull reports the ingested change's outcomes");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn pull_via_ingests_a_pure_deletion_change() {
+        // #370's second face: a deletion-only change introduces no new
+        // objects at all, so `offer` has nothing new to return and `wants`
+        // stays empty — it must ride the same metadata-only round-trip.
+        use loot_core::Repo as _;
+        let dir_a = std::env::temp_dir().join(format!("loot-puredel-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("doc.txt"), b"v1").unwrap();
+        alice.snapshot("doc").unwrap();
+        alice.finalize_working().unwrap();
+        let (relay_dir, mut relay) = relay_holding("puredel", &alice);
+
+        let dir_b = std::env::temp_dir().join(format!("loot-puredel-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+        bob.pull_via(&relay).unwrap();
+        bob.surface().unwrap();
+        assert_eq!(bob.heads(), alice.heads(), "bob shares the base");
+
+        std::fs::remove_file(dir_a.join("doc.txt")).unwrap();
+        alice.snapshot("rm doc").unwrap();
+        alice.finalize_working().unwrap();
+        relay.0.stow(&alice.repo().bundle(&[]).unwrap()).unwrap();
+
+        let _ = bob.pull_via(&relay).unwrap();
+        assert_eq!(
+            bob.heads(),
+            alice.heads(),
+            "the deletion ingested despite an empty wants list — bob is not stranded"
+        );
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&relay_dir);
