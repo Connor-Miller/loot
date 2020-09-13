@@ -155,6 +155,22 @@ can never be pruned (#263's root cause, prevented).
 
 ## Recovery playbook
 
+### Open the review round BEFORE a sibling lands (the seal strands your PR)
+
+Run `loot-first review` **immediately after `describe`** — before any other
+sync verb, and before a sibling's land can slip in. If git `main` moved since
+your lane spawned, the *review's own ferry pass* reconciles first, and
+reconciling over described WIP **seals it** as a signed merge parent (#275) —
+after which the WIP projection finds nothing unsigned and reports "nothing to
+review": your change is signed, merged with the landed line, and **PR-less**,
+and `loot-first land` refuses without a pr-map entry (hit live landing #289,
+2026-07-17). Recovery: a plain `loot ferry` projects the signed line onto the
+local mirror `main` (harbor-locked; GitHub does not move until a land pushes),
+after which a follow-up working change in the lane can open a review round
+whose branch carries the sealed work into the PR diff. Whether `review`
+should be able to project a signed-but-unlanded line directly is an open
+question for a future ticket.
+
 ### A break-glass git commit landed on `main` → `loot ferry`
 
 git `main` is a projection of loot (workflow.md). A direct commit to git `main`
