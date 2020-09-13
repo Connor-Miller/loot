@@ -437,6 +437,13 @@ impl Workspace {
         self.repo.current_tree_oid(path)
     }
 
+    /// A path's most recently recorded `(oid, visibility)` — current tree
+    /// first, else searched across all of history (`loot embargo-status`,
+    /// #15). `None` if `path` never appears in any recorded change.
+    pub fn path_history_entry(&self, path: &Path) -> Option<(Oid, Visibility)> {
+        self.repo.path_history_entry(path)
+    }
+
     /// A stored object's visibility (grant --relay reads the embargo clock).
     pub fn visibility_of(&self, oid: &Oid) -> Option<Visibility> {
         self.repo.visibility_of(oid)
