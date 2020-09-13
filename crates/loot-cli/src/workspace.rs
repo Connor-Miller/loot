@@ -1851,6 +1851,12 @@ impl Workspace {
         if self.store.dock_exists(name) {
             return Err(format!("dock '{name}' already exists — pick a fresh name"));
         }
+        // The review-ref namespace is shared with lane ids (#281): the ref
+        // suffix is the dock name from the primary but the lane id from a
+        // lane, so a dock named like a live lane would put two writers back
+        // on one `review/<x>`. Lane spawn guards the other direction.
+        self.ensure_lane_name_free(name, None)
+            .map_err(|e| format!("{e} — a dock and a lane share the review-ref namespace (#281)"))?;
         // Capture the current dock's work so the new dock forks from a real tip.
         if self.working.is_some() {
             let msg = self.working_message_or_placeholder();
@@ -2244,11 +2250,19 @@ impl Workspace {
         Ok(lanes_root.join(candidate))
     }
 
-    /// Whether `key` is claimed in the lane lookup space — as a registry id or
-    /// a promoted name (the two share `lane rm <id-or-name>`'s space).
+    /// Whether `key` is claimed in the lane lookup space — as a registry id, a
+    /// promoted name (the two share `lane rm <id-or-name>`'s space), or an
+    /// existing dock's name. The dock check guards the review-ref namespace
+    /// (#281): the ref suffix is the lane id from a lane but the *dock name*
+    /// from the primary, so a lane id equal to a dock name would put two
+    /// writers back on one `review/<x>` — spawn is primary-only, making the
+    /// primary's docks exactly the names its projections can use.
     fn lane_key_taken(&self, entries: &[LaneEntry], key: &str) -> bool {
+        // `main` needs no arm here: every lane handle passes `valid_dock_name`,
+        // which already refuses the default dock's name.
         self.store.lane_entry_exists(key)
             || entries.iter().any(|e| e.name.as_deref() == Some(key))
+            || self.store.dock_exists(key)
     }
 
     /// The handle that becomes the registry id: the explicit (ticket-derived)
@@ -5288,6 +5302,31 @@ mod tests {
         let lw = Workspace::open_at(&spawned.dir).unwrap();
         assert_eq!(lw.lane_id(), Some("l1"));
         assert!(ws.spawn_lane(None, Some(&lane_dir)).is_err(), "dir already a position");
+
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn lane_ids_and_dock_names_share_the_review_ref_namespace() {
+        // #281: the review ref suffix is the lane id from a lane but the dock
+        // name from the primary — either name claimed by the other kind would
+        // put two writers back on one `review/<x>`.
+        let (area, _dir, mut ws) = lane_setup("lane-dock-collide");
+        ws.create_dock("t9", Some(&area.join("dock-t9"))).unwrap();
+
+        // A lane handle equal to an existing dock name suffixes past it, and
+        // `main` (the home dock, the primary's usual review handle) is always
+        // taken.
+        let spawned = ws.spawn_lane_as(None, Some(&area.join("lane-a")), Some("t9")).unwrap();
+        assert_eq!(spawned.id, "t9-2", "dock names are taken in the lane id space");
+        // `main` (the primary's usual review handle) never becomes a lane id:
+        // handle validation already refuses the default dock's name.
+        let err = ws.spawn_lane_as(None, Some(&area.join("lane-b")), Some("main")).unwrap_err();
+        assert!(err.contains("default dock"), "{err}");
+
+        // And the reverse: a dock cannot take a live lane's id.
+        let err = ws.create_dock("t9-2", Some(&area.join("dock-t9-2"))).unwrap_err();
+        assert!(err.contains("review-ref namespace"), "{err}");
 
         let _ = std::fs::remove_dir_all(&area);
     }

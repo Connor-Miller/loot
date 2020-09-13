@@ -64,6 +64,12 @@ fn hex8(s: Option<&str>) -> String {
     }
 }
 
+/// A position for an operator-facing message: the primary's owner key is the
+/// empty string (#281), which would read as nothing at all.
+fn position_name(owner: &str) -> String {
+    if owner.is_empty() { "the primary".to_string() } else { format!("lane '{owner}'") }
+}
+
 /// The dock git-main tracks, from the mirror config (`dock = <name>`, default
 /// `main`). The land gate refuses a lane on any other dock (see [`LandFacts`]).
 fn tracked_dock(config_path: &Path) -> String {
@@ -121,7 +127,7 @@ pub fn review(
     }
 
     let mut map = read_pr_map(&p.pr_map);
-    if let Some(lane) = map.lane_for(&projected.change, &projected.dock) {
+    if let Some(lane) = map.lane_for(&projected.change, &projected.dock, &projected.owner) {
         println!("review round updated on PR #{} (op={})", lane.pr, projected.op);
         return Ok(());
     }
@@ -141,7 +147,12 @@ pub fn review(
     );
     println!(">>> gh pr create --head {}", projected.branch);
     let pr = forge.create_pr(&projected.branch, "main", &title, &body)?;
-    map.push(PrLane { change: projected.change.clone(), dock: projected.dock.clone(), pr });
+    map.push(PrLane {
+        change: projected.change.clone(),
+        dock: projected.dock.clone(),
+        pr,
+        owner: projected.owner.clone(),
+    });
     write_pr_map(&p.pr_map, &map)?;
     println!("opened PR #{pr} for {}", projected.branch);
     Ok(())
@@ -191,6 +202,13 @@ const MAX_PR_TITLE: usize = 256;
 pub struct LandFacts<'a> {
     pub pr: u64,
     pub lane_dock: &'a str,
+    /// The position that opened the PR (the pr-map lane's owner, #281): an
+    /// isolation-lane id, empty for the primary (and for pre-#281 rows).
+    pub lane_owner: &'a str,
+    /// The position running this land: `Workspace::lane_id()`, empty on the
+    /// primary. A land finalizes *this* position's working change, so it must
+    /// be the one that opened the PR.
+    pub position: &'a str,
     /// The dock currently ambient in the workspace (main normalized to `main`).
     pub ambient_dock: &'a str,
     /// The dock git-main tracks (mirror config `dock`, default `main`). A lane on
@@ -235,6 +253,20 @@ pub fn land_gate(forge: &dyn Forge, f: &LandFacts) -> Result<Gate, String> {
             f.ambient_dock, f.lane_dock, f.lane_dock
         )));
     }
+    // Position guard (#281): a land finalizes and signs *this* position's
+    // working change, then collapses the PR — run from any other position it
+    // would sign the wrong work against the wrong branch. Every lane's home
+    // dock is `main`, so the dock guard above cannot catch this.
+    if f.lane_owner != f.position {
+        return Ok(Gate::Refuse(format!(
+            "PR #{} was opened from {} — this is {}; land finalizes the current \
+             position's working change, so run it from the position that opened \
+             the PR (#281)",
+            f.pr,
+            position_name(f.lane_owner),
+            position_name(f.position)
+        )));
+    }
     // The lane must be on the dock git-main tracks; a side-lane change cannot be
     // projected to main by a bare `ferry`, so landing it would finalize + reap
     // the lane while git-main never moves (the false-success gap the first #218
@@ -264,18 +296,19 @@ pub fn land_gate(forge: &dyn Forge, f: &LandFacts) -> Result<Gate, String> {
 // ---------------------------------------------------------------------------
 
 /// After finalize + ferry, publish the land and interpret GitHub's async
-/// reaction (#150/#166). `poll_attempts`/`sleep` drive the terminal-state poll;
-/// production passes 10 attempts and a 2s sleep, tests pass a no-op sleep.
+/// reaction (#150/#166). `branch` is the PR's review branch, derived from the
+/// pr-map lane's owner (#281) — this function no longer assumes the dock names
+/// it. `poll_attempts`/`sleep` drive the terminal-state poll; production
+/// passes 10 attempts and a 2s sleep, tests pass a no-op sleep.
 pub fn execute_landing(
     forge: &dyn Forge,
     pr: u64,
     change_hex: &str,
-    dock: &str,
+    branch: &str,
     main_sha: &str,
     poll_attempts: usize,
     sleep: &mut dyn FnMut(),
 ) -> Result<LandingStatus, String> {
-    let branch = format!("review/{dock}");
     // ASCII pointer strings, matching the ps1's audit trail (shadow-run parity).
     let pointer = format!("Landed via loot as change `{change_hex}` -> main `{main_sha}`.");
 
@@ -349,8 +382,9 @@ pub fn land(
 
     let ambient = ws.current_dock().unwrap_or("main").to_string();
     let tracked = tracked_dock(&ws.store().git_config());
+    let position = ws.lane_id().unwrap_or("").to_string();
     let reviewed = WipState::parse(&std::fs::read_to_string(&p.wip).unwrap_or_default())
-        .reviewed_version(&lane.change, &lane.dock)
+        .reviewed_version(&lane.change, &lane.dock, &lane.owner)
         .map(str::to_string);
     let current = ws
         .live_working_row()?
@@ -359,6 +393,8 @@ pub fn land(
     let facts = LandFacts {
         pr,
         lane_dock: &lane.dock,
+        lane_owner: &lane.owner,
+        position: &position,
         ambient_dock: &ambient,
         tracked_dock: &tracked,
         reviewed_version: reviewed.as_deref(),
@@ -442,8 +478,11 @@ pub fn land(
     }
 
     println!(">>> publish main + collapse PR head → {}", &main_sha[..main_sha.len().min(8)]);
+    // The PR's review branch carries the opening position (#281): the owning
+    // lane's id, or the dock name for a primary-opened (or pre-#281) lane.
+    let branch = lane.review_branch();
     let mut sleep = || std::thread::sleep(std::time::Duration::from_secs(2));
-    let status = execute_landing(forge, pr, &lane.change, &lane.dock, &main_sha, 10, &mut sleep)?;
+    let status = execute_landing(forge, pr, &lane.change, &branch, &main_sha, 10, &mut sleep)?;
 
     // git-main is published; free the harbor before the relay push (independent
     // of git-main) and the lane-landed bookkeeping so the next agent proceeds.
@@ -1105,6 +1144,8 @@ mod tests {
         LandFacts {
             pr: 218,
             lane_dock,
+            lane_owner: "",
+            position: "",
             ambient_dock: ambient,
             tracked_dock: lane_dock,
             reviewed_version: reviewed,
@@ -1166,6 +1207,8 @@ mod tests {
         let facts = LandFacts {
             pr: 218,
             lane_dock: "loot-first",
+            lane_owner: "",
+            position: "",
             ambient_dock: "loot-first",
             tracked_dock: "main",
             reviewed_version: None,
@@ -1193,6 +1236,29 @@ mod tests {
     }
 
     #[test]
+    fn gate_refuses_a_land_from_another_position() {
+        // #281: the PR was opened from lane t67; landing it from anywhere else
+        // (here: the primary) would finalize the *wrong* position's working
+        // change and collapse t67's branch over work it never reviewed. The
+        // dock guard can't catch this — every lane's home dock is `main`.
+        let f = FakeForge::new().with_view(view(ReviewDecision::Approved, "someone", PrState::Open));
+        let facts = LandFacts { lane_owner: "t67", ..facts("main", "main", None, None) };
+        let Gate::Refuse(why) = land_gate(&f, &facts).unwrap() else {
+            panic!("expected refuse");
+        };
+        assert!(why.contains("lane 't67'") && why.contains("the primary"), "{why}");
+    }
+
+    #[test]
+    fn gate_allows_the_owning_lane_to_land() {
+        // The same PR lands fine from the position that opened it.
+        let f = FakeForge::new().with_view(view(ReviewDecision::Approved, "someone", PrState::Open));
+        let facts =
+            LandFacts { lane_owner: "t67", position: "t67", ..facts("main", "main", None, None) };
+        assert_eq!(land_gate(&f, &facts).unwrap(), Gate::Proceed { self_fast_path: false });
+    }
+
+    #[test]
     fn harbor_guard_refuses_a_no_op_land() {
         // #195: a ferry that leaves main where it was must read as "not moved".
         assert!(!harbor_moved_main(Some("abc123"), "abc123"), "unchanged main = not integrated");
@@ -1209,7 +1275,8 @@ mod tests {
     fn landing_merged_by_reachability() {
         let f = FakeForge::new().with_poll(vec![PrState::Merged]);
         let mut s = no_sleep();
-        let st = execute_landing(&f, 218, "deadbeef", "ferry", "abc1234567", 10, &mut s).unwrap();
+        let st =
+            execute_landing(&f, 218, "deadbeef", "review/ferry", "abc1234567", 10, &mut s).unwrap();
         assert_eq!(st, LandingStatus::Merged);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.contains("push refs/heads/main:refs/heads/main")));
@@ -1220,10 +1287,26 @@ mod tests {
     }
 
     #[test]
+    fn landing_collapses_the_lane_named_branch() {
+        // A lane-opened PR's head is review/<lane-id> (#281): the collapse and
+        // the cleanup must target the branch the pr-map lane names, not the
+        // dock (every lane's dock is `main`).
+        let f = FakeForge::new().with_poll(vec![PrState::Merged]);
+        let mut s = no_sleep();
+        let st =
+            execute_landing(&f, 281, "deadbeef", "review/t281", "abc1234567", 10, &mut s).unwrap();
+        assert_eq!(st, LandingStatus::Merged);
+        let calls = f.calls();
+        assert!(calls.iter().any(|c| c.contains("push abc1234567:refs/heads/review/t281 force=true")));
+        assert!(calls.iter().any(|c| c.contains("push :refs/heads/review/t281")));
+    }
+
+    #[test]
     fn landing_auto_close_is_the_signal() {
         let f = FakeForge::new().with_poll(vec![PrState::Open, PrState::Closed]);
         let mut s = no_sleep();
-        let st = execute_landing(&f, 218, "deadbeef", "ferry", "abc1234567", 10, &mut s).unwrap();
+        let st =
+            execute_landing(&f, 218, "deadbeef", "review/ferry", "abc1234567", 10, &mut s).unwrap();
         assert_eq!(st, LandingStatus::ClosedByCollapse);
         assert!(f.calls().iter().any(|c| c.contains("auto-closed on the zero-diff collapse")));
     }
@@ -1232,7 +1315,8 @@ mod tests {
     fn landing_diverged_main_closes_with_pointer() {
         let f = FakeForge::new().failing_push("refs/heads/main:refs/heads/main");
         let mut s = no_sleep();
-        let st = execute_landing(&f, 218, "deadbeef", "ferry", "abc1234567", 10, &mut s).unwrap();
+        let st =
+            execute_landing(&f, 218, "deadbeef", "review/ferry", "abc1234567", 10, &mut s).unwrap();
         assert_eq!(st, LandingStatus::ClosedWithPointer);
         let calls = f.calls();
         // Diverged path: close with the reconcile pointer, and NEVER collapse the head.
@@ -1244,7 +1328,8 @@ mod tests {
     fn landing_open_after_poll_closes_with_pointer() {
         let f = FakeForge::new().with_poll(vec![PrState::Open]);
         let mut s = no_sleep();
-        let st = execute_landing(&f, 218, "deadbeef", "ferry", "abc1234567", 3, &mut s).unwrap();
+        let st =
+            execute_landing(&f, 218, "deadbeef", "review/ferry", "abc1234567", 3, &mut s).unwrap();
         assert_eq!(st, LandingStatus::ClosedWithPointer);
         assert!(f.calls().iter().any(|c| c.starts_with("close_pr #218")));
     }

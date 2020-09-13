@@ -161,7 +161,11 @@ writer is its own lane). `loot lane new --ticket <n>` spawns under the
 ticket-derived handle (`t<n>`, suffixed until free); wayfinder's claim ritual
 (docs/agents/issue-tracker.md) is assign → spawn → work from the lane.
 Distinct from a *review lane* (a `pr-map` entry, ADR 0033): a lane opens a
-review lane when it ferries for review. _Avoid_: worktree, sandbox, session.
+review lane when it ferries for review. A review lane is **owner-keyed**
+(#281): its branch carries the position — `review/<lane-id>` from a lane,
+`review/<dock>` on the primary — so concurrent lanes never share a review
+ref, and only the owning position can judge (or land) it.
+_Avoid_: worktree, sandbox, session.
 Concurrent-agent playbook: [docs/agents/concurrent.md](docs/agents/concurrent.md).
 
 **Shared store** *(the "share only the immutable store" half of ADR 0034;

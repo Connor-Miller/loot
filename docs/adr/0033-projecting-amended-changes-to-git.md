@@ -139,3 +139,44 @@ check; the guard exists to catch a *reopened* lane, which is always non-empty.
   multi-predecessor collapse (one X′ naming both live versions of a divergent
   handle) and descendant rebase remain map #169 fog; the `Vec<Oid>` field and
   the space-separated trailer already carry more than one id when they graduate.
+
+## Amendment (#281): review refs carry the position, not the dock
+
+This ADR named review branches `review/<dock>`. Sealed lanes (ADR 0034/0035)
+broke that quietly: every lane's home dock is `main`, so N concurrent lanes
+shared **one** `review/main` — a mutable ref with N writers, exactly what ADR
+0034 forbids. Hit live twice on 2026-07-15: a second lane's `ferry --with-wip`
+force-pushed its content over the first lane's in-flight PR head (#281, the
+visible half), and either position's reap pass could misjudge the other's
+entry — liveness reads the *positional* working pointer, which a foreign
+position cannot see — and retire a live ref (the same root as the #280 data
+loss).
+
+The fix keys the whole review lane by its **owner position**:
+
+- The projected ref is `review/<lane-id>` from a lane, `review/<dock>` on the
+  primary. One position, one ref, one PR — no shared mutable ref.
+- The `wip` and `pr-map` ledgers gain an owner column (`-` = primary;
+  pre-#281 short rows parse as primary-owned), and `ferry`'s review line
+  carries `owner=`. Liveness (this section above) and review-currency (the
+  land guard) are judged per `(change, dock, owner)`.
+- Reap is owner-scoped: only the owner judges liveness. A foreign pass reaps
+  exactly the entries whose owner lane is **gone from the registry** — an
+  abandoned lane's review ref dies with it instead of leaking.
+- `land` refuses to run from a position other than the PR's owner: it
+  finalizes the *current* position's working change, and the dock guard can't
+  catch the mismatch when every lane's dock is `main`.
+- Lane ids and dock names share the review-ref namespace, so lane spawn
+  suffixes past existing dock names (and `main`), and dock binding refuses a
+  live lane's id.
+
+**Mixed-version window.** A pre-#281 binary parses only the short rows, so a
+pass from a not-yet-rebuilt position silently drops the new 6-field `wip` /
+4-field `pr-map` rows when it rewrites those files. Nothing is corrupted —
+the owning position's next `review` re-mints its row (a fresh round 1) and
+`land` refuses on the missing pr-map row rather than misfiring — but rebuild
+every live position promptly after this lands. The other legacy edge: a
+5-field row that was actually written *by a lane* reads as primary-owned, so
+the primary's next pass reaps it exactly as the pre-#281 code would have —
+migration makes nothing worse, but an in-flight lane review opened with the
+old binary should be re-run with the new one.

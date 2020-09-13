@@ -53,9 +53,10 @@ code path; **every change lands through a PR** (you self-approve your own).
    tree it would otherwise sign your edits in one stroke, straight past this
    lane, under the `(working change)` placeholder.
 3. **Project for review.** `loot ferry --with-wip` snapshots the dock's WIP and
-   projects it to a sealed-free `review/<dock>` branch, then a single-ref push
-   publishes it to GitHub; `loot-first review` opens the PR. The PR reviews
-   **unsigned** WIP.
+   projects it to a sealed-free branch named for the *position* —
+   `review/<lane-id>` from a lane, `review/<dock>` on the primary (#281, so
+   concurrent lanes never share a ref) — then a single-ref push publishes it to
+   GitHub; `loot-first review` opens the PR. The PR reviews **unsigned** WIP.
 4. **Revise.** On a review comment, edit and re-run `loot ferry --with-wip`. It
    **appends** a commit to the branch (same `change id`, new `version id`), so
    GitHub shows *"changes since your last review."*

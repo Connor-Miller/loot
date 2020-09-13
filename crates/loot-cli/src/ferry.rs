@@ -47,8 +47,10 @@ pub struct FerryReport {
 /// the mirror config under `.loot/git-mirror/config`; the override persists
 /// only when the pass succeeds (#201 — a failed probe must not rebind).
 /// `with_wip` additionally projects the ambient dock's *unfinalized* working
-/// change to `refs/heads/review/<dock>` as a provisional commit (map #148);
-/// provisional lifecycle reaping runs on every pass regardless of the flag.
+/// change as a provisional commit (map #148) on `refs/heads/review/<lane-id>`
+/// — `review/<dock>` on the primary — so concurrent lanes never share a
+/// review ref (#281); provisional lifecycle reaping runs on every pass
+/// regardless of the flag.
 pub fn run(
     ws: &mut Workspace,
     git_dir_flag: Option<&str>,
@@ -269,7 +271,33 @@ pub fn run(
     let wip_path = ws.store().git_wip();
     let mut wip = WipState::parse(&read_or_empty(&wip_path));
     let dock_sel_wip = |name: &str| if name == "main" { None } else { Some(name.to_string()) };
+    // This position's owner key: the isolation-lane id, empty on the primary.
+    // Entries are owner-scoped (#281): only the position that projected an
+    // entry can judge its liveness, because the judgment reads *positional*
+    // state (the dock's current working change) and a foreign position's read
+    // sees its own dock, not the owner's — the misjudgment that let one
+    // lane's pass reap another's live review ref.
+    let mine = ws.lane_id().unwrap_or("").to_string();
     wip.entries.retain(|e| {
+        if e.owner != mine {
+            // Foreign entry: keep it while its owner position still exists;
+            // reap it (ref and all) once the owner lane is gone from the
+            // registry — an abandoned lane's review lane dies with it. The
+            // primary (empty owner) always exists.
+            if e.owner.is_empty() || ws.store().lane_entry_exists(&e.owner) {
+                return true;
+            }
+            let handle = e.review_handle();
+            if let Ok(mut r) = git.find_reference(&format!("refs/heads/review/{handle}")) {
+                let _ = r.delete();
+            }
+            report.notes.push(format!(
+                "reaped review/{handle} (change {} — lane '{}' is gone)",
+                &e.change[..8.min(e.change.len())],
+                e.owner
+            ));
+            return false;
+        }
         // A lane is live iff its dock's *current* working change still carries
         // this change id and is unfinalized (ADR 0033). The old change-id-wide
         // "a signed version exists" test reaped a reopened lane every pass:
@@ -289,13 +317,12 @@ pub fn run(
                     && ws.graph().author(c).is_some()
                     && wip_key(ws, c) == e.change
             });
-            let ref_name = format!("refs/heads/review/{}", e.dock);
-            if let Ok(mut r) = git.find_reference(&ref_name) {
+            let handle = e.review_handle();
+            if let Ok(mut r) = git.find_reference(&format!("refs/heads/review/{handle}")) {
                 let _ = r.delete();
             }
             report.notes.push(format!(
-                "reaped review/{} (change {} {})",
-                e.dock,
+                "reaped review/{handle} (change {} {})",
                 &e.change[..8.min(e.change.len())],
                 if landed { "landed" } else { "abandoned or superseded" }
             ));
@@ -319,16 +346,23 @@ pub fn run(
             Some(wid) => {
                 let key = wip_key(ws, &wid);
                 let dock = ws.dock_name().to_string();
+                // The projected ref carries the *position*, not the dock
+                // (#281): every lane's home dock is `main`, so a dock-named
+                // ref is one shared branch with N writers — the second lane's
+                // ferry force-pushed over the first's in-flight PR head. The
+                // owner token in the review line is `-` on the primary.
+                let handle = crate::ledger::review_handle(&mine, &dock).to_string();
+                let owner_tok = if mine.is_empty() { "-" } else { mine.as_str() };
                 let version_hex = hex::encode(&wid.0);
                 let existing = wip
                     .entries
                     .iter()
-                    .find(|e| e.dock == dock && e.change == key)
+                    .find(|e| e.owner == mine && e.dock == dock && e.change == key)
                     .cloned();
                 if existing.as_ref().is_some_and(|e| e.version == version_hex) {
                     let e = existing.as_ref().unwrap();
                     report.review = Some(format!(
-                        "review: dock={dock} branch=review/{dock} sha={} change={key} version={} round={} op=up-to-date",
+                        "review: dock={dock} owner={owner_tok} branch=review/{handle} sha={} change={key} version={} round={} op=up-to-date",
                         e.sha, &version_hex[..8], e.round
                     ));
                 } else {
@@ -383,7 +417,7 @@ pub fn run(
                                 skipped.join(", ")
                             ));
                         }
-                        let ref_name = format!("refs/heads/review/{dock}");
+                        let ref_name = format!("refs/heads/review/{handle}");
                         git.reference(
                             &ref_name,
                             git2::Oid::from_str(&sha).map_err(|e| e.to_string())?,
@@ -391,16 +425,18 @@ pub fn run(
                             "loot ferry --with-wip",
                         )
                         .map_err(|e| format!("update {ref_name}: {e}"))?;
-                        wip.entries.retain(|e| !(e.dock == dock && e.change == key));
+                        wip.entries
+                            .retain(|e| !(e.owner == mine && e.dock == dock && e.change == key));
                         wip.entries.push(WipEntry {
                             change: key.clone(),
                             dock: dock.clone(),
                             sha: sha.clone(),
                             version: version_hex.clone(),
                             round,
+                            owner: mine.clone(),
                         });
                         report.review = Some(format!(
-                            "review: dock={dock} branch=review/{dock} sha={sha} change={key} version={} round={round} op={}",
+                            "review: dock={dock} owner={owner_tok} branch=review/{handle} sha={sha} change={key} version={} round={round} op={}",
                             &version_hex[..8],
                             if round == 1 { "opened" } else { "appended" }
                         ));
@@ -976,7 +1012,10 @@ fn wip_key(ws: &Workspace, id: &Oid) -> String {
 
 /// One in-flight review lane (`.loot/git-mirror/wip`, local-only): durable
 /// change key -> its latest provisional projection. Deliberately not part of
-/// the mark map — provisional shas never enter the round-trip spine.
+/// the mark map — provisional shas never enter the round-trip spine. `owner`
+/// is the position that projected it (#281): an isolation-lane id, empty for
+/// the primary — entries are owner-scoped because liveness is a *positional*
+/// judgment only the owner can make, and the owner names the review ref.
 #[derive(Clone)]
 struct WipEntry {
     change: String,
@@ -984,6 +1023,17 @@ struct WipEntry {
     sha: String,
     version: String,
     round: u64,
+    owner: String,
+}
+
+impl WipEntry {
+    /// The suffix of this entry's `review/<...>` ref: the owning lane's id,
+    /// or the dock name on the primary (#281) — one position, one ref, so
+    /// concurrent lanes never force-push over each other's PR heads. The rule
+    /// itself lives in [`crate::ledger::review_handle`], shared with `land`.
+    fn review_handle(&self) -> &str {
+        crate::ledger::review_handle(&self.owner, &self.dock)
+    }
 }
 
 /// The `wip` ledger. `ferry` owns writes; the loot-first orchestrator (#218)
@@ -998,14 +1048,21 @@ impl WipState {
         let mut entries = Vec::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() == 5 {
+            // Five fields is the pre-#281 row (no owner column → primary);
+            // six carries the owner, `-` meaning primary.
+            if f.len() == 5 || f.len() == 6 {
                 if let Ok(round) = f[4].parse() {
+                    let owner = match f.get(5) {
+                        None | Some(&"-") => String::new(),
+                        Some(o) => (*o).to_string(),
+                    };
                     entries.push(WipEntry {
                         change: f[0].into(),
                         dock: f[1].into(),
                         sha: f[2].into(),
                         version: f[3].into(),
                         round,
+                        owner,
                     });
                 }
             }
@@ -1016,22 +1073,24 @@ impl WipState {
     fn encode(&self) -> String {
         let mut out = String::new();
         for e in &self.entries {
+            let owner = if e.owner.is_empty() { "-" } else { e.owner.as_str() };
             out.push_str(&format!(
-                "{} {} {} {} {}\n",
-                e.change, e.dock, e.sha, e.version, e.round
+                "{} {} {} {} {} {}\n",
+                e.change, e.dock, e.sha, e.version, e.round, owner
             ));
         }
         out
     }
 
-    /// The full version the review lane last projected for `(change, dock)` —
-    /// the reviewed version the land path compares the live version against
-    /// (the review-currency guard, ADR 0033). Full hex, not the 8-char review
-    /// line truncation.
-    pub fn reviewed_version(&self, change: &str, dock: &str) -> Option<&str> {
+    /// The full version the review lane last projected for
+    /// `(change, dock, owner)` — the reviewed version the land path compares
+    /// the live version against (the review-currency guard, ADR 0033).
+    /// Owner-keyed (#281): the same change reviewed from two positions is two
+    /// review lanes. Full hex, not the 8-char review line truncation.
+    pub fn reviewed_version(&self, change: &str, dock: &str, owner: &str) -> Option<&str> {
         self.entries
             .iter()
-            .find(|e| e.change == change && e.dock == dock)
+            .find(|e| e.change == change && e.dock == dock && e.owner == owner)
             .map(|e| e.version.as_str())
     }
 }
@@ -1042,13 +1101,33 @@ mod wip_state_tests {
 
     #[test]
     fn round_trips_and_reads_reviewed_version() {
-        let text = "aabb ferry deadbeef cafef00d 3\nccdd list f00dcafe abadidea 1\n";
+        let text = "aabb ferry deadbeef cafef00d 3 -\nccdd list f00dcafe abadidea 1 t67\n";
         let wip = WipState::parse(text);
         assert_eq!(wip.entries.len(), 2);
         // Full version, not truncated.
-        assert_eq!(wip.reviewed_version("aabb", "ferry"), Some("cafef00d"));
-        assert_eq!(wip.reviewed_version("aabb", "other-dock"), None);
+        assert_eq!(wip.reviewed_version("aabb", "ferry", ""), Some("cafef00d"));
+        assert_eq!(wip.reviewed_version("aabb", "other-dock", ""), None);
+        // Owner participates in the key (#281).
+        assert_eq!(wip.reviewed_version("ccdd", "list", "t67"), Some("abadidea"));
+        assert_eq!(wip.reviewed_version("ccdd", "list", ""), None);
         assert_eq!(wip.encode(), text);
+    }
+
+    #[test]
+    fn parses_legacy_five_field_rows_as_primary() {
+        // Pre-#281 rows carried no owner column; they read as primary-owned
+        // (and re-encode with the explicit `-`).
+        let wip = WipState::parse("aabb ferry deadbeef cafef00d 3\n");
+        assert_eq!(wip.entries.len(), 1);
+        assert_eq!(wip.entries[0].owner, "");
+        assert_eq!(wip.entries[0].review_handle(), "ferry");
+        assert_eq!(wip.encode(), "aabb ferry deadbeef cafef00d 3 -\n");
+    }
+
+    #[test]
+    fn review_handle_prefers_the_owning_lane() {
+        let wip = WipState::parse("aabb main deadbeef cafef00d 1 t281\n");
+        assert_eq!(wip.entries[0].review_handle(), "t281");
     }
 
     #[test]
@@ -1998,6 +2077,98 @@ mod tests {
         // And the pass after that is a full no-op.
         let r5 = ferry(&mut ws, &mirror);
         assert_eq!((r5.ingested, r5.projected), (0, 0));
+    }
+
+    #[test]
+    fn lane_review_projections_are_position_scoped() {
+        // #281: every lane's home dock is `main`, so dock-named review refs
+        // made N concurrent lanes share one branch — the second lane's ferry
+        // force-pushed over the first's in-flight PR head, and either pass
+        // could misjudge (and reap) the other's live entry. The ref must carry
+        // the *position*: `review/<lane-id>` from a lane, `review/<dock>` on
+        // the primary.
+        let (mut ws, dir, mirror) = setup("wip-lane-281");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // The primary opens a review lane on the home dock, dock-named.
+        put_file(&dir, "a.txt", "primary wip\n");
+        ws.snapshot("primary wip").unwrap();
+        let line = ferry_wip(&mut ws, &mirror).review.unwrap();
+        assert!(line.contains("branch=review/main") && line.contains("owner=-"), "{line}");
+
+        // A lane over the same store (same dock!) projects to its own ref.
+        let spawned = ws
+            .spawn_lane_as(None, Some(&dir.parent().unwrap().join("lane-281")), Some("t281"))
+            .unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        put_file(&spawned.dir, "b.txt", "lane wip\n");
+        lw.snapshot("lane wip").unwrap();
+        let rl = ferry_wip(&mut lw, &mirror);
+        let line = rl.review.unwrap();
+        assert!(
+            line.contains(&format!("branch=review/{}", spawned.id))
+                && line.contains(&format!("owner={}", spawned.id)),
+            "{line}"
+        );
+
+        // Both refs exist side by side — no shared mutable ref (ADR 0034).
+        let git = git2::Repository::open(&mirror).unwrap();
+        assert!(git.find_reference("refs/heads/review/main").is_ok());
+        let lane_ref = format!("refs/heads/review/{}", spawned.id);
+        assert!(git.find_reference(&lane_ref).is_ok());
+
+        // Neither position's pass judged (or reaped) the other's live entry:
+        // the lane's pass kept the primary's, and vice versa.
+        assert!(!rl.notes.iter().any(|n| n.contains("reaped")), "{:?}", rl.notes);
+        let rp = ferry_wip(&mut ws, &mirror);
+        assert!(rp.review.unwrap().contains("op=up-to-date"));
+        assert!(!rp.notes.iter().any(|n| n.contains("reaped")), "{:?}", rp.notes);
+        assert!(git.find_reference("refs/heads/review/main").is_ok());
+        assert!(git.find_reference(&lane_ref).is_ok());
+    }
+
+    #[test]
+    fn a_gone_lanes_review_ref_is_reaped_by_any_pass() {
+        // The flip side of owner-scoping (#281): only the owner can judge its
+        // entry's liveness, so an abandoned lane (reaped from the registry
+        // without landing) would leak its entry and ref forever. A foreign
+        // pass reaps exactly the entries whose owner lane no longer exists.
+        let (mut ws, dir, mirror) = setup("wip-lane-gone-281");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        let spawned = ws
+            .spawn_lane_as(None, Some(&dir.parent().unwrap().join("lane-gone")), Some("t9"))
+            .unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        put_file(&spawned.dir, "b.txt", "lane wip\n");
+        lw.snapshot("lane wip").unwrap();
+        ferry_wip(&mut lw, &mirror);
+        let git = git2::Repository::open(&mirror).unwrap();
+        let lane_ref = format!("refs/heads/review/{}", spawned.id);
+        assert!(git.find_reference(&lane_ref).is_ok());
+
+        // While the owner lane exists, a primary pass keeps its entry intact.
+        let keep = ferry(&mut ws, &mirror);
+        assert!(!keep.notes.iter().any(|n| n.contains("reaped")), "{:?}", keep.notes);
+        assert!(git.find_reference(&lane_ref).is_ok());
+
+        // Remove the lane from the registry; the next pass — any position —
+        // retires the orphaned review lane, ref and all.
+        ws.store().remove_lane_entry(&spawned.id).unwrap();
+        let swept = ferry(&mut ws, &mirror);
+        assert!(
+            swept
+                .notes
+                .iter()
+                .any(|n| n.contains(&format!("review/{}", spawned.id)) && n.contains("gone")),
+            "{:?}",
+            swept.notes
+        );
+        assert!(git.find_reference(&lane_ref).is_err());
     }
 
     /// Ferry designating `dock` as the git-main dock — the binding pass. Using

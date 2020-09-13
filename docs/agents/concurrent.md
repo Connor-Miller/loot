@@ -69,9 +69,13 @@ The full claim ritual (assign the issue, then spawn) is in
 - Editing files, auto-snapshot, `describe`, `new` (finalize/sign). Finalize is
   **git-quiet** — no mirror I/O — so two lanes signing at once never contend
   (workflow.md).
-- `loot ferry --with-wip` / `loot-first review` to open a PR. Review projection
-  briefly serializes on the harbor (seconds — a wait on a mechanism, not on
-  another agent's unfinished work, ADR 0034).
+- `loot ferry --with-wip` / `loot-first review` to open a PR. Each position
+  projects to its **own** branch — `review/<lane-id>` from a lane,
+  `review/<dock>` from the primary (#281) — so two lanes reviewing at once
+  never touch the same ref. (Before #281 every lane shared `review/main` and a
+  second lane's ferry force-pushed over the first's in-flight PR head.) The
+  projection itself briefly serializes on the harbor (seconds — a wait on a
+  mechanism, not on another agent's unfinished work, ADR 0034).
 - Reading anything, including another lane's landed heads (single-*writer* does
   not forbid multi-*reader*).
 
@@ -101,7 +105,9 @@ Landing is the single serialized funnel. From the lane:
 1. Finalize — `loot new` signs the change (git-quiet).
 2. `loot-first land --pr <n>` — detects approval, runs the pre-land gate
    (`cargo test`), takes the harbor lock, projects the one signed commit onto
-   `main`, collapses the PR head, releases. Full mechanics: workflow.md.
+   `main`, collapses the PR head, releases. Full mechanics: workflow.md. Land
+   from the position that opened the PR — it finalizes the *current*
+   position's working change, so run from anywhere else it refuses (#281).
 3. If the change conflicts with what landed while the lane worked, the land
    **bounces** — nothing is pushed, the signed change is safe. Reconcile
    (`loot resolve …`, or `loot adopt` to take the landed line) and re-run `land`.

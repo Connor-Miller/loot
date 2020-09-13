@@ -180,6 +180,9 @@ fn short(sha: &str) -> &str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewLine {
     pub dock: String,
+    /// The position that projected the lane (#281): an isolation-lane id,
+    /// empty for the primary (`owner=-` on the wire).
+    pub owner: String,
     pub branch: String,
     pub sha: String,
     pub change: String,
@@ -215,8 +218,14 @@ pub fn parse_review_line(line: &str) -> Result<ReviewOutcome, String> {
     let round = get("round")?
         .parse()
         .map_err(|_| format!("review line: bad round: {line:?}"))?;
+    // `owner` is `-` on the primary; tolerate its absence (pre-#281 line).
+    let owner = match kv.get("owner").copied() {
+        None | Some("-") => String::new(),
+        Some(o) => o.to_string(),
+    };
     Ok(ReviewOutcome::Projected(ReviewLine {
         dock: get("dock")?.into(),
+        owner,
         branch: get("branch")?.into(),
         sha: get("sha")?.into(),
         change: get("change")?.into(),
@@ -338,16 +347,35 @@ mod tests {
 
     #[test]
     fn parse_review_line_projected() {
-        let line = "review: dock=ferry branch=review/ferry sha=abc123 change=deadbeef version=cafef00d round=2 op=appended";
+        let line = "review: dock=ferry owner=- branch=review/ferry sha=abc123 change=deadbeef version=cafef00d round=2 op=appended";
         let ReviewOutcome::Projected(r) = parse_review_line(line).unwrap() else {
             panic!("expected projected");
         };
         assert_eq!(r.dock, "ferry");
+        assert_eq!(r.owner, "", "`owner=-` is the primary");
         assert_eq!(r.branch, "review/ferry");
         assert_eq!(r.change, "deadbeef");
         assert_eq!(r.version, "cafef00d");
         assert_eq!(r.round, 2);
         assert_eq!(r.op, "appended");
+    }
+
+    #[test]
+    fn parse_review_line_carries_the_owning_lane() {
+        // From an isolation lane the branch is lane-named (#281) and `owner`
+        // carries the lane id; a pre-#281 line without the token parses too.
+        let line = "review: dock=main owner=t281 branch=review/t281 sha=abc123 change=deadbeef version=cafef00d round=1 op=opened";
+        let ReviewOutcome::Projected(r) = parse_review_line(line).unwrap() else {
+            panic!("expected projected");
+        };
+        assert_eq!(r.owner, "t281");
+        assert_eq!(r.branch, "review/t281");
+
+        let legacy = "review: dock=main branch=review/main sha=abc123 change=deadbeef version=cafef00d round=1 op=opened";
+        let ReviewOutcome::Projected(r) = parse_review_line(legacy).unwrap() else {
+            panic!("expected projected");
+        };
+        assert_eq!(r.owner, "", "missing owner token reads as primary");
     }
 
     #[test]
