@@ -1,0 +1,34 @@
+# Standalone smoke test — kept OUT of the dist-generated release.yml on purpose,
+# so `dist generate` never clobbers it (#258). Proves the published Linux
+# `curl | sh` one-liner actually installs and resolves `loot` on a clean runner.
+name: Smoke — Linux install
+
+on:
+  # Fire once cargo-dist's release.yml publishes the GitHub Release, so the
+  # installer + binaries exist at releases/latest to fetch.
+  release:
+    types: [published]
+  # And on demand, to re-check an existing release without cutting a new one.
+  workflow_dispatch:
+
+jobs:
+  linux-curl-sh:
+    name: linux curl | sh installs and resolves loot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install loot from the release installer (anonymous, public repo)
+        # bash for pipefail: catch a failing curl rather than letting `sh` swallow it.
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/Connor-Miller/loot/releases/latest/download/loot-cli-installer.sh | sh
+
+      - name: Put the install dir on PATH for the next step
+        # The installer targets ~/.loot/bin and edits the shell rc, which does not
+        # affect the already-running job — surface it to later steps explicitly.
+        run: echo "$HOME/.loot/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve `loot` and print its version
+        run: |
+          which loot
+          loot --version

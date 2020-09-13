@@ -21,3 +21,11 @@ install-path = "~/.loot/bin"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# Generate GitHub Artifact Attestations (build provenance) for the release
+# artifacts (#221 integrity). Adds id-token/attestations permissions + the
+# attest-build-provenance step to release.yml; verifiable with
+# `gh attestation verify <file> --repo Connor-Miller/loot`.
+github-attestations = true
+# Emit a SHA-256 digest alongside every artifact (a unified `sha256.sum` on the
+# Release), so the Install page's manual-verify path has a checksum to check.
+checksum = "sha256"
