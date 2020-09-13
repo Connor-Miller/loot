@@ -2178,4 +2178,54 @@ mod tests {
         assert!(report.notes.iter().any(|n| n.contains("baseline")));
         assert_eq!(ws.repo().heads(), heads_before, "loot history untouched");
     }
+
+    /// #265: `loot-first tag` runs a bare ferry from the primary. When the
+    /// primary dock is strictly behind a lane-landed main — the landed change
+    /// outside its lineage-filtered load — that ferry must catch the dock up
+    /// and project NOTHING: never re-mint the landed tree as a duplicate line
+    /// or move the mirror's main off the landed tip.
+    #[test]
+    fn bare_ferry_from_a_dock_behind_a_lane_land_adopts_and_projects_nothing() {
+        let (mut ws, repo_dir, mirror) = setup("behind-dock");
+        put_file(&repo_dir, "a.txt", "one");
+        seal_change(&mut ws, "c1");
+        let r1 = ferry(&mut ws, &mirror);
+        assert_eq!(r1.projected, 1, "c1 projects to git-main");
+
+        // A lane lands c2 — finalize there, then ferry from the lane exactly
+        // as `loot-first land` does. The shared spine now names c2 as main.
+        let lane_dir = repo_dir.parent().unwrap().join("l1");
+        let spawned = ws.spawn_lane(None, Some(&lane_dir)).unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        put_file(&spawned.dir, "b.txt", "landed");
+        seal_change(&mut lw, "landed c2");
+        let c2 = lw.heads()[0].clone();
+        let r2 = run(&mut lw, None, None, false).unwrap();
+        assert_eq!(r2.projected, 1, "the lane's land projected c2");
+        let landed_sha = git2::Repository::open(&mirror)
+            .unwrap()
+            .find_reference(MAIN_REF)
+            .unwrap()
+            .target()
+            .unwrap();
+
+        // The primary reopens fresh: strictly behind, c2 out of its lineage.
+        let mut ws = Workspace::open_at(&repo_dir).unwrap();
+        let r3 = run(&mut ws, None, None, false).unwrap();
+        assert_eq!(r3.ingested, 0, "the landed commit is already marked — nothing to ingest");
+        assert_eq!(r3.projected, 0, "a catch-up projects nothing");
+        assert!(r3.notes.is_empty(), "no refusals — the catch-up is clean: {:?}", r3.notes);
+        assert_eq!(ws.finalized_anchor(), Some(c2), "the dock caught up to landed main");
+        assert!(
+            repo_dir.join("b.txt").exists(),
+            "the landed content materialized into the primary tree"
+        );
+        let now_sha = git2::Repository::open(&mirror)
+            .unwrap()
+            .find_reference(MAIN_REF)
+            .unwrap()
+            .target()
+            .unwrap();
+        assert_eq!(now_sha, landed_sha, "the mirror's main stayed on the landed tip");
+    }
 }

@@ -453,6 +453,14 @@ pub fn land(
             ),
             Err(e) => eprintln!("warning: could not mark lane '{id}' landed ({e})"),
         }
+        // A lane land leaves the primary's main dock behind the harbor it just
+        // advanced — by construction, not by accident (#265). Positional state
+        // is single-writer (ADR 0034), so this land must not advance another
+        // position's pointers; say it instead. The catch-up is a clean FF.
+        println!(
+            "note: the primary's main dock is now behind landed main — `loot adopt` from \
+             the primary fast-forwards it (any bare `loot ferry` there does too)."
+        );
     }
     Ok(())
 }

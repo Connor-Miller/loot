@@ -138,6 +138,15 @@ the landed line settles through a plain `loot ferry` too. The three, in short:
 the harbor lineage in, and **`ferry`** when there are also git-origin commits to
 ingest.
 
+Both catch-up paths hold even when the landed change was never in the primary's
+view (a position's load is lineage-filtered, ADR 0022): the catch-up ingests the
+harbor lineage from the shared graph before it reasons, so a lane-landed change
+the primary never adopted is a clean fast-forward — not a duplicate merge line
+(#265). A checkout already `git reset` onto landed main is recognized as landed
+content, not re-captured as local work. And `loot gc` roots every change in the
+shared graph file plus every live lane's WIP, so a landed-but-unadopted change
+can never be pruned (#263's root cause, prevented).
+
 ## Recovery playbook
 
 ### A break-glass git commit landed on `main` → `loot ferry`

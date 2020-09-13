@@ -798,14 +798,99 @@ impl DagRepo {
     /// Objects referenced by non-HEAD changes are retained — the whole reachable
     /// history is preserved, only truly orphaned objects go. `dir` is the same
     /// `.loot/` directory passed to [`Self::save`]/[`Self::load`].
+    ///
+    /// The live set is rooted in the **whole shared store**, not this dock's
+    /// loaded graph (#263/#265): the load is lineage-filtered (ADR 0022), so a
+    /// change landed from a lane and never adopted here is exactly the node a
+    /// loaded-graph walk misses — pruning its objects strands the projection
+    /// (git-main names a change whose content is gone). So gc re-reads the
+    /// shared graph file (every position's finalized nodes) and every
+    /// registered lane's working-change blob (an unsigned change's objects are
+    /// already sealed into the shared store) as additional roots.
     pub fn gc(&mut self, dir: &Path, dry_run: bool) -> Result<GcReport, RepoError> {
-        let live = self.referenced_oids();
+        let store = RepoStore::new(dir);
+        let mut live = self.referenced_oids();
+        for node in read_shared_graph(&store)? {
+            for (oid, _vis) in node.tree.values() {
+                live.insert(oid.clone());
+            }
+        }
+        for entry in store.list_lane_entries() {
+            // Strict read, absent-is-empty: a lane with no WIP roots nothing,
+            // but an unreadable or torn blob must FAIL the gc — treating it as
+            // empty silently shrinks the root set, and gc then over-prunes:
+            // the exact loss class this walk exists to prevent.
+            let blob = match std::fs::read(store.lane_view(&entry).working_change()) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(RepoError::Backend(format!(
+                        "gc: read lane '{}' working change: {e}",
+                        entry.id
+                    )))
+                }
+            };
+            for node in persist_codec::decode_nodes(&blob)? {
+                for (oid, _vis) in node.tree.values() {
+                    live.insert(oid.clone());
+                }
+            }
+        }
         let (pruned, bytes) =
-            persist_codec::prune_orphaned_objects_loose(&RepoStore::new(dir).objects_dir(), &live, dry_run)?;
+            persist_codec::prune_orphaned_objects_loose(&store.objects_dir(), &live, dry_run)?;
         if !dry_run {
             self.objects.retain(&live);
         }
         Ok(GcReport { pruned, bytes })
+    }
+
+    /// Make a landed-but-unadopted lineage visible to this position (#265):
+    /// insert into the loaded graph every ancestor of `tip` that the shared
+    /// graph file records but the lineage-filtered load (ADR 0022) dropped.
+    /// This is how a catch-up verb (`loot adopt`, ferry's reconcile) reasons
+    /// about a change another lane landed: the nodes and their objects are
+    /// already in the shared store — only this dock's *view* lacked them.
+    ///
+    /// Inserts parents-before-children (the [`ChangeGraph::reachable_from`]
+    /// discipline) so head tracking stays exact; nodes already loaded stop the
+    /// walk. Returns whether `tip` is known afterwards — `false` means the
+    /// shared graph has no such node (it predates the gc guard above and was
+    /// pruned; recovery is ferry's baseline adoption, #263) and the loaded
+    /// graph is left untouched.
+    pub fn ingest_shared_lineage(
+        &mut self,
+        store: &RepoStore,
+        tip: &Oid,
+    ) -> Result<bool, RepoError> {
+        if self.graph.get(tip).is_some() {
+            return Ok(true);
+        }
+        let mut pool: BTreeMap<Oid, ChangeNode> = BTreeMap::new();
+        for node in read_shared_graph(store)? {
+            pool.insert(node.id.clone(), node);
+        }
+        if !pool.contains_key(tip) {
+            return Ok(false);
+        }
+        fn visit(
+            id: &Oid,
+            pool: &BTreeMap<Oid, ChangeNode>,
+            seen: &mut BTreeSet<Oid>,
+            graph: &mut ChangeGraph,
+        ) {
+            if graph.get(id).is_some() || !seen.insert(id.clone()) {
+                return;
+            }
+            if let Some(node) = pool.get(id) {
+                for p in &node.parents {
+                    visit(p, pool, seen, graph);
+                }
+                graph.insert(node.clone());
+            }
+        }
+        let mut seen = BTreeSet::new();
+        visit(tip, &pool, &mut seen, &mut self.graph);
+        Ok(true)
     }
 
     /// Persist the whole repo under `dir` (typically `.loot/`): all sealed
@@ -2115,6 +2200,20 @@ fn is_working_change(node: &ChangeNode) -> bool {
     node.author.is_some() && node.signature.is_none()
 }
 
+/// Every finalized node in the shared graph file — the whole-store view the
+/// lineage-filtered load deliberately narrows (ADR 0022). gc's root walk and
+/// [`DagRepo::ingest_shared_lineage`] both read it (#265). Absent-is-empty (a
+/// store may predate its first save); any other read error propagates —
+/// callers decide what is *safe to prune* or *known to exist* from this, so a
+/// torn read must fail loudly, never read as empty.
+fn read_shared_graph(store: &RepoStore) -> Result<Vec<ChangeNode>, RepoError> {
+    match std::fs::read(store.graph()) {
+        Ok(bytes) => persist_codec::decode_nodes(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(RepoError::Backend(format!("read shared graph: {e}"))),
+    }
+}
+
 fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let Some(author) = node.author else {
@@ -2838,6 +2937,133 @@ mod tests {
         );
         assert!(obj_dir.join(crate::hex::encode(&new_oid.0)).exists(), "head object retained");
         assert!(!obj_dir.join(crate::hex::encode(&orphan.0)).exists(), "orphan deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #263/#265 prevention: a change finalized by another lane lives in the
+    /// shared graph file but not in this dock's lineage-filtered loaded graph
+    /// (ADR 0022). gc must root its objects anyway — landed work is never
+    /// garbage, even before the primary adopts it.
+    #[test]
+    fn gc_keeps_objects_of_changes_outside_the_dock_lineage() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-lineage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Primary: one change c1, persisted (its heads file names c1).
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let kept = repo.put(b"primary\n", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a.txt"), (kept, Visibility::Public));
+        let c1 = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
+            .unwrap();
+        repo.save(&dir).unwrap();
+
+        // A lane over the same shared store finalizes c2 (a child of c1) with
+        // a new object — the landed-from-lane shape: the shared graph file
+        // gains c2 while the primary's heads still name only c1.
+        let lane_work = dir.join("lane");
+        std::fs::create_dir_all(lane_work.join(".loot")).unwrap();
+        let lane_store = RepoStore::for_lane(&dir, lane_work.join(".loot"));
+        let mut lane = DagRepo::load_from(&lane_store, lane_work.clone()).unwrap();
+        let landed = lane.put(b"landed\n", Visibility::Public).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("b.txt"), (landed.clone(), Visibility::Public));
+        lane.record(Change {
+            id: Oid([0; 32]),
+            parents: vec![c1.clone()],
+            message: "c2".into(),
+            tree: t2,
+        })
+        .unwrap();
+        lane.save_to(&lane_store).unwrap();
+
+        // The primary reloads: its lineage is c1 only — c2 is out of view.
+        let mut primary = DagRepo::load(&dir, dir.join("work")).unwrap();
+        assert_eq!(primary.heads(), vec![c1], "the landed change is outside the loaded lineage");
+
+        let report = primary.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 0, "a landed-but-unadopted change is rooted, not garbage");
+        let obj = RepoStore::new(&dir).objects_dir().join(crate::hex::encode(&landed.0));
+        assert!(obj.exists(), "the landed change's object survives the prune");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A registered lane's *unsigned* working change roots its objects too:
+    /// they are sealed into the shared store at snapshot, before any finalize,
+    /// and the primary is the only pruner (ADR 0034) — so gc consults every
+    /// lane's working-change blob, not just its own loaded graph.
+    #[test]
+    fn gc_keeps_a_registered_lanes_working_change_objects() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-lanewip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let base = repo.put(b"base\n", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a.txt"), (base, Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
+            .unwrap();
+        repo.save(&dir).unwrap();
+
+        // A registered lane with in-progress (authored, unsigned) work.
+        let (_, pk) = test_signer(9);
+        let lane_work = dir.join("lane");
+        std::fs::create_dir_all(lane_work.join(".loot")).unwrap();
+        let lane_store = RepoStore::for_lane(&dir, lane_work.join(".loot"));
+        let mut lane = DagRepo::load_from(&lane_store, lane_work.clone()).unwrap();
+        lane.set_author(pk);
+        let wip = lane
+            .snapshot(None, None, &[entry("wip.txt", b"lane wip", Visibility::Public)], "wip", 0)
+            .unwrap();
+        let wip_oid = lane.change_tree(&wip).unwrap()[&PathBuf::from("wip.txt")].0.clone();
+        lane.save_to(&lane_store).unwrap();
+        RepoStore::new(&dir).create_lane_entry("l1", &lane_work, None, 0).unwrap();
+
+        let mut primary = DagRepo::load(&dir, dir.join("work")).unwrap();
+        let report = primary.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 0, "a live lane's WIP objects are rooted");
+        let obj = RepoStore::new(&dir).objects_dir().join(crate::hex::encode(&wip_oid.0));
+        assert!(obj.exists(), "the lane's uncommitted object survives the prune");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The catch-up primitive (#265): a landed change recorded in the shared
+    /// graph file but dropped by the lineage-filtered load becomes walkable
+    /// (ancestry, merge) after `ingest_shared_lineage` — no disk state moves.
+    #[test]
+    fn ingest_shared_lineage_makes_a_landed_change_visible() {
+        let dir = std::env::temp_dir().join(format!("loot-ingest-lineage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let c1 = repo.record(empty_change(vec![], "c1")).unwrap();
+        repo.save(&dir).unwrap();
+
+        let lane_work = dir.join("lane");
+        std::fs::create_dir_all(lane_work.join(".loot")).unwrap();
+        let lane_store = RepoStore::for_lane(&dir, lane_work.join(".loot"));
+        let mut lane = DagRepo::load_from(&lane_store, lane_work).unwrap();
+        let c2 = lane.record(empty_change(vec![c1.clone()], "landed c2")).unwrap();
+        lane.save_to(&lane_store).unwrap();
+
+        let mut primary = DagRepo::load(&dir, dir.join("work")).unwrap();
+        let store = RepoStore::new(&dir);
+        assert_eq!(primary.heads(), vec![c1.clone()], "c2 starts outside the loaded lineage");
+
+        assert!(
+            primary.ingest_shared_lineage(&store, &c2).unwrap(),
+            "the landed tip is in the shared graph"
+        );
+        assert_eq!(primary.parents_of(&c2), vec![c1], "the lineage is walkable");
+        assert_eq!(primary.heads(), vec![c2.clone()], "the landed tip is now the frontier");
+        // Idempotent; an unknown tip reports false and touches nothing.
+        assert!(primary.ingest_shared_lineage(&store, &c2).unwrap());
+        assert!(!primary.ingest_shared_lineage(&store, &Oid([9; 32])).unwrap());
+        assert_eq!(primary.heads(), vec![c2]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

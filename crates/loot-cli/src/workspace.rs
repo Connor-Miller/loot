@@ -672,16 +672,9 @@ impl Workspace {
         // tip) there is nothing to finalize — leave the dock's tip intact.
         //
         // A seeded tip must always advance, even on the pristine-looking home
-        // dock. Two ways the home dock ends up with a real tip while
-        // `docks_active()` is false and it is not a lane: a lane (ADR 0034) is
-        // born with a spawn-seeded tip, and `loot adopt`/`dock merge` (ADR
-        // 0034/0022) pin the home dock's tip on a landed change. In either case
-        // dropping the working change without advancing leaves the tip stuck at
-        // the seed while `heads` moves on, so a land aims git-main at the change's
-        // parent and moves nothing (the #195 guard caught both live — the lane
-        // case dogfooding ADR 0036, the home-dock adopt case landing #234).
-        // `tip.is_some()` subsumes the lane predicate but both are kept explicit.
-        if self.docks_active() || self.lane_id.is_some() || self.tip.is_some() {
+        // dock — [`tracks_tip`](Self::tracks_tip) names the predicate and the
+        // stuck-tip bug class it exists for (#229, #234, #265).
+        if self.tracks_tip() {
             if self.working.is_some() {
                 self.tip = self.working.take();
                 let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
@@ -1229,6 +1222,14 @@ impl Workspace {
                 );
             }
         }
+        // A legal target is anything on the mirror-main lineage (the fence
+        // below) — but a change landed from a lane may be outside this dock's
+        // lineage-filtered load entirely (#265: `adopt <version>` reported "no
+        // live version" for a landed change). Pull the harbor lineage in from
+        // the shared graph first so every fence-legal target resolves.
+        if let Some(m) = self.mirror_main_change() {
+            self.repo.ingest_shared_lineage(&self.store, &m).map_err(|e| e.to_string())?;
+        }
         // Resolve among live, finalized versions (the working change is excluded).
         let target = self.resolve_live_version(prefix)?;
 
@@ -1253,16 +1254,31 @@ impl Workspace {
             );
         }
 
-        // Already settled: T is the sole live head and nothing is dirty (§4 — a
-        // no-op with a note, not an error).
+        // Already settled: T is the sole live head, the dock's anchor agrees,
+        // and nothing is dirty (§4 — a no-op with a note, not an error). The
+        // anchor check matters once the harbor lineage is ingested above: the
+        // graph frontier moves to the landed tip immediately, but a dock whose
+        // pinned tip still sits behind it has NOT settled — its disk and tip
+        // must still move (#265).
         let heads = self.repo.heads();
-        if !has_wip && heads.len() == 1 && heads[0] == target {
+        if !has_wip
+            && heads.len() == 1
+            && heads[0] == target
+            && self.anchor().as_ref() == Some(&target)
+        {
             return Ok(AdoptReport { target, abandoned: vec![], discarded_wip: false, already_there: true });
         }
 
-        // T must be reachable from some live line, or there is nothing to settle
-        // onto (guards against emptying the dock — checked before any mutation).
-        let reachable = heads.iter().any(|h| h == &target || self.graph().is_ancestor(&target, h));
+        // T must share a line with some live head, or there is nothing to
+        // settle onto (guards against emptying the dock — checked before any
+        // mutation). A *descendant* of a head is a shared line too: the
+        // behind-dock catch-up onto a lane-landed change (#265), where the
+        // settle is forward, not across.
+        let reachable = heads.iter().any(|h| {
+            h == &target
+                || self.graph().is_ancestor(&target, h)
+                || self.graph().is_ancestor(h, &target)
+        });
         if !reachable {
             return Err(format!(
                 "{} is not on any live line of this dock — nothing to settle onto",
@@ -1334,6 +1350,19 @@ impl Workspace {
             "no mirror main to catch up to — bind and `loot ferry` a mirror first, \
              or name a landed change: `loot adopt <version-id>`",
         )?;
+        // The landed change may be entirely outside this dock's loaded lineage
+        // (landed from a lane, never adopted here — the #265 shape): pull its
+        // line in from the shared graph first, or no ancestry check below can
+        // prove the fast-forward and every catch-up degenerates to a merge.
+        // `false` means the shared graph lost the node (pruned before the #265
+        // gc guard); the recovery for that is ferry's baseline adoption (#263).
+        if !self.repo.ingest_shared_lineage(&self.store, &their).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "landed main {} is not in the shared graph (pruned before the #265 gc \
+                 guard?) — run `loot ferry` to re-adopt its content as a baseline (#263)",
+                short_version(&their)
+            ));
+        }
         // Capture-first (#219, ADR 0030): fold any uncaptured disk edits into a
         // working change *before* we choose fast-forward vs merge. Otherwise a
         // dirty tree with no in-progress working change (the state right after a
@@ -1356,6 +1385,26 @@ impl Workspace {
             }
         }
         let msg = format!("adopt: catch up to landed main {}", short_version(&their));
+        // A working change that duplicates the landed content itself (the
+        // primary checkout after a `git reset` onto landed main — or a capture
+        // stranded by a pre-#265 catch-up attempt), adds nothing over the
+        // anchor, or is empty, is not local work: drop it so the catch-up
+        // fast-forwards instead of minting a merge that re-lands the same
+        // tree. Only a capture the disk still agrees with is droppable — dirt
+        // beyond it is real work and falls through to the capture-first merge.
+        if let Some(w) = self.working.clone() {
+            if !self.tree_is_dirty_over(Some(&w))? {
+                let empty = self.repo.change_tree(&w).is_none_or(|t| t.is_empty());
+                let redundant = empty
+                    || self.repo.same_tree_content(&their, &w, self.now)
+                    || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &w, self.now));
+                if redundant {
+                    self.repo.drop_working(&w);
+                    self.working = None;
+                    self.persist()?;
+                }
+            }
+        }
         // Clean fast-forward: no captured local work and our line is strictly
         // behind the harbor's — settle *exactly* on it. A merge would leave the
         // dock at a node that is not main, defeating "catch up"; the FF keeps the
@@ -1584,6 +1633,18 @@ impl Workspace {
     /// repo that never docks stays pristine on disk.
     fn docks_active(&self) -> bool {
         self.dock != HOME_DOCK || self.store.list_docks().len() > 1
+    }
+
+    /// Whether this position tracks a pinned tip that every tip-moving verb
+    /// must advance: a named dock, a lane (born with a spawn-seeded tip), or a
+    /// home dock that `adopt`/`dock merge` seeded. Leaving a seeded tip behind
+    /// is the stuck-tip bug class — `anchor()` stays at the seed while `heads`
+    /// moves on, so the next ferry aims git-main backward and the #195/#201
+    /// guards refuse (#229, #234, #265: three verbs hit it independently
+    /// before this predicate was extracted). `tip.is_some()` subsumes the
+    /// other two; they are kept explicit for the reader.
+    fn tracks_tip(&self) -> bool {
+        self.docks_active() || self.lane_id.is_some() || self.tip.is_some()
     }
 
     /// The finalized change the ambient dock currently sits on — a new dock forks
@@ -2524,11 +2585,11 @@ impl Workspace {
                 .attach_signature(&change_id, sig)
                 .map_err(|e| e.to_string())?;
         }
-        // On a dock or lane, the resolution also advances the tip so it isn't
-        // orphaned and the next snapshot builds on it. (A lane is a home dock
-        // with a seeded tip, so gate on `lane_id` too — the same class of
-        // stuck-tip bug #229 fixed in `finalize_working`.)
-        if self.docks_active() || self.lane_id.is_some() {
+        // On any tip-tracking position, the resolution also advances the tip so
+        // it isn't orphaned and the next snapshot builds on it —
+        // [`tracks_tip`](Self::tracks_tip) covers the adopt/merge-seeded home
+        // dock this arm used to miss (the #229/#234/#265 stuck-tip class).
+        if self.tracks_tip() {
             // Reflect ONLY the resolved path on disk (#233). The rest of the
             // merged tree is already materialized — the merge that produced the
             // conflicts wrote it — and the operator may be holding uncommitted
@@ -2624,6 +2685,18 @@ impl Workspace {
         capture: bool,
         label: &str,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        // The incoming change may have landed from a lane this dock never
+        // adopted — outside the lineage-filtered load (#265). Pull its line in
+        // from the shared graph first, so the arms below see the truth: the
+        // duplicate-capture drop recognizes a disk that already holds the
+        // landed tree, and the strictly-behind case adopts instead of minting
+        // a duplicate merge line (the spurious projection a bare ferry from a
+        // behind dock used to make). A tip the shared graph lost (pruned
+        // pre-guard) keeps the pre-#265 arms — ferry's baseline adoption
+        // (#263) recovers its content.
+        if let Some(t) = target {
+            self.repo.ingest_shared_lineage(&self.store, t).map_err(|e| e.to_string())?;
+        }
         let wip = if capture { self.reconcile_capture(pinned, target)? } else { None };
         let Some(target) = target else {
             return Ok(BTreeMap::new());
@@ -2707,7 +2780,12 @@ impl Workspace {
         self.repo
             .materialize(from.as_ref(), new_tip, &self.identity, self.now)
             .map_err(|e| e.to_string())?;
-        if self.docks_active() {
+        // A pinned tip must advance too — a home dock seeded by a spawn,
+        // `adopt`, or `dock merge` carries one even with no named docks, and
+        // leaving it behind keeps `anchor()` at the seed forever: the ferry
+        // right after this adopt then aims git-main backward and the #201
+        // guard refuses every pass (#265). [`tracks_tip`](Self::tracks_tip).
+        if self.tracks_tip() {
             self.tip = Some(new_tip.clone());
             let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
         }
@@ -4332,6 +4410,128 @@ mod tests {
         );
         assert!(ws.graph().is_ancestor(&f, &ws.anchor().unwrap()), "main is an ancestor — caught up");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- no-arg `loot adopt`: catch-up to a lane-landed change the loaded
+    // --- lineage has never seen (#265) ---
+
+    /// Seed the #265 topology: a primary on `c1`, a lane that lands `c2` (a
+    /// real child with content), the mirror spine naming `c2` as landed main —
+    /// and a primary whose lineage-filtered load has never seen `c2`.
+    /// Returns `(area, dir, c2)`; the caller reopens the primary fresh.
+    fn landed_from_lane(tag: &str) -> (PathBuf, PathBuf, loot_core::Oid) {
+        let (area, dir, mut ws) = lane_setup(tag);
+        let spawned = ws.spawn_lane(None, Some(&area.join("l1"))).unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        std::fs::write(spawned.dir.join("landed.txt"), b"landed").unwrap();
+        lw.snapshot("landed c2").unwrap();
+        lw.finalize_working().unwrap();
+        let c2 = lw.heads()[0].clone();
+        seed_mirror_main(&ws, &"2".repeat(40), &c2);
+        (area, dir, c2)
+    }
+
+    #[test]
+    fn adopt_no_arg_fast_forwards_a_landed_change_outside_the_loaded_lineage() {
+        // The #265 repro: every catch-up used to fail here because the landed
+        // change is not in the primary's loaded graph (ADR 0022 lineage
+        // filter), so no ancestry check could prove the fast-forward.
+        let (area, dir, c2) = landed_from_lane("adopt-265-ff");
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        assert!(
+            ws.repo().change_message(&c2).is_none(),
+            "precondition: the landed change is outside the loaded lineage"
+        );
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged && !report.already_current, "caught up");
+        assert!(report.outcomes.is_empty(), "a fast-forward has no merge outcomes");
+        assert_eq!(ws.repo().heads(), vec![c2.clone()], "clean FF — no merge node minted");
+        assert_eq!(ws.anchor(), Some(c2), "the dock sits exactly on landed main");
+        assert_eq!(
+            std::fs::read(dir.join("landed.txt")).unwrap(),
+            b"landed",
+            "the landed content materialized into the primary tree"
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn adopt_no_arg_ffs_when_the_disk_already_holds_landed_content() {
+        // The operator ran `git reset --hard origin/main` in the primary
+        // checkout first: the landed file is already on disk. That is landed
+        // content, not local work — catch-up must NOT capture it as a working
+        // change and mint a merge that re-lands the same tree (#265's loop).
+        let (area, dir, c2) = landed_from_lane("adopt-265-disk");
+        std::fs::write(dir.join("landed.txt"), b"landed").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged && report.outcomes.is_empty(), "clean FF");
+        assert_eq!(ws.repo().heads(), vec![c2], "no duplicate line, no merge node");
+        assert!(ws.working_id().is_none(), "no stray working change survives the catch-up");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn adopt_no_arg_drops_a_stale_capture_that_duplicates_landed_main() {
+        // A previous broken catch-up attempt captured the landed content as a
+        // working change and stranded it (the state #265 was reported in).
+        // Re-running adopt drops the redundant capture and fast-forwards.
+        let (area, dir, c2) = landed_from_lane("adopt-265-stale");
+        std::fs::write(dir.join("landed.txt"), b"landed").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        ws.snapshot("(working change)").unwrap();
+        assert!(ws.working_id().is_some(), "precondition: the stale capture exists");
+
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged && report.outcomes.is_empty(), "clean FF");
+        assert_eq!(ws.repo().heads(), vec![c2], "the duplicate capture did not become a merge");
+        assert!(ws.working_id().is_none(), "the redundant capture was dropped");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn adopt_version_settles_forward_on_a_lane_landed_change_outside_the_lineage() {
+        // The other #265 repro: `loot adopt <version> --discard-wip` reported
+        // "no live version" for a landed-from-lane change — it was outside the
+        // lineage-filtered load, and even in view a *descendant* target read
+        // as "not on any live line". Take-wholesale must settle forward too.
+        let (area, dir, c2) = landed_from_lane("adopt-265-version");
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let report = ws.adopt(&loot_core::hex::encode(&c2.0), false).unwrap();
+        assert_eq!(report.target, c2);
+        assert!(!report.already_there);
+        assert!(report.abandoned.is_empty(), "a forward settle abandons nothing");
+        assert_eq!(ws.anchor(), Some(c2), "the dock sits on the landed change");
+        assert_eq!(
+            std::fs::read(dir.join("landed.txt")).unwrap(),
+            b"landed",
+            "the landed content materialized"
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn adopt_no_arg_folds_real_local_work_over_an_out_of_lineage_landed_change() {
+        // Genuine local dirt is still local work: catch-up folds it into a
+        // merge (capture-first, #219) even when the landed side had to be
+        // ingested from the shared graph — never dropped, never clobbered.
+        let (area, dir, c2) = landed_from_lane("adopt-265-dirt");
+        std::fs::write(dir.join("local.txt"), b"my work").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged, "the local line was folded in");
+        let tip = ws.anchor().unwrap();
+        assert!(ws.graph().is_ancestor(&c2, &tip), "landed main is an ancestor — caught up");
+        assert_eq!(
+            std::fs::read(dir.join("local.txt")).unwrap(),
+            b"my work",
+            "the local edit survived the catch-up"
+        );
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]

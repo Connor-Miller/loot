@@ -85,6 +85,8 @@ const ID_PUB: &str = "id.pub";
 const PEERS: &str = "peers";
 const STORE_POINTER: &str = "store";
 const LANE_ID: &str = "lane-id";
+/// A position's dot-directory name — the `.loot/` under a repo or lane root.
+const DOT_DIR: &str = ".loot";
 const LANES: &str = "lanes";
 const LANE_PATH: &str = "path";
 const LANE_NAME: &str = "name";
@@ -456,6 +458,14 @@ impl RepoStore {
 
     pub fn lanes_dir(&self) -> PathBuf { self.dot.join(LANES) }
     pub fn lane_entry_dir(&self, id: &str) -> PathBuf { self.lanes_dir().join(id) }
+
+    /// The store view a registered lane sees: this shared root plus the lane's
+    /// own `.loot/` under its working directory. RepoStore owns the layout, so
+    /// the `.loot` name for a lane's dot directory is named here, not by
+    /// callers walking the registry (#265's gc walk, the lane peek).
+    pub fn lane_view(&self, entry: &LaneEntry) -> RepoStore {
+        RepoStore::for_lane(&self.dot, entry.path.join(DOT_DIR))
+    }
 
     /// Whether a registry entry exists for `id`.
     pub fn lane_entry_exists(&self, id: &str) -> bool {
