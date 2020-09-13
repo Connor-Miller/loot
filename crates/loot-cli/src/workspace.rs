@@ -1288,13 +1288,28 @@ impl Workspace {
     /// The paths the ambient dock currently materializes — the "before" picture a
     /// view step prunes against.
     fn ambient_visible_paths(&self) -> Vec<PathBuf> {
-        let tip = self
-            .working
-            .clone()
-            .or_else(|| self.position.tip().cloned())
-            .or_else(|| self.repo.heads().into_iter().next());
-        tip.map(|t| self.repo.visible_paths_at(&t, &self.identity, self.now))
+        self.surface_target()
+            .map(|t| self.repo.visible_paths_at(&t, &self.identity, self.now))
             .unwrap_or_default()
+    }
+
+    /// The change whose tree the ambient working directory should reflect: an
+    /// active [`loot bisect`](crate::bisect) midpoint (#390) when one is checked
+    /// out, else the normal working/tip/head chain. Undo's re-materialize and the
+    /// bisect verbs both funnel through this, so a bisect checkout is what an
+    /// `undo`/`op restore` restores to (the oplog captures `.loot/bisect`).
+    fn surface_target(&self) -> Option<Oid> {
+        self.active_bisect_midpoint()
+            .or_else(|| self.working.clone())
+            .or_else(|| self.position.tip().cloned())
+            .or_else(|| self.repo.heads().into_iter().next())
+    }
+
+    /// The midpoint an in-progress bisect currently has materialized, if any —
+    /// read fresh from `.loot/bisect` (stateless, so an oplog restore of that
+    /// file is seen immediately). `None` when no bisect is active.
+    pub fn active_bisect_midpoint(&self) -> Option<Oid> {
+        crate::bisect::BisectSession::load(&self.store).and_then(|s| s.current)
     }
 
     /// Rebuild in-memory state (engine, pointers, ambient dock) from the on-disk
@@ -1319,19 +1334,25 @@ impl Workspace {
     /// operator asked to walk back, so it never consults it — overwriting the
     /// current disk is the point, not an accident.
     fn resurface(&mut self, old_paths: Vec<PathBuf>) -> Result<(), CliError> {
+        let to = self.surface_target();
+        self.materialize_target(to, old_paths)
+    }
+
+    /// Write `to`'s readable tree to disk and prune any path in `old_paths` the
+    /// new tree no longer contains — the shared body under both undo's
+    /// [`resurface`](Self::resurface) and the [`loot bisect`](crate::bisect)
+    /// midpoint checkout. This is a tree write deliberately EXEMPT from the #219
+    /// capture chokepoint: undo/abandon/bisect exist precisely to overwrite the
+    /// tree the operator asked to move onto, so it never consults dirtiness. `to
+    /// == None` writes nothing and prunes everything (an empty view).
+    fn materialize_target(&mut self, to: Option<Oid>, old_paths: Vec<PathBuf>) -> Result<(), CliError> {
         self.repo.flush_escrow(self.now);
-        let to = self
-            .working
-            .clone()
-            .or_else(|| self.position.tip().cloned())
-            .or_else(|| self.repo.heads().into_iter().next());
         let written = match &to {
             Some(to) => self
                 .repo
                 .surface_with_report(to, &self.identity, self.now)
                 .map_err(CliError::from)?
                 .0,
-            // Restored to an empty view: nothing to write, prune everything.
             None => Vec::new(),
         };
         let keep: std::collections::BTreeSet<&PathBuf> = written.iter().map(|(p, _)| p).collect();
@@ -1350,6 +1371,232 @@ impl Workspace {
             }
         }
         Ok(())
+    }
+
+    // --- bisect (#390) ---
+    //
+    // Binary-search history for the change that introduced a regression. The
+    // session lives at `.loot/bisect` (lane-owned, captured by the oplog so a
+    // step is undoable); the pure search is [`crate::bisect::next_step`]. Each
+    // verb resolves a selector, advances the search, materializes the midpoint's
+    // tree, and records one operation.
+
+    /// `loot bisect start` — begin a session over this position. Refuses if one
+    /// is already in progress, over uncaptured working-tree edits a midpoint
+    /// checkout would clobber (name them first, like the converge verbs), or on a
+    /// repo with nothing finalized to search. Records the starting tree so
+    /// `reset` returns to it. One undoable op.
+    pub fn bisect_start(&mut self) -> Result<(), CliError> {
+        if crate::bisect::BisectSession::load(&self.store).is_some() {
+            return Err(
+                "a bisect is already in progress — `loot bisect reset` to end it first".into(),
+            );
+        }
+        let reflected = self.working.clone().or_else(|| self.anchor());
+        if self.tree_is_dirty_over(reflected.as_ref())? {
+            return Err(REFUSE_UNCAPTURED_TREE.into());
+        }
+        let start = self.surface_target();
+        if start.is_none() {
+            return Err("nothing to bisect yet — no finalized changes recorded".into());
+        }
+        let session = crate::bisect::BisectSession { start, ..Default::default() };
+        session
+            .save(&self.store)
+            .map_err(|e| CliError::from(format!("write bisect: {e}")))?;
+        self.record_op("bisect", "start", false);
+        Ok(())
+    }
+
+    /// `loot bisect good|bad|skip [<selector>]` — record a bound (default: the
+    /// midpoint currently checked out), then advance: materialize the next
+    /// midpoint, or converge on the first bad change. One undoable op.
+    pub fn bisect_mark(
+        &mut self,
+        kind: crate::bisect::BisectMark,
+        selector: Option<&str>,
+    ) -> Result<crate::bisect::BisectOutcome, CliError> {
+        use crate::bisect::BisectMark;
+        let mut session = crate::bisect::BisectSession::load(&self.store)
+            .ok_or("no bisect in progress — `loot bisect start` first")?;
+        let target = match selector {
+            Some(s) => self.resolve_selector(s)?,
+            None => session
+                .current
+                .clone()
+                .ok_or("no change to mark — pass a selector, e.g. `loot bisect bad HEAD`")?,
+        };
+        match kind {
+            BisectMark::Good => {
+                if !session.good.contains(&target) {
+                    session.good.push(target.clone());
+                }
+            }
+            BisectMark::Bad => session.bad = Some(target.clone()),
+            BisectMark::Skip => {
+                if !session.skip.contains(&target) {
+                    session.skip.push(target.clone());
+                }
+            }
+        }
+        let desc = format!("{} {}", kind.word(), short_version(&target));
+        self.advance_bisect(session, &desc)
+    }
+
+    /// Compute the next search state for `session`, persist it, materialize the
+    /// midpoint (or first-bad) tree, and record the op. The session is saved
+    /// **before** the op is recorded so the oplog captures the new `.loot/bisect`
+    /// — an `undo` then restores this exact search state and its midpoint.
+    fn advance_bisect(
+        &mut self,
+        mut session: crate::bisect::BisectSession,
+        desc: &str,
+    ) -> Result<crate::bisect::BisectOutcome, CliError> {
+        use crate::bisect::{BisectOutcome, BisectProgress};
+        let old_paths = self.ambient_visible_paths();
+        if !session.has_bounds() {
+            session.current = None;
+            session
+                .save(&self.store)
+                .map_err(|e| CliError::from(format!("write bisect: {e}")))?;
+            self.record_op("bisect", desc, false);
+            return Ok(BisectOutcome::AwaitingBounds);
+        }
+        let progress = {
+            let parents_of = |id: &Oid| self.repo.parents_of(id);
+            crate::bisect::next_step(&session, parents_of).map_err(CliError::from)?
+        };
+        let outcome = match progress {
+            BisectProgress::Test { midpoint, remaining } => {
+                session.current = Some(midpoint.clone());
+                BisectOutcome::Testing { midpoint, remaining }
+            }
+            BisectProgress::Done { first_bad } => {
+                session.current = Some(first_bad.clone());
+                BisectOutcome::Found { first_bad }
+            }
+            BisectProgress::Blocked { candidates } => BisectOutcome::Blocked { candidates },
+        };
+        session
+            .save(&self.store)
+            .map_err(|e| CliError::from(format!("write bisect: {e}")))?;
+        let to = session.current.clone();
+        self.materialize_target(to, old_paths)?;
+        self.record_op("bisect", desc, false);
+        Ok(outcome)
+    }
+
+    /// `loot bisect reset` — end the session and restore the tree to where it
+    /// began. One undoable op. Returns the restored change (if one was recorded).
+    pub fn bisect_reset(&mut self) -> Result<Option<Oid>, CliError> {
+        let session =
+            crate::bisect::BisectSession::load(&self.store).ok_or("no bisect in progress")?;
+        let old_paths = self.ambient_visible_paths();
+        let start = session.start.clone();
+        crate::bisect::BisectSession::clear(&self.store)
+            .map_err(|e| CliError::from(format!("clear bisect: {e}")))?;
+        // The session is gone, so `surface_target` now falls back to the normal
+        // chain; we still restore the recorded start tree explicitly.
+        self.materialize_target(start.clone(), old_paths)?;
+        self.record_op("bisect", "reset", false);
+        Ok(start)
+    }
+
+    /// The current session for `loot bisect status`, or `None` if not bisecting.
+    pub fn bisect_session(&self) -> Option<crate::bisect::BisectSession> {
+        crate::bisect::BisectSession::load(&self.store)
+    }
+
+    /// `loot bisect run <cmd...>` — automate the walk: at each midpoint,
+    /// materialize its tree and run `test`; exit 0 marks good, 125 marks skip,
+    /// any other nonzero marks bad. Iterates until the first bad change is found
+    /// (or the search is blocked by skips). Each checkout and each mark is one
+    /// undoable op. Requires both bounds already set.
+    pub fn bisect_run<F>(&mut self, mut test: F) -> Result<crate::bisect::BisectOutcome, CliError>
+    where
+        F: FnMut(&Path, &Oid) -> Result<i32, CliError>,
+    {
+        use crate::bisect::{BisectOutcome, BisectProgress};
+        match crate::bisect::BisectSession::load(&self.store) {
+            None => {
+                return Err(
+                    "no bisect in progress — `loot bisect start`, mark a good and a bad, then `run`"
+                        .into(),
+                )
+            }
+            Some(s) if !s.has_bounds() => {
+                return Err("`loot bisect run` needs a good and a bad change marked first".into())
+            }
+            Some(_) => {}
+        }
+        let root = self.root.clone();
+        for _ in 0..1024 {
+            let mut session = crate::bisect::BisectSession::load(&self.store)
+                .ok_or("bisect session vanished mid-run")?;
+            let progress = {
+                let parents_of = |id: &Oid| self.repo.parents_of(id);
+                crate::bisect::next_step(&session, parents_of).map_err(CliError::from)?
+            };
+            match progress {
+                BisectProgress::Done { first_bad } => {
+                    let old_paths = self.ambient_visible_paths();
+                    session.current = Some(first_bad.clone());
+                    session
+                        .save(&self.store)
+                        .map_err(|e| CliError::from(format!("write bisect: {e}")))?;
+                    self.materialize_target(Some(first_bad.clone()), old_paths)?;
+                    self.record_op("bisect", "run: first bad found", false);
+                    return Ok(BisectOutcome::Found { first_bad });
+                }
+                BisectProgress::Blocked { candidates } => {
+                    return Ok(BisectOutcome::Blocked { candidates })
+                }
+                BisectProgress::Test { midpoint, .. } => {
+                    // Check the midpoint out, then run the test against it.
+                    let old_paths = self.ambient_visible_paths();
+                    session.current = Some(midpoint.clone());
+                    session
+                        .save(&self.store)
+                        .map_err(|e| CliError::from(format!("write bisect: {e}")))?;
+                    self.materialize_target(Some(midpoint.clone()), old_paths)?;
+                    self.record_op(
+                        "bisect",
+                        &format!("run: test {}", short_version(&midpoint)),
+                        false,
+                    );
+                    let code = test(&root, &midpoint)?;
+                    let mut session = crate::bisect::BisectSession::load(&self.store)
+                        .ok_or("bisect session vanished mid-run")?;
+                    let verdict = match code {
+                        0 => {
+                            if !session.good.contains(&midpoint) {
+                                session.good.push(midpoint.clone());
+                            }
+                            "good"
+                        }
+                        125 => {
+                            if !session.skip.contains(&midpoint) {
+                                session.skip.push(midpoint.clone());
+                            }
+                            "skip"
+                        }
+                        _ => {
+                            session.bad = Some(midpoint.clone());
+                            "bad"
+                        }
+                    };
+                    session
+                        .save(&self.store)
+                        .map_err(|e| CliError::from(format!("write bisect: {e}")))?;
+                    self.record_op(
+                        "bisect",
+                        &format!("run: {} {}", verdict, short_version(&midpoint)),
+                        false,
+                    );
+                }
+            }
+        }
+        Err("bisect run exceeded its step budget — aborting".into())
     }
 
     // --- divergent changes (S3, ADR 0029/0030) ---
@@ -4304,6 +4551,113 @@ mod tests {
         let redo = ws.restore_op(3).unwrap();
         assert_eq!(redo.restored_to, 3);
         assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"two", "redo restores the change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a linear history of `n` finalized changes, each adding `f{i}.txt`
+    /// (cumulative), and return their version ids v1..vn. Leaves a clean tree at
+    /// vn with no working change — the state `loot bisect` expects.
+    fn linear_history(ws: &mut Workspace, dir: &Path, n: usize) -> Vec<Oid> {
+        let mut versions = Vec::new();
+        for i in 1..=n {
+            std::fs::write(dir.join(format!("f{i}.txt")), format!("{i}")).unwrap();
+            let (v, _) = ws.snapshot(&format!("c{i}")).unwrap();
+            ws.finalize_working().unwrap();
+            versions.push(v);
+        }
+        versions
+    }
+
+    /// #390 end-to-end at the Workspace level: a manual bisect over a linear
+    /// history halves to the first bad change, materializes each midpoint's tree,
+    /// and each step is an undoable operation.
+    #[test]
+    fn bisect_narrows_to_the_first_bad_change_and_each_step_is_undoable() {
+        use crate::bisect::{BisectMark, BisectOutcome};
+        let dir = std::env::temp_dir().join(format!("loot-390-bisect-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let v = linear_history(&mut ws, &dir, 5); // v[0]=v1 .. v[4]=v5
+
+        ws.bisect_start().unwrap();
+
+        // Mark the tip bad — one bound, so the search awaits the other.
+        assert_eq!(
+            ws.bisect_mark(BisectMark::Bad, Some("HEAD")).unwrap(),
+            BisectOutcome::AwaitingBounds
+        );
+        // Mark the root good — now both bounds are set; the midpoint is v3 (the
+        // even split of the {v2,v3,v4} suspects), and its tree is checked out.
+        match ws.bisect_mark(BisectMark::Good, Some("HEAD~4")).unwrap() {
+            BisectOutcome::Testing { midpoint, .. } => assert_eq!(midpoint, v[2]),
+            other => panic!("expected to test v3, got {other:?}"),
+        }
+        assert!(dir.join("f3.txt").exists(), "v3's tree is materialized");
+        assert!(!dir.join("f4.txt").exists(), "later files pruned at the midpoint");
+
+        // v3 tests good → the regression is in {v4,v5}; next midpoint is v4.
+        match ws.bisect_mark(BisectMark::Good, None).unwrap() {
+            BisectOutcome::Testing { midpoint, .. } => assert_eq!(midpoint, v[3]),
+            other => panic!("expected to test v4, got {other:?}"),
+        }
+        assert!(dir.join("f4.txt").exists(), "v4's tree is materialized");
+
+        // v4 tests bad → v4 is the first bad change.
+        assert_eq!(
+            ws.bisect_mark(BisectMark::Bad, None).unwrap(),
+            BisectOutcome::Found { first_bad: v[3].clone() }
+        );
+
+        // Undo steps the search back one operation: the `bad v4` mark is
+        // reversed, so the session's bad bound returns to the tip (v5).
+        ws.undo().unwrap();
+        let session = ws.bisect_session().expect("still bisecting after undo");
+        assert_eq!(session.bad, Some(v[4].clone()), "undo reversed the last mark");
+
+        // Reset ends the session and restores the starting tree (all five files).
+        ws.bisect_reset().unwrap();
+        assert!(ws.bisect_session().is_none(), "reset ends the bisect");
+        assert!(dir.join("f5.txt").exists(), "reset restored the starting tree");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #390 `loot bisect run`: with both bounds set, an injected tester (stand-in
+    /// for the subprocess) drives the walk to the first bad change automatically.
+    /// The tester calls f4 the regression, so the answer is v4.
+    #[test]
+    fn bisect_run_automates_the_walk_to_the_first_bad_change() {
+        use crate::bisect::{BisectMark, BisectOutcome};
+        let dir = std::env::temp_dir().join(format!("loot-390-bisect-run-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let v = linear_history(&mut ws, &dir, 5);
+
+        ws.bisect_start().unwrap();
+        ws.bisect_mark(BisectMark::Bad, Some("HEAD")).unwrap();
+        ws.bisect_mark(BisectMark::Good, Some("HEAD~4")).unwrap();
+
+        // The regression is f4.txt: a checkout containing it is bad (exit 1),
+        // otherwise good (exit 0).
+        let outcome = ws
+            .bisect_run(|root: &Path, _mid: &Oid| {
+                Ok(if root.join("f4.txt").exists() { 1 } else { 0 })
+            })
+            .unwrap();
+        assert_eq!(outcome, BisectOutcome::Found { first_bad: v[3].clone() });
+        assert!(dir.join("f4.txt").exists(), "the culprit's tree is left checked out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bisect refuses to begin over uncaptured working-tree edits — a midpoint
+    /// checkout would clobber them, so name them first (the #219 discipline).
+    #[test]
+    fn bisect_start_refuses_over_uncaptured_edits() {
+        let dir = std::env::temp_dir().join(format!("loot-390-bisect-dirty-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let _ = linear_history(&mut ws, &dir, 2);
+        // Dirty the tree without capturing it.
+        std::fs::write(dir.join("scratch.txt"), b"uncommitted").unwrap();
+        let err = ws.bisect_start().unwrap_err();
+        assert!(err.message.contains("uncaptured"), "names the reason: {err}");
+        assert!(ws.bisect_session().is_none(), "no session was opened");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
