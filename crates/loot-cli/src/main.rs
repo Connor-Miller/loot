@@ -1308,15 +1308,36 @@ const LANE_SUBS: &[&FlagSpec] =
 /// Unnamed lanes are reaped by `lane gc` once their change lands or their
 /// heartbeat goes stale; `merge` folds a lane's finalized line into the primary
 /// (#253, the former `loot dock merge`).
+/// Resolve `loot lane <sub>` and run the resolved subcommand's own flag gate
+/// (#278): the table's `lane` entry is the union over the subcommands, so
+/// `main`'s gate alone would let a sibling's flag (`lane new --stale-hours`)
+/// ride through ignored. Pure — no workspace opens here — so the gate's tests
+/// exercise every refusal without ever walking the test runner's cwd into a
+/// real `.loot` store (#322). Returns the resolved subcommand (`ls`
+/// normalizes to `list`; bare `loot lane` defaults to it).
+fn lane_gate(args: &[String]) -> Result<&'static str, String> {
+    let (sub, spec) = match args.first().map(String::as_str).unwrap_or("list") {
+        "new" => ("new", &LANE_NEW),
+        "list" | "ls" => ("list", &LANE_LIST),
+        "merge" => ("merge", &LANE_MERGE),
+        "name" => ("name", &LANE_NAME),
+        "rm" => ("rm", &LANE_RM),
+        "gc" => ("gc", &LANE_GC),
+        other => {
+            return Err(format!(
+                "unknown lane subcommand '{other}'\n\nusage: loot lane new [--ticket <n>] \
+                 [--name <n>] [--at <dir>] | list | merge <id-or-name> | name <n> | \
+                 rm <id-or-name> | gc [--stale-hours <h>]"
+            ))
+        }
+    };
+    spec.check_sub(args)?;
+    Ok(sub)
+}
+
 fn cmd_lane(args: &[String]) -> Result<(), String> {
-    let sub = args.first().map(String::as_str).unwrap_or("list");
-    // Each arm re-gates against its own spec (#278) before the workspace
-    // opens: the table's `lane` entry is the union over these, so `main`'s
-    // gate alone would let a sibling's flag (`lane new --stale-hours`) ride
-    // through ignored.
-    match sub {
+    match lane_gate(args)? {
         "new" => {
-            LANE_NEW.check_sub(args)?;
             let fmt = out_fmt(args);
             let name = flag(args, "--name");
             let at = flag(args, "--at").map(std::path::PathBuf::from);
@@ -1357,17 +1378,12 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
         }
         // Full `args` (not `args[1..]`): `out_fmt` only reads flags, and bare
         // `loot lane` used to panic slicing an empty argv here.
-        "list" | "ls" => {
-            LANE_LIST.check_sub(args)?;
-            cmd_lane_list(args)
-        }
+        "list" => cmd_lane_list(args),
         "merge" => {
-            LANE_MERGE.check_sub(args)?;
             let key = args.get(1).ok_or("usage: loot lane merge <id-or-name>")?;
             cmd_lane_merge(key, args)
         }
         "name" => {
-            LANE_NAME.check_sub(args)?;
             let name = args.get(1).ok_or("usage: loot lane name <name>  (inside the lane)")?;
             let ws = Workspace::open()?;
             ws.name_lane(name)?;
@@ -1378,7 +1394,6 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "rm" => {
-            LANE_RM.check_sub(args)?;
             let key = args.get(1).ok_or("usage: loot lane rm <id-or-name>")?;
             let mut ws = Workspace::open()?;
             let e = ws.remove_lane(key)?;
@@ -1391,7 +1406,6 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "gc" => {
-            LANE_GC.check_sub(args)?;
             let stale_secs: u64 = match flag(args, "--stale-hours") {
                 Some(v) => {
                     let hours: u64 =
@@ -1415,10 +1429,8 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        other => Err(format!(
-            "unknown lane subcommand '{other}'\n\nusage: loot lane new [--ticket <n>] [--name <n>] \
-             [--at <dir>] | list | merge <id-or-name> | name <n> | rm <id-or-name> | gc [--stale-hours <h>]"
-        )),
+        // `lane_gate` refuses anything it doesn't resolve to one of the above.
+        _ => unreachable!("lane_gate returns only resolved subcommands"),
     }
 }
 
@@ -2584,28 +2596,35 @@ mod tests {
 
     /// The finding itself: `loot lane new --stale-hours 12` read as accepted
     /// (`--stale-hours` is `lane gc`'s flag) and did nothing. Each refusal
-    /// fires at the gate, before the workspace opens.
+    /// fires at [`lane_gate`] — pure, so these tests never open a workspace:
+    /// calling `cmd_lane` here walked the test runner's cwd into the
+    /// developer's *real* `.loot` store whenever an arm got past the gate
+    /// (#322).
     #[test]
     fn a_sibling_subcommands_flag_is_rejected_at_the_subcommand() {
-        let err = cmd_lane(&args(&["new", "--stale-hours", "12"])).unwrap_err();
+        let err = lane_gate(&args(&["new", "--stale-hours", "12"])).unwrap_err();
         assert!(err.contains("--stale-hours"), "the error names the offending flag: {err}");
         assert!(err.contains("`loot lane new` accepts"), "{err}");
 
-        let err = cmd_lane(&args(&["gc", "--ticket", "67"])).unwrap_err();
+        let err = lane_gate(&args(&["gc", "--ticket", "67"])).unwrap_err();
         assert!(err.contains("--ticket"), "{err}");
         assert!(err.contains("`loot lane gc` accepts"), "{err}");
 
         // `lane name`/`lane rm` take no flags at all — even the union's
         // machine-output selectors refuse.
-        let err = cmd_lane(&args(&["name", "n", "--json"])).unwrap_err();
+        let err = lane_gate(&args(&["name", "n", "--json"])).unwrap_err();
         assert!(err.contains("`loot lane name` takes no flags"), "{err}");
-        let err = cmd_lane(&args(&["rm", "t1", "--porcelain"])).unwrap_err();
+        let err = lane_gate(&args(&["rm", "t1", "--porcelain"])).unwrap_err();
         assert!(err.contains("`loot lane rm` takes no flags"), "{err}");
 
         // `lane merge` takes only the machine-output selectors — an unrelated
         // sibling flag (`--at`, the create form's) is refused, not ignored.
-        let err = cmd_lane(&args(&["merge", "x", "--at", "y"])).unwrap_err();
+        let err = lane_gate(&args(&["merge", "x", "--at", "y"])).unwrap_err();
         assert!(err.contains("`loot lane merge` accepts"), "{err}");
+
+        // An unknown subcommand refuses at the gate too, naming the usage.
+        let err = lane_gate(&args(&["frobnicate"])).unwrap_err();
+        assert!(err.contains("unknown lane subcommand 'frobnicate'"), "{err}");
     }
 
     /// Each subcommand's own flags still pass its gate — the narrowed specs
@@ -2647,11 +2666,15 @@ mod tests {
     }
 
     /// Bare `loot lane` defaults to `list` — it must not panic slicing an
-    /// empty argv (found wiring #278; `&args[1..]` on zero args). The contract
-    /// here is only "returns": a listing or a real refusal, never a panic.
+    /// empty argv (found wiring #278; `&args[1..]` on zero args). Asserted at
+    /// the pure gate: the old form ran `cmd_lane(&[])`, which opened a
+    /// workspace from the test runner's ambient cwd — the real `.loot` when
+    /// run from the repo (#322). The end-to-end "returns a refusal, never
+    /// panics" contract lives in `tests/cli_smoke.rs` with a controlled cwd.
     #[test]
-    fn bare_lane_defaults_to_list_without_panicking() {
-        let _ = cmd_lane(&args(&[]));
+    fn bare_lane_defaults_to_list_at_the_gate() {
+        assert_eq!(lane_gate(&args(&[])), Ok("list"));
+        assert_eq!(lane_gate(&args(&["ls"])), Ok("list"), "`ls` normalizes");
     }
 
     #[test]

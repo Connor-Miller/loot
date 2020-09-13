@@ -90,6 +90,17 @@ impl Workspace {
 
     /// Load a repo rooted at an explicit directory (used by `clone`).
     pub fn open_at(dir: &Path) -> Result<Self, String> {
+        Self::open_at_clocked(dir, real_now())
+    }
+
+    /// [`open_at`](Self::open_at) with the clock injected (#322). The engine
+    /// already takes `now` as a value everywhere; this is the workspace-level
+    /// twin, so an in-process test drives embargo/heartbeat timing race-free —
+    /// the `LOOT_CLOCK` env override stays as the *cross-process* adapter (a
+    /// spawned binary can only be reached through its environment, and the
+    /// attack demo's lying-clock exhibit depends on it). Production callers use
+    /// `open`/`open_at`, which pass [`real_now`].
+    pub fn open_at_clocked(dir: &Path, now: u64) -> Result<Self, String> {
         let loot = dir.join(DOT);
         // A `.loot` *pointer file* (not a directory) is a retired `--at` worktree
         // dock (#253/ADR 0034): named docks are gone, so this only ever appears as
@@ -105,7 +116,7 @@ impl Workspace {
         // A spawned lane's `.loot` is a *directory* whose `store` file points at
         // the shared store; every lane-owned file lives here (ADR 0034).
         if let Some(shared) = RepoStore::read_store_pointer(&loot) {
-            return Self::open_lane(dir, &loot, &shared);
+            return Self::open_lane(dir, &loot, &shared, now);
         }
         let store = RepoStore::new(&loot);
         if !store.identity().exists() {
@@ -115,14 +126,14 @@ impl Workspace {
             ));
         }
         let dock = store.read_dock();
-        Self::assemble(loot, store, dir.to_path_buf(), dock, None)
+        Self::assemble(loot, store, dir.to_path_buf(), dock, None, now)
     }
 
     /// Load a spawned lane: position is place (ADR 0034) — the cwd's `.loot`
     /// directory carries the lane's private mutable state, `shared` the
     /// append-only store. Refreshes the lane's registry heartbeat (the gc-sweep
     /// signal); the touch is best-effort and self-healing.
-    fn open_lane(dir: &Path, lane_dot: &Path, shared: &Path) -> Result<Self, String> {
+    fn open_lane(dir: &Path, lane_dot: &Path, shared: &Path, now: u64) -> Result<Self, String> {
         let store = RepoStore::for_lane(shared, lane_dot);
         if !store.identity().exists() {
             return Err(format!(
@@ -134,9 +145,9 @@ impl Workspace {
         let lane_id = RepoStore::read_lane_id(lane_dot).ok_or_else(|| {
             format!("malformed lane at {} — no lane-id in its .loot/", dir.display())
         })?;
-        let _ = store.touch_lane_heartbeat(&lane_id, dir, real_now());
+        let _ = store.touch_lane_heartbeat(&lane_id, dir, now);
         let dock = store.read_dock();
-        Self::assemble(shared.to_path_buf(), store, dir.to_path_buf(), dock, Some(lane_id))
+        Self::assemble(shared.to_path_buf(), store, dir.to_path_buf(), dock, Some(lane_id), now)
     }
 
 
@@ -150,6 +161,7 @@ impl Workspace {
         root: PathBuf,
         dock: String,
         lane_id: Option<String>,
+        now: u64,
     ) -> Result<Self, String> {
         let mut repo = DagRepo::load_from(&store, root.clone()).map_err(|e| e.to_string())?;
         let identity = read_to_string(&store.identity())?;
@@ -179,7 +191,7 @@ impl Workspace {
             next_change_id,
             signer,
             lane_id,
-            now: real_now(),
+            now,
         })
     }
 
@@ -4259,6 +4271,21 @@ mod tests {
         let mut ws = Workspace::open_at(dir).unwrap();
         ws.start_fresh_change().unwrap();
         ws
+    }
+
+    /// The clock is a constructor input (#322): an in-process test pins time
+    /// without the process-global `LOOT_CLOCK` env (which races under the
+    /// parallel test runner — env is the *cross-process* adapter, this is the
+    /// in-process one). The injected instant is what every time-stamped write
+    /// in the session carries.
+    #[test]
+    fn the_clock_is_injectable_at_construction() {
+        let dir = std::env::temp_dir().join(format!("loot-clock-inject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        let ws = Workspace::open_at_clocked(&dir, 12_345).unwrap();
+        assert_eq!(ws.now(), 12_345, "the workspace runs on the injected clock");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
