@@ -106,6 +106,22 @@ via the converge that threads it under a merge tip). "Moved" therefore implies
 marks read and an ancestry check to close a hole the upstream gate already
 closes.
 
+> **Amendment (#349, 2026-07-19).** "Did not move within this invocation" turned
+> out not to imply "nothing to land": a bare `loot ferry` run between describe
+> and land projects the lane's signed line onto mirror `main` *then*, so the
+> land's own ferry finds nothing to do while the push + PR collapse are still
+> owed — and the refusal wedged (re-running land could never move `main` again;
+> the live workaround was describing a dummy edit). The guard now consults an
+> escape hatch before refusing: if mirror `main` is **strictly ahead** of the
+> real `origin/main` (fresh — land's drift guard fetches it) *and* a commit
+> reachable from mirror `main` carries this land's finalized tip as its
+> `Loot-Change-Id` trailer, the projection already happened and the land
+> proceeds to the owed publication. This is exactly the "contains the projected
+> commit" walk the paragraph above declined, now paid for only on the not-moved
+> path. Anything unprovable — no origin ref, mirror behind or diverged, tip
+> absent from `main` (e.g. only a *sibling's* unpushed projection made the
+> mirror ahead) — still refuses.
+
 ### A conflicted change bounces back to its agent, never blocking the queue
 
 If ferry's reconcile surfaces a conflict — this change collides on some path

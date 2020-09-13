@@ -173,7 +173,11 @@ surfaced by `loot conflicts`; that change can't land until you resolve it in loo
   what landed while the lane worked, the land **bounces** — nothing is pushed, the
   signed change is safe, and you reconcile (`loot resolve …`) and re-run `land`.
   And a land that does not actually move `main` now **refuses** rather than
-  reporting a false `landed:` (the #195 guard).
+  reporting a false `landed:` (the #195 guard) — unless git proves the line was
+  *already* projected by an earlier bare `loot ferry` and only the push + PR
+  collapse are owed (mirror `main` strictly ahead of `origin/main` and carrying
+  this land's signed tip), in which case the land proceeds instead of wedging
+  (#349).
 
 ## Abandonment
 

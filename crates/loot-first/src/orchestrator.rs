@@ -599,12 +599,27 @@ pub fn land(
     // loudly rather than land a lie. The first land ever (empty mirror before,
     // so `main_before == None`) is unaffected — see [`harbor_moved_main`].
     if !harbor_moved_main(main_before.as_deref(), &main_sha) {
-        return Err(format!(
-            "harbor: git-main did not move (still {}) — this lane's change was not integrated \
-             into the harbor, so there is nothing to collapse the PR onto (issue #195). \
-             Nothing was pushed; check the `loot ferry` output above.",
-            &main_sha[..main_sha.len().min(12)]
-        ));
+        // "Did not move within THIS invocation" is not yet "nothing to land"
+        // (#349): an earlier bare `loot ferry` may already have projected this
+        // lane's signed line onto mirror main, leaving only the push + PR
+        // collapse owed — and a refusal here wedges (re-running land can never
+        // move main again; the live workaround was describing a dummy edit).
+        // Prove the already-projected state from git facts before refusing.
+        let tip_hex = ws.finalized_anchor().map(|t| loot_core::hex::encode(&t.0));
+        if already_projected_unpushed(&p.checkout, &p.mirror, &main_sha, tip_hex.as_deref()) {
+            println!(
+                "harbor: main did not move in this land, but it already carries this land's \
+                 signed tip ahead of origin/main — an earlier ferry projected it (#349); \
+                 proceeding to the owed push + PR collapse"
+            );
+        } else {
+            return Err(format!(
+                "harbor: git-main did not move (still {}) — this lane's change was not integrated \
+                 into the harbor, so there is nothing to collapse the PR onto (issue #195). \
+                 Nothing was pushed; check the `loot ferry` output above.",
+                &main_sha[..main_sha.len().min(12)]
+            ));
+        }
     }
 
     println!(">>> publish main + collapse PR head → {}", &main_sha[..main_sha.len().min(8)]);
@@ -726,6 +741,62 @@ pub fn execute_tag_push(forge: &dyn Forge, name: &str) -> Result<(), String> {
 /// land always reads as moved.
 fn harbor_moved_main(before: Option<&str>, after: &str) -> bool {
     before != Some(after)
+}
+
+/// The #349 escape hatch, consulted only when [`harbor_moved_main`] reads "not
+/// moved": is the mirror's `main` *already* carrying this land's signed line,
+/// with only the push + PR collapse owed? An earlier bare `loot ferry` projects
+/// any unprojected signed history the moment it runs, so a land's own ferry can
+/// find nothing to do while the publication is still owed — indistinguishable,
+/// within one invocation, from the "never integrated" case #195 refuses.
+/// The distinction is provable from git facts, all three of which must hold:
+///
+/// 1. `origin/main` is known to the checkout — fresh, because the land's
+///    up-front drift guard fetched it ([`OriginRef::Remote`]); a tracking read
+///    here costs no second round-trip and stays offline-safe;
+/// 2. the mirror's `main` is **strictly ahead** of it (origin's tip is a proper
+///    ancestor — asked of the mirror, which always holds its own lineage, the
+///    same oracle choice as [`mirror_ancestry`]); and
+/// 3. a commit reachable from mirror `main` carries this land's finalized tip
+///    as its `Loot-Change-Id` trailer — the trailer every ferry projection
+///    mints, so "an earlier ferry already projected exactly the line this land
+///    was about to" is a fact, not an inference. Without this walk, a
+///    *sibling's* unpushed projection would unlock a land whose own change
+///    never integrated — the exact green lie #195 forbids.
+///
+/// Anything unprovable — no origin ref, mirror behind or diverged, no finalized
+/// tip, trailer absent — reads `false`, leaving the #195 refusal as the
+/// conservative default.
+fn already_projected_unpushed(
+    checkout: &Path,
+    mirror: &Path,
+    main_sha: &str,
+    tip_hex: Option<&str>,
+) -> bool {
+    let Some(tip) = tip_hex else { return false };
+    let Some(origin) = origin_main(checkout, OriginRef::Tracking) else { return false };
+    if origin == main_sha {
+        return false; // mirror == origin: genuinely nothing unpushed — #195 stands
+    }
+    if !is_ancestor(mirror, /* ancestor */ &origin, /* descendant */ main_sha) {
+        return false; // behind or diverged: no clean fast-forward is owed from here
+    }
+    projected_on(mirror, main_sha, tip)
+}
+
+/// Whether a commit reachable from `main_sha` in `repo` carries
+/// `Loot-Change-Id: <change_hex>` — the trailer [`ferry`]'s projection mints on
+/// every mirrored change. `--fixed-strings` so the needle is never a regex;
+/// any git failure reads as "not projected" (the conservative answer).
+fn projected_on(repo: &Path, main_sha: &str, change_hex: &str) -> bool {
+    let needle = format!("{}: {change_hex}", loot_core::bridge::TRAILER_CHANGE_ID);
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "--fixed-strings", "-1", "--format=%H", &format!("--grep={needle}"), main_sha])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 fn landing_word(s: LandingStatus) -> &'static str {
@@ -1563,6 +1634,116 @@ mod tests {
         assert!(harbor_moved_main(Some("abc123"), "def456"), "advanced main = integrated");
         // First land ever: empty mirror before can never match a real sha.
         assert!(harbor_moved_main(None, "def456"), "first land is always a move");
+    }
+
+    // -----------------------------------------------------------------------
+    // already_projected_unpushed — the #195 guard's #349 blind spot
+    // -----------------------------------------------------------------------
+
+    /// A mirror seeded from the checkout's `main`, sharing lineage — the shape
+    /// ferry leaves behind. Initialized on a throwaway unborn branch so the
+    /// fetch may write `refs/heads/main`, then switched onto it.
+    fn mirror_of(base: &Path, checkout: &Path) -> PathBuf {
+        let dir = base.join("mirror");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "seed"]);
+        git(&dir, &["config", "user.email", "t@loot.test"]);
+        git(&dir, &["config", "user.name", "loot test"]);
+        git(&dir, &["fetch", "-q", checkout.to_str().unwrap(), "refs/heads/main:refs/heads/main"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        dir
+    }
+
+    /// An empty commit whose message carries the `Loot-Change-Id` trailer a
+    /// ferry projection mints — the mirror-side shape of a projected change.
+    fn projected_commit(repo: &Path, change_hex: &str) -> String {
+        let msg = format!("a projected change\n\nLoot-Change-Id: {change_hex}");
+        git(repo, &["commit", "-q", "--allow-empty", "-m", &msg]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// The #349 repro at the decision seam: describe → a pre-land bare ferry
+    /// projected the signed line onto mirror main → land's own ferry no-ops
+    /// (main does not move within the invocation) — but the mirror is strictly
+    /// ahead of origin/main and carries this land's tip, so the land must
+    /// proceed to the owed push + collapse instead of refusing and wedging.
+    #[test]
+    fn already_projected_line_ahead_of_origin_reads_as_landable() {
+        let base = scratch("349-already-projected");
+        let checkout = git_repo(&base, "checkout");
+        let origin_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        git(&checkout, &["update-ref", "refs/remotes/origin/main", &origin_sha]);
+        let mirror = mirror_of(&base, &checkout);
+        let tip = "ab".repeat(32);
+        let main_sha = projected_commit(&mirror, &tip);
+        assert!(
+            already_projected_unpushed(&checkout, &mirror, &main_sha, Some(&tip)),
+            "mirror ahead of origin/main and carrying this land's tip = push owed, not a refusal"
+        );
+    }
+
+    #[test]
+    fn a_mirror_matching_origin_is_genuinely_nothing_to_land() {
+        // The refusal the #195 guard exists for must stand: mirror main ==
+        // origin/main == before — nothing new projected, nothing unpushed.
+        let base = scratch("349-nothing-to-land");
+        let checkout = git_repo(&base, "checkout");
+        let origin_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        git(&checkout, &["update-ref", "refs/remotes/origin/main", &origin_sha]);
+        let mirror = mirror_of(&base, &checkout);
+        assert!(!already_projected_unpushed(&checkout, &mirror, &origin_sha, Some(&"ab".repeat(32))));
+    }
+
+    #[test]
+    fn an_ahead_line_that_is_not_this_lands_does_not_unlock_the_land() {
+        // A sibling's unpushed projection makes the mirror ahead — but this
+        // land's tip is absent from main, so pushing would green-lie exactly
+        // the way #195 forbids.
+        let base = scratch("349-siblings-line");
+        let checkout = git_repo(&base, "checkout");
+        let origin_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        git(&checkout, &["update-ref", "refs/remotes/origin/main", &origin_sha]);
+        let mirror = mirror_of(&base, &checkout);
+        let main_sha = projected_commit(&mirror, &"cd".repeat(32));
+        assert!(!already_projected_unpushed(&checkout, &mirror, &main_sha, Some(&"ab".repeat(32))));
+    }
+
+    #[test]
+    fn no_origin_ref_keeps_the_conservative_refusal() {
+        // Unprovable = refuse: with no origin/main to compare against, "ahead"
+        // cannot be established and the old guard's verdict stands.
+        let base = scratch("349-no-origin");
+        let checkout = git_repo(&base, "checkout");
+        let mirror = mirror_of(&base, &checkout);
+        let tip = "ab".repeat(32);
+        let main_sha = projected_commit(&mirror, &tip);
+        assert!(!already_projected_unpushed(&checkout, &mirror, &main_sha, Some(&tip)));
+    }
+
+    #[test]
+    fn a_diverged_mirror_keeps_the_conservative_refusal() {
+        // origin/main advanced past the fork with a commit the mirror never
+        // ingested: the mirror is not strictly ahead, so nothing here is a
+        // clean fast-forward push — refuse as before.
+        let base = scratch("349-diverged");
+        let checkout = git_repo(&base, "checkout");
+        let mirror = mirror_of(&base, &checkout);
+        let origin_sha = commit(&checkout, "originside");
+        git(&checkout, &["update-ref", "refs/remotes/origin/main", &origin_sha]);
+        let tip = "ab".repeat(32);
+        let main_sha = projected_commit(&mirror, &tip);
+        assert!(!already_projected_unpushed(&checkout, &mirror, &main_sha, Some(&tip)));
+    }
+
+    #[test]
+    fn a_land_with_no_finalized_tip_keeps_the_conservative_refusal() {
+        let base = scratch("349-no-tip");
+        let checkout = git_repo(&base, "checkout");
+        let origin_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        git(&checkout, &["update-ref", "refs/remotes/origin/main", &origin_sha]);
+        let mirror = mirror_of(&base, &checkout);
+        let main_sha = projected_commit(&mirror, &"ab".repeat(32));
+        assert!(!already_projected_unpushed(&checkout, &mirror, &main_sha, None));
     }
 
     #[test]
