@@ -64,6 +64,13 @@ with precise SSH key names (`id_rsa`, `id_ed25519`, …) chosen over a broad
 default *or* a catch-all glob — a pattern made only of `*`/`/` (`* public`);
 any literal segment makes a rule an explicit naming, i.e. consent.
 
+*Amendment (#353).* The gate now lives inside the shared finalize seam
+(`Workspace::finalize_capturing_allowing`) rather than only in the verbs, so
+every capture-and-sign — `new`, the amend re-finalize after `edit` (ADR 0032),
+and `loot-first land` — runs it; the folding verbs' wip-signing steps
+(`fold_line_in`, ferry's reconcile) run it flagless, and `describe` keeps a
+pre-capture preflight.
+
 ### 2. `loot burn <path>` (the cure)
 
 Burn **destroys the object's bytes and records a signed tombstone** — the

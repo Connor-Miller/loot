@@ -556,6 +556,10 @@ pub fn land(
     }
 
     println!(">>> loot new  (finalize + sign)");
+    // The mis-seal gate rides the finalize seam itself (#353, ADR 0038 §1), so
+    // this signing runs gated with no override: a first-seal secret refuses the
+    // land; the remedy is a `.lootattributes` rule or an explicit
+    // `loot new --allow-reveal <path>` in the lane, then re-land.
     ws.finalize_capturing(&[], false)?;
     ws.record_op("new", "finalize (loot-first land)", false);
 

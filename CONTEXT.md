@@ -471,9 +471,14 @@ set (`.env*`, `*.pem`, `*.key`, `*credentials*`, `id_rsa`/`id_ed25519`, … — 
 `SECRET_NAMES` constant in `workspace.rs`) that resolves Public *via
 fallthrough* (the default or a catch-all glob, not an explicit rule naming it)
 and is being sealed for the **first time** (absent from the finalized anchor)
-refuses at the signing verbs `describe`/`new` with a typed `RepoError::MisSeal`,
-per-path overridable via the global **`--allow-reveal <path>`** (a sibling of
-`--allow-demote`, likewise refused on read-only `status`). Finalize also prints
+refuses with a typed `RepoError::MisSeal` at every signing seam (#353): inside
+the shared finalize path (`loot new`, the amend re-finalize after `loot edit`,
+`loot-first land`), at the wip-signing steps of the folding verbs
+(`adopt`/`lane merge`/ferry reconcile), and as `describe`'s pre-capture
+preflight; per-path overridable via the global **`--allow-reveal <path>`** (a
+sibling of `--allow-demote`, likewise refused on read-only `status`; the
+flagless folding verbs refuse outright — consent there is a `.lootattributes`
+rule or an explicit `loot new --allow-reveal` first). Finalize also prints
 a **first-seal summary** (each never-before-sealed path with its resolved
 visibility). An explicit rule is consent; falling through is not — the gate
 exists because a typo'd rule (`.evn restricted=alice`) sails a secret to the

@@ -746,6 +746,28 @@ impl Workspace {
         allow_demote: &[PathBuf],
         skip_snapshot: bool,
     ) -> Result<Option<Oid>, String> {
+        self.finalize_capturing_allowing(allow_demote, &[], skip_snapshot).map(|(id, _)| id)
+    }
+
+    /// [`finalize_capturing`](Self::finalize_capturing) with the mis-seal
+    /// override threaded through (#353): the full finalize seam. Every
+    /// capture-and-sign — `loot new`, the amend re-finalize after `loot edit`,
+    /// and `loot-first land` — funnels through here, so the mis-seal gate
+    /// (#63, ADR 0038 §1) runs at the seam itself and no verb can miss it.
+    /// Returns the finalized version id (as `finalize_capturing`) plus the
+    /// gate's first-seal summary, computed at the moment of signing.
+    pub fn finalize_capturing_allowing(
+        &mut self,
+        allow_demote: &[PathBuf],
+        allow_reveal: &[PathBuf],
+        skip_snapshot: bool,
+    ) -> Result<(Option<Oid>, Vec<(PathBuf, Visibility)>), String> {
+        // The mis-seal gate (#63/#353, ADR 0038 §1) at the signing seam: refuse
+        // a first-time public-by-fallthrough seal of a secret-shaped path
+        // before anything is captured or signed. Running it here (not only in
+        // the verbs) is what closes the amend re-finalize and `loot-first
+        // land`, which reach this seam without passing through `cmd_new`.
+        let first_seals = self.seal_gate(allow_reveal)?;
         if !skip_snapshot {
             let msg = self.working_message().unwrap_or_else(|| UNDESCRIBED_MESSAGE.to_string());
             let (id, _) = self.snapshot_allowing(&msg, allow_demote)?;
@@ -758,13 +780,16 @@ impl Workspace {
         self.refuse_if_undescribed(REFUSE_UNDESCRIBED)?;
         let finalized = self.working.clone();
         self.finalize_working()?;
-        Ok(finalized)
+        Ok((finalized, first_seals))
     }
 
-    /// The **mis-seal gate** (#63, ADR 0038 §1) — run by the signing verbs
-    /// (`describe`, `new`) before they capture. Two guarantees in one pass over
-    /// the working tree, both content-agnostic (name + resolution provenance
-    /// only, never plaintext):
+    /// The **mis-seal gate** (#63, ADR 0038 §1) — run at every signing seam:
+    /// inside [`finalize_capturing_allowing`](Self::finalize_capturing_allowing)
+    /// (`loot new`, the amend re-finalize after `loot edit`, `loot-first
+    /// land`), at `fold_line_in`'s and `reconcile_onto`'s wip-signing steps
+    /// (#353), and as `describe`'s pre-capture preflight. Two guarantees in one
+    /// pass over the working tree, both content-agnostic (name + resolution
+    /// provenance only, never plaintext):
     ///
     /// - **Refusal.** A path whose basename is [secret-shaped](SECRET_NAMES),
     ///   that resolves Public *by fallthrough* (the default or a catch-all, not
@@ -2623,6 +2648,13 @@ impl Workspace {
         // never nagged about), exactly as `finalize_capturing` and the bridge's
         // `reconcile_capture` do.
         if self.working.is_some() {
+            // Mis-seal gate (#353, ADR 0038 §1): this capture-and-sign is a
+            // signing seam too — a secret that reached the disk after the WIP
+            // was described (describe's own gate ran on the pre-secret tree)
+            // would otherwise be sealed public ungated. No override rides the
+            // folding verbs; the remedy is a `.lootattributes` rule or an
+            // explicit `loot new --allow-reveal` first.
+            self.seal_gate(&[])?;
             let m = self.working_message_or_placeholder();
             let (id, _) = self.snapshot(&m)?;
             let anchor = self.anchor();
@@ -3259,6 +3291,13 @@ impl Workspace {
                 // history") — a pinned tip merged instead is already finalized,
                 // nothing left to sign.
                 if wip.is_some() {
+                    // Mis-seal gate (#353, ADR 0038 §1): the wip about to be
+                    // signed was captured from the disk this pass — same seam
+                    // as `fold_line_in`'s capture-and-sign, same gate. The
+                    // disk still shows the captured tree here (materialize
+                    // runs after the merge), so the disk-reading gate vets
+                    // exactly what is being sealed.
+                    self.seal_gate(&[])?;
                     self.finalize_working()?;
                 }
                 self.reconcile_merge(&ours, target, label)
@@ -5836,6 +5875,139 @@ mod tests {
                 && matches!(v, Visibility::Restricted(ids) if ids == &["connor"])),
             "the .env first-seal is restricted, not public: {seals:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_covers_the_amend_refinalize() {
+        // #353: ADR 0038 §1 says the gate fires at every signing verb. An amend
+        // (`loot edit` → re-finalize) signs a tree too — a secret-shaped path
+        // whose FIRST seal arrives through the amend must refuse at the
+        // finalize seam itself, not only via `cmd_new`'s courtesy preflight.
+        let dir = std::env::temp_dir().join(format!("loot-gate-amend-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("app.rs"), b"fn main() {}").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let x = ws.repo().heads()[0].clone();
+        let cid = ws.repo().change_change_id(&x).unwrap();
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        // The amend introduces the secret, public by fallthrough (no rule).
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        // The re-finalize must run the gate: refuse, and sign nothing.
+        let err = ws.finalize_capturing(&[], false).unwrap_err();
+        assert!(err.contains("refusing to seal"), "{err}");
+        assert!(err.contains(".env"), "names the offending path: {err}");
+        let reopened = ws.working_id().cloned();
+        assert!(reopened.is_some(), "the reopen is still in progress — nothing was signed");
+        let live = ws.liveness().live_of(&cid);
+        assert_eq!(live.len(), 1, "no divergence was minted");
+        let live_v = live.into_iter().next().unwrap();
+        assert_eq!(Some(live_v.clone()), reopened, "the live version is still the unsigned reopen");
+        assert!(ws.repo().change_signature(&live_v).is_none(), "…and it is unsigned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_amend_refinalize_allow_reveal_overrides() {
+        // #353: the override has the same semantics at the finalize seam as at
+        // `describe`/`new` — the deliberate seal goes through, signed, and the
+        // first-seal summary names it.
+        let dir = std::env::temp_dir().join(format!("loot-gate-amendok-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("app.rs"), b"fn main() {}").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let x = ws.repo().heads()[0].clone();
+        let cid = ws.repo().change_change_id(&x).unwrap();
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        let (finalized, seals) = ws
+            .finalize_capturing_allowing(&[], &[PathBuf::from(".env")], false)
+            .expect("the override waves the amend's secret through");
+        let x2 = finalized.expect("the amend finalized a new version");
+        assert_ne!(x2, x, "a fresh version id");
+        assert_eq!(ws.repo().change_change_id(&x2), Some(cid), "under the same handle");
+        assert!(ws.repo().change_signature(&x2).is_some(), "signed");
+        assert!(
+            ws.repo().change_tree(&x2).unwrap().keys().any(|p| p.ends_with(".env")),
+            "the amended tree carries the revealed path"
+        );
+        assert!(
+            seals.iter().any(|(p, v)| p.ends_with(".env") && matches!(v, Visibility::Public)),
+            "the first-seal summary names the deliberate reveal: {seals:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_amend_refinalize_explicit_rule_is_consent() {
+        // #353: an explicit `.lootattributes` rule naming the path is consent —
+        // the amend's re-finalize does not refuse, exactly as at `new`.
+        let dir = std::env::temp_dir().join(format!("loot-gate-amendrule-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("app.rs"), b"fn main() {}").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let cid = ws.repo().change_change_id(&ws.repo().heads()[0]).unwrap();
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        std::fs::write(dir.join(".lootattributes"), ".env public\n").unwrap();
+        let finalized = ws
+            .finalize_capturing(&[], false)
+            .expect("an explicit rule is consent — no refusal at the re-finalize");
+        assert!(finalized.is_some(), "the amend finalized");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mis_seal_gate_covers_fold_line_ins_wip_finalize() {
+        // #353 audit: `fold_line_in` (lane merge / adopt catch-up) captures and
+        // signs in-progress WIP as the merge parent. A secret that reached the
+        // disk after the WIP was described would be signed ungated — the gate
+        // must run at this finalize too.
+        use loot_core::Change;
+        let dir = std::env::temp_dir().join(format!("loot-gate-fold-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let base = ws.repo().heads()[0].clone();
+        let base_tree = ws.repo().change_tree(&base).unwrap();
+        // Pin the position at base so the wip below forks from base (a pristine
+        // home would fork from all heads, folding `their` in before the merge).
+        ws.pin_tip_at_anchor();
+        // Described WIP whose disk tree grew a fallthrough-public secret.
+        std::fs::write(dir.join("wip.txt"), b"wip").unwrap();
+        ws.snapshot("described wip").unwrap();
+        // A finalized sibling line to fold in (a reword-style sibling suffices).
+        let their = ws
+            .with_repo(|repo| {
+                repo.record_carrying(
+                    Change {
+                        id: Oid([0; 32]),
+                        parents: vec![base.clone()],
+                        message: "their line".into(),
+                        tree: base_tree.clone(),
+                    },
+                    Some([7u8; 16]),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
+        let err = ws.fold_line_in(&their, "fold").unwrap_err();
+        assert!(err.contains("refusing to seal"), "{err}");
+        assert!(err.contains(".env"), "names the offending path: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

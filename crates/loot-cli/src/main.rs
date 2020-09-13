@@ -555,11 +555,12 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
     let allow_reveal: Vec<std::path::PathBuf> =
         flag_values(args, "--allow-reveal").into_iter().map(Into::into).collect();
     let mut ws = Workspace::open()?;
-    // The mis-seal gate (#63, ADR 0038 §1): vet the tree before this finalize
-    // signs it. Refuses a first-time public-by-fallthrough seal of a secret-
-    // shaped path; the first-seal list it returns (relative to the current
-    // anchor) is exactly what this change is about to seal for the first time.
-    let first_seals = ws.seal_gate(&allow_reveal)?;
+    // The mis-seal gate (#63, ADR 0038 §1): vet the tree before anything is
+    // captured — an early refusal keeps the `-m` snapshot below from naming a
+    // tree the finalize would refuse anyway. The gate runs again inside the
+    // finalize seam itself (#353), which is what guards the callers that don't
+    // pass through this verb (the amend re-finalize, `loot-first land`).
+    ws.seal_gate(&allow_reveal)?;
     // Convenience `new -m <msg>`: name the working change before finalizing, so
     // finalize-and-name is one step (ADR 0030). It is a mutating snapshot, so it
     // honors the demotion guard via `--allow-demote`.
@@ -568,7 +569,10 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
     }
     // Capture edits made since the last command before finalizing (ADR 0030),
     // so `edit; loot new` cannot lose work — no manual `loot status` needed.
-    let finalized = ws.finalize_capturing(&opts.allow_demote, opts.skip)?;
+    // The first-seal list (relative to the current anchor) is exactly what
+    // this change sealed for the first time, computed at the signing moment.
+    let (finalized, first_seals) =
+        ws.finalize_capturing_allowing(&opts.allow_demote, &allow_reveal, opts.skip)?;
     // `new` is the finalize/sign boundary and eagerly mints the *next* change's
     // durable handle (ADR 0029/0030), so the fresh change has a name from birth.
     let next = ws
