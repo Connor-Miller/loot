@@ -8,7 +8,7 @@
 use crate::converge::Tree;
 use crate::{Change, Oid, Visibility};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A node in the change DAG.
 #[derive(Clone)]
@@ -279,6 +279,21 @@ impl ChangeGraph {
         tree
     }
 
+    /// The most recently recorded `(oid, visibility)` for `path`, searching
+    /// the live tree first and then **every** change in history if `path`
+    /// isn't there — so a path this graph's current heads no longer carry
+    /// (deleted on that line) or don't carry *yet* (landed on a head this
+    /// position hasn't surfaced) is still explainable rather than a bare
+    /// "not found" (`loot embargo-status`, #15). Unlike `current_tree`, this
+    /// walks the whole graph, not just the heads' own manifests; topo-newest
+    /// match wins. `None` if `path` never appears in any recorded change.
+    pub fn path_in_history(&self, path: &Path) -> Option<(Oid, Visibility)> {
+        if let Some(entry) = self.current_tree().get(path) {
+            return Some(entry.clone());
+        }
+        self.in_order().into_iter().rev().find_map(|n| n.tree.get(path).cloned())
+    }
+
     /// The tree at one change: its recorded manifest, exactly. Unlike
     /// [`current_tree`], which merges every head, this scopes to one line — the
     /// basis for per-dock isolation, where each dock forks from its own tip
@@ -493,5 +508,67 @@ mod tests {
         // The single-head current tree agrees with the head's manifest.
         let ct = g.current_tree();
         assert!(!ct.contains_key(&PathBuf::from("b")));
+    }
+
+    /// Like `manifest_node`, but lets a caller pin a path's [`Visibility`]
+    /// (the others stay `Public`) — needed to test `path_in_history` against
+    /// an embargoed entry the current heads no longer carry (#15).
+    fn manifest_node_vis(id: u8, parents: &[u8], entries: &[(&str, u8, Visibility)]) -> ChangeNode {
+        let tree = entries
+            .iter()
+            .map(|(path, addr, vis)| (PathBuf::from(*path), (Oid([*addr; 32]), vis.clone())))
+            .collect();
+        ChangeNode {
+            id: Oid([id; 32]),
+            parents: parents.iter().map(|&p| Oid([p; 32])).collect(),
+            message: format!("c{id}"),
+            tree,
+            author: None,
+            signature: None,
+            change_id: None,
+            predecessors: Vec::new(),
+        }
+    }
+
+    /// #15: a path still in the current tree resolves straight from it —
+    /// `path_in_history` must not fall back to a stale historical entry when
+    /// a live one exists.
+    #[test]
+    fn path_in_history_prefers_the_current_tree() {
+        let mut g = ChangeGraph::new();
+        g.insert(manifest_node(1, &[], &[("a", 10)]));
+        g.insert(manifest_node(2, &[1], &[("a", 11)]));
+        let (oid, vis) = g.path_in_history(&PathBuf::from("a")).expect("path is live");
+        assert_eq!(oid, Oid([11; 32]));
+        assert_eq!(vis, Visibility::Public);
+    }
+
+    /// #15's core AC: a path deleted off the live line is still found by
+    /// walking history — "works for paths not in the working tree".
+    #[test]
+    fn path_in_history_falls_back_to_a_deleted_path() {
+        let mut g = ChangeGraph::new();
+        g.insert(manifest_node_vis(
+            1,
+            &[],
+            &[("secret.md", 10, Visibility::Embargoed { reveal_at: 500 })],
+        ));
+        g.insert(manifest_node(2, &[1], &[])); // deletes secret.md on the live line
+        assert!(
+            g.current_tree().get(&PathBuf::from("secret.md")).is_none(),
+            "precondition: the path is gone from the live tree"
+        );
+        let (oid, vis) = g
+            .path_in_history(&PathBuf::from("secret.md"))
+            .expect("still explainable via history");
+        assert_eq!(oid, Oid([10; 32]));
+        assert_eq!(vis, Visibility::Embargoed { reveal_at: 500 });
+    }
+
+    #[test]
+    fn path_in_history_is_none_for_a_path_that_never_existed() {
+        let mut g = ChangeGraph::new();
+        g.insert(manifest_node(1, &[], &[("a", 10)]));
+        assert!(g.path_in_history(&PathBuf::from("never.md")).is_none());
     }
 }

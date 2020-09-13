@@ -1857,9 +1857,14 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     // snapshot uses). Unrecognized paths default to Public.
     let vis = ws.visibility_for(&path.to_string_lossy());
 
-    let new_oid = ws.resolve_conflict(path, &bytes, vis)?;
+    let (new_oid, message) = ws.resolve_conflict(path, &bytes, vis)?;
 
     println!("resolved {} (new oid: {})", path.display(), short(&new_oid));
+    // The minted subject (#337): the ours-line subject suffixed with
+    // "(conflict resolution: <path>)", or the bare placeholder when none was
+    // derivable — showing it here is what tells the operator whether a
+    // `loot describe` rescue is still needed before landing (#316).
+    println!("recorded as \"{message}\"");
     ws.record_op("resolve", &format!("resolve {}", path.display()), false);
 
     // The resolution is signed on the spot; on a dock it also advanced the tip.

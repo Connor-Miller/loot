@@ -407,6 +407,35 @@ pub fn render_grant_status(
     out
 }
 
+/// The `loot embargo-status <path>` report (#15): one of three states, read
+/// straight off `path`'s recorded [`Visibility`] against the clock — the same
+/// time gate `sealed::open` enforces (embargo is a property of time, checked
+/// before key custody, even for a keyholder). Pure render — `vis`/`now` are
+/// caller-resolved (`Workspace::path_history_entry`, `Workspace::now`), same
+/// no-`Workspace`-in-the-test-surface shape as `render_grant_status`:
+///
+/// - `Embargoed { reveal_at }` with `now < reveal_at` — **embargoed until**
+///   `reveal_at`, key withheld (ADR 0007: `open` refuses everyone, even the
+///   keyholder, until then).
+/// - `Embargoed { reveal_at }` with `now >= reveal_at` — **revealed**, the
+///   embargo has lapsed.
+/// - anything else (`Public`/`Restricted`) — **not embargoed**, plain
+///   visibility rules apply.
+pub fn render_embargo_status(path: &Path, vis: &Visibility, now: u64) -> String {
+    match vis {
+        Visibility::Embargoed { reveal_at } if now < *reveal_at => {
+            format!(
+                "{}: embargoed until {} ({})\n",
+                path.display(),
+                reveal_at,
+                civil_datetime(*reveal_at)
+            )
+        }
+        Visibility::Embargoed { .. } => format!("{}: revealed\n", path.display()),
+        _ => format!("{}: not embargoed\n", path.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +756,43 @@ mod tests {
         assert!(out.contains("relay"), "{out}");
         assert!(out.contains("cc…"), "unresolved grantor falls back to its pubkey: {out}");
         assert!(!out.contains("(file)"), "a relay grant is never labelled file-based: {out}");
+    }
+
+    // --- `loot embargo-status <path>` (#15) ---
+
+    #[test]
+    fn embargo_status_reports_embargoed_until_before_reveal() {
+        let vis = Visibility::Embargoed { reveal_at: 1_799_971_200 };
+        let out = render_embargo_status(&PathBuf::from("plans.md"), &vis, 1_799_971_199);
+        assert_eq!(out, "plans.md: embargoed until 1799971200 (2027-01-15 00:00:00 UTC)\n");
+    }
+
+    #[test]
+    fn embargo_status_reports_embargoed_at_the_exact_reveal_instant() {
+        // `now == reveal_at` is the boundary `sealed::open` treats as revealed
+        // (its gate is `now < reveal_at`, not `<=`) — pin the same edge here.
+        let vis = Visibility::Embargoed { reveal_at: 1_799_971_200 };
+        let out = render_embargo_status(&PathBuf::from("plans.md"), &vis, 1_799_971_200);
+        assert_eq!(out, "plans.md: revealed\n");
+    }
+
+    #[test]
+    fn embargo_status_reports_revealed_once_reveal_at_has_passed() {
+        let vis = Visibility::Embargoed { reveal_at: 100 };
+        let out = render_embargo_status(&PathBuf::from("plans.md"), &vis, 101);
+        assert_eq!(out, "plans.md: revealed\n");
+    }
+
+    #[test]
+    fn embargo_status_reports_not_embargoed_for_public() {
+        let out = render_embargo_status(&PathBuf::from("readme.md"), &Visibility::Public, 0);
+        assert_eq!(out, "readme.md: not embargoed\n");
+    }
+
+    #[test]
+    fn embargo_status_reports_not_embargoed_for_restricted() {
+        let vis = Visibility::Restricted(vec!["alice".into()]);
+        let out = render_embargo_status(&PathBuf::from("secret.env"), &vis, 0);
+        assert_eq!(out, "secret.env: not embargoed\n");
     }
 }
