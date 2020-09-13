@@ -336,7 +336,11 @@ attest <change> [role]`.
 - *Public* — readable by anyone who can read the repo.
 - *Restricted* — readable only by named identities (key holders).
 - *Embargoed* — encrypted to all; key withheld until a reveal time. Models
-  embargoed security fixes and delayed-reveal merges.
+  embargoed security fixes and delayed-reveal merges. `loot embargo-status
+  <path>` (#15) reports a path's state — embargoed until its reveal time,
+  revealed, or not embargoed at all — by reading its recorded visibility
+  against the clock; useful when troubleshooting why a file isn't visible
+  after a pull.
 
 **Identity** — a keyholder. Visibility is ultimately enforced by who holds the
 decryption key for a unit of content. "Permissioning is key management."
