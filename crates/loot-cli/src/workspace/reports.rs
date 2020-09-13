@@ -146,12 +146,15 @@ pub struct ConflictSide {
     pub content: Option<Vec<u8>>,
 }
 
-/// A conflict at one path, both sides packaged for rendering (#13). `ours` is
+/// A conflict at one path, its sides packaged for rendering (#13). `ours` is
 /// the side kept on disk after the conflicted merge; `theirs` the incoming side
-/// preserved in the recorded conflict.
+/// preserved in the recorded conflict. `base` is the common-ancestor side when
+/// one was recorded (#400) — `None` for a merge with no common base — shown
+/// ahead of ours/theirs so a 3-way view has its third side.
 #[derive(Debug)]
 pub struct ConflictView {
     pub path: PathBuf,
+    pub base: Option<ConflictSide>,
     pub ours: ConflictSide,
     pub theirs: ConflictSide,
 }

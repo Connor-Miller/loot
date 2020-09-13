@@ -27,6 +27,7 @@ pub mod grep;
 pub mod history;
 mod kv;
 pub mod ledger;
+pub mod mergetool;
 pub mod pick;
 mod policy;
 mod position;

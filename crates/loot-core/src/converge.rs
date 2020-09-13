@@ -231,8 +231,11 @@ fn line_set_merge(ours: &Oid, theirs: &Oid, a: &[u8], b: &[u8]) -> MergeDecision
 pub struct Merge {
     /// The tree the merge change carries.
     pub tree: Tree,
-    /// Paths needing human resolution: `path -> (ours, theirs)` addresses.
-    pub conflicts: BTreeMap<PathBuf, (Oid, Oid)>,
+    /// Paths needing human resolution: `path -> (base, ours, theirs)` addresses.
+    /// `base` is the common ancestor's content (`None` when the merge had no
+    /// common base, or the path is a since-fork add) — the third side a 3-way
+    /// merge tool needs (#400).
+    pub conflicts: BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)>,
     /// Per-path outcome, for reporting (same labels as [`classify`]).
     pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
 }
@@ -245,7 +248,7 @@ pub fn merge_trees(
     now: u64,
 ) -> Merge {
     let mut tree = ours.clone();
-    let mut conflicts: BTreeMap<PathBuf, (Oid, Oid)> = BTreeMap::new();
+    let mut conflicts: BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)> = BTreeMap::new();
     let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
     for (path, their_entry) in theirs {
         // `tree` starts as ours, so "keep ours" cases need no write — only the
@@ -270,8 +273,11 @@ pub fn merge_trees(
             }
             MergeDecision::Conflict { ours: o, theirs: t } => {
                 // Keep ours in the tree (a deletion stays deleted); theirs
-                // survives via the merge's 2nd parent, for `loot resolve`.
-                conflicts.insert(path.clone(), (o.clone(), t.clone()));
+                // survives via the merge's 2nd parent, for `loot resolve`. The
+                // common-ancestor `base_oid` (in scope for this path) rides along
+                // so a 3-way merge tool has its third side (#400); it is `None`
+                // when there is no base or the path is a since-fork add.
+                conflicts.insert(path.clone(), (base_oid.cloned(), o.clone(), t.clone()));
             }
         }
         outcomes.insert(path.clone(), decision.outcome());
@@ -301,7 +307,13 @@ pub fn merge_trees(
                 // in for the deleted side. Keep ours' edit in the tree; theirs'
                 // deletion is the merge's 2nd parent.
                 Some(false) => {
-                    conflicts.insert(path.clone(), (our_oid.clone(), base_oid.clone()));
+                    // Delete/edit: theirs deleted, so the base content stands in
+                    // for the deleted side — and it is also the common ancestor,
+                    // so `base` is `Some(base_oid)` (#400).
+                    conflicts.insert(
+                        path.clone(),
+                        (Some(base_oid.clone()), our_oid.clone(), base_oid.clone()),
+                    );
                     outcomes.insert(
                         path.clone(),
                         MergeOutcome::Conflict { ours: our_oid.clone(), theirs: base_oid.clone() },
@@ -542,7 +554,8 @@ mod tests {
         let m = merge_trees(&ours, &theirs, None, &FakeOracle(plain), 0);
         // Ours stays in the tree; theirs is recorded for resolution, not dropped.
         assert_eq!(m.tree[&p("a.txt")].0, oid(1));
-        assert_eq!(m.conflicts[&p("a.txt")], (oid(1), oid(2)));
+        // No base was supplied to this merge, so `base = None` (#400).
+        assert_eq!(m.conflicts[&p("a.txt")], (None, oid(1), oid(2)));
         assert_eq!(
             m.outcomes[&p("a.txt")],
             MergeOutcome::Conflict { ours: oid(1), theirs: oid(2) }
@@ -627,7 +640,11 @@ mod tests {
         plain.insert(oid(3), b"edited\n".to_vec());
         let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(plain), 0);
         assert!(!m.tree.contains_key(&p("del.txt")), "ours' deletion kept in the tree; theirs via 2nd parent");
-        assert_eq!(m.conflicts[&p("del.txt")], (oid(2), oid(3)), "base stands in for the deleted side");
+        assert_eq!(
+            m.conflicts[&p("del.txt")],
+            (Some(oid(2)), oid(2), oid(3)),
+            "base = the common ancestor; it also stands in for the deleted ours side"
+        );
         assert_eq!(
             m.outcomes[&p("del.txt")],
             MergeOutcome::Conflict { ours: oid(2), theirs: oid(3) }
@@ -646,7 +663,11 @@ mod tests {
         plain.insert(oid(4), b"edited\n".to_vec());
         let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(plain), 0);
         assert_eq!(m.tree[&p("del.txt")].0, oid(4), "our edit kept in the tree");
-        assert_eq!(m.conflicts[&p("del.txt")], (oid(4), oid(2)), "base stands in for the deleted side");
+        assert_eq!(
+            m.conflicts[&p("del.txt")],
+            (Some(oid(2)), oid(4), oid(2)),
+            "base = the common ancestor; it also stands in for the deleted theirs side"
+        );
         assert_eq!(
             m.outcomes[&p("del.txt")],
             MergeOutcome::Conflict { ours: oid(4), theirs: oid(2) }

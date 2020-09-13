@@ -189,9 +189,11 @@ pub struct DagRepo {
     objects: ObjectStore,
     graph: ChangeGraph,
     /// Paths with unresolved conflicts from the last `apply`, keyed by path,
-    /// value is (our oid, their oid). Populated from `MergeOutcome::Conflict`
-    /// during `apply`; cleared entry-by-entry as `resolve` is called (ADR 0001).
-    conflicts: BTreeMap<PathBuf, (Oid, Oid)>,
+    /// value is (base, ours, theirs) — `base` is the common-ancestor oid a 3-way
+    /// merge tool needs (`None` when there is no base, #400). Populated from
+    /// `MergeOutcome::Conflict` during `apply`; cleared entry-by-entry as
+    /// `resolve` is called (ADR 0001).
+    conflicts: BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)>,
     /// Detachable, advisory attestations over changes (S4, ADR 0018). Travels in
     /// bundles; verified-and-dropped on ingest; never affects a change id.
     attestations: AttestationLog,
@@ -361,8 +363,9 @@ impl DagRepo {
         None
     }
     /// All unresolved conflicts from the last `apply`, keyed by path.
-    /// Each value is `(our_oid, their_oid)`.
-    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
+    /// Each value is `(base, our_oid, their_oid)` — `base` is the common
+    /// ancestor's oid for a 3-way merge tool, `None` when none was recorded.
+    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)> {
         &self.conflicts
     }
 
@@ -372,9 +375,9 @@ impl DagRepo {
     /// fold into an ancestor was also touched by an intervening change: the
     /// fold cannot skip past that edit unambiguously, so it records the clash
     /// and stops, minting nothing (like `apply`).
-    pub fn record_conflicts(&mut self, conflicts: BTreeMap<PathBuf, (Oid, Oid)>) {
-        for (path, pair) in conflicts {
-            self.conflicts.insert(path, pair);
+    pub fn record_conflicts(&mut self, conflicts: BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)>) {
+        for (path, entry) in conflicts {
+            self.conflicts.insert(path, entry);
         }
     }
 
@@ -568,6 +571,11 @@ impl DagRepo {
         // base, those classified as conflicts whenever our line had moved on.
         let batch: BTreeMap<&Oid, &ChangeNode> = changes.iter().map(|n| (&n.id, n)).collect();
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
+        // The common-ancestor oid for each path that classifies as a conflict,
+        // captured from the incoming change's own base tree at classify time —
+        // the third side a 3-way merge tool needs (#400). Keyed to the first
+        // node that conflicts a path; `None` when that node's base lacks it.
+        let mut conflict_bases: BTreeMap<PathBuf, Option<Oid>> = BTreeMap::new();
         // One Liveness view for the whole batch (#216) — built before any
         // insert, so it reflects exactly what we held when the bundle arrived.
         // The caller's abandoned set rides in: an incoming co-version of a
@@ -598,15 +606,24 @@ impl DagRepo {
             let per_change =
                 converge::classify(&local_before, &node.tree, base_tree.as_ref(), self, now);
             for (path, outcome) in per_change {
+                if matches!(outcome, MergeOutcome::Conflict { .. }) {
+                    // Record this path's common-ancestor oid from the node's own
+                    // base tree — the first conflicting node wins (#400).
+                    let base_oid =
+                        base_tree.as_ref().and_then(|t| t.get(&path)).map(|(o, _)| o.clone());
+                    conflict_bases.entry(path.clone()).or_insert(base_oid);
+                }
                 let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
                 *slot = converge::worst(slot.clone(), outcome);
             }
         }
 
-        // Populate the conflict map from Conflict outcomes.
+        // Populate the conflict map from Conflict outcomes, carrying the base
+        // captured above so a 3-way merge tool has its third side (#400).
         for (path, outcome) in &outcomes {
             if let MergeOutcome::Conflict { ref ours, ref theirs } = outcome {
-                self.conflicts.insert(path.clone(), (ours.clone(), theirs.clone()));
+                let base = conflict_bases.get(path).cloned().flatten();
+                self.conflicts.insert(path.clone(), (base, ours.clone(), theirs.clone()));
             }
         }
 
@@ -754,7 +771,10 @@ impl DagRepo {
         // Unresolved conflict sides are already graph-covered (both changes are
         // recorded, append-only), but keep them explicitly live so gc stays
         // correct if that invariant ever loosens.
-        for (ours, theirs) in self.conflicts.values() {
+        for (base, ours, theirs) in self.conflicts.values() {
+            if let Some(base) = base {
+                live.insert(base.clone());
+            }
             live.insert(ours.clone());
             live.insert(theirs.clone());
         }
@@ -1655,8 +1675,8 @@ impl DagRepo {
         let merged = converge::merge_trees(&our_tree, &their_tree, base_tree.as_ref(), self, now);
         // Record conflicts so `loot conflicts`/`loot resolve` see them, exactly
         // as the apply path does.
-        for (path, (o, t)) in &merged.conflicts {
-            self.conflicts.insert(path.clone(), (o.clone(), t.clone()));
+        for (path, (b, o, t)) in &merged.conflicts {
+            self.conflicts.insert(path.clone(), (b.clone(), o.clone(), t.clone()));
         }
         let change = Change {
             id: Oid([0; 32]),
@@ -1891,7 +1911,7 @@ impl DagRepo {
         let mut pendings: Vec<Pending> = Vec::new();
         let mut carried_tree = self.graph.tree_at(onto);
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
-        let mut open_conflicts: BTreeMap<PathBuf, (Oid, Oid)> = BTreeMap::new();
+        let mut open_conflicts: BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)> = BTreeMap::new();
 
         for id in &chain {
             let node = self.graph.get(id).expect("chain nodes are loaded").clone();
@@ -2646,30 +2666,55 @@ fn decode_attestations(b: &[u8]) -> Result<AttestationLog, RepoError> {
 // `custody.rs` (#323) — they codec the two fields [`custody::Custody`] owns
 // alongside the keyring/escrow.
 
-fn encode_conflicts(conflicts: &BTreeMap<PathBuf, (Oid, Oid)>) -> Vec<u8> {
+/// The format major at which each conflicts entry grew a leading `base`
+/// presence byte + optional 32-byte base oid ahead of the ours/theirs pair
+/// (#400). A file written at an earlier major carries the pre-base 2-tuple
+/// layout and migrates as `base = None`.
+const CONFLICTS_BASE_MAJOR: u8 = 9;
+
+fn encode_conflicts(conflicts: &BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)>) -> Vec<u8> {
     use crate::bundle_codec::{put_bytes, put_u32};
     let mut out = Vec::new();
     crate::format::put_version(&mut out);
     put_u32(&mut out, conflicts.len());
-    for (path, (ours, theirs)) in conflicts {
+    for (path, (base, ours, theirs)) in conflicts {
         put_bytes(&mut out, path.to_string_lossy().as_bytes());
+        // base: one presence byte, then the 32-byte oid only when present (v9+).
+        match base {
+            Some(base) => {
+                out.push(1);
+                out.extend_from_slice(&base.0);
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&ours.0);
         out.extend_from_slice(&theirs.0);
     }
     out
 }
 
-fn decode_conflicts(b: &[u8]) -> Result<BTreeMap<PathBuf, (Oid, Oid)>, RepoError> {
+fn decode_conflicts(b: &[u8]) -> Result<BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)>, RepoError> {
     use crate::format::Cursor;
     let mut c = Cursor { b, i: 0 };
-    crate::format::read_version(&mut c)?;
+    let (major, _minor) = crate::format::read_version(&mut c)?;
     let n = c.u32()?;
     let mut conflicts = BTreeMap::new();
     for _ in 0..n {
         let path = PathBuf::from(c.string()?);
+        // A v≤8 file predates the base field: it holds only the ours/theirs
+        // pair, so it migrates as `base = None` (#400).
+        let base = if major >= CONFLICTS_BASE_MAJOR {
+            if c.take(1)?[0] == 1 {
+                Some(Oid(c.arr32()?))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let ours = Oid(c.arr32()?);
         let theirs = Oid(c.arr32()?);
-        conflicts.insert(path, (ours, theirs));
+        conflicts.insert(path, (base, ours, theirs));
     }
     Ok(conflicts)
 }
@@ -5181,7 +5226,9 @@ mod tests {
     #[test]
     fn v1_conflicts_still_decodes() {
         let back = decode_conflicts(&GOLDEN_CONFLICTS_V1).unwrap();
-        let (ours, theirs) = &back[Path::new("f.txt")];
+        let (base, ours, theirs) = &back[Path::new("f.txt")];
+        // A pre-v9 (2-tuple) entry migrates with no base recorded (#400).
+        assert!(base.is_none(), "a v≤8 conflict entry migrates as base = None");
         assert_eq!(*ours, Oid([7; 32]));
         assert_eq!(*theirs, Oid([8; 32]));
     }
@@ -5196,14 +5243,54 @@ mod tests {
         assert!(decode_conflicts(&GOLDEN_CONFLICTS_V3).unwrap().contains_key(Path::new("f.txt")));
     }
 
+    // v9 golden (FORMAT_MAJOR = 9, #400). Each entry grew a leading base
+    // presence byte + optional 32-byte base ahead of the ours/theirs pair.
+    // One entry — path="f.txt", base=[6;32], ours=[7;32], theirs=[8;32].
+    // Layout: [major=9][minor=0][count=1 u32le][put_bytes("f.txt")=9][base=1][base 32][ours 32][theirs 32]
+    const GOLDEN_CONFLICTS_V9: [u8; 112] = [
+        9, 0, 1, 0, 0, 0,
+        5, 0, 0, 0, 102, 46, 116, 120, 116, // put_bytes("f.txt")
+        1, // base present
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, // base=[6;32]
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // ours=[7;32]
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // theirs=[8;32]
+    ];
+
     #[test]
-    fn golden_v4_conflicts_matches_and_round_trips() {
+    fn golden_v9_conflicts_matches_and_round_trips() {
+        // Encode-direction golden: the v9 layout (with base) must not drift.
         let mut conflicts = BTreeMap::new();
-        conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
-        let mut golden_v5 = GOLDEN_CONFLICTS_V4.to_vec();
-        golden_v5[0] = crate::format::FORMAT_MAJOR;
-        assert_eq!(encode_conflicts(&conflicts), golden_v5, "v5 conflicts layout must not drift");
-        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V4).unwrap().contains_key(Path::new("f.txt")));
+        conflicts.insert(PathBuf::from("f.txt"), (Some(Oid([6; 32])), Oid([7; 32]), Oid([8; 32])));
+        let mut golden = GOLDEN_CONFLICTS_V9.to_vec();
+        golden[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_conflicts(&conflicts), golden, "v9 conflicts layout must not drift");
+        // Round-trips base/ours/theirs intact (#400).
+        let back = decode_conflicts(&GOLDEN_CONFLICTS_V9).unwrap();
+        let (base, ours, theirs) = &back[Path::new("f.txt")];
+        assert_eq!(*base, Some(Oid([6; 32])), "base survives the round trip");
+        assert_eq!(*ours, Oid([7; 32]));
+        assert_eq!(*theirs, Oid([8; 32]));
+    }
+
+    #[test]
+    fn v9_conflicts_with_no_base_round_trips_as_none() {
+        // A merge with no common ancestor records `base = None`; it survives as
+        // a single presence byte with no oid (#400).
+        let mut conflicts = BTreeMap::new();
+        conflicts.insert(PathBuf::from("f.txt"), (None, Oid([7; 32]), Oid([8; 32])));
+        let back = decode_conflicts(&encode_conflicts(&conflicts)).unwrap();
+        assert_eq!(back[Path::new("f.txt")], (None, Oid([7; 32]), Oid([8; 32])));
+    }
+
+    #[test]
+    fn old_format_conflicts_migrate_with_no_base() {
+        // The v4 (pre-base) golden still decodes under a v9 reader, migrating
+        // each entry as base = None (#400).
+        let back = decode_conflicts(&GOLDEN_CONFLICTS_V4).unwrap();
+        let (base, ours, theirs) = &back[Path::new("f.txt")];
+        assert!(base.is_none(), "a pre-v9 file migrates as base = None");
+        assert_eq!(*ours, Oid([7; 32]));
+        assert_eq!(*theirs, Oid([8; 32]));
     }
 
     #[test]
@@ -5939,7 +6026,7 @@ mod tests {
     #[test]
     fn decode_conflicts_rejects_incompatible_future_major() {
         let mut conflicts = BTreeMap::new();
-        conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
+        conflicts.insert(PathBuf::from("f.txt"), (Some(Oid([6; 32])), Oid([7; 32]), Oid([8; 32])));
         let mut bytes = encode_conflicts(&conflicts);
         bytes[0] = crate::format::FORMAT_MAJOR + 1;
         assert!(matches!(decode_conflicts(&bytes), Err(RepoError::UnsupportedFormat { .. })));
@@ -5952,17 +6039,18 @@ mod tests {
 
         {
             let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
-            // Manually insert a conflict to test persistence.
+            // Manually insert a conflict to test persistence — base included.
             repo.conflicts.insert(
                 PathBuf::from("f.txt"),
-                (Oid([1; 32]), Oid([2; 32])),
+                (Some(Oid([3; 32])), Oid([1; 32]), Oid([2; 32])),
             );
             repo.save(&dir).unwrap();
         }
 
         let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
         assert!(loaded.conflicts.contains_key(Path::new("f.txt")), "conflict must survive save/load");
-        let (ours, theirs) = &loaded.conflicts[Path::new("f.txt")];
+        let (base, ours, theirs) = &loaded.conflicts[Path::new("f.txt")];
+        assert_eq!(*base, Some(Oid([3; 32])), "base survives save/load (#400)");
         assert_eq!(*ours, Oid([1; 32]));
         assert_eq!(*theirs, Oid([2; 32]));
 

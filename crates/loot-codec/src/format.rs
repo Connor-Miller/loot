@@ -106,13 +106,21 @@ impl<'a> Cursor<'a> {
 ///   entry or SealedGrant decodes with `expires_at = None` (never expires, the
 ///   pre-#20 behavior), and an unset `expires_at` adds nothing beyond one
 ///   presence byte, so existing grants are unaffected.
+/// - v9 (#400) added the common-ancestor `base` OID to each `.loot/conflicts`
+///   entry — the third side a 3-way merge tool (`loot resolve --tool`, #401)
+///   needs. The entry layout grew a leading presence byte + optional 32-byte
+///   base ahead of the existing ours/theirs pair, so an older reader parsing a
+///   v9 conflicts file would mis-frame every entry. The loader migrates a v≤8
+///   entry as `base = None` (no ancestor recorded). `.loot/conflicts` is
+///   lane-local view state, never shipped on the wire, so no bundle/wire frame
+///   changed — only the durable conflicts codec.
 ///
 /// Each was a change an older reader cannot parse, so each bumped the major. A
-/// v8 reader still reads v1–v7 artifacts (missing fields default to absent;
+/// v9 reader still reads v1–v8 artifacts (missing fields default to absent;
 /// a v4 escrow section is parsed for cursor correctness but its plaintext keys
 /// are DROPPED, never filed); an older reader cleanly rejects a newer major
 /// rather than mis-parsing.
-pub const FORMAT_MAJOR: u8 = 8;
+pub const FORMAT_MAJOR: u8 = 9;
 /// The compatible revision this build writes.
 pub const FORMAT_MINOR: u8 = 0;
 /// Bytes the version marker occupies at the front of an artifact.

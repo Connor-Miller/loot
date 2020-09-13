@@ -183,7 +183,7 @@ const COMMANDS: &[Verb] = &[
     verb("manifest", &[], &[], |_| cmd_manifest()),
     verb("attest", &[], &[], cmd_attest),
     verb("conflicts", &[], OUT, cmd_conflicts),
-    verb("resolve", &[], &[], cmd_resolve),
+    verb("resolve", &["--tool"], &[], cmd_resolve),
     verb("remote", &[], &[], cmd_remote),
     verb("keygen", &[], &[], |_| cmd_keygen()),
     verb("whoami", &[], &["--pubkey"], cmd_whoami),
@@ -264,6 +264,7 @@ usage:
   loot buoy [role] [--verbose] [--porcelain|--json]  resolve the newest trusted role-attested change (CA4, ADR 0025)
   loot conflicts [--porcelain|--json]       list paths that need human resolution
   loot resolve <path> <file>                resolve a conflict at <path> using the content of <file>
+  loot resolve --tool <cmd> <path>          resolve a conflict with an external 3-way merge tool: materializes base/ours/theirs temp files (LOOT_BASE/LOOT_OURS/LOOT_THEIRS + $BASE/$LOCAL/$REMOTE expansion), execs <cmd> (a shell string or a token: vimdiff|code|idea|kaleidoscope), reads back $MERGED (#401)
   loot remote add <name> <url>              register a relay URL under a name
   loot remote remove <name>                 forget a named relay
   loot remote list                          show all named relays
@@ -342,6 +343,24 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
 /// True if `name` appears as a bare flag anywhere in `args`.
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// `loot resolve --tool <cmd> <path>` (#401): the sole positional (the path),
+/// skipping `--tool` and its value plus any other flag. Lets the tool command
+/// and the path sit on either side of `--tool`.
+fn resolve_tool_path(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--tool" {
+            i += 2; // skip the flag and its command value
+        } else if a.starts_with('-') {
+            i += 1; // skip any other flag
+        } else {
+            return Some(a);
+        }
+    }
+    None
 }
 
 /// `grant --relay --expires <timestamp>` (#20): the unix timestamp after which
@@ -439,13 +458,15 @@ fn verdicts_of(
         .collect()
 }
 
-/// Lift the recorded conflict set (path -> ours/theirs) into verdict rows.
+/// Lift the recorded conflict set (path -> base/ours/theirs) into verdict rows.
+/// `base` (#400) is not part of the `C`-row contract (ADR 0023) — the row still
+/// carries only ours/theirs — so it is dropped here.
 fn conflict_verdicts(
-    conflicts: &std::collections::BTreeMap<std::path::PathBuf, (Oid, Oid)>,
+    conflicts: &std::collections::BTreeMap<std::path::PathBuf, (Option<Oid>, Oid, Oid)>,
 ) -> Vec<PathVerdict> {
     conflicts
         .iter()
-        .map(|(p, (ours, theirs))| {
+        .map(|(p, (_base, ours, theirs))| {
             PathVerdict::new(
                 p.clone(),
                 MergeOutcome::Conflict { ours: ours.clone(), theirs: theirs.clone() },
@@ -2140,8 +2161,12 @@ fn cmd_conflicts(_args: &[String]) -> Emitted {
     if conflicts.is_empty() {
         let _ = writeln!(human, "no conflicts");
     } else {
-        for (path, (our_oid, their_oid)) in conflicts {
+        for (path, (base_oid, our_oid, their_oid)) in conflicts {
             let _ = writeln!(human, "conflict at {}", path.display());
+            // Show the common-ancestor address when one was recorded (#400).
+            if let Some(base_oid) = base_oid {
+                let _ = writeln!(human, "  base:   {}", short(base_oid));
+            }
             let _ = writeln!(human, "  ours:   {}", short(our_oid));
             let _ = writeln!(human, "  theirs: {}", short(their_oid));
         }
@@ -2151,6 +2176,32 @@ fn cmd_conflicts(_args: &[String]) -> Emitted {
 }
 
 fn cmd_resolve(args: &[String]) -> Emitted {
+    // `--tool <cmd> <path>` (#401): resolve with an external 3-way merge tool
+    // instead of a pre-produced <file>. The path is the sole positional (the
+    // tool command is the flag's value).
+    if let Some(tool) = flag(args, "--tool") {
+        let path = resolve_tool_path(args)
+            .ok_or("usage: loot resolve --tool <cmd> <path>")?;
+        let path = std::path::Path::new(path);
+        let mut ws = open_repo()?;
+        let report = loot_cli::mergetool::run(&mut ws, path, tool)?;
+        ws.record_op("resolve", &format!("resolve {} (--tool)", path.display()), false);
+        let mut text = String::new();
+        if let Some(warn) = &report.vis_warning {
+            let _ = writeln!(text, "warning: {warn}");
+        }
+        let _ = writeln!(text, "resolved {} (new oid: {})", path.display(), short(&report.new_oid));
+        let _ = writeln!(text, "recorded as \"{}\"", report.message);
+        if ws.conflicts().is_empty() {
+            if ws.current_dock().is_none() {
+                let _ = writeln!(text, "all conflicts resolved");
+            } else {
+                let _ = writeln!(text, "all conflicts resolved — dock tip advanced");
+            }
+        }
+        return msg(text);
+    }
+
     if args.len() < 2 {
         return Err("resolve requires <path> <file>".into());
     }
@@ -3745,9 +3796,9 @@ mod tests {
 
     #[test]
     fn conflict_verdicts_builds_conflict_rows() {
-        let mut c: std::collections::BTreeMap<std::path::PathBuf, (Oid, Oid)> =
+        let mut c: std::collections::BTreeMap<std::path::PathBuf, (Option<Oid>, Oid, Oid)> =
             std::collections::BTreeMap::new();
-        c.insert("x".into(), (Oid([7; 32]), Oid([9; 32])));
+        c.insert("x".into(), (Some(Oid([5; 32])), Oid([7; 32]), Oid([9; 32])));
         let v = conflict_verdicts(&c);
         assert_eq!(v[0].status_char(), 'C');
         assert_eq!(v[0].addrs(), (Some(Oid([7; 32])), Some(Oid([9; 32]))));

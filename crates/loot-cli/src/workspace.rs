@@ -441,7 +441,9 @@ impl Workspace {
     }
 
     /// The recorded conflict set (`loot conflicts` / `resolve` preflight).
-    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
+    /// Each value is `(base, ours, theirs)` — `base` is the common-ancestor oid
+    /// a 3-way merge tool needs, `None` when none was recorded (#400).
+    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)> {
         self.repo.conflicts()
     }
 
@@ -2894,7 +2896,7 @@ impl Workspace {
         // touched relative to the target — folding past that edit is ambiguous.
         // The combined intervening effect is `target_tree` vs `parent_tree`.
         let intervening_delta = tree_delta(&target_tree, &parent_tree);
-        let mut clash: BTreeMap<PathBuf, (Oid, Oid)> = BTreeMap::new();
+        let mut clash: BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)> = BTreeMap::new();
         for path in source_delta.keys() {
             if intervening_delta.contains_key(path) {
                 let ours = parent_tree
@@ -2905,7 +2907,9 @@ impl Workspace {
                     .get(path)
                     .map(|(o, _)| o.clone())
                     .unwrap_or(Oid([0; 32]));
-                clash.insert(path.clone(), (ours, theirs));
+                // No distinct common ancestor is tracked for a squash fold —
+                // `base = None`, so `--tool` shows a 2-way view here (#400).
+                clash.insert(path.clone(), (None, ours, theirs));
             }
         }
         if !clash.is_empty() {
@@ -4720,7 +4724,7 @@ impl Graph<'_> {
         self.repo.change_message(id)
     }
 
-    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
+    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Option<Oid>, Oid, Oid)> {
         self.repo.conflicts()
     }
 
@@ -4737,11 +4741,18 @@ impl Graph<'_> {
     /// is not currently in conflict, and propagates a genuine read failure rather
     /// than passing it off as sealed.
     pub fn conflict_at(&self, path: &Path) -> Result<ConflictView, String> {
-        let (our_oid, their_oid) = self.conflicts().get(path).ok_or_else(|| {
+        let (base_oid, our_oid, their_oid) = self.conflicts().get(path).ok_or_else(|| {
             format!("no conflict at {} — run `loot conflicts` to list them", path.display())
         })?;
+        // The common-ancestor side, when one was recorded (#400) — shown
+        // alongside ours/theirs so a 3-way view has its third side.
+        let base = match base_oid {
+            Some(oid) => Some(self.conflict_side(oid)?),
+            None => None,
+        };
         Ok(ConflictView {
             path: path.to_path_buf(),
+            base,
             ours: self.conflict_side(our_oid)?,
             theirs: self.conflict_side(their_oid)?,
         })

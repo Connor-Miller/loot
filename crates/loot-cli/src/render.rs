@@ -305,7 +305,14 @@ pub(crate) fn civil_datetime(unix_secs: u64) -> String {
 /// OIDs").
 pub fn conflict_sides(view: &ConflictView) -> String {
     let mut out = format!("conflict at {}\n", view.path.display());
-    for (label, side) in [("ours", &view.ours), ("theirs", &view.theirs)] {
+    // The common-ancestor side first when recorded (#400), then ours/theirs.
+    let mut sides: Vec<(&str, &ConflictSide)> = Vec::new();
+    if let Some(base) = &view.base {
+        sides.push(("base", base));
+    }
+    sides.push(("ours", &view.ours));
+    sides.push(("theirs", &view.theirs));
+    for (label, side) in sides {
         let _ = write!(out, "\n  {label}:\n{}\n", delta_line(&side_delta(view, side)));
         if let Some(bytes) = &side.content {
             out.push_str(&indented_content(bytes));
@@ -656,6 +663,7 @@ mod tests {
     fn conflict_sides_prints_both_sides_and_their_content_when_the_key_is_held() {
         let view = ConflictView {
             path: PathBuf::from("a.txt"),
+            base: Some(conflict_side(Visibility::Public, Some(b"base side\n"))),
             ours: conflict_side(Visibility::Public, Some(b"home side\n")),
             theirs: conflict_side(
                 Visibility::Restricted(vec!["alice".into()]),
@@ -665,6 +673,8 @@ mod tests {
         let out = conflict_sides(&view);
         assert!(out.contains("conflict at a.txt"), "{out}");
         assert!(out.contains("ours:") && out.contains("theirs:"), "both sides labeled: {out}");
+        // The common-ancestor side shows when recorded (#400).
+        assert!(out.contains("base:") && out.contains("    base side"), "base side shown: {out}");
         // Each side renders the shared #306 delta line (M gutter, path, token).
         assert!(out.contains("  M  a.txt"), "the shared delta line: {out}");
         assert!(out.contains("public") && out.contains("restricted=alice"), "{out}");
@@ -676,6 +686,7 @@ mod tests {
     fn conflict_sides_falls_back_to_the_oid_when_a_side_is_sealed() {
         let view = ConflictView {
             path: PathBuf::from("secret.txt"),
+            base: None,
             ours: conflict_side(Visibility::Public, Some(b"readable\n")),
             theirs: conflict_side(Visibility::Restricted(vec!["alice".into()]), None),
         };
@@ -692,6 +703,7 @@ mod tests {
     fn conflict_sides_summarizes_binary_content_rather_than_dumping_bytes() {
         let view = ConflictView {
             path: PathBuf::from("blob.bin"),
+            base: None,
             ours: conflict_side(Visibility::Public, Some(&[0xff, 0xfe, 0x00, 0x01])),
             theirs: conflict_side(Visibility::Public, Some(b"text\n")),
         };
