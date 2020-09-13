@@ -5653,7 +5653,6 @@ mod tests {
         let (area, dir, c2) = landed_from_lane("0039-carry-land");
 
         let mut ws = Workspace::open_at(&dir).unwrap();
-        let ours = ws.finalized_anchor();
         std::fs::write(dir.join("local.txt"), b"my landed work").unwrap();
         ws.snapshot("feat: my landing change").unwrap();
         ws.finalize_working().unwrap();
