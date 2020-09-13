@@ -168,6 +168,20 @@ ref, and only the owning position can judge (or land) it.
 _Avoid_: worktree, sandbox, session.
 Concurrent-agent playbook: [docs/agents/concurrent.md](docs/agents/concurrent.md).
 
+**Review projection** *(ADR 0039, keystone of map #354)* — what
+`ferry --with-wip` / `loot-first review` does, and *all* it does: mint the
+provisional commit(s) for the current working change from the [[Lane]]'s own
+anchor marks and push the one `review/<position>` ref. A review pass never
+reconciles the dock, never advances mirror `main`, never finalizes — it is
+read-only with respect to the dock tip and the harbor's `main`, so a lane
+whose anchor is behind git `main` reviews normally (the PR renders from the
+merge-base). Reconcile happens only where signing is legitimate: plain
+`ferry`, `adopt`, and `loot-first land` (harbor bounce, ADR 0036) — and a
+land from a behind-anchor lane still projects exactly one commit per change.
+Supersedes the #292/#302 stale-anchor refusal, which guarded the fold this
+definition makes unrepresentable.
+_Avoid_: "review ferry" (it is not a ferry pass), catch-up-on-review.
+
 **Position** *(#324, shipped this wave)* — ADR 0034's "position is place, not
 state" lifted into its own module (`crates/loot-cli/src/position.rs`): the
 three fields that name where a [[Workspace]] sits — the dock, the
