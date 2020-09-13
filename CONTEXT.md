@@ -151,6 +151,22 @@ ticket-derived handle (`t<n>`, suffixed until free); wayfinder's claim ritual
 (docs/agents/issue-tracker.md) is assign → spawn → work from the lane.
 Distinct from a *review lane* (a `pr-map` entry, ADR 0033): a lane opens a
 review lane when it ferries for review. _Avoid_: worktree, sandbox, session.
+Concurrent-agent playbook: [docs/agents/concurrent.md](docs/agents/concurrent.md).
+
+**Shared store** *(the "share only the immutable store" half of ADR 0034;
+ownership classes locked #228, audited #230)* — the append-only surface every
+[[Lane]] forks over without a second clone: `objects/`, `graph`, `keyring`,
+`escrow`, `manifest`, `purges`, `attestations`, `identity`, `peers`, and the
+repo-level `config` (named remotes). Any lane may **append** a *finalized*
+(signed) change and its objects; nobody rewrites, so N concurrent lanes never
+race here. It is one of the three ownership classes ADR 0034's rule partitions
+`.loot/` into — shared-append-only, [[Lane]]-owned, [[Harbor]]-owned — under the
+governing invariant **no mutable file has more than one writer**. `config` is the
+edge case: a repo-level fact, so shared, but single-writer holds by refusing
+*writes* from inside a lane ("run from the primary"). In the primary directory the
+root `.loot/` is two things at once — the shared store *and* lane #0's private
+state — so shared-surface tooling excludes the lane-owned file set by name, not by
+directory. _Avoid_: repo state, global state (they blur the writer classes).
 
 **Adopt** *(ADR 0034 accepted 2026-07-12; `<version>` arm shipped #244,
 2026-07-14; no-arg arm build pending)* — `loot adopt` settles a dock/[[Lane]]
@@ -186,9 +202,12 @@ outgoing dock first, so nothing uncommitted is lost); per-dock *physical*
 directories for truly simultaneous editing are a later, additive step (the
 on-disk format is already dock-agnostic). *(Redefined by ADR 0034: a dock
 becomes a **named [[Lane]]** — since #231 the promotion verb is `loot lane
-name <n>`. Legacy in-place switching still lives in the primary because
-today's landing ritual runs on it; its retirement — and `loot dock <name>`
-becoming the naming verb — rides the harbor, #229/ADR 0035.)* _Avoid_:
+name <n>`. The naming call is locked and #234 swept the primary's stale named
+docks (`adr-0033-ferry`, `list`, `loot-first`) into the lane model, leaving only
+`main` — the git-`main`-tracked [[Harbor]] position, a dock in the new sense.
+Legacy in-place *switching* still lives in the primary because today's landing
+ritual runs on the `main` dock; retiring that switching code — and `loot dock
+<name>` becoming purely the naming verb — is the remaining build gap.)* _Avoid_:
 worktree, checkout, berth, slip.
 
 **Buoy** *(CA4 shipped, 2026-07-09)* — a change that
