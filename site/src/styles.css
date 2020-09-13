@@ -1,0 +1,89 @@
+/* Design-system tokens: identical CSS bytes to millerbyte.com (ADR 0037 /
+   millerbyte ADR 0010) — theming is plain custom properties, no Tailwind. */
+@import "@millerbyte/ui/theme.css";
+
+/* Site shell — thin tracer layout over the theme tokens. */
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	background: var(--color-surface);
+	color: var(--color-text-primary);
+	font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+	line-height: 1.6;
+}
+
+a {
+	color: var(--color-primary);
+	text-decoration: none;
+}
+
+a:hover {
+	color: var(--color-primary-hover);
+}
+
+.site-header {
+	display: flex;
+	align-items: center;
+	gap: 1.5rem;
+	padding: 1rem 2rem;
+	background: var(--color-surface-overlay);
+	border-bottom: 1px solid var(--color-surface-elevated);
+}
+
+.site-header .brand {
+	font-weight: 700;
+	font-size: 1.25rem;
+	color: var(--color-text-primary);
+}
+
+.site-header nav {
+	display: flex;
+	gap: 1.25rem;
+	flex-wrap: wrap;
+}
+
+.site-header nav a {
+	color: var(--color-text-secondary);
+}
+
+.site-header nav a:hover,
+.site-header nav a[data-status="active"] {
+	color: var(--color-text-primary);
+}
+
+.site-main {
+	max-width: 56rem;
+	margin: 0 auto;
+	padding: 3rem 2rem 5rem;
+}
+
+.site-main h1 {
+	font-size: 2rem;
+}
+
+.placeholder {
+	color: var(--color-text-tertiary);
+	border: 1px dashed var(--color-secondary);
+	border-radius: 0.5rem;
+	padding: 1rem 1.5rem;
+	margin-top: 2rem;
+}
+
+.site-footer {
+	padding: 2rem;
+	background: var(--color-surface-overlay);
+	border-top: 1px solid var(--color-surface-elevated);
+	color: var(--color-text-tertiary);
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+}
+
+.site-footer .links {
+	display: flex;
+	gap: 1.25rem;
+	flex-wrap: wrap;
+}

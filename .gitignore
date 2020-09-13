@@ -1,5 +1,7 @@
 /target
 **/*.rs.bk
+# Vercel CLI project link (site deploys); machine-local, never committed.
+/.vercel/
 .DS_Store
 /.claude/worktrees/
 # Throwaway loot repos for relay/identity testing; keep the generator tracked.
