@@ -663,8 +663,9 @@ impl Workspace {
     }
 
     /// Drop the working capture `id` when it adds nothing over `against` (the
-    /// tip, and for the bridge the incoming target too): empty, or content-identical
-    /// to something already held. Returns whether it was dropped.
+    /// tip, and for the bridge the incoming target too): manifest-identical —
+    /// same path set AND same content — to something already held. Returns
+    /// whether it was dropped.
     ///
     /// The shared shape behind three sites that must not mint a redundant signed
     /// change: `finalize_capturing` (a bare `new` on a clean tree), `fold_line_in`
@@ -673,10 +674,19 @@ impl Workspace {
     /// It is also what keeps [`refuse_if_undescribed`](Self::refuse_if_undescribed)
     /// honest — without it, those passes would demand a name for work that does
     /// not exist.
+    ///
+    /// Deletions count (#289): the judgment compares recorded manifests, so a
+    /// capture that only *deletes* paths is real work, never a tip-duplicate.
+    /// Likewise an **empty** capture is redundant only when there is nothing
+    /// held to compare against (a bare `new` in a fresh repo) — over a
+    /// non-empty tip it is a delete-everything change, and `same_tree_content`
+    /// already equates it with a tip whose manifest is itself empty.
     fn drop_capture_if_redundant(&mut self, id: &Oid, against: &[&Oid]) -> Result<bool, String> {
-        let empty = self.repo.change_tree(id).is_none_or(|t| t.is_empty());
-        let redundant =
-            empty || against.iter().any(|o| self.repo.same_tree_content(o, id, self.now));
+        let redundant = if against.is_empty() {
+            self.repo.change_tree(id).is_none_or(|t| t.is_empty())
+        } else {
+            against.iter().any(|o| self.repo.same_tree_content(o, id, self.now))
+        };
         if redundant {
             self.repo.drop_working(id);
             self.working = None;
@@ -688,9 +698,9 @@ impl Workspace {
     /// `loot new` under implicit snapshot (ADR 0030): capture any edits made
     /// since the last command into the working change *first* — so `edit; new`
     /// never loses work — then finalize. A snapshot that adds nothing over the
-    /// dock tip (an empty or tip-duplicate working change) is dropped rather
-    /// than finalized, so a bare `loot new` does not mint an empty signed
-    /// change. `--no-snapshot` skips the capture (`skip_snapshot`); the
+    /// dock tip (manifest-identical — same paths, same content; deletions are
+    /// real work, #289) is dropped rather than finalized, so a bare `loot new`
+    /// does not mint an empty signed change. `--no-snapshot` skips the capture (`skip_snapshot`); the
     /// demotion guard rides the capture via `allow_demote`.
     /// Returns the finalized change's **version id**, or `None` when there was
     /// nothing to finalize (a bare `new` whose capture added nothing over the
@@ -878,8 +888,14 @@ impl Workspace {
         if let Some(w) = &self.working {
             let up_to_date = self.store.read_tree_hash(self.dock_opt()) == hash_tree(&entries, &message);
             if up_to_date {
-                let empty = self.repo.change_tree(w).is_none_or(|t| t.is_empty())
-                    || base.as_ref().is_some_and(|a| self.repo.same_tree_content(a, w, self.now));
+                // Same manifest judgment as the finalize drop (#289): a
+                // deletion-only (or delete-everything) working change is NOT
+                // empty; an empty manifest reads empty only with no anchor to
+                // have deleted from.
+                let empty = match base.as_ref() {
+                    Some(a) => self.repo.same_tree_content(a, w, self.now),
+                    None => self.repo.change_tree(w).is_none_or(|t| t.is_empty()),
+                };
                 return Ok(Some(WorkingRow {
                     change_id,
                     version: w.clone(),
@@ -1480,8 +1496,13 @@ impl Workspace {
                 let m = self.working_message_or_placeholder();
                 w = self.snapshot(&m)?.0;
             }
+            // Manifest comparison, deletions included (#289): a deletion-only
+            // capture is local work and folds in; an empty capture over a held
+            // tree is a delete-everything change, only redundant when nothing
+            // is held (no anchor — `same_tree_content` equates it with an
+            // empty-manifest tip on its own).
             let empty = self.repo.change_tree(&w).is_none_or(|t| t.is_empty());
-            let redundant = empty
+            let redundant = (empty && anchor.is_none())
                 || self.repo.same_tree_content(&their, &w, self.now)
                 || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &w, self.now));
             if redundant {
@@ -5575,6 +5596,96 @@ mod tests {
     }
 
     #[test]
+    fn finalize_signs_a_deletion_only_change() {
+        // #289: a change whose only content is DELETING files is real work. The
+        // tip-duplicate drop judged it content-identical to the tip (the tree
+        // comparison never saw the missing paths) and silently destroyed the
+        // working change — describe message and all — at finalize.
+        let dir = std::env::temp_dir().join(format!("loot-289-del-only-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("keep.txt"), b"k").unwrap();
+        std::fs::write(dir.join("gone.txt"), b"g").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let tip = ws.finalized_anchor().unwrap();
+
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        ws.snapshot("chore: delete gone.txt").unwrap(); // describe -m
+        let finalized = ws.finalize_capturing(&[], false).unwrap();
+        let new_tip = finalized
+            .expect("a deletion-only change must be SIGNED, not dropped as a tip-duplicate (#289)");
+        assert_ne!(new_tip, tip, "the tip advanced");
+        assert_eq!(ws.finalized_anchor(), Some(new_tip.clone()), "onto the signed deletion");
+        let tree = ws.repo().change_tree(&new_tip).unwrap();
+        assert!(!tree.contains_key(std::path::Path::new("gone.txt")), "the deletion is recorded");
+        assert!(tree.contains_key(std::path::Path::new("keep.txt")), "kept content rides along");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_signs_a_delete_everything_change() {
+        // The #289 boundary case: an EMPTY capture over a non-empty tip is a
+        // delete-everything change, not "nothing" — only a bare `new` with
+        // nothing held to compare against still drops an empty capture.
+        let dir = std::env::temp_dir().join(format!("loot-289-del-all-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("only.txt"), b"o").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        std::fs::remove_file(dir.join("only.txt")).unwrap();
+        ws.snapshot("chore: delete everything").unwrap();
+        let finalized = ws.finalize_capturing(&[], false).unwrap();
+        let new_tip = finalized.expect("delete-everything is real work — signed, not dropped");
+        assert!(
+            ws.repo().change_tree(&new_tip).unwrap().is_empty(),
+            "the signed manifest is empty — every path deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_new_over_an_undescribed_deletion_refuses_not_noops() {
+        // Now that a deletion-only capture survives the duplicate drop, an
+        // un-described one must hit the #174 refusal — it IS real work, and the
+        // pre-#289 silent no-op (capture dropped, message and all) is exactly
+        // how a cleanup change was destroyed. The refusal keeps the capture.
+        let dir = std::env::temp_dir().join(format!("loot-289-undesc-del-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("keep.txt"), b"k").unwrap();
+        std::fs::write(dir.join("gone.txt"), b"g").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        let err = ws.finalize_capturing(&[], false).unwrap_err();
+        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        assert!(ws.working.is_some(), "the deletion capture is held, not dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_named_tip_identical_capture_is_still_dropped() {
+        // Regression guard on the #289 fix: a TRULY identical capture — same
+        // path set, same content (the co-located checkout after a `git pull`,
+        // or a save that changed nothing) — still evaporates at finalize, even
+        // when it carries a name.
+        let dir = std::env::temp_dir().join(format!("loot-289-identical-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"same").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let tip = ws.finalized_anchor();
+
+        std::fs::write(dir.join("a.txt"), b"same").unwrap(); // rewritten, same bytes
+        ws.snapshot("chore: describes nothing new").unwrap();
+        assert_eq!(ws.finalize_capturing(&[], false).unwrap(), None, "identical capture dropped");
+        assert_eq!(ws.finalized_anchor(), tip, "the tip did not move");
+        assert!(ws.working.is_none(), "no stray working change left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn lane_spawn_ticket_handle_names_dir_and_id_suffixed_until_free() {
         let (area, _dir, mut ws) = lane_setup("ticket");
 
@@ -6150,6 +6261,11 @@ mod tests {
         // primitive, as the abandon tests do).
         let head = ws.repo().heads()[0].clone();
         let dcid = [9u8; 16];
+        // Each divergent version carries the head's full manifest (a reword-style
+        // amend): every change records its complete tree, and an empty manifest
+        // would read as delete-everything against the disk (#289), tripping the
+        // dirt refusal before the divergence one this test is about.
+        let head_tree = ws.repo().change_tree(&head).unwrap();
         ws.with_repo(|repo| {
             for msg in ["A", "B"] {
                 repo.record_carrying(
@@ -6157,7 +6273,7 @@ mod tests {
                         id: Oid([0; 32]),
                         parents: vec![head.clone()],
                         message: msg.into(),
-                        tree: Default::default(),
+                        tree: head_tree.clone(),
                     },
                     Some(dcid),
                 )
