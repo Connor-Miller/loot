@@ -1,0 +1,353 @@
+=== loot trust-story evidence run (#340, map #339) ===
+run started (utc): 2026-07-20 02:20:01Z
+relay:             http://127.0.0.1:47340 (local, spawned by this script)
+work dir:          C:\Users\conno\AppData\Local\Temp\loot-trust-story-1784514000
+
+>>> building loot (release)
+    loot: C:\Users\conno\source\repos\loot-lanes\t340\target\release\loot.exe
+
+>>> casey:   loot init --identity casey
+    initialized empty loot repo at ., identity = casey
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAuZaufQzEbJyEHpQwkBnLMmLXZKmgYB8Z3t9VLbzcG2 casey@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=casey`
+    quickstart — paste this into a .lootattributes file to control visibility:
+    # .lootattributes — control per-path visibility
+    # public      — everyone can read
+    # restricted  — only named identities
+    # embargoed   — sealed until unix timestamp
+    *.md          public
+    .env          restricted=alice
+    RELEASE.md    embargoed=1800000000
+
+>>> alice:   loot init --identity alice
+    initialized empty loot repo at ., identity = alice
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMomuTOVzsVpVSh6u/tRSa93HEySDFvGv0eMyIVsNYUv alice@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=alice`
+    quickstart — paste this into a .lootattributes file to control visibility:
+    # .lootattributes — control per-path visibility
+    # public      — everyone can read
+    # restricted  — only named identities
+    # embargoed   — sealed until unix timestamp
+    *.md          public
+    .env          restricted=alice
+    RELEASE.md    embargoed=1800000000
+
+>>> bob:     loot init --identity bob
+    initialized empty loot repo at ., identity = bob
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEeW+YS0H5VsN7uGQ4bTz2Z8P2qE5o2WTy1c/8/bZxvA bob@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=bob`
+    quickstart — paste this into a .lootattributes file to control visibility:
+    # .lootattributes — control per-path visibility
+    # public      — everyone can read
+    # restricted  — only named identities
+    # embargoed   — sealed until unix timestamp
+    *.md          public
+    .env          restricted=alice
+    RELEASE.md    embargoed=1800000000
+
+>>> mallory: loot init --identity mallory
+    initialized empty loot repo at ., identity = mallory
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKa0/yIzgLOIPSPKIgo4QcW387GPCYhhPA1yod8kqkVt mallory@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=mallory`
+    quickstart — paste this into a .lootattributes file to control visibility:
+    # .lootattributes — control per-path visibility
+    # public      — everyone can read
+    # restricted  — only named identities
+    # embargoed   — sealed until unix timestamp
+    *.md          public
+    .env          restricted=alice
+    RELEASE.md    embargoed=1800000000
+
+>>> local relay spawned (pid 31000), waiting for it to answer
+    relay is answering
+
+================  ACT 1: MIS-SEAL -> BURN (ADR 0038)  ================
+
+>>> casey: loot new (the mis-seal gate must refuse .env)
+    loot.exe : loot: refusing to seal .env publicly: it matches a built-in secret-shaped name and resolves Public only by
+    fallthrough (no .lootattributes rule names it). Name it in .lootattributes — `<path> restricted=<id>` to seal it, or
+    `<path> public` to consent — or re-run with `--allow-reveal <path>` to seal it public deliberately
+    At C:\Users\conno\source\repos\loot-lanes\t340\docs\evidence\scripts\trust-story-demo.ps1:199 char:5
+    +     & $Loot new -m "initial"
+    +     ~~~~~~~~~~~~~~~~~~~~~~~~
+        + CategoryInfo          : NotSpecified: (loot: refusing ...ic deliberately:String) [], RemoteException
+        + FullyQualifiedErrorId : NativeCommandError
+PASS: a secret-shaped path resolving Public by fallthrough is refused at the signing seam
+
+>>> casey: loot new --allow-reveal .env (deliberate override)
+    finalized working change 21cc6cfb; started fresh change uyzxxtpy
+    first-seal summary (2 new paths):
+      public  .env
+      public  readme.md
+PASS: the per-path override seals it, and the first-seal summary says so out loud
+
+>>> casey: loot bundle (pre-burn ciphertext, the resurrection vector)
+    wrote C:\Users\conno\AppData\Local\Temp\loot-trust-story-1784514000\casey-cipher.bundle (653 bytes) — copy it to a peer and `loot apply`
+PASS: pre-burn bundle written
+
+>>> casey: loot burn .env
+    burned 1 object(s) at .env — tier: never-pushed
+      destroyed ff3b5922
+      never pushed — destruction is complete on this machine.
+      forward fix: re-seal the path restricted (`loot migrate .env restricted=<you>`) or delete it at tip, then finalize.
+      ROTATE THE LEAKED SECRET — burning bytes cannot recall what was already read.
+PASS: never-pushed tier: bytes destroyed on this machine, signed tombstone recorded
+PASS: the burned object's bytes are gone from .loot/objects
+
+>>> casey: loot surface (the burned path is labelled, never silent)
+      readme.md                        public
+      .env                             burned (bytes destroyed — ADR 0038)
+    surfaced 21cc6cfb as casey
+PASS: surface labels the burned path instead of silently skipping it
+
+>>> casey: loot verify (a burn is documented absence, not damage)
+    all objects OK — 1 object(s) verified
+PASS: verify passes on a store with burned objects
+
+>>> casey: loot apply cipher.bundle (resurrection attempt)
+    applied C:\Users\conno\AppData\Local\Temp\loot-trust-story-1784514000\casey-cipher.bundle as casey:
+      .env                     converged
+      readme.md                converged
+    run `loot surface` to materialize what you may see
+PASS: applying the pre-burn bundle does NOT resurrect the bytes (ingest refuses a burned oid)
+
+>>> casey: the forward fix -- delete .env at tip, finalize
+    nothing to finalize; started fresh change xrwquqyn
+PASS: the forward fix finalizes without tripping the gate (first-seal scoped)
+
+================  ACT 2: GRANT EXPIRY (#20)  ================
+
+>>> alice: seal plan.md restricted, notes.md public; push to the relay
+    finalized working change 4a8dbe26; started fresh change msrywpln
+    first-seal summary (3 new paths):
+      public  .lootattributes
+      public  notes.md
+      restricted=alice  plan.md
+    remote 'origin' → http://127.0.0.1:47340
+    pushed 3 new object(s) to http://127.0.0.1:47340 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+PASS: alice pushed her history to the local relay
+
+>>> bob: register alice, pull
+    registered peer 'alice'
+    remote 'origin' → http://127.0.0.1:47340
+    pulled from http://127.0.0.1:47340 as bob:
+      .lootattributes          converged
+      notes.md                 converged
+      plan.md                  converged
+    converged onto one line:
+      .lootattributes                  public
+      notes.md                         public
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced 4a8dbe26 as bob
+PASS: pull materializes the public path; the sealed plan stays withheld (no key yet)
+
+expires_at (unix): 1784517602   (one hour out; LOOT_CLOCK will lapse it without sleeping)
+
+>>> alice: grant --relay plan.md bob --expires (sealed, expiring)
+    registered peer 'bob'
+    delivered sealed grant for 'bob' via relay http://127.0.0.1:47340
+      plan.md → bob (sealed, signed, recorded in manifest)
+      expires at 1784517602 — `apply_sealed_grant` rejects it for the recipient after that (#20)
+      recipient runs `loot pull-grants` to receive it
+PASS: sealed grant deposited carrying expires_at
+
+>>> bob: pull-grants + surface (grant is live)
+    applied 1/1 grant(s) from http://127.0.0.1:47340
+    run `loot surface` to materialize newly-accessible content
+      .lootattributes                  public
+      notes.md                         public
+      plan.md                          restricted=alice
+    surfaced 4a8dbe26 as bob
+PASS: before expires_at the grant admits bob: plan.md materializes with the sealed content
+
+>>> alice: deposit a second copy of the expiring grant
+    delivered sealed grant for 'bob' via relay http://127.0.0.1:47340
+      plan.md → bob (sealed, signed, recorded in manifest)
+      expires at 1784517602 — `apply_sealed_grant` rejects it for the recipient after that (#20)
+      recipient runs `loot pull-grants` to receive it
+
+>>> bob (clock past expires_at): pull-grants
+    loot.exe : loot: skipping grant (could not apply): grant expired at 1784517602
+    At C:\Users\conno\source\repos\loot-lanes\t340\docs\evidence\scripts\trust-story-demo.ps1:305 char:5
+    +     & $Loot pull-grants $RelayUrl
+    +     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        + CategoryInfo          : NotSpecified: (loot: skipping ...d at 1784517602:String) [], RemoteException
+        + FullyQualifiedErrorId : NativeCommandError
+    applied 0/1 grant(s) from http://127.0.0.1:47340
+PASS: past expires_at the same grant is rejected outright at apply -- nothing installed
+
+>>> bob (clock past expires_at): surface
+      .lootattributes                  public
+      notes.md                         public
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced 4a8dbe26 as bob
+PASS: surface skips the lapsed path -- an expired grant no longer materializes content
+
+================  ACT 3: QUARANTINE (#12)  ================
+
+>>> mallory: seal tip.md, push, grant to bob (bob does NOT know mallory)
+    finalized working change 38a65a77; started fresh change tyrupqto
+    first-seal summary (2 new paths):
+      public  .lootattributes
+      restricted=mallory  tip.md
+    remote 'origin' → http://127.0.0.1:47340
+    pushed 2 new object(s) to http://127.0.0.1:47340 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+    registered peer 'bob'
+    delivered sealed grant for 'bob' via relay http://127.0.0.1:47340
+      tip.md → bob (sealed, signed, recorded in manifest)
+      recipient runs `loot pull-grants` to receive it
+
+>>> bob: pull (mallory's history arrives; tip.md stays sealed)
+    pulled from http://127.0.0.1:47340 as bob:
+      .lootattributes          merged
+      tip.md                   converged
+    converged onto one line:
+      .lootattributes                  public
+      notes.md                         public
+      plan.md                          restricted=alice
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced 8bd1f1ea as bob
+
+>>> bob: pull-grants (unknown sender must be held, not applied)
+    applied 0/1 grant(s) from http://127.0.0.1:47340
+      1 quarantined (unknown grantor) — register the sender as a peer to trust them
+    loot.exe : loot: quarantined grant from unknown key a6b4ff22… — run `loot grants --trust
+    a6b4ff223380b3883d23ca220a3841c5b7f3b18f0988613c0d72a1df24aa456d` to trust and re-apply
+    At C:\Users\conno\source\repos\loot-lanes\t340\docs\evidence\scripts\trust-story-demo.ps1:342 char:5
+    +     & $Loot pull-grants $RelayUrl
+    +     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        + CategoryInfo          : NotSpecified: (loot: quarantin...st and re-apply:String) [], RemoteException
+        + FullyQualifiedErrorId : NativeCommandError
+PASS: a grant from an unregistered sender is quarantined, not silently applied or dropped
+
+>>> bob: loot grants --quarantined
+    1 quarantined grant(s):
+    sender (pubkey hex)                                              oid                                                              received
+    ------------------------------------------------------------------------------------------------------------------------------------------------------
+    a6b4ff223380b3883d23ca220a3841c5b7f3b18f0988613c0d72a1df24aa456d b46c6c45648ba9aff12cccf49ae046e804257b2cb339231ac1dde22b5c11dec2 2026-07-20 02:20:02 UTC
+    run `loot grants --trust <pubkey-hex>` to register a sender and re-apply their grants
+PASS: the held grant is reviewable: sender pubkey, oid, received time
+
+>>> bob: loot grants --trust a6b4ff223380...
+    registered peer 'a6b4ff223380b3883d23ca220a3841c5b7f3b18f0988613c0d72a1df24aa456d'
+    re-applied 1/1 quarantined grant(s) from a6b4ff223380b3883d23ca220a3841c5b7f3b18f0988613c0d72a1df24aa456d
+    run `loot surface` to materialize newly-accessible content
+PASS: trusting the sender registers the peer and re-applies the held grant through the same gate
+
+>>> bob: surface (now holding mallory's key)
+      .lootattributes                  public
+      notes.md                         public
+      plan.md                          restricted=alice
+      tip.md                           restricted=mallory
+    surfaced 8bd1f1ea as bob
+PASS: the trusted sender's content materializes for bob
+
+================  ACT 4: EMBARGO-STATUS (#15)  ================
+
+>>> mallory: seal roadmap.md embargoed
+    finalized working change 8377c305; started fresh change ukrkyukz
+    first-seal summary (1 new path):
+      embargoed until 2026-07-20  roadmap.md
+
+>>> mallory: embargo-status roadmap.md (pre-reveal)
+    roadmap.md: embargoed until 1784517602 (2026-07-20 03:20:02 UTC)
+PASS: pre-reveal: reported embargoed-until with the reveal timestamp
+
+>>> mallory (clock past reveal_at): embargo-status roadmap.md
+    roadmap.md: revealed
+PASS: post-reveal: the same path reports revealed
+
+>>> mallory: embargo-status tip.md (restricted, not embargoed)
+    tip.md: not embargoed
+PASS: a non-embargoed path reports not-embargoed
+
+================  ACT 5: ROTATION (#16, ADR 0016)  ================
+
+>>> bob (clock past plan.md's expiry): loot id rotate
+    rotated identity keypair for bob
+      new public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMPKArm7yR9XOtL4/lbUeQtZLhkAEUzdGLeRUphUcSJo bob@loot
+      old key archived at .\.loot\id.rotated-1784521202 — archived, not deleted; copy it back over .loot/id to roll back
+      re-grant wave: 1 bundle(s), each keeping its original expiry (#20):
+        C:\Users\conno\AppData\Local\Temp\loot-trust-story-1784514000\bob-regrants\regrant-b46c6c45.bundle
+      skipped 1 expired grant(s) — rotation never revives a lapsed grant
+    next steps:
+      1. peers must re-verify you out-of-band, then replace the old key (paste-ready):
+           loot peer add bob ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMPKArm7yR9XOtL4/lbUeQtZLhkAEUzdGLeRUphUcSJo bob@loot
+      2. carry each re-grant bundle to your other machine(s) running this identity:
+           loot apply <bundle>   then `loot surface`
+      3. push so relays and peers see activity signed by the new key:
+           loot push
+      4. maroon the old key: it still opens everything it could read. If it may be
+         compromised, re-seal that content (`loot maroon <path> <peer>` per revoked
+         reader, `loot burn <path>` for a leaked secret), then move the archived key
+         offline once you no longer need the rollback.
+PASS: rotation minted a fresh keypair (whoami changes)
+PASS: the old key is archived (.loot/id.rotated-<ts>), never deleted -- the rollback artifact
+PASS: the re-grant wave re-issued the one live grant and SKIPPED the lapsed one -- rotation never revives
+    (note: applied-side expiry carry of a re-grant bundle is tracked as #368 and deliberately not asserted here)
+
+>>> alice: seal handoff.md, push
+    finalized working change 55eec174; started fresh change pwxkrlzv
+    first-seal summary (1 new path):
+      restricted=alice  handoff.md
+    pushed 1 new object(s) to http://127.0.0.1:47340 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> alice: grant handoff.md to bob's RETIRED key (stale registry)
+    delivered sealed grant for 'bob' via relay http://127.0.0.1:47340
+      handoff.md → bob (sealed, signed, recorded in manifest)
+      recipient runs `loot pull-grants` to receive it
+
+>>> bob: pull-grants (the old mailbox is dead to the new key)
+    no pending grants at http://127.0.0.1:47340
+PASS: a grant aimed at the retired key never reaches the rotated identity
+
+>>> alice: re-verify bob out-of-band, register the NEW key, grant again
+    registered peer 'bob'
+    delivered sealed grant for 'bob' via relay http://127.0.0.1:47340
+      handoff.md → bob (sealed, signed, recorded in manifest)
+      recipient runs `loot pull-grants` to receive it
+
+>>> bob: pull, pull-grants, surface (the new key receives)
+    pulled from http://127.0.0.1:47340 as bob:
+      .lootattributes          merged
+      handoff.md               converged
+      notes.md                 converged
+      plan.md                  converged
+      tip.md                   converged
+    converged onto one line:
+      .lootattributes                  public
+      notes.md                         public
+      plan.md                          restricted=alice
+      tip.md                           restricted=mallory
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced 2e86622b as bob
+    applied 1/1 grant(s) from http://127.0.0.1:47340
+    run `loot surface` to materialize newly-accessible content
+      .lootattributes                  public
+      handoff.md                       restricted=alice
+      notes.md                         public
+      plan.md                          restricted=alice
+      tip.md                           restricted=mallory
+    surfaced 2e86622b as bob
+PASS: after the grantor registers the new key, grants flow to it end to end
+
+================  TRUST CLAIM (map #339)  ================
+A mis-sealed secret has a remedy: the gate refuses the accident, the
+override is a deliberate per-path ceremony, and loot burn destroys the
+bytes with a signed tombstone that sync refuses to resurrect -- while
+verify keeps passing, because a documented absence is not damage.
+Grants lapse at expires_at on the recipient's own gate; grants from
+unknown senders wait in a reviewable quarantine; embargo state is
+inspectable at every step; and identities rotate with a wave that
+re-issues only what is still live and archives what it retires.
+
+================  RESULT  ================
+ALL CHECKS PASSED -- the trust story holds end to end against this build.
+run finished (utc): 2026-07-20 02:20:03Z
