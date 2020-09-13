@@ -6151,13 +6151,17 @@ mod tests {
         let head = ws.repo().heads()[0].clone();
         let dcid = [9u8; 16];
         ws.with_repo(|repo| {
+            // Carry the head's manifest: a change's tree is its FULL manifest
+            // (an empty tree would mean delete-all, #288), and these seeded
+            // versions stand in for realistic finalized changes.
+            let tree = repo.change_tree(&head).unwrap_or_default();
             for msg in ["A", "B"] {
                 repo.record_carrying(
                     Change {
                         id: Oid([0; 32]),
                         parents: vec![head.clone()],
                         message: msg.into(),
-                        tree: Default::default(),
+                        tree: tree.clone(),
                     },
                     Some(dcid),
                 )
