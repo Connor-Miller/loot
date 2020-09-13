@@ -208,7 +208,7 @@ usage:
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
   loot pull [<url>] [--remote <name>] [--porcelain|--json]  fetch, merge, and converge changes from a relay
-  loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip also projects the ambient dock's unfinalized WIP to review/<dock> (map #148)
+  loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip also projects the ambient dock's unfinalized WIP to review/<lane-id> (review/<dock> on the primary; map #148, #281)
 
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
 first (ADR 0030) — no manual `loot status` needed. Two globals ride them:
