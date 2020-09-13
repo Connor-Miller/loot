@@ -93,8 +93,8 @@ pub fn review(
     let p = paths(ws);
     // Surface mirror drift before projecting anything: a review opened while the
     // mirror has diverged from origin/main is exactly how PR #241 projected a
-    // revert of landed work (#243).
-    warn_if_drifted(ws);
+    // revert of landed work (#243). Local read only — review stays cheap.
+    warn_if_drifted(ws, OriginRef::Tracking);
 
     let report = ferry::run(ws, None, None, /* with_wip */ true)?;
     for note in &report.notes {
@@ -318,8 +318,9 @@ pub fn land(
     let p = paths(ws);
     // A land onto a drifted mirror would project this change over a `main` that
     // is not origin's — the #243 hazard. Warn loudly up front (break-glass stays
-    // open per loot's philosophy; the operator decides).
-    warn_if_drifted(ws);
+    // open per loot's philosophy; the operator decides). This verb pushes, so it
+    // asks the remote: at the moment of the loudest warning, be sure.
+    warn_if_drifted(ws, OriginRef::Remote);
     let mut map = read_pr_map(&p.pr_map);
     let lane = map
         .lane_for_pr(pr)
@@ -479,8 +480,9 @@ pub fn land(
 /// git: every GitHub push goes through the [`Forge`] seam.
 pub fn tag(ws: &mut Workspace, forge: &dyn Forge, name: &str, message: &str) -> Result<(), String> {
     // A tag onto a drifted mirror would point at a `main` that is not origin's
-    // (the #243 hazard); warn loudly up front, but let the operator decide.
-    warn_if_drifted(ws);
+    // (the #243 hazard); warn loudly up front, but let the operator decide. Like
+    // `land`, this verb pushes, so the remote answers rather than a stale ref.
+    warn_if_drifted(ws, OriginRef::Remote);
 
     println!(">>> harbor: acquiring the land lock (tag)");
     let harbor = HarborLock::acquire(ws.store().harbor_lock(), HARBOR_WAIT, HARBOR_STALE)?;
@@ -550,26 +552,85 @@ fn landing_word(s: LandingStatus) -> &'static str {
 // mirror drift guard (#243, Deliverable 2)
 // ---------------------------------------------------------------------------
 
-/// Compare the mirror's projected `main` against the checkout's real
-/// `origin/main` and return the loud operator warning if they have drifted
-/// (#243). Best-effort and side-effect-free: an unbound mirror, a missing
-/// `origin/main`, or any git error yields `None` (nothing to warn about) rather
-/// than failing the surrounding command. Reads the local remote-tracking ref
-/// only — no network — so `status` / `review` stay cheap; a stale `origin/main`
-/// just means a `git fetch` would sharpen the check.
-pub fn mirror_drift(ws: &Workspace) -> Option<String> {
+/// Where the guard reads `origin/main` from — the one axis on which the four
+/// verbs differ (#273).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginRef {
+    /// The checkout's local `refs/remotes/origin/main`. No network, so `status`
+    /// and `review` stay cheap; a stale ref only ever reads as
+    /// [`Ancestry::MirrorAhead`], which is quiet.
+    Tracking,
+    /// Fetch `main` from the remote first. Reserved for `land` and `tag`, which
+    /// already talk to the network to push — one more round-trip is free there,
+    /// and it turns their verdict from a guess into a fact. This is what pays
+    /// for [`Ancestry::MirrorAhead`] being quiet: once a stale tracking ref reads
+    /// as the healthy *ahead*, a `main` that moved under us would go unnoticed at
+    /// exactly the two verbs that must not miss it. Falls back to the tracking
+    /// ref (with a note) when the remote is unreachable, so an offline land still
+    /// runs.
+    Remote,
+}
+
+/// Compare the mirror's projected `main` against the real `origin/main` and
+/// return the loud operator warning if they have drifted (#243). Best-effort and
+/// side-effect-free: an unbound mirror, a missing `origin/main`, or any git error
+/// yields `None` (nothing to warn about) rather than failing the surrounding
+/// command.
+pub fn mirror_drift(ws: &Workspace, origin_ref: OriginRef) -> Option<String> {
     let p = paths(ws);
     let mirror = git_rev_parse(&p.mirror, "refs/heads/main")?;
-    let origin = git_rev_parse(&p.root, "refs/remotes/origin/main")?;
-    let ancestry = mirror_ancestry(&p.root, &mirror, &origin);
+    let origin = origin_main(&p.root, origin_ref)?;
+    let ancestry = mirror_ancestry(&p.root, &p.mirror, &mirror, &origin);
     mirror_drift_warning(&mirror, &origin, ancestry)
 }
 
+/// Resolve origin's `main` for the guard, per [`OriginRef`]. Always returns a
+/// commit the *checkout* holds, which `mirror_ancestry`'s "behind" probe relies
+/// on: `Tracking` reads a ref (so its objects are present by definition), and
+/// `Remote` fetches before answering.
+fn origin_main(root: &Path, origin_ref: OriginRef) -> Option<String> {
+    let tracking = || git_rev_parse(root, "refs/remotes/origin/main");
+    match origin_ref {
+        OriginRef::Tracking => tracking(),
+        OriginRef::Remote => match git_fetch_main(root) {
+            Some(sha) => Some(sha),
+            None => {
+                // Say so rather than degrade in silence: this verb advertises a
+                // fact, and the operator is about to act on the answer.
+                eprintln!(
+                    "!! drift guard: could not reach origin — judging against the local \
+                     origin/main, which may be stale"
+                );
+                tracking()
+            }
+        },
+    }
+}
+
+/// Fetch origin's `main` and return its tip. Fetches rather than `ls-remote`ing
+/// on purpose: ancestry needs operands git can *walk*, and a bare sha is not one
+/// — the checkout may never have seen that commit, and the probe would fail into
+/// a false [`Ancestry::Diverged`] on exactly the fresh break-glass push this is
+/// here to catch. Touches only objects and refs (never the working tree); `None`
+/// on any failure, leaving the caller to fall back to the tracking ref.
+fn git_fetch_main(repo: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "-q", "origin", "main"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    git_rev_parse(repo, "FETCH_HEAD")
+}
+
 /// Print the drift warning to stderr if the mirror has drifted — the loud
-/// surface `status` / `review` / `land` share. Never fails the caller (a guard
-/// must not itself become a reason a command can't run).
-fn warn_if_drifted(ws: &Workspace) {
-    if let Some(w) = mirror_drift(ws) {
+/// surface `status` / `review` / `land` / `tag` share. Never fails the caller (a
+/// guard must not itself become a reason a command can't run).
+fn warn_if_drifted(ws: &Workspace, origin_ref: OriginRef) {
+    if let Some(w) = mirror_drift(ws, origin_ref) {
         eprintln!("!! {w}");
     }
 }
@@ -590,32 +651,55 @@ fn git_rev_parse(repo: &Path, refname: &str) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
-/// Classify how `mirror` stands against `origin`, using `repo` (the checkout,
-/// which holds `origin/main` and — in the common drift — the mirror commit too)
-/// as the ancestry oracle. Equal shas are [`Ancestry::Same`]; a mirror that is a
-/// strict ancestor of origin is [`Ancestry::MirrorBehind`]; anything else is
-/// [`Ancestry::Diverged`] — including a mirror commit `repo` does not have (a
-/// never-pushed projection, or a genuine unpushed-ahead mirror), which makes the
-/// ancestry probe fail and reads as the safe, loud divergence answer.
-fn mirror_ancestry(repo: &Path, mirror: &str, origin: &str) -> Ancestry {
+/// Classify how `mirror` stands against `origin`, probing **both** directions —
+/// each in the repo that is guaranteed to hold both commits when that answer is
+/// the true one (#273):
+///
+/// - *Ahead* (`origin` is an ancestor of `mirror`) is asked of `mirror_repo`. A
+///   mirror always holds its own lineage, so if origin really is behind the
+///   mirror's tip, the mirror holds origin's commit too and can answer. The
+///   checkout often cannot — it may never have fetched the mirror's tip — which
+///   is exactly why asking it there collapsed *ahead* into [`Ancestry::Diverged`]
+///   and made the guard cry wolf on every post-land command.
+/// - *Behind* (`mirror` is an ancestor of `origin`) is asked of `checkout`. If
+///   the mirror is truly behind, its tip is in `origin/main`'s lineage, which the
+///   checkout holds by definition of having that ref.
+///
+/// Equal shas short-circuit to [`Ancestry::Same`]. When neither probe answers —
+/// a genuine fork, or a commit no repo here holds — the result is the safe, loud
+/// [`Ancestry::Diverged`]. Ahead is probed first: it is the common healthy path,
+/// so the usual case costs one `git` call rather than two.
+///
+/// `origin` must be a commit `checkout` holds — see [`origin_main`], which is
+/// what guarantees it for both [`OriginRef`] modes.
+fn mirror_ancestry(checkout: &Path, mirror_repo: &Path, mirror: &str, origin: &str) -> Ancestry {
     if mirror == origin {
         Ancestry::Same
-    } else if is_ancestor(repo, mirror, origin) {
+    } else if is_ancestor(mirror_repo, /* ancestor */ origin, /* descendant */ mirror) {
+        Ancestry::MirrorAhead
+    } else if is_ancestor(checkout, /* ancestor */ mirror, /* descendant */ origin) {
         Ancestry::MirrorBehind
     } else {
         Ancestry::Diverged
     }
 }
 
-/// `git merge-base --is-ancestor a b`: true iff `a` is an ancestor of `b`. Any
-/// error (including an object `repo` does not have) reads as false.
-fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+/// `git merge-base --is-ancestor`: true iff `ancestor` is an ancestor of
+/// `descendant`, as judged by `repo`. The parameters are named rather than
+/// positional-by-convention because the two call sites above deliberately
+/// transpose them — swapping a pair silently inverts the guard's verdict.
+///
+/// Any error (including an object `repo` does not have) reads as false. Captures
+/// output rather than inheriting the terminal: a missing object makes git print
+/// `fatal: Not a valid commit name …`, and a best-effort guard must not leak
+/// that — it reads like a real failure of the command the operator ran (#273).
+fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
     std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["merge-base", "--is-ancestor", a, b])
-        .status()
-        .map(|s| s.success())
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
@@ -673,7 +757,9 @@ fn relay_push(root: &Path) -> Result<(), String> {
 /// Show the in-flight review lanes and their PRs.
 pub fn status(ws: &Workspace) -> Result<(), String> {
     let p = paths(ws);
-    warn_if_drifted(ws);
+    // Local read only: `status` is the verb operators run constantly, and it has
+    // no other reason to touch the network.
+    warn_if_drifted(ws, OriginRef::Tracking);
     let map = read_pr_map(&p.pr_map);
     if map.lanes.is_empty() {
         println!("no in-flight review lanes");
@@ -722,6 +808,238 @@ pub fn init_hook(ws: &Workspace) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::forge::{FakeForge, PrView, ReviewDecision};
+
+    // -----------------------------------------------------------------------
+    // mirror_ancestry — the oracle behind the drift guard (#273)
+    // -----------------------------------------------------------------------
+
+    /// A throwaway dir, isolated per test name and process.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("loot-273-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A git repo with one commit on `main`, identity configured so commits work
+    /// on a bare CI box.
+    fn git_repo(base: &Path, name: &str) -> PathBuf {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@loot.test"]);
+        git(&dir, &["config", "user.name", "loot test"]);
+        commit(&dir, "base");
+        dir
+    }
+
+    /// An empty commit on the current branch, tagged with a ref named `msg` so
+    /// other repos can fetch it by name (fetching a bare sha needs
+    /// `uploadpack.allowAnySHA1InWant`); returns its sha.
+    fn commit(repo: &Path, msg: &str) -> String {
+        git(repo, &["commit", "-q", "--allow-empty", "-m", msg]);
+        let sha = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["update-ref", &format!("refs/heads/{msg}"), &sha]);
+        sha
+    }
+
+    /// Copy the lineage of the ref named `refname` from `from` into `to` — the
+    /// fetch that decides whether a repo can answer an ancestry question about
+    /// that commit at all.
+    fn fetch(to: &Path, from: &Path, refname: &str) {
+        git(
+            to,
+            &[
+                "fetch",
+                "-q",
+                from.to_str().unwrap(),
+                &format!("refs/heads/{refname}:refs/heads/from-{refname}"),
+            ],
+        );
+    }
+
+    /// Whether `repo` holds `sha` as a commit — asked without panicking, so a
+    /// test can state "this repo cannot answer".
+    fn has_commit(repo: &Path, sha: &str) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn ancestry_same_when_shas_match() {
+        let base = scratch("same");
+        let checkout = git_repo(&base, "checkout");
+        let mirror = git_repo(&base, "mirror");
+        let sha = git(&checkout, &["rev-parse", "HEAD"]);
+        assert_eq!(mirror_ancestry(&checkout, &mirror, &sha, &sha), Ancestry::Same);
+    }
+
+    #[test]
+    fn ancestry_behind_when_origin_advanced_past_the_mirror() {
+        // A break-glass git land: origin/main has a commit the mirror never
+        // ingested. The checkout holds both, and this must stay a warning.
+        let base = scratch("behind");
+        let checkout = git_repo(&base, "checkout");
+        let mirror_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        let origin_sha = commit(&checkout, "landedelsewhere");
+        let mirror = git_repo(&base, "mirror");
+        fetch(&mirror, &checkout, "base");
+        assert_eq!(
+            mirror_ancestry(&checkout, &mirror, &mirror_sha, &origin_sha),
+            Ancestry::MirrorBehind
+        );
+    }
+
+    #[test]
+    fn ancestry_ahead_when_the_mirror_leads_a_stale_tracking_ref() {
+        // The #273 repro: the mirror pushed, the checkout has not fetched, so
+        // its origin/main is one behind. The checkout holds both commits — and
+        // this still read as Diverged before the fix.
+        let base = scratch("ahead");
+        let checkout = git_repo(&base, "checkout");
+        let origin_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        let mirror_sha = commit(&checkout, "landed");
+        let mirror = git_repo(&base, "mirror");
+        fetch(&mirror, &checkout, "landed");
+        assert_eq!(
+            mirror_ancestry(&checkout, &mirror, &mirror_sha, &origin_sha),
+            Ancestry::MirrorAhead
+        );
+    }
+
+    #[test]
+    fn ancestry_ahead_even_when_the_checkout_lacks_the_mirror_commit() {
+        // The case the old doc claimed was undecidable. The checkout cannot
+        // answer — it has never seen the mirror's tip — but the mirror always
+        // holds its own lineage, so the mirror is the oracle that can.
+        let base = scratch("ahead-unfetched");
+        let mirror = git_repo(&base, "mirror");
+        let origin_sha = git(&mirror, &["rev-parse", "HEAD"]);
+        let mirror_sha = commit(&mirror, "unpushed");
+        let checkout = git_repo(&base, "checkout");
+        fetch(&checkout, &mirror, "base");
+        assert!(
+            !has_commit(&checkout, &mirror_sha),
+            "precondition: the checkout must not hold the mirror's tip"
+        );
+        assert_eq!(
+            mirror_ancestry(&checkout, &mirror, &mirror_sha, &origin_sha),
+            Ancestry::MirrorAhead
+        );
+    }
+
+    #[test]
+    fn ancestry_diverged_when_neither_reaches_the_other() {
+        // The real #243/#241 shape: the mirror projected a main that never
+        // reached origin. This must stay the loudest answer.
+        let base = scratch("diverged");
+        let checkout = git_repo(&base, "checkout");
+        let fork = git(&checkout, &["rev-parse", "HEAD"]);
+        let origin_sha = commit(&checkout, "originside");
+        git(&checkout, &["checkout", "-q", &fork]);
+        let mirror_sha = commit(&checkout, "mirrorside");
+        let mirror = git_repo(&base, "mirror");
+        fetch(&mirror, &checkout, "mirrorside");
+        fetch(&mirror, &checkout, "originside");
+        assert_eq!(
+            mirror_ancestry(&checkout, &mirror, &mirror_sha, &origin_sha),
+            Ancestry::Diverged
+        );
+    }
+
+    /// An `origin` repo and a checkout cloned from it, as `land` / `tag` see the
+    /// world.
+    fn origin_and_clone(base: &Path) -> (PathBuf, PathBuf) {
+        let origin = git_repo(base, "origin");
+        let checkout = base.join("checkout");
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&origin)
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone: {}", String::from_utf8_lossy(&out.stderr));
+        (origin, checkout)
+    }
+
+    #[test]
+    fn remote_refresh_reads_mains_tip_and_brings_its_objects() {
+        // The land/tag refresh must fetch, not just ls-remote: a sha the checkout
+        // does not hold is not an operand `merge-base` can walk, and the behind
+        // probe would fail into a false Diverged.
+        let base = scratch("refresh");
+        let (origin, checkout) = origin_and_clone(&base);
+        let tip = commit(&origin, "breakglasspush");
+        assert!(!has_commit(&checkout, &tip), "precondition: not fetched yet");
+        assert_eq!(origin_main(&checkout, OriginRef::Remote), Some(tip.clone()));
+        assert!(has_commit(&checkout, &tip), "the refresh must bring the objects, not just the sha");
+    }
+
+    #[test]
+    fn remote_refresh_sees_a_break_glass_push_the_tracking_ref_still_hides() {
+        // Why `Remote` exists: with MirrorAhead quiet, a stale tracking ref would
+        // read this as the healthy ahead and say nothing. The refresh is what
+        // keeps the real #243 case loud at the two verbs that push.
+        let base = scratch("refresh-behind");
+        let (origin, checkout) = origin_and_clone(&base);
+        let mirror_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        let mirror = git_repo(&base, "mirror");
+        // Seed the mirror from `origin` — a clone carries only `main`.
+        fetch(&mirror, &origin, "base");
+        commit(&origin, "breakglasspush");
+
+        let stale = origin_main(&checkout, OriginRef::Tracking).expect("tracking ref");
+        assert_eq!(
+            mirror_ancestry(&checkout, &mirror, &mirror_sha, &stale),
+            Ancestry::Same,
+            "the stale tracking ref cannot see the push"
+        );
+
+        let fresh = origin_main(&checkout, OriginRef::Remote).expect("refresh");
+        assert_eq!(
+            mirror_ancestry(&checkout, &mirror, &mirror_sha, &fresh),
+            Ancestry::MirrorBehind,
+            "a fetched origin must read as behind — not as a false Diverged"
+        );
+    }
+
+    #[test]
+    fn remote_refresh_falls_back_to_the_tracking_ref_when_origin_is_unreachable() {
+        // Offline: fall back rather than failing the verb the guard is advising.
+        let base = scratch("refresh-offline");
+        let checkout = git_repo(&base, "checkout");
+        let sha = git(&checkout, &["rev-parse", "HEAD"]);
+        git(&checkout, &["update-ref", "refs/remotes/origin/main", &sha]);
+        assert_eq!(origin_main(&checkout, OriginRef::Remote), Some(sha));
+    }
+
+    #[test]
+    fn ancestry_diverged_when_no_repo_holds_the_mirror_commit() {
+        // Nothing can answer: the probe fails in both oracles and folds into the
+        // safe, loud answer rather than erroring.
+        let base = scratch("missing");
+        let checkout = git_repo(&base, "checkout");
+        let mirror = git_repo(&base, "mirror");
+        let origin_sha = git(&checkout, &["rev-parse", "HEAD"]);
+        let ghost = "d15f24799f5a1a91f5f821f14190625143e829e5";
+        assert_eq!(mirror_ancestry(&checkout, &mirror, ghost, &origin_sha), Ancestry::Diverged);
+    }
 
     fn view(decision: ReviewDecision, author: &str, state: PrState) -> PrView {
         PrView { state, review_decision: decision, author_login: author.into() }

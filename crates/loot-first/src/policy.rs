@@ -115,10 +115,11 @@ pub fn interpret_landing(main_fast_forwarded: bool, polled_state: PrState) -> La
     }
 }
 
-/// How the loot mirror's projected `main` stands against the checkout's real
-/// `origin/main` (#243, Deliverable 2). The mirror pushes its `main` to *become*
-/// `origin/main`, so on the happy path the two are the same commit ([`Same`]);
-/// any other relation is drift the guard surfaces loudly:
+/// How the loot mirror's projected `main` stands against the real `origin/main`
+/// (#243, Deliverable 2). The mirror pushes its `main` to *become* `origin/main`,
+/// so a healthy repo is one of two shapes — the two agree ([`Same`]), or the
+/// mirror leads a not-yet-fetched `origin/main` ([`MirrorAhead`]). The other two
+/// are drift the guard surfaces loudly:
 ///
 /// - [`MirrorBehind`] — `origin/main` has commits the mirror never ingested (a
 ///   break-glass git land): reconcile before landing, or a lane spawned now
@@ -128,28 +129,34 @@ pub fn interpret_landing(main_fast_forwarded: bool, polled_state: PrState) -> La
 ///   loudest case — the guard warns hardest, though it stays advisory
 ///   (break-glass is never blocked, per loot's philosophy).
 ///
-/// There is deliberately no "mirror ahead" variant: an unpushed-ahead mirror's
-/// tip is not an object the *checkout* holds, so it cannot be told apart from a
-/// divergence there and folds into [`Diverged`] — still drift worth surfacing.
+/// [`MirrorAhead`] is quiet because it is the *normal* state between a land and
+/// the checkout's next `git fetch`: the tip is pushed, only the local
+/// remote-tracking ref trails. Folding it into [`Diverged`] made the guard cry
+/// wolf on the most common healthy path, which is how a real divergence gets
+/// scrolled past (#273). Telling it apart needs the mirror as the ancestry
+/// oracle, not the checkout — see `orchestrator::mirror_ancestry`.
 ///
 /// [`Same`]: Ancestry::Same
+/// [`MirrorAhead`]: Ancestry::MirrorAhead
 /// [`MirrorBehind`]: Ancestry::MirrorBehind
 /// [`Diverged`]: Ancestry::Diverged
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ancestry {
     Same,
+    MirrorAhead,
     MirrorBehind,
     Diverged,
 }
 
-/// Render the operator warning for a mirror/origin comparison, or `None` when
-/// the two agree ([`Ancestry::Same`]). Pure over the two shas and the ancestry
-/// the caller reads from git, so the exact wording — the message that would have
-/// stopped PR #241 before projection — is unit-tested without a repo.
+/// Render the operator warning for a mirror/origin comparison, or `None` for the
+/// healthy shapes ([`Ancestry::Same`] and [`Ancestry::MirrorAhead`]). Pure over
+/// the two shas and the ancestry the caller reads from git, so the exact wording
+/// — the message that would have stopped PR #241 before projection — is
+/// unit-tested without a repo.
 pub fn mirror_drift_warning(mirror: &str, origin: &str, ancestry: Ancestry) -> Option<String> {
     let (m, o) = (short(mirror), short(origin));
     Some(match ancestry {
-        Ancestry::Same => return None,
+        Ancestry::Same | Ancestry::MirrorAhead => return None,
         Ancestry::MirrorBehind => format!(
             "loot mirror is behind origin/main ({m} vs {o}) — reconcile before landing (#243)."
         ),
@@ -228,6 +235,18 @@ mod tests {
         // Mirror main == origin/main (the happy path right after a land+push):
         // no warning at all.
         assert_eq!(mirror_drift_warning("abc123", "abc123", Ancestry::Same), None);
+    }
+
+    #[test]
+    fn drift_ahead_is_quiet() {
+        // The mirror pushed and the checkout has not fetched yet, so its
+        // origin/main trails by a commit. This is the normal post-land state,
+        // not drift — warning here is the #273 wolf-cry that trains the
+        // operator to scroll past the real divergence.
+        assert_eq!(
+            mirror_drift_warning("bbbbbbbbbbbb", "aaaaaaaaaaaa", Ancestry::MirrorAhead),
+            None
+        );
     }
 
     #[test]

@@ -166,9 +166,18 @@ See "Catch the primary up" above. The two habits are the same discipline stated
 twice because they fail the same way: **the loot mirror silently falls behind git
 `origin/main`**, and the next lane spawned from the stale position projects a
 *revert* of landed work. A drift guard now warns loudly on
-`loot-first status`/`review`/`land` when the shared mirror's `main` ≠ real
-`origin/main` (#243) — treat that warning as a hard stop: reconcile before you
-land.
+`loot-first status`/`review`/`land`/`tag` when the shared mirror's `main` has
+fallen *behind* real `origin/main`, or *diverged* from it (#243) — treat that
+warning as a hard stop: reconcile before you land.
+
+A mirror **ahead** of `origin/main` is quiet: that is the normal state between a
+land and the checkout's next `git fetch`, when only the local tracking ref
+trails. The guard used to shout DIVERGED there, on the most common healthy path
+(#273) — a guard that cries wolf is one you learn to scroll past, and its whole
+value is its rarity. Because *ahead* is now quiet, a stale tracking ref could
+hide a `main` that moved under you, so `land` and `tag` fetch `main` before
+judging (they already push, so the round-trip is free) — `status` and `review`
+stay local and cheap.
 
 ### Parking / clobber gotchas (legacy in-place switching)
 
