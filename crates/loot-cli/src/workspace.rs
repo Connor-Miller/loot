@@ -345,6 +345,36 @@ impl Workspace {
         })
     }
 
+    /// Narrow a [`HistoryView`] to the rows whose recorded tree includes
+    /// `path` (#6, `loot log --path`) — a straight filter over the same
+    /// per-change full tree `log_detailed` already sizes, not a new walk.
+    /// Every row (the flat listing, each fork lane, and the shared section)
+    /// is filtered identically, so visibility hints and every other column
+    /// a surviving row carries are untouched — only membership changes. The
+    /// live working row survives only when the *current* working tree (not
+    /// its last sealed version, which may predate an uncaptured edit) holds
+    /// the path — checked directly against its `entries`, not the graph, so
+    /// this works whether or not the working change has been snapshotted.
+    ///
+    /// Composes with selector scoping (`loot log <selector>`, #315): apply
+    /// both filters and the result is their intersection — order does not
+    /// matter, `retain` is commutative here.
+    pub fn filter_history_to_path(&self, view: &mut HistoryView, path: &Path) {
+        let touches = |id: &Oid| self.repo.change_has_path(id, path);
+        view.rows.retain(|r| touches(&r.version));
+        if let Some(g) = &mut view.graph {
+            for lane in &mut g.per_head {
+                lane.retain(|r| touches(&r.version));
+            }
+            g.shared.retain(|r| touches(&r.version));
+        }
+        if let Some(w) = &view.working {
+            if !w.entries.iter().any(|(p, _)| p.as_path() == path) {
+                view.working = None;
+            }
+        }
+    }
+
     /// Resolve the buoy for `role` (CA4, ADR 0025), owning the whole read:
     /// present set, parent lookup, attestation stream, and the trust predicate
     /// (peer registry ∪ self). Also reports trusted attestations naming changes
@@ -4340,6 +4370,64 @@ mod tests {
             !hist.rows.iter().any(|r| r.version == working),
             "the working node renders once, as the live row — never among the finalized rows"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #6: `loot log --path` — a history where only some changes touched the
+    /// target path. `ChangeNode.tree` is the *full* materialized tree, not a
+    /// delta, so a change only omits a path once it is actually deleted (a
+    /// change that simply never edited it still carries it forward).
+    #[test]
+    fn filter_history_to_path_keeps_only_matching_changes() {
+        let dir = std::env::temp_dir().join(format!("loot-6-log-path-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+
+        // c1: adds a.txt.
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("adds a").unwrap();
+        ws.finalize_working().unwrap();
+        let c1 = ws.repo().heads()[0].clone();
+
+        // c2: deletes a.txt, adds b.txt — its full tree never holds a.txt.
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        std::fs::write(dir.join("b.txt"), b"two").unwrap();
+        ws.snapshot("adds b, drops a").unwrap();
+        ws.finalize_working().unwrap();
+        let c2 = ws.repo().heads()[0].clone();
+
+        // A fresh (unfinalized) working change still carrying b.txt.
+        std::fs::write(dir.join("b.txt"), b"two-edited").unwrap();
+        ws.snapshot("edit b").unwrap();
+        let working = ws.working_id().cloned().expect("snapshot minted a working node");
+
+        let mut view = ws.history().unwrap();
+        assert_eq!(view.rows.len(), 2, "sanity: two finalized rows before filtering");
+        assert!(view.working.is_some(), "sanity: a live working row before filtering");
+
+        ws.filter_history_to_path(&mut view, Path::new("a.txt"));
+        assert_eq!(
+            view.rows.iter().map(|r| r.version.clone()).collect::<Vec<_>>(),
+            vec![c1.clone()],
+            "only the change whose tree held a.txt survives"
+        );
+        assert_eq!(view.rows[0].total, 1, "the surviving row keeps its own visibility-hint fields");
+        assert!(view.working.is_none(), "the working tree no longer holds a.txt");
+
+        // A fresh view, filtered on b.txt instead: c2 and the live working
+        // row (which still carries b.txt) survive; c1 does not.
+        let mut view2 = ws.history().unwrap();
+        ws.filter_history_to_path(&mut view2, Path::new("b.txt"));
+        assert_eq!(
+            view2.rows.iter().map(|r| r.version.clone()).collect::<Vec<_>>(),
+            vec![c2.clone()],
+            "only the change whose tree held b.txt survives"
+        );
+        assert_eq!(
+            view2.working.as_ref().map(|w| &w.version),
+            Some(&working),
+            "the live working row still carries b.txt"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
