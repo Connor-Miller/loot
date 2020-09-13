@@ -13,8 +13,8 @@ use loot_core::{
 };
 use loot_identity as identity;
 use render::{
-    change_col, delta_line, outcome_rows, render_buoy_human, render_grant_status, render_history,
-    short, short_change,
+    change_col, delta_line, outcome_rows, render_buoy_human, render_embargo_status,
+    render_grant_status, render_history, short, short_change,
 };
 use std::fmt::Write as _;
 use std::process::ExitCode;
@@ -125,6 +125,7 @@ const COMMANDS: &[Verb] = &[
     verb("apply", &[], OUT, cmd_apply),
     verb("grant", &["--relay", "--allow-demote"], SKIP, cmd_grant),
     verb("grant-status", &[], &[], cmd_grant_status),
+    verb("embargo-status", &[], &[], cmd_embargo_status),
     verb("maroon", DEMOTE, &["--hard", "--no-snapshot", "--ignore-working-copy"], cmd_maroon),
     verb("migrate", DEMOTE, SKIP, cmd_migrate),
     verb("manifest", &[], &[], |_| cmd_manifest()),
@@ -183,6 +184,7 @@ usage:
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
   loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
   loot grant-status <path>                  list current grantees for <path> — grantor, delivery method, granted_at (sanity check before `loot maroon`, #5)
+  loot embargo-status <path>                show whether <path> is embargoed (sealed until a unix timestamp, shown with its human-readable date/time too), revealed (embargo passed), or not embargoed at all (#15); checks history too, not just the working tree — useful when troubleshooting why a file isn't visible after a pull
   loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
@@ -1195,6 +1197,23 @@ fn cmd_grant_status(args: &[String]) -> Result<(), String> {
     let entries = ws.manifest().grants_for(&oid);
     let name_of = |pk: &[u8; 32]| resolve_pubkey_name(&reg, pk);
     print!("{}", render_grant_status(std::path::Path::new(path), &entries, &name_of));
+    Ok(())
+}
+
+/// `loot embargo-status <path>` (#15): embargoed / revealed / not embargoed,
+/// read straight off the recorded `Visibility` against the clock. Read-only
+/// (no snapshot, ADR 0030 — this inspects existing history, it doesn't
+/// record any), and — unlike `grant-status`, which needs the *current* tree
+/// oid — searches all of history so a path that's been deleted, or one this
+/// dock's heads haven't picked up yet, is still explainable (the
+/// troubleshooting case #15 names: "why isn't a file visible after a pull").
+fn cmd_embargo_status(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("embargo-status requires <path>")?;
+    let ws = Workspace::open()?;
+    let (_, vis) = ws
+        .path_history_entry(std::path::Path::new(path))
+        .ok_or_else(|| format!("path '{path}' not found in any recorded change"))?;
+    print!("{}", render_embargo_status(std::path::Path::new(path), &vis, ws.now()));
     Ok(())
 }
 
