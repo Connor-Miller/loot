@@ -28,6 +28,7 @@
 //! config       named remotes                            (Workspace, ADR 0013)
 //! ops          local-only operation log for undo (LOCAL) (oplog, ADR 0031)
 //! abandoned     local-only set of abandoned version ids (LOCAL) (S3, ADR 0029)
+//! lost         acknowledged-lost object addresses (LOCAL)  (#335)
 //! id, id.pub   the ed25519 keypair                      (loot-identity, ADR 0014)
 //! peers        nickname -> pubkey registry              (loot-identity, ADR 0014)
 //! ```
@@ -189,6 +190,9 @@ const CONFIG: &str = "config";
 const GIT_MIRROR: &str = "git-mirror";
 const OPS: &str = "ops";
 const ABANDONED: &str = "abandoned";
+/// Acknowledged-lost content addresses (#335). Shared-store-rooted; see
+/// [`RepoStore::lost`].
+const LOST: &str = "lost";
 /// The shared-store metadata lock (#293). `save_to` persists the append-only
 /// shared surface (graph, keyring, …) by a read-modify-write of whole files;
 /// without serialization two concurrent writers lose one another's appends. A
@@ -374,6 +378,51 @@ impl RepoStore {
             bytes.extend_from_slice(&id.0);
         }
         atomic_write(&self.abandoned(), &bytes)
+    }
+
+    // --- acknowledged object loss (#335) ---
+    //
+    // Local-only set of **content addresses** an operator has explicitly
+    // accepted as lost (`loot verify --accept-loss`): referenced by a change
+    // but absent from `objects/` and unrecoverable — the address is
+    // `blake3(nonce || ciphertext)` and the nonce lived only inside the
+    // deleted file, so not even the original plaintext can rebuild it.
+    // `verify` reports acknowledged addresses separately and stops failing on
+    // them; NEW damage still fails. Shared-store-rooted (the loss is a fact
+    // about this store's disk, the same for every lane); written only by the
+    // primary's accept-loss verb under the store lock, so the single-writer
+    // rule (ADR 0034) holds. Never bundled — another clone may still hold the
+    // bytes.
+    pub fn lost(&self) -> PathBuf { self.dot.join(LOST) }
+
+    /// The set of acknowledged-lost addresses (each 32 raw bytes), or empty if
+    /// none. A malformed file reads as empty — verify then fails on the
+    /// addresses again, the safe direction (never silently forgives).
+    pub fn read_lost(&self) -> std::collections::BTreeSet<Oid> {
+        match read_replaced(&self.lost()) {
+            Ok(b) if b.len() % 32 == 0 => b
+                .chunks_exact(32)
+                .map(|c| {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(c);
+                    Oid(a)
+                })
+                .collect(),
+            _ => std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Persist the acknowledged-lost set, or remove the file when empty.
+    pub fn write_lost(&self, set: &std::collections::BTreeSet<Oid>) -> std::io::Result<()> {
+        if set.is_empty() {
+            let _ = std::fs::remove_file(self.lost());
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(set.len() * 32);
+        for id in set {
+            bytes.extend_from_slice(&id.0);
+        }
+        atomic_write(&self.lost(), &bytes)
     }
 
     /// Read the working-change id (32 raw bytes) for `dock` if one is in

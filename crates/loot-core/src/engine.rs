@@ -82,14 +82,40 @@ pub struct VerifyReport {
     /// Addresses whose file exists but is undecodable or re-hashes to a
     /// different address (bit rot, truncation, tampering).
     pub corrupt: Vec<Oid>,
-    /// Addresses referenced by a change but with no file on disk.
-    pub missing: Vec<Oid>,
+    /// Addresses referenced by a change but with no file on disk, each with
+    /// the referencing sites (#335) — a bare address says *that* something is
+    /// lost; the referencing change and path say *what*.
+    pub missing: Vec<MissingObject>,
+    /// Absent addresses an operator already accepted as lost (#335,
+    /// `--accept-loss`): reported for the record, but not a failure —
+    /// acknowledged loss must not drown out NEW damage.
+    pub lost: Vec<Oid>,
 }
 
 impl VerifyReport {
+    /// Acknowledged losses are clean: the ledger exists precisely so a store
+    /// with known-unrecoverable history can gate CI on integrity again.
     pub fn is_clean(&self) -> bool {
         self.corrupt.is_empty() && self.missing.is_empty()
     }
+}
+
+/// One missing address with every (change, path) site that references it
+/// (#335). Sites are in the shared graph's stored order, deduped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingObject {
+    pub addr: Oid,
+    pub referenced_by: Vec<MissingRef>,
+}
+
+/// A site referencing a missing object: the change, the path within it, and
+/// the change's message — enough to judge whether the lost content matters
+/// (a superseded historical version vs. a path live history still needs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingRef {
+    pub change: Oid,
+    pub path: PathBuf,
+    pub message: String,
 }
 
 /// One change in a [`LogGraph`]: its id, message, and which heads can reach it
@@ -536,24 +562,74 @@ impl DagRepo {
     /// root: both sides' changes are recorded in the graph (ADR 0001).
     pub fn verify(dir: &Path) -> Result<VerifyReport, RepoError> {
         let store = RepoStore::new(dir);
-        let mut rooted = disk_rooted_oids(&store)?;
+        let mut nodes = disk_rooted_nodes(&store)?;
         // The primary is lane #0 and not in the registry; its in-progress
         // working change lives at the shared root's own `working-change`.
         if let Some(blob) = store.read_working_change() {
-            for node in persist_codec::decode_nodes(&blob)? {
-                for (oid, _vis) in node.tree.values() {
-                    rooted.insert(oid.clone());
+            nodes.extend(persist_codec::decode_nodes(&blob)?);
+        }
+        let scan = persist_codec::scan_objects_loose(&store.objects_dir())?;
+        // First pass names the absent addresses; the second attaches every
+        // referencing (change, path) site so the report says what was lost.
+        // An address in the acknowledged-lost ledger is partitioned out of
+        // `missing` — reported, but no longer a failure (#335). A ledger
+        // entry whose object is present again (or no longer referenced) is
+        // simply inert.
+        let acknowledged = store.read_lost();
+        let absent: BTreeSet<Oid> = nodes
+            .iter()
+            .flat_map(|n| n.tree.values())
+            .filter(|(oid, _)| !scan.present.contains(oid))
+            .map(|(oid, _)| oid.clone())
+            .collect();
+        let (lost, unacknowledged): (Vec<Oid>, Vec<Oid>) =
+            absent.into_iter().partition(|a| acknowledged.contains(a));
+        let mut refs: BTreeMap<Oid, Vec<MissingRef>> =
+            unacknowledged.into_iter().map(|a| (a, Vec::new())).collect();
+        for node in &nodes {
+            for (path, (oid, _vis)) in &node.tree {
+                if let Some(sites) = refs.get_mut(oid) {
+                    let site = MissingRef {
+                        change: node.id.clone(),
+                        path: path.clone(),
+                        message: node.message.clone(),
+                    };
+                    if !sites.contains(&site) {
+                        sites.push(site);
+                    }
                 }
             }
         }
-        let scan = persist_codec::scan_objects_loose(&store.objects_dir())?;
-        let missing: Vec<Oid> =
-            rooted.into_iter().filter(|oid| !scan.present.contains(oid)).collect();
         Ok(VerifyReport {
             ok: scan.present.len() - scan.corrupt.len(),
             corrupt: scan.corrupt,
-            missing,
+            missing: refs
+                .into_iter()
+                .map(|(addr, referenced_by)| MissingObject { addr, referenced_by })
+                .collect(),
+            lost,
         })
+    }
+
+    /// Accept every currently-missing object as lost (#335): append the
+    /// addresses `verify` reports missing to the store's acknowledged-lost
+    /// ledger, so subsequent verifies stop failing on them while still
+    /// catching new damage. An explicit operator action — nothing writes the
+    /// ledger implicitly — taken under the store lock (read-modify-write of a
+    /// shared file, ADR 0034/#293). Returns the newly acknowledged report so
+    /// the caller can show exactly what was accepted, provenance included.
+    pub fn accept_loss(dir: &Path) -> Result<VerifyReport, RepoError> {
+        let store = RepoStore::new(dir);
+        let report = Self::verify(dir)?;
+        if !report.missing.is_empty() {
+            let _lock = store.lock_shared();
+            let mut ledger = store.read_lost();
+            ledger.extend(report.missing.iter().map(|m| m.addr.clone()));
+            store
+                .write_lost(&ledger)
+                .map_err(|e| RepoError::Backend(format!("write lost ledger: {e}")))?;
+        }
+        Ok(report)
     }
 
     /// Make a landed-but-unadopted lineage visible to this position (#265):
@@ -2041,12 +2117,17 @@ fn read_shared_graph(store: &RepoStore) -> Result<Vec<ChangeNode>, RepoError> {
 /// repo's own [`DagRepo::referenced_oids`]; verify (#19) adds the primary's
 /// working-change blob and treats the union as the referenced set.
 fn disk_rooted_oids(store: &RepoStore) -> Result<BTreeSet<Oid>, RepoError> {
-    let mut live = BTreeSet::new();
-    for node in read_shared_graph(store)? {
-        for (oid, _vis) in node.tree.values() {
-            live.insert(oid.clone());
-        }
-    }
+    Ok(disk_rooted_nodes(store)?
+        .iter()
+        .flat_map(|n| n.tree.values())
+        .map(|(oid, _vis)| oid.clone())
+        .collect())
+}
+
+/// The nodes behind [`disk_rooted_oids`], whole: verify (#335) needs the
+/// referencing change and path for each missing address, not just the oid set.
+fn disk_rooted_nodes(store: &RepoStore) -> Result<Vec<ChangeNode>, RepoError> {
+    let mut nodes = read_shared_graph(store)?;
     for entry in store.list_lane_entries() {
         // Strict read, absent-is-empty: a lane with no WIP roots nothing, but
         // an unreadable or torn blob must FAIL the walk — treating it as empty
@@ -2062,13 +2143,9 @@ fn disk_rooted_oids(store: &RepoStore) -> Result<BTreeSet<Oid>, RepoError> {
                 )))
             }
         };
-        for node in persist_codec::decode_nodes(&blob)? {
-            for (oid, _vis) in node.tree.values() {
-                live.insert(oid.clone());
-            }
-        }
+        nodes.extend(persist_codec::decode_nodes(&blob)?);
     }
-    Ok(live)
+    Ok(nodes)
 }
 
 fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
@@ -2938,8 +3015,14 @@ mod tests {
         assert!(!report.is_clean());
         assert!(report.corrupt.contains(&smashed), "undecodable file is corrupt");
         assert!(report.corrupt.contains(&bogus), "hash-mismatched file is corrupt");
-        assert!(report.missing.contains(&moved), "the renamed-away address is missing");
-        assert!(!report.missing.contains(&smashed), "corrupt is present, never also missing");
+        assert!(
+            report.missing.iter().any(|m| m.addr == moved),
+            "the renamed-away address is missing"
+        );
+        assert!(
+            !report.missing.iter().any(|m| m.addr == smashed),
+            "corrupt is present, never also missing"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2955,7 +3038,8 @@ mod tests {
         let lost = repo.put(b"referenced then deleted\n", Visibility::Public).unwrap();
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from("a.txt"), (lost.clone(), Visibility::Public));
-        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+        let c1 = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
             .unwrap();
         repo.save(&dir).unwrap();
 
@@ -2964,8 +3048,79 @@ mod tests {
 
         let report = DagRepo::verify(&dir).unwrap();
         assert!(!report.is_clean());
-        assert_eq!(report.missing, vec![lost], "the deleted referenced object is missing");
+        assert_eq!(report.missing.len(), 1, "exactly the deleted referenced object is missing");
+        let m = &report.missing[0];
+        assert_eq!(m.addr, lost);
+        // Provenance (#335): the report names the referencing change, path,
+        // and message — the address alone doesn't say what was lost.
+        assert_eq!(
+            m.referenced_by,
+            vec![MissingRef {
+                change: c1.clone(),
+                path: PathBuf::from("a.txt"),
+                message: "c".into(),
+            }]
+        );
         assert!(report.corrupt.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The acknowledged-loss flow (#335): `accept_loss` records the missing
+    /// set in the ledger, after which verify is clean and reports the
+    /// addresses as `lost`; NEW damage still fails; and a ledgered object
+    /// whose bytes come back is simply verified normally again.
+    #[test]
+    fn accept_loss_acknowledges_missing_and_still_catches_new_damage() {
+        let dir = std::env::temp_dir().join(format!("loot-verify-loss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let gone = repo.put(b"lost forever\n", Visibility::Public).unwrap();
+        let later = repo.put(b"damaged later\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (gone.clone(), Visibility::Public));
+        tree.insert(PathBuf::from("b.txt"), (later.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = RepoStore::new(&dir).objects_dir();
+        let gone_path = obj_dir.join(crate::hex::encode(&gone.0));
+        let gone_bytes = std::fs::read(&gone_path).unwrap();
+        std::fs::remove_file(&gone_path).unwrap();
+
+        // Accept the loss: the report shows what was acknowledged (provenance
+        // included), and the next verify is clean with the address in `lost`.
+        let accepted = DagRepo::accept_loss(&dir).unwrap();
+        assert_eq!(accepted.missing.len(), 1);
+        assert_eq!(accepted.missing[0].addr, gone);
+        let report = DagRepo::verify(&dir).unwrap();
+        assert!(report.is_clean(), "acknowledged loss no longer fails: {report:?}");
+        assert!(report.missing.is_empty());
+        assert_eq!(report.lost, vec![gone.clone()], "the loss stays on the record");
+
+        // New damage after the acknowledgment still fails — the ledger must
+        // never become a blanket pardon.
+        std::fs::remove_file(obj_dir.join(crate::hex::encode(&later.0))).unwrap();
+        let report = DagRepo::verify(&dir).unwrap();
+        assert!(!report.is_clean());
+        assert_eq!(report.missing.len(), 1, "only the NEW loss fails");
+        assert_eq!(report.missing[0].addr, later);
+        assert_eq!(report.lost, vec![gone.clone()]);
+
+        // A ledgered object whose bytes come back is verified normally; its
+        // inert ledger entry stops mattering.
+        std::fs::write(&gone_path, &gone_bytes).unwrap();
+        let report = DagRepo::verify(&dir).unwrap();
+        assert!(!report.lost.contains(&gone), "a present object is not lost");
+        assert!(report.missing.iter().all(|m| m.addr != gone));
+
+        // Idempotent: accepting again only adds the still-missing address.
+        DagRepo::accept_loss(&dir).unwrap();
+        let report = DagRepo::verify(&dir).unwrap();
+        assert!(report.is_clean());
+        assert_eq!(report.lost, vec![later], "both losses acknowledged, one inert");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

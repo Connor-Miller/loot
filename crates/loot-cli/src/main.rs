@@ -120,7 +120,7 @@ const COMMANDS: &[Verb] = &[
     verb("lanes", &[], OUT, cmd_lane_list),
     verb("log", &["--path"], &[], cmd_log),
     verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
-    verb("verify", &[], &[], |_| cmd_verify()),
+    verb("verify", &[], &["--accept-loss"], cmd_verify),
     verb("bundle", &[], &[], cmd_bundle),
     verb("apply", &[], OUT, cmd_apply),
     verb("grant", &["--relay", "--allow-demote"], SKIP, cmd_grant),
@@ -177,7 +177,7 @@ usage:
   loot surface                              materialize what the current identity may see
   loot log [<selector>] [--path <path>]     show change history, or the ancestry of one point in it; selectors: @, HEAD, HEAD~<n>, id prefix; --path filters to changes whose recorded tree includes <path> (#6) — combine both to intersect (the selector's ancestry AND the path)
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
-  loot verify                               integrity-check the object store: rehash every object, find missing ones (exits 1 on problems)
+  loot verify [--accept-loss]               integrity-check the object store: rehash every object, find missing ones with their referencing changes (exits 1 on problems); --accept-loss records current losses as acknowledged
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
@@ -796,16 +796,59 @@ fn cmd_gc(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `loot verify` — integrity-check the loose object store (#19). Read-only:
-/// every object file is decoded and re-hashed against its filename (the
-/// content address), and every address a change references must have a file.
-/// A clean store exits 0; any corrupt or missing object is reported by full
-/// address and the command errors (exit 1), so CI can gate on it. Deliberately
-/// never opens the Workspace: a corrupt store fails to load, and the store
-/// that fails to load is the one this command exists to diagnose.
-fn cmd_verify() -> Result<(), String> {
+/// `loot verify [--accept-loss]` — integrity-check the loose object store
+/// (#19). Read-only: every object file is decoded and re-hashed against its
+/// filename (the content address), and every address a change references must
+/// have a file. A clean store exits 0; any corrupt or missing object is
+/// reported by full address — with the referencing change and path (#335) —
+/// and the command errors (exit 1), so CI can gate on it. Deliberately never
+/// opens the Workspace: a corrupt store fails to load, and the store that
+/// fails to load is the one this command exists to diagnose.
+///
+/// `--accept-loss` records the currently-missing addresses in the store's
+/// acknowledged-lost ledger (`.loot/lost`, #335): an unrecoverable loss —
+/// the address hashes nonce+ciphertext, and the nonce died with the file —
+/// stops failing every future verify, while NEW damage still fails. Primary
+/// only: the ledger is a shared-store file with one writer (ADR 0034).
+fn cmd_verify(args: &[String]) -> Result<(), String> {
+    let accept = args.iter().any(|a| a == "--accept-loss");
     let dot = workspace::resolve_store_dot(std::path::Path::new("."))?;
-    let report = loot_core::DagRepo::verify(&dot).map_err(|e| e.to_string())?;
+    if accept && loot_core::RepoStore::read_store_pointer(std::path::Path::new(".loot")).is_some()
+    {
+        return Err(
+            "`loot verify --accept-loss` writes the shared store's loss ledger — run it \
+             from the primary, not a lane (ADR 0034 single-writer)"
+                .into(),
+        );
+    }
+
+    let report = if accept {
+        let report = loot_core::DagRepo::accept_loss(&dot).map_err(|e| e.to_string())?;
+        if report.missing.is_empty() {
+            println!("nothing missing — loss ledger unchanged");
+        } else {
+            println!(
+                "accepted {} missing object(s) as lost — recorded in .loot/lost:",
+                report.missing.len()
+            );
+            for m in &report.missing {
+                print_missing(m);
+            }
+        }
+        // Re-read so the exit reflects the post-acknowledgment state: the
+        // accepted addresses moved to `lost`; anything still failing is
+        // corruption (or a race), which acknowledgment must not mask.
+        loot_core::DagRepo::verify(&dot).map_err(|e| e.to_string())?
+    } else {
+        loot_core::DagRepo::verify(&dot).map_err(|e| e.to_string())?
+    };
+
+    if !report.lost.is_empty() {
+        println!(
+            "lost (acknowledged): {} object(s) — unrecoverable, recorded in .loot/lost",
+            report.lost.len()
+        );
+    }
     if report.is_clean() {
         println!("all objects OK — {} object(s) verified", report.ok);
         return Ok(());
@@ -813,8 +856,8 @@ fn cmd_verify() -> Result<(), String> {
     for addr in &report.corrupt {
         println!("corrupt: {}", loot_core::hex::encode(&addr.0));
     }
-    for addr in &report.missing {
-        println!("missing: {}", loot_core::hex::encode(&addr.0));
+    for m in &report.missing {
+        print_missing(m);
     }
     Err(format!(
         "object store failed verification: {} corrupt, {} missing ({} OK)",
@@ -822,6 +865,25 @@ fn cmd_verify() -> Result<(), String> {
         report.missing.len(),
         report.ok
     ))
+}
+
+/// One missing address with its referencing sites (#335); a long-lived path
+/// can be referenced by many changes — show a few.
+fn print_missing(m: &loot_core::MissingObject) {
+    println!("missing: {}", loot_core::hex::encode(&m.addr.0));
+    const SHOWN: usize = 3;
+    for site in m.referenced_by.iter().take(SHOWN) {
+        let subject = site.message.lines().next().unwrap_or("");
+        println!(
+            "    referenced by {} \"{}\" at {}",
+            short(&site.change),
+            subject,
+            site.path.display()
+        );
+    }
+    if m.referenced_by.len() > SHOWN {
+        println!("    ... and {} more reference(s)", m.referenced_by.len() - SHOWN);
+    }
 }
 
 /// Render a byte count as a compact human-readable size (B / KiB / MiB / GiB).
