@@ -509,6 +509,12 @@ impl Workspace {
 
     /// Run a closure that mutates the repo, then persist. The single path for
     /// "mutation ⇒ save" — callers can't forget to persist (e.g. `apply`).
+    ///
+    /// Scope: the **reconciliation family** (`apply`/`pull`/`resolve`/dock
+    /// merge/ferry), whose capture disciplines are their own and deliberately
+    /// not the implicit snapshot. A **snapshotting verb** (grant/maroon/
+    /// migrate, ADR 0030) must not call this directly — it mutates through the
+    /// [`Snapshotted`] handle, whose construction *is* the capture.
     pub fn with_repo<T>(
         &mut self,
         f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
@@ -516,6 +522,26 @@ impl Workspace {
         let out = f(&mut self.repo)?;
         self.persist()?;
         Ok(out)
+    }
+
+    /// The one door to the snapshotting (mutating) verbs (ADR 0030): capture
+    /// the working tree first — honoring the demotion allowlist (#62) and the
+    /// `--no-snapshot`/`--ignore-working-copy` escape — then hand back the
+    /// handle that exposes mutation. Holding a [`Snapshotted`] *is* the proof
+    /// the capture ran (or was explicitly skipped); a verb that forgets it
+    /// cannot mutate, so the invariant is a type, not a hand-maintained call
+    /// list (which had drifted across main.rs and ferry.rs — #182). Preserves
+    /// a `describe`d name: an implicit capture must not clobber it.
+    pub fn snapshotted(
+        &mut self,
+        allow_demote: &[PathBuf],
+        skip: bool,
+    ) -> Result<Snapshotted<'_>, String> {
+        if !skip {
+            let msg = self.working_message().unwrap_or_else(|| "(working change)".to_string());
+            self.snapshot_allowing(&msg, allow_demote)?;
+        }
+        Ok(Snapshotted { ws: self })
     }
 
     // --- operation log + undo (S4, ADR 0031) ---
@@ -1263,6 +1289,43 @@ pub enum DockAction {
     Already,
     Switched,
     Created,
+}
+
+/// Proof-of-capture handle for the snapshotting verbs (ADR 0030), constructed
+/// only by [`Workspace::snapshotted`]. Mutation for those verbs lives here —
+/// [`Snapshotted::mutate`] is `with_repo` gated behind the capture the handle
+/// proves — so "forgot the implicit snapshot" is a compile error, not a silent
+/// edit-drop (#182). Reads pass through via [`Snapshotted::ws`].
+pub struct Snapshotted<'a> {
+    ws: &'a mut Workspace,
+}
+
+impl Snapshotted<'_> {
+    /// Read-only view of the workspace (`now`, `dot`, `repo`, remote
+    /// resolution). Reads are not the hazard the handle exists for.
+    pub fn ws(&self) -> &Workspace {
+        self.ws
+    }
+
+    /// Run a closure that mutates the repo, then persist — the snapshotting
+    /// verbs' `with_repo`, reachable only through the capture.
+    pub fn mutate<T>(
+        &mut self,
+        f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.ws.with_repo(f)
+    }
+
+    /// Finalize (sign) a change this verb recorded — maroon's re-seal must be
+    /// signed or it never travels (ADR 0018).
+    pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), String> {
+        self.ws.sign_change(change_id)
+    }
+
+    /// Record the verb in the op log (after its persist, ADR 0031).
+    pub fn record_op(&self, command: &str, description: &str, barrier: bool) {
+        self.ws.record_op(command, description, barrier);
+    }
 }
 
 /// The live working-change row `status`/`log` render (ADR 0030). `change_id` is

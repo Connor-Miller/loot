@@ -241,21 +241,6 @@ fn positionals(args: &[String]) -> Vec<&str> {
     out
 }
 
-/// The implicit snapshot that precedes a mutating verb (ADR 0030): capture the
-/// working tree into the working change so the verb acts on what is on disk,
-/// without a manual `loot status` first. Preserves the working change's name
-/// (an implicit capture must not clobber a message a prior `describe` set), and
-/// carries the demotion guard via `--allow-demote`. `--no-snapshot` /
-/// `--ignore-working-copy` skips it. Read-only verbs never call this.
-fn implicit_snapshot(ws: &mut Workspace, opts: &SnapshotOpts) -> Result<(), String> {
-    if opts.skip {
-        return Ok(());
-    }
-    let msg = ws.working_message().unwrap_or_else(|| "(working change)".to_string());
-    ws.snapshot_allowing(&msg, &opts.allow_demote)?;
-    Ok(())
-}
-
 /// Lift an apply/pull outcome map into the serializable verdict rows.
 fn verdicts_of(
     outcomes: &std::collections::BTreeMap<std::path::PathBuf, MergeOutcome>,
@@ -857,16 +842,17 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
     let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
     // Capture the working tree first (ADR 0030) so the grant seals what is on
-    // disk now, not a stale last-`status` snapshot.
-    implicit_snapshot(&mut ws, &opts)?;
-    let now = ws.now();
+    // disk now, not a stale last-`status` snapshot — the handle is the proof.
+    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let now = snap.ws().now();
 
-    let oid = ws
+    let oid = snap
+        .ws()
         .repo()
         .current_tree_oid(std::path::Path::new(path))
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
-    let bundle = ws.with_repo(|repo| {
+    let bundle = snap.mutate(|repo| {
         repo.grant(&oid, grantee, now).map_err(|e| e.to_string())
     })?;
     std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
@@ -877,7 +863,7 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
     );
     println!("  {path} → {grantee} (recorded in manifest)");
     // A grant hands a content key to a peer — one-way (ADR 0031). Barrier.
-    ws.record_op("grant", &format!("grant {path} → {grantee}"), true);
+    snap.record_op("grant", &format!("grant {path} → {grantee}"), true);
     Ok(())
 }
 
@@ -900,12 +886,12 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
     // Capture the working tree first (ADR 0030) so the sealed grant covers the
-    // path's current on-disk content.
-    implicit_snapshot(&mut ws, &opts)?;
-    let dot = ws.dot().to_owned();
+    // path's current on-disk content — the handle is the proof.
+    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let dot = snap.ws().dot().to_owned();
 
     // Resolve the relay URL via the shared helper (consistent with push/pull).
-    let url = resolve_remote(args, &ws)
+    let url = resolve_remote(args, snap.ws())
         .unwrap_or_else(|_| relay_target.to_string());
 
     // Load our signing identity (grantor).
@@ -920,8 +906,9 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     let recipient_x25519 = identity::x25519_pubkey_from_ed25519_bytes(&grantee_ed_pubkey)
         .map_err(|e| format!("could not derive x25519 key for '{grantee}': {e}"))?;
 
-    let now = ws.now();
-    let oid = ws
+    let now = snap.ws().now();
+    let oid = snap
+        .ws()
         .repo()
         .current_tree_oid(std::path::Path::new(path))
         .map_err(|_| format!("path '{path}' not found in current change"))?;
@@ -930,12 +917,12 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     // recipient gets a timed grant the relay withholds like the push-time
     // deposits — never an immediately-delivered key. Everything else is an
     // ordinary untimed grant (reveal_at = 0).
-    let reveal_at = match ws.repo().visibility_of(&oid) {
+    let reveal_at = match snap.ws().repo().visibility_of(&oid) {
         Some(Visibility::Embargoed { reveal_at }) => reveal_at,
         _ => 0,
     };
 
-    let bundle = ws.with_repo(|repo| {
+    let bundle = snap.mutate(|repo| {
         repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, reveal_at, now, |content_key| {
             identity::seal_key(content_key, &recipient_x25519)
                 .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
@@ -954,7 +941,7 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     }
     println!("  recipient runs `loot pull-grants` to receive it");
     // Sealed grant delivered to the relay — a one-way disclosure (ADR 0031).
-    ws.record_op("grant", &format!("grant {path} → {grantee} (sealed)"), true);
+    snap.record_op("grant", &format!("grant {path} → {grantee} (sealed)"), true);
     Ok(())
 }
 
@@ -1045,10 +1032,11 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
 
     let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
-    // Re-seal against the working tree as it is now (ADR 0030).
-    implicit_snapshot(&mut ws, &opts)?;
-    let now = ws.now();
-    let result: MaroonResult = ws.with_repo(|repo| {
+    // Re-seal against the working tree as it is now (ADR 0030) — the handle is
+    // the proof of capture.
+    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let now = snap.ws().now();
+    let result: MaroonResult = snap.mutate(|repo| {
         if hard {
             repo.maroon_hard(path, marooned, now).map_err(|e| e.to_string())
         } else {
@@ -1060,7 +1048,7 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
     // authored-but-unsigned, and unsigned authored changes never travel via
     // push/bundle (ADR 0018). Without this, a maroon's re-seal is stranded on
     // the originator and peers keep reading the old content.
-    ws.sign_change(&result.change_id)?;
+    snap.sign_change(&result.change_id)?;
 
     let level = if hard { "hard-marooned" } else { "marooned" };
     println!(
@@ -1094,7 +1082,7 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
         println!("  also run `loot bundle` to ship the re-sealed object to all peers");
     }
     // A maroon is an audited, one-way revocation of a restricted key (ADR 0031).
-    ws.record_op("maroon", &format!("maroon {} ⁄ {marooned}", path.display()), true);
+    snap.record_op("maroon", &format!("maroon {} ⁄ {marooned}", path.display()), true);
     Ok(())
 }
 
@@ -1130,10 +1118,11 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
 
     let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
-    // Re-classify against the current on-disk tree (ADR 0030).
-    implicit_snapshot(&mut ws, &opts)?;
-    let now = ws.now();
-    let result: MigrateResult = ws.with_repo(|repo| {
+    // Re-classify against the current on-disk tree (ADR 0030) — the handle is
+    // the proof of capture.
+    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let now = snap.ws().now();
+    let result: MigrateResult = snap.mutate(|repo| {
         repo.migrate(path, new_vis.clone(), now).map_err(|e| e.to_string())
     })?;
 
@@ -1163,7 +1152,7 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
         }
         println!("  run `loot bundle` to ship the re-sealed object to all peers");
     }
-    ws.record_op("migrate", &format!("migrate {} → {vis_label}", path.display()), false);
+    snap.record_op("migrate", &format!("migrate {} → {vis_label}", path.display()), false);
     Ok(())
 }
 
@@ -2437,10 +2426,6 @@ mod tests {
 
     // --- S1: implicit auto-snapshot on mutating verbs (#144, ADR 0030) ---
 
-    fn no_opts() -> SnapshotOpts {
-        SnapshotOpts { allow_demote: vec![], skip: false }
-    }
-
     /// `--allow-demote` is repeatable; either skip flag sets `skip`.
     #[test]
     fn snapshot_opts_parse_globals() {
@@ -2498,8 +2483,8 @@ mod tests {
         assert!(ws.repo().log().is_empty(), "no spurious empty change: {:?}", ws.repo().log());
     }
 
-    /// An implicit capture re-records the tree without clobbering a name a
-    /// prior `describe` set (working_message is preserved).
+    /// An implicit capture (via the Snapshotted handle, #182) re-records the
+    /// tree without clobbering a name a prior `describe` set.
     #[test]
     fn implicit_snapshot_preserves_describe_name() {
         let dir = tmp("s1-preserve-name");
@@ -2510,13 +2495,14 @@ mod tests {
         assert_eq!(ws.working_message().as_deref(), Some("the intro"));
 
         std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
-        implicit_snapshot(&mut ws, &no_opts()).unwrap();
+        let _ = ws.snapshotted(&[], false).unwrap();
         assert_eq!(ws.working_message().as_deref(), Some("the intro"), "name survives implicit capture");
     }
 
     /// `--no-snapshot` acts on the last recorded working change: a later edit is
     /// not captured, so the working change id is unchanged; without the flag the
-    /// same edit is captured and the id moves.
+    /// same edit is captured and the id moves. The skip rides the handle's
+    /// constructor, so even a skipped verb holds the proof-of-capture type.
     #[test]
     fn no_snapshot_skips_the_implicit_capture() {
         let dir = tmp("s1-skip");
@@ -2527,10 +2513,10 @@ mod tests {
         let before = ws.working_id().cloned();
 
         std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
-        implicit_snapshot(&mut ws, &SnapshotOpts { allow_demote: vec![], skip: true }).unwrap();
+        let _ = ws.snapshotted(&[], true).unwrap();
         assert_eq!(ws.working_id(), before.as_ref(), "skip leaves the working change untouched");
 
-        implicit_snapshot(&mut ws, &no_opts()).unwrap();
+        let _ = ws.snapshotted(&[], false).unwrap();
         assert_ne!(ws.working_id(), before.as_ref(), "a real capture moves the working change");
     }
 }

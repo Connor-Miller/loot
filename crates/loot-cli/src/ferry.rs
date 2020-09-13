@@ -294,10 +294,12 @@ pub fn run(
 
     if with_wip {
         // Ferry is a mutating verb in this mode: capture the ambient tree
-        // first (tree-hash short-circuit makes an unchanged tree a no-op, and
-        // the demotion guard applies exactly as on any snapshot, #135).
-        let msg = ws.working_message().unwrap_or_else(|| "wip".to_string());
-        let _ = ws.snapshot(&msg)?;
+        // first through the same proof-of-capture door every snapshotting verb
+        // uses (ADR 0030, #182) — the tree-hash short-circuit makes an
+        // unchanged tree a no-op, and the demotion guard applies exactly as on
+        // any snapshot (#135). The handle drops immediately; the projection
+        // below reads the captured working change.
+        let _ = ws.snapshotted(&[], false)?;
         match ws.working_id().cloned() {
             None => {
                 report.review =
