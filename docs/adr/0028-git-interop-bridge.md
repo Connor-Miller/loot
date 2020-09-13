@@ -136,3 +136,31 @@ never held. Charted in `.scratch/git-interop-bridge/` (wayfinder), non-relay.
   (out-of-scope) public projection.
 - New surface: a `loot ferry` verb, a git2 dependency, `.loot/git-mirror/` in
   RepoStore, and the identity map + SSH signing config.
+
+## Amendment (#288): a change's tree is a full manifest, never an ancestry overlay
+
+Hit live 2026-07-16: the reconcile merge `d3ca4b8` ("ferry: reconcile git
+main") resurrected `tools/loot-first.ps1` and `crates/loot-first/src/ledger.rs`
+— deleted months earlier on **every** line involved; neither merge parent held
+them — and the land published them to origin/main (cleaned up by PR #286).
+
+The bridge was innocent; the hole was under it, in loot-core. Every recorded
+change carries a **full** path→address manifest (snapshot, ingest and merge all
+record whole trees; deletion = absence from the child's manifest), but
+`ChangeGraph::tree_at`/`current_tree` computed a tip's tree by unioning every
+*ancestor's* tree child-wins — delta semantics no production node ever had. So
+every path ever deleted anywhere in the ancestry re-entered the computed tree,
+forever. `merge_tips` fed those polluted trees to the converge classifier,
+which saw the same stale address on both sides ("untouched") and kept it; the
+merge's manifest carried the phantoms, and projection — which correctly diffs
+recorded manifests — faithfully published the resurrection. The merge *base*
+was never at fault: `common_ancestor_tree` always returned the ancestor's exact
+manifest.
+
+The fix makes the graph agree with what its recorders write: `tree_at` returns
+the change's own manifest; `current_tree` unions the **head** manifests only
+(the pre-dock multi-head view), never the ancestry. One classifier gap remains
+out of scope here: the converge rule has no deletion-vs-base case, so a path
+freshly deleted on *one* side since the fork is still re-adopted from the other
+(the same shape concurrent.md warns about for the adopt merge) — tracked
+separately.

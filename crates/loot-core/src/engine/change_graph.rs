@@ -259,11 +259,19 @@ impl ChangeGraph {
         Some(())
     }
 
-    /// Latest content address per path, applying changes in topo order so a
-    /// child's write wins over its parent's.
+    /// The current tree across every head: the union of the **head manifests**,
+    /// in topo order so a later head's write wins a shared path. Every recorded
+    /// change carries a *full* path→address manifest (snapshot, ingest and
+    /// merge all record whole trees), so a head's own manifest is authoritative
+    /// for its line; ancestors are history, not an overlay. Unioning the whole
+    /// ancestry — the pre-#288 behavior — treated manifests as deltas and
+    /// re-raised every path ever deleted anywhere in the graph, forever.
     pub fn current_tree(&self) -> Tree {
         let mut tree: Tree = BTreeMap::new();
         for node in self.in_order() {
+            if !self.heads.contains(&node.id) {
+                continue;
+            }
             for (path, entry) in &node.tree {
                 tree.insert(path.clone(), entry.clone());
             }
@@ -271,21 +279,19 @@ impl ChangeGraph {
         tree
     }
 
-    /// Latest content address per path along a *single* head's ancestry, applying
-    /// changes in topo order so a child's write wins. Unlike [`current_tree`],
-    /// which merges every head, this scopes the tree to one line — the basis for
-    /// per-dock isolation, where each dock forks from its own tip (ADR 0022). An
-    /// unknown head yields an empty tree.
+    /// The tree at one change: its recorded manifest, exactly. Unlike
+    /// [`current_tree`], which merges every head, this scopes to one line — the
+    /// basis for per-dock isolation, where each dock forks from its own tip
+    /// (ADR 0022). A path present in an ancestor but absent here was **deleted**
+    /// on the way and must stay gone: walking the ancestry child-wins (the
+    /// pre-#288 behavior) resurrected every deleted path into merge inputs,
+    /// which is how `merge_tips` re-raised files both lines had deleted months
+    /// earlier and published them to git `main`. An unknown head yields an
+    /// empty tree.
     ///
     /// [`current_tree`]: ChangeGraph::current_tree
     pub fn tree_at(&self, head: &Oid) -> Tree {
-        let mut tree: Tree = BTreeMap::new();
-        for node in self.ancestry_in_order(head) {
-            for (path, entry) in &node.tree {
-                tree.insert(path.clone(), entry.clone());
-            }
-        }
-        tree
+        self.changes.get(head).map(|n| n.tree.clone()).unwrap_or_default()
     }
 
     /// The full tree of the nearest common ancestor of `a` and `b` — the merge
@@ -331,14 +337,6 @@ impl ChangeGraph {
         ordered
     }
 
-    /// The ancestor-closure of `head` (head included) in parents-before-children
-    /// order. Empty if `head` is unknown.
-    fn ancestry_in_order(&self, head: &Oid) -> Vec<&ChangeNode> {
-        let mut ordered = Vec::new();
-        let mut visited: BTreeMap<Oid, bool> = BTreeMap::new();
-        visit(head, &self.changes, &mut visited, &mut ordered);
-        ordered
-    }
 }
 
 /// Shared DFS: emit `id` and its ancestors with parents before children.
@@ -424,14 +422,34 @@ mod tests {
         assert_eq!(heads, vec![Oid([1; 32]), Oid([2; 32])]);
     }
 
+    /// A node carrying a FULL manifest — the shape every production recorder
+    /// (snapshot, ingest, merge) actually writes (#288).
+    fn manifest_node(id: u8, parents: &[u8], entries: &[(&str, u8)]) -> ChangeNode {
+        let tree = entries
+            .iter()
+            .map(|&(path, addr)| (PathBuf::from(path), (Oid([addr; 32]), Visibility::Public)))
+            .collect();
+        ChangeNode {
+            id: Oid([id; 32]),
+            parents: parents.iter().map(|&p| Oid([p; 32])).collect(),
+            message: format!("c{id}"),
+            tree,
+            author: None,
+            signature: None,
+            change_id: None,
+            predecessors: Vec::new(),
+        }
+    }
+
     #[test]
     fn tree_at_scopes_to_one_line_unlike_current_tree() {
-        // A common base (1), then two forks: 2 writes b, 3 writes c. Both are
-        // heads. current_tree() merges everything; tree_at() sees one line only.
+        // A common base (1), then two forks whose manifests carry the base
+        // plus their own write. current_tree() merges the heads; tree_at()
+        // sees one line only.
         let mut g = ChangeGraph::new();
-        g.insert(node(1, &[], "a", 10));
-        g.insert(node(2, &[1], "b", 20)); // fork A
-        g.insert(node(3, &[1], "c", 30)); // fork B
+        g.insert(manifest_node(1, &[], &[("a", 10)]));
+        g.insert(manifest_node(2, &[1], &[("a", 10), ("b", 20)])); // fork A
+        g.insert(manifest_node(3, &[1], &[("a", 10), ("c", 30)])); // fork B
 
         let merged = g.current_tree();
         assert!(merged.contains_key(&PathBuf::from("a")));
@@ -451,9 +469,29 @@ mod tests {
     #[test]
     fn tree_at_child_write_wins_and_unknown_head_is_empty() {
         let mut g = ChangeGraph::new();
-        g.insert(node(1, &[], "a", 10));
-        g.insert(node(2, &[1], "a", 11)); // child overwrites a
+        g.insert(manifest_node(1, &[], &[("a", 10)]));
+        g.insert(manifest_node(2, &[1], &[("a", 11)])); // child overwrites a
         assert_eq!(g.tree_at(&Oid([2; 32]))[&PathBuf::from("a")].0, Oid([11; 32]));
         assert!(g.tree_at(&Oid([99; 32])).is_empty(), "unknown head => empty tree");
+    }
+
+    #[test]
+    fn tree_at_honors_a_deletion_instead_of_unioning_the_ancestry() {
+        // #288: a change's tree is its full manifest; a path present in an
+        // ancestor but absent from the child's manifest was DELETED. The old
+        // ancestry-union re-raised it forever, which is what resurrected
+        // long-deleted files in every reconcile merge.
+        let mut g = ChangeGraph::new();
+        g.insert(manifest_node(1, &[], &[("a", 10), ("b", 20)]));
+        g.insert(manifest_node(2, &[1], &[("a", 10)])); // deletes b
+        let t = g.tree_at(&Oid([2; 32]));
+        assert!(t.contains_key(&PathBuf::from("a")));
+        assert!(
+            !t.contains_key(&PathBuf::from("b")),
+            "a deleted path must not resurrect via the ancestry"
+        );
+        // The single-head current tree agrees with the head's manifest.
+        let ct = g.current_tree();
+        assert!(!ct.contains_key(&PathBuf::from("b")));
     }
 }
