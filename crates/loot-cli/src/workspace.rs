@@ -1390,19 +1390,31 @@ impl Workspace {
         // stranded by a pre-#265 catch-up attempt), adds nothing over the
         // anchor, or is empty, is not local work: drop it so the catch-up
         // fast-forwards instead of minting a merge that re-lands the same
-        // tree. Only a capture the disk still agrees with is droppable — dirt
-        // beyond it is real work and falls through to the capture-first merge.
-        if let Some(w) = self.working.clone() {
-            if !self.tree_is_dirty_over(Some(&w))? {
-                let empty = self.repo.change_tree(&w).is_none_or(|t| t.is_empty());
-                let redundant = empty
-                    || self.repo.same_tree_content(&their, &w, self.now)
-                    || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &w, self.now));
-                if redundant {
-                    self.repo.drop_working(&w);
-                    self.working = None;
-                    self.persist()?;
-                }
+        // tree.
+        if let Some(mut w) = self.working.clone() {
+            // Refresh a stale capture first: the disk may have moved *past* it
+            // (a `git reset` onto landed main left an older-era snapshot
+            // behind — the #265 dogfood case). `capture_uncaptured_edits`
+            // returns an existing working change untouched, and judging the
+            // stale version would wrongly keep — and then merge — a capture
+            // the tree has already superseded. Snapshot rewrites the working
+            // change in place (ADR 0006), so the redundancy check below judges
+            // what the disk actually holds.
+            if self.tree_is_dirty_over(Some(&w))? {
+                let m = self
+                    .repo
+                    .change_message(&w)
+                    .unwrap_or_else(|| "(working change)".to_string());
+                w = self.snapshot(&m)?.0;
+            }
+            let empty = self.repo.change_tree(&w).is_none_or(|t| t.is_empty());
+            let redundant = empty
+                || self.repo.same_tree_content(&their, &w, self.now)
+                || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &w, self.now));
+            if redundant {
+                self.repo.drop_working(&w);
+                self.working = None;
+                self.persist()?;
             }
         }
         // Clean fast-forward: no captured local work and our line is strictly
@@ -4488,6 +4500,29 @@ mod tests {
         assert!(report.merged && report.outcomes.is_empty(), "clean FF");
         assert_eq!(ws.repo().heads(), vec![c2], "the duplicate capture did not become a merge");
         assert!(ws.working_id().is_none(), "the redundant capture was dropped");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn adopt_no_arg_refreshes_a_stale_capture_the_disk_moved_past() {
+        // The #265 dogfood case: an older-era capture is in progress, then the
+        // operator `git reset`s the checkout onto landed main — the disk moves
+        // *past* the capture, onto exactly the landed content. The stale
+        // snapshot is not local work; catch-up must refresh it to the disk's
+        // truth, see it duplicates landed main, and fast-forward — not keep
+        // the stale version and mint a merge.
+        let (area, dir, c2) = landed_from_lane("adopt-265-refresh");
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        // The stale capture: pre-reset content in the landed path.
+        std::fs::write(dir.join("landed.txt"), b"old guess").unwrap();
+        ws.snapshot("(working change)").unwrap();
+        // The reset: the disk now holds exactly the landed content.
+        std::fs::write(dir.join("landed.txt"), b"landed").unwrap();
+
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged && report.outcomes.is_empty(), "clean FF");
+        assert_eq!(ws.repo().heads(), vec![c2], "the stale capture did not become a merge");
+        assert!(ws.working_id().is_none(), "the refreshed-then-redundant capture was dropped");
         let _ = std::fs::remove_dir_all(&area);
     }
 
