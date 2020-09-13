@@ -34,7 +34,7 @@ pub(crate) use change_graph::ChangeNode;
 pub use change_graph::change_signing_message;
 use change_graph::{compute_change_id, mint_change_id, ChangeGraph};
 use crate::store::{read_replaced, RepoStore};
-pub use custody::{MaroonResult, MigrateResult};
+pub use custody::{MaroonResult, MigrateResult, RotateRegrant, RotateReport};
 use custody::{decode_manifest, decode_purges, encode_manifest, encode_purges, Custody};
 use object_store::{ObjectStore, Stored};
 use std::collections::{BTreeMap, BTreeSet};

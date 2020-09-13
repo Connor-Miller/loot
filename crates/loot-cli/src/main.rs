@@ -211,6 +211,7 @@ usage:
   loot whoami [--pubkey]                    show this repo's public key (with the flag: bare OpenSSH line only, for scripting)
   loot id export <file>                     export keypair to <file>, passphrase-encrypted
   loot id import <file>                     import keypair from passphrase-encrypted <file>
+  loot id rotate [dir]                      new keypair + expiry-preserving re-grant wave into [dir] (old key archived, ADR 0016)
   loot peer add <name> <pubkey>             register a peer's public key (<pubkey> of `-` reads the key from stdin)
   loot peer remove <name>                   forget a peer
   loot peer list                            show all known peers
@@ -2270,8 +2271,153 @@ fn cmd_id(args: &[String]) -> Result<(), String> {
             println!("public key: {}", pub_line.trim());
             Ok(())
         }
-        _ => Err("id subcommands: export <file> | import <file>".into()),
+        "rotate" => cmd_id_rotate(args),
+        _ => Err("id subcommands: export <file> | import <file> | rotate [dir]".into()),
     }
+}
+
+/// `loot id rotate [dir]` (#16, ADR 0016): rotation modeled as **new identity
+/// + a re-grant wave**, not cryptographic key-succession. In order:
+///
+/// 1. re-issue every still-live grant this identity holds as a targeted
+///    bundle in `[dir]` (default `.`), each carrying its original
+///    `expires_at` exactly — rotation never extends a lapsing grant (#20);
+/// 2. archive the old key files (`.loot/id` → `.loot/id.rotated-<ts>`, never
+///    deleted — the emergency-rollback artifact);
+/// 3. generate a fresh ed25519 keypair as the active identity;
+/// 4. print the operator ritual: paste-ready `loot peer add` for peers,
+///    where the bundles go, and what the archived key still opens.
+///
+/// The wave runs first so any failure aborts before the keypair is touched.
+fn cmd_id_rotate(args: &[String]) -> Result<(), String> {
+    let out_dir = args
+        .get(1)
+        .map(|s| std::path::Path::new(s.as_str()))
+        .unwrap_or(std::path::Path::new("."));
+    let mut ws = Workspace::open()?;
+    let dot = ws.dot().to_owned();
+    let name = ws.identity().to_string();
+    if !identity::keypair_exists(&dot) {
+        return Err("no identity keypair — run `loot keygen` to generate one".into());
+    }
+
+    // 1) The re-grant wave, while the repo state is still the old key's.
+    let report = ws.rotate_regrants()?;
+    let mut bundle_files: Vec<std::path::PathBuf> = Vec::new();
+    if !report.regrants.is_empty() {
+        std::fs::create_dir_all(out_dir)
+            .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+        for r in &report.regrants {
+            let dest = out_dir.join(format!("regrant-{}.bundle", short(&r.oid)));
+            std::fs::write(&dest, &r.bundle.0)
+                .map_err(|e| format!("write {}: {e}", dest.display()))?;
+            bundle_files.push(dest);
+        }
+    }
+
+    // 2) Archive the old key — rename, never delete (#16 rollback property).
+    let (priv_arch, _pub_arch) =
+        identity::archive_keypair(&dot, ws.now()).map_err(|e| e.to_string())?;
+
+    // 3) Fresh keypair into the freed active slot.
+    identity::generate_and_save(&dot, &format!("{name}@loot"))
+        .map_err(|e| e.to_string())?;
+    let new_pub_line = std::fs::read_to_string(dot.join("id.pub"))
+        .map_err(|e| format!("read id.pub: {e}"))?
+        .trim()
+        .to_string();
+
+    // 4) The operator ritual.
+    print!(
+        "{}",
+        render_rotate_instructions(
+            &name,
+            &new_pub_line,
+            &bundle_files,
+            report.skipped_expired.len(),
+            report.skipped_unheld.len(),
+            &priv_arch,
+        )
+    );
+    // Rotation swaps the signing key and mints grant bundles — key state undo
+    // never touches (ADR 0031). Barrier.
+    ws.record_op("id", "id rotate (new keypair + re-grant wave)", true);
+    Ok(())
+}
+
+/// The `loot id rotate` report + operator instructions (#16): everything the
+/// human must do by hand after the mechanical steps succeeded. Pure, so the
+/// coaching is testable without a repo.
+fn render_rotate_instructions(
+    identity: &str,
+    new_pub_line: &str,
+    bundle_files: &[std::path::PathBuf],
+    skipped_expired: usize,
+    skipped_unheld: usize,
+    archived_key: &std::path::Path,
+) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "rotated identity keypair for {identity}");
+    let _ = writeln!(s, "  new public key: {new_pub_line}");
+    let _ = writeln!(
+        s,
+        "  old key archived at {} — archived, not deleted; copy it back over .loot/id to roll back",
+        archived_key.display()
+    );
+    match bundle_files.len() {
+        0 => {
+            let _ = writeln!(s, "  re-grant wave: nothing to re-issue (no live grants held by this identity)");
+        }
+        n => {
+            let _ = writeln!(s, "  re-grant wave: {n} bundle(s), each keeping its original expiry (#20):");
+            for f in bundle_files {
+                let _ = writeln!(s, "    {}", f.display());
+            }
+        }
+    }
+    if skipped_expired > 0 {
+        let _ = writeln!(
+            s,
+            "  skipped {skipped_expired} expired grant(s) — rotation never revives a lapsed grant"
+        );
+    }
+    if skipped_unheld > 0 {
+        let _ = writeln!(
+            s,
+            "  skipped {skipped_unheld} grant(s) whose key this repo no longer holds"
+        );
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(s, "next steps:");
+    let _ = writeln!(
+        s,
+        "  1. peers must re-verify you out-of-band, then replace the old key (paste-ready):"
+    );
+    let _ = writeln!(s, "       loot peer add {identity} {new_pub_line}");
+    let _ = writeln!(
+        s,
+        "  2. carry each re-grant bundle to your other machine(s) running this identity:"
+    );
+    let _ = writeln!(s, "       loot apply <bundle>   then `loot surface`");
+    let _ = writeln!(
+        s,
+        "  3. push so relays and peers see activity signed by the new key:"
+    );
+    let _ = writeln!(s, "       loot push");
+    let _ = writeln!(
+        s,
+        "  4. maroon the old key: it still opens everything it could read. If it may be"
+    );
+    let _ = writeln!(
+        s,
+        "     compromised, re-seal that content (`loot maroon <path> <peer>` per revoked"
+    );
+    let _ = writeln!(
+        s,
+        "     reader, `loot burn <path>` for a leaked secret), then move the archived key"
+    );
+    let _ = writeln!(s, "     offline once you no longer need the rollback.");
+    s
 }
 
 fn cmd_keygen() -> Result<(), String> {
@@ -2445,7 +2591,7 @@ const SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("lane", &["new", "list", "merge", "name", "rm", "gc"]),
     ("peer", &["add", "remove", "list"]),
     ("remote", &["add", "remove", "list"]),
-    ("id", &["export", "import"]),
+    ("id", &["export", "import", "rotate"]),
     ("config", &["set", "unset", "list"]),
     ("op", &["log", "restore"]),
 ];
@@ -2977,6 +3123,52 @@ mod tests {
         let full = render_whoami("connor", key, false);
         assert!(full.contains("identity: connor") && full.contains("pubkey:   "));
         assert!(full.contains("loot peer add connor "));
+    }
+
+    // --- #16: `loot id rotate` operator instructions ---
+
+    /// The rotate report coaches every manual step of the rotation ritual:
+    /// a paste-ready `peer add` with the NEW key, where the re-grant bundles
+    /// went, the archived (never deleted) old key, and the maroon-the-old-key
+    /// closing step.
+    #[test]
+    fn rotate_instructions_cover_the_whole_operator_ritual() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINewRotatedKey alice@loot";
+        let bundles = [std::path::PathBuf::from("regrant-abcd1234.bundle")];
+        let out = render_rotate_instructions(
+            "alice",
+            key,
+            &bundles,
+            0,
+            0,
+            std::path::Path::new(".loot/id.rotated-1234"),
+        );
+        assert!(out.contains(&format!("loot peer add alice {key}")), "paste-ready peer add: {out}");
+        assert!(out.contains("regrant-abcd1234.bundle"), "names each bundle file");
+        assert!(out.contains("loot apply <bundle>"), "says how the new machine ingests the wave");
+        assert!(out.contains(".loot/id.rotated-1234"), "names the archive");
+        assert!(out.contains("archived, not deleted"), "rollback property is stated");
+        assert!(out.contains("maroon the old key"), "the closing revocation step");
+        // Nothing was skipped, so the skip lines must not appear.
+        assert!(!out.contains("skipped"), "no skip noise when nothing was skipped: {out}");
+    }
+
+    /// Skipped grants are reported, not silently dropped — and the expired
+    /// line states the #20 rule (rotation never revives a lapsed grant).
+    #[test]
+    fn rotate_instructions_report_skips() {
+        let out = render_rotate_instructions(
+            "alice",
+            "ssh-ed25519 KEY alice@loot",
+            &[],
+            2,
+            1,
+            std::path::Path::new(".loot/id.rotated-9"),
+        );
+        assert!(out.contains("nothing to re-issue"), "empty wave is stated: {out}");
+        assert!(out.contains("skipped 2 expired grant(s)"));
+        assert!(out.contains("never revives a lapsed grant"));
+        assert!(out.contains("skipped 1 grant(s) whose key this repo no longer holds"));
     }
 
     /// `peer add <name> -` reads the key from the reader; a literal key never

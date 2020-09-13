@@ -63,6 +63,29 @@ pub struct MigrateResult {
     pub grants: Vec<(String, SyncBundle)>,
 }
 
+/// One re-issued grant in a rotation wave (`loot id rotate`, #16): the object
+/// it covers, the original grant's `expires_at` carried forward **exactly**
+/// (rotation never extends a lapsing grant — the maroon re-grant property,
+/// #20), and the targeted grant bundle to hand to the new key's machine.
+pub struct RotateRegrant {
+    pub oid: Oid,
+    pub expires_at: Option<u64>,
+    pub bundle: SyncBundle,
+}
+
+/// Returned by [`DagRepo::rotate_regrants`]: the re-grant wave plus what was
+/// deliberately left out of it.
+pub struct RotateReport {
+    /// One bundle per still-live grant held by this identity.
+    pub regrants: Vec<RotateRegrant>,
+    /// Grants already past their `expires_at` — re-issuing one would revive
+    /// access that had lapsed, so rotation skips them (#20's rule).
+    pub skipped_expired: Vec<Oid>,
+    /// Grants whose content key this repo no longer holds (purged by a hard
+    /// maroon, or still escrowed behind an embargo) — nothing to re-issue.
+    pub skipped_unheld: Vec<Oid>,
+}
+
 /// **Custody face** (R3, #179): key management as verbs — grant, sealed grant,
 /// maroon, migrate, escrow flush — plus the manifest/visibility reads that
 /// audit it. "Permissioning is key management" (ADR 0003/0007/0008/0010);
@@ -396,6 +419,55 @@ impl DagRepo {
             grants,
             change_id,
         })
+    }
+
+    /// The rotation re-grant wave (`loot id rotate`, #16, ADR 0016): walk the
+    /// [`Manifest`] for every grant where **this identity is the grantee** —
+    /// what the outgoing key could read — and re-issue each as a targeted
+    /// grant bundle addressed to this same identity name, for the new key's
+    /// machine(s) to `apply`. Reuses the maroon re-grant mechanism (#20):
+    ///
+    /// - each re-grant carries the original grant's `expires_at` **exactly**
+    ///   (never extend a lapsing grant via rotation), and the manifest's
+    ///   first-write-wins `record` means the original audit entry — grantor,
+    ///   timestamp, expiry — is untouched;
+    /// - an already-expired grant is skipped, not revived;
+    /// - a grant whose key this repo no longer holds (hard-marooned away, or
+    ///   still escrowed behind an embargo) is skipped and reported.
+    ///
+    /// Grants this identity issued *to others* are not part of the wave —
+    /// those peers' access never depended on our key.
+    pub fn rotate_regrants(&mut self, now: u64) -> Result<RotateReport, RepoError> {
+        let me = self.identity.clone();
+        let held: Vec<(Oid, Option<u64>, bool)> = self
+            .custody
+            .manifest
+            .grants_to(&me)
+            .into_iter()
+            .map(|e| (e.oid.clone(), e.expires_at, e.is_expired(now)))
+            .collect();
+
+        let mut report = RotateReport {
+            regrants: Vec::new(),
+            skipped_expired: Vec::new(),
+            skipped_unheld: Vec::new(),
+        };
+        for (oid, expires_at, expired) in held {
+            if expired {
+                report.skipped_expired.push(oid);
+                continue;
+            }
+            match self.grant(&oid, &me, now, expires_at) {
+                Ok(bundle) => report.regrants.push(RotateRegrant { oid, expires_at, bundle }),
+                // No key (hard-marooned / escrowed) or no object (burned): the
+                // outgoing key can't read it now, so the wave honestly omits it.
+                Err(RepoError::Unauthorized(_)) | Err(RepoError::NotFound(_)) => {
+                    report.skipped_unheld.push(oid)
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(report)
     }
 
     /// Migrate `path` to a new visibility policy: re-seal the content under
@@ -1188,6 +1260,126 @@ mod tests {
         // Bob cannot maroon alice (he doesn't hold the key).
         let result = bob.maroon(Path::new("s.txt"), "alice", 0);
         assert!(matches!(result, Err(RepoError::Unauthorized(_))));
+    }
+
+    // --- rotation re-grant wave (`loot id rotate`, #16) ---
+
+    /// A multi-grant manifest: only the grants where *this identity is the
+    /// grantee* are re-issued; grants we made to others are not in the wave,
+    /// and every re-grant carries the original `expires_at` exactly.
+    #[test]
+    fn rotate_regrants_covers_only_grants_held_by_self_and_preserves_expiry() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        // Two objects alice can read (keys in her keyring via put).
+        let oid1 = alice
+            .put(b"granted-1", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        let oid2 = alice
+            .put(b"granted-2", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        let oid3 = alice
+            .put(b"outbound", Visibility::Restricted(vec!["alice".into(), "bob".into()]))
+            .unwrap();
+        // Manifest: two inbound grants to alice (one with an expiry, one
+        // without — the state `apply_sealed_grant` leaves after a pull-grants),
+        // and one outbound grant alice issued to bob.
+        alice
+            .custody
+            .manifest
+            .record(oid1.clone(), "alice".into(), [0xa1; 32], [0xb0; 32], 10, None);
+        alice
+            .custody
+            .manifest
+            .record(oid2.clone(), "alice".into(), [0xa1; 32], [0xb0; 32], 10, Some(9_999));
+        alice
+            .custody
+            .manifest
+            .record(oid3.clone(), "bob".into(), [0xbb; 32], [0xa1; 32], 10, None);
+
+        let report = alice.rotate_regrants(100).unwrap();
+
+        assert_eq!(report.regrants.len(), 2, "exactly the two inbound grants re-issue");
+        assert!(report.skipped_expired.is_empty());
+        assert!(report.skipped_unheld.is_empty());
+        assert!(
+            !report.regrants.iter().any(|r| r.oid == oid3),
+            "a grant we issued to bob is not part of our rotation wave"
+        );
+        let r2 = report.regrants.iter().find(|r| r.oid == oid2).unwrap();
+        assert_eq!(r2.expires_at, Some(9_999), "the original expiry rides the re-grant exactly");
+        let r1 = report.regrants.iter().find(|r| r.oid == oid1).unwrap();
+        assert_eq!(r1.expires_at, None, "an unexpiring grant re-issues unexpiring");
+        // The audit trail is untouched: first-write-wins `record` keeps the
+        // original grantor, timestamp, and expiry (the #20 property).
+        let e2 = alice.custody.manifest.grant_for(&oid2, "alice").unwrap();
+        assert_eq!((e2.granted_at, e2.expires_at, e2.grantor_pubkey), (10, Some(9_999), [0xb0; 32]));
+    }
+
+    /// A grant already past its `expires_at` is skipped, never revived — the
+    /// whole point of carrying expiry through rotation (#20).
+    #[test]
+    fn rotate_regrants_never_revives_an_expired_grant() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice
+            .put(b"lapsing", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        alice
+            .custody
+            .manifest
+            .record(oid.clone(), "alice".into(), [0xa1; 32], [0xb0; 32], 10, Some(100));
+
+        let report = alice.rotate_regrants(100).unwrap();
+
+        assert!(report.regrants.is_empty(), "an expired grant must not re-issue");
+        assert_eq!(report.skipped_expired, vec![oid]);
+    }
+
+    /// A grant whose content key this repo no longer holds (e.g. purged by a
+    /// hard maroon) has nothing to re-issue — reported, not silently dropped.
+    #[test]
+    fn rotate_regrants_reports_grants_whose_key_is_gone() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let gone = Oid([0x77; 32]);
+        alice
+            .custody
+            .manifest
+            .record(gone.clone(), "alice".into(), [0xa1; 32], [0xb0; 32], 10, None);
+
+        let report = alice.rotate_regrants(100).unwrap();
+
+        assert!(report.regrants.is_empty());
+        assert_eq!(report.skipped_unheld, vec![gone]);
+    }
+
+    /// End-to-end: a rotation re-grant bundle applied on a fresh repo with the
+    /// same identity name (the new key's machine) files the key and the
+    /// content becomes readable there — the "new identity + re-grant wave"
+    /// model of ADR 0016.
+    #[test]
+    fn rotate_regrant_bundle_applies_on_the_new_keys_machine() {
+        let mut old_machine = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = old_machine
+            .put(b"carried across the rotation", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        old_machine
+            .custody
+            .manifest
+            .record(oid.clone(), "alice".into(), [0xa1; 32], [0xb0; 32], 10, None);
+
+        let report = old_machine.rotate_regrants(100).unwrap();
+        assert_eq!(report.regrants.len(), 1);
+
+        // Same identity name, fresh repo (fresh keypair in real life).
+        let mut new_machine = DagRepo::init(tmp(), "alice").unwrap();
+        new_machine.apply(&report.regrants[0].bundle, 100).unwrap();
+        assert!(
+            new_machine.custody.keyring.holds(&oid),
+            "the re-grant files the key on the new machine"
+        );
+        assert_eq!(
+            new_machine.get(&oid, "alice", 100).unwrap(),
+            b"carried across the rotation"
+        );
     }
 
     // --- hard maroon (ADR 0009) ---

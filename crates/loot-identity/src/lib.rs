@@ -318,6 +318,34 @@ pub fn unwrap_envelope<'a>(
     Ok((pubkey, bundle))
 }
 
+/// Archive the current keypair files for a rotation (`loot id rotate`, #16,
+/// ADR 0016): rename `dot/id` → `dot/id.rotated-<ts>` and `dot/id.pub` →
+/// `dot/id.pub.rotated-<ts>`. The old key is **archived, never deleted** — it
+/// is the emergency-rollback artifact (copy it back over `dot/id` to undo a
+/// rotation). Returns the two archive paths. If an archive for the same
+/// timestamp already exists, a `-2`, `-3`, … suffix keeps it collision-free.
+pub fn archive_keypair(dot: &Path, ts: u64) -> Result<(std::path::PathBuf, std::path::PathBuf), IdentityError> {
+    let id = dot.join("id");
+    if !id.exists() {
+        return Err(IdentityError::NoKeypair);
+    }
+    // Find a free suffix shared by both files.
+    let (priv_arch, pub_arch) = (1u32..)
+        .map(|n| {
+            let tag = if n == 1 { format!("rotated-{ts}") } else { format!("rotated-{ts}-{n}") };
+            (dot.join(format!("id.{tag}")), dot.join(format!("id.pub.{tag}")))
+        })
+        .find(|(p, q)| !p.exists() && !q.exists())
+        .expect("unbounded suffix search always terminates");
+
+    std::fs::rename(&id, &priv_arch).map_err(|e| IdentityError::Io(e.to_string()))?;
+    let id_pub = dot.join("id.pub");
+    if id_pub.exists() {
+        std::fs::rename(&id_pub, &pub_arch).map_err(|e| IdentityError::Io(e.to_string()))?;
+    }
+    Ok((priv_arch, pub_arch))
+}
+
 /// Load the identity from `dot/id`, returning `Err(NoKeypair)` if absent.
 pub fn load_or_missing(dot: &Path) -> Result<Identity, IdentityError> {
     let path = dot.join("id");
@@ -412,6 +440,47 @@ mod tests {
         let id = Identity::generate();
         id.save(&dir, "test").unwrap();
         assert!(keypair_exists(&dir));
+    }
+
+    // --- rotation key archive (`loot id rotate`, #16) ---
+
+    #[test]
+    fn archive_keypair_renames_both_files_and_keeps_the_bytes() {
+        let dir = tmp("archive");
+        let id = Identity::generate();
+        let pubkey = id.public_key_bytes();
+        id.save(&dir, "alice@loot").unwrap();
+        let priv_bytes = std::fs::read(dir.join("id")).unwrap();
+
+        let (priv_arch, pub_arch) = archive_keypair(&dir, 1234).unwrap();
+
+        assert!(!dir.join("id").exists(), "the active slot is freed for the new key");
+        assert!(!dir.join("id.pub").exists());
+        assert_eq!(priv_arch, dir.join("id.rotated-1234"));
+        assert_eq!(pub_arch, dir.join("id.pub.rotated-1234"));
+        // Archived, not deleted: the bytes survive and still load — the
+        // emergency-rollback property #16 requires.
+        assert_eq!(std::fs::read(&priv_arch).unwrap(), priv_bytes);
+        let restored = Identity::load(&priv_arch).unwrap();
+        assert_eq!(restored.public_key_bytes(), pubkey);
+    }
+
+    #[test]
+    fn archive_keypair_twice_in_the_same_second_does_not_clobber() {
+        let dir = tmp("archive2");
+        Identity::generate().save(&dir, "a@loot").unwrap();
+        let (first, _) = archive_keypair(&dir, 99).unwrap();
+        Identity::generate().save(&dir, "a@loot").unwrap();
+        let (second, _) = archive_keypair(&dir, 99).unwrap();
+
+        assert_ne!(first, second, "the second archive must not overwrite the first");
+        assert!(first.exists() && second.exists());
+    }
+
+    #[test]
+    fn archive_keypair_without_a_keypair_is_no_keypair() {
+        let dir = tmp("archive-none");
+        assert!(matches!(archive_keypair(&dir, 1), Err(IdentityError::NoKeypair)));
     }
 
     #[test]

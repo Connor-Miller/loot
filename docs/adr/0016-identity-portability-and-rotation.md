@@ -47,9 +47,18 @@ passphrase exercises that crypto path first and de-risks it.
 
 ### Rotation: deferred, shape sketched
 
-Rotation is NOT implemented. We record its likely shape so a future
-implementation does not start from scratch and so reviewers stop re-suggesting a
-naive version:
+*Amendment (2026-07-19, #16): rotation shipped as `loot id rotate`, following
+exactly the shape sketched below — a new identity keypair plus a re-grant wave
+reusing the existing [[Grant]] primitive, not key-succession. Each re-grant
+preserves the original grant's `expires_at` (#20; expired grants are never
+revived), the old key is archived alongside the keyring
+(`.loot/id.rotated-<ts>`, never deleted — the emergency-rollback artifact),
+and peers re-trust the new pubkey manually via `loot peer add`, as
+anticipated. The signed-succession-statement variant remains unbuilt.*
+
+Rotation was initially NOT implemented. We recorded its likely shape so a
+future implementation does not start from scratch and so reviewers stop
+re-suggesting a naive version:
 
 - Rotation is probably best modeled **not** as cryptographic key-succession but
   as **"new identity + a re-grant wave"**: the rotated-in key is a fresh

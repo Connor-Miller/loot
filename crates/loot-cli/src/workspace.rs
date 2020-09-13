@@ -555,6 +555,17 @@ impl Workspace {
         })
     }
 
+    /// The rotation re-grant wave (`loot id rotate`, #16): re-issue every
+    /// still-live grant this identity holds as a targeted bundle for the new
+    /// key's machine(s), each carrying its original `expires_at` exactly
+    /// (#20), then persist. Reads the Manifest, not the working tree — no
+    /// snapshot handle needed (ADR 0030 guards tree capture, and rotation
+    /// captures nothing from disk).
+    pub fn rotate_regrants(&mut self) -> Result<loot_core::RotateReport, String> {
+        let now = self.now;
+        self.with_repo(|repo| repo.rotate_regrants(now).map_err(|e| e.to_string()))
+    }
+
     /// Snapshot the working tree into the working change (visibility-aware,
     /// engine-owned). Reads the tree + `.lootattributes`, hands entries to the
     /// engine, tracks the resulting working id, and persists. Returns the
@@ -4599,6 +4610,56 @@ mod tests {
         Workspace::init_at(&dir, "connor").unwrap();
         let ws = Workspace::open_at_clocked(&dir, 12_345).unwrap();
         assert_eq!(ws.now(), 12_345, "the workspace runs on the injected clock");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `loot id rotate` at the workspace seam (#16): the re-grant wave rides
+    /// the persisted manifest (expiry carried exactly, audit entry untouched),
+    /// and the wrapper's key steps — archive then regenerate — leave a
+    /// loadable old key (rollback) and a different active pubkey.
+    #[test]
+    fn id_rotate_wave_end_to_end_at_the_workspace_seam() {
+        let dir = std::env::temp_dir().join(format!("loot-id-rotate-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let dot = dir.join(DOT);
+        let old_pub = std::fs::read_to_string(dot.join("id.pub")).unwrap();
+
+        // Seed a grant held by this identity, with an expiry (#20). The ws
+        // runs on the real clock, so the expiry must sit in the real future —
+        // year ~2286 — for the grant to still be live at rotation time.
+        const FUTURE: u64 = 9_999_999_999;
+        let oid = ws
+            .with_repo_mut(|repo| {
+                let oid = repo
+                    .put(b"inbound", Visibility::Restricted(vec!["connor".into()]))
+                    .map_err(|e| e.to_string())?;
+                repo.grant(&oid, "connor", 10, Some(FUTURE)).map_err(|e| e.to_string())?;
+                Ok(oid)
+            })
+            .unwrap();
+
+        let report = ws.rotate_regrants().unwrap();
+        assert_eq!(report.regrants.len(), 1);
+        assert_eq!(report.regrants[0].oid, oid);
+        assert_eq!(
+            report.regrants[0].expires_at,
+            Some(FUTURE),
+            "the wave preserves the original expiry exactly"
+        );
+
+        // The wrapper's steps 2–3: archive the old key, mint the new one.
+        let (arch, _) = loot_identity::archive_keypair(&dot, 42).unwrap();
+        loot_identity::generate_and_save(&dot, "connor@loot").unwrap();
+        let new_pub = std::fs::read_to_string(dot.join("id.pub")).unwrap();
+        assert_ne!(new_pub, old_pub, "a fresh keypair is the active identity");
+        assert!(arch.exists(), "the old key is archived, not deleted");
+        loot_identity::Identity::load(&arch).expect("the archived key still loads — rollback works");
+
+        // Reopen: the persisted manifest's audit entry is untouched.
+        drop(ws);
+        let ws2 = Workspace::open_at(&dir).unwrap();
+        let e = ws2.manifest().grant_for(&oid, "connor").expect("audit entry survives");
+        assert_eq!((e.granted_at, e.expires_at), (10, Some(FUTURE)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
