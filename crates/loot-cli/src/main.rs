@@ -172,6 +172,7 @@ const COMMANDS: &[Verb] = &[
     verb("grep", &[], &[], grep::cmd_grep),
     verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
     verb("verify", &[], &["--accept-loss"], cmd_verify),
+    verb("doctor", &[], &[], loot_cli::doctor::run),
     verb("bundle", &[], &[], cmd_bundle),
     verb("apply", &[], OUT, cmd_apply),
     verb("grant", &["--relay", "--allow-demote", "--expires"], SKIP, cmd_grant),
@@ -240,6 +241,7 @@ usage:
   loot grep <pattern> [<selector>]          search readable content for the literal <pattern> (fixed-string, case-sensitive), printing <path>:<line>:<match>; searches the current change, or the change named by <selector> (@, HEAD, HEAD~<n>, id prefix); decrypts via the key oracle, skips sealed paths this identity can't open, and reports the skipped count (#391)
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
   loot verify [--accept-loss]               integrity-check the object store: rehash every object, find missing ones with their referencing changes (exits 1 on problems); --accept-loss records current losses as acknowledged
+  loot doctor                               read-only setup self-check: keypair, peers, origin remote, core .loot/ files, global config — prints each check with a suggested fix; exits 1 if any fail (CI-friendly, #22)
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery); no --expires here — a tag-1 bundle carries no expiry, use the --relay form (#352)
