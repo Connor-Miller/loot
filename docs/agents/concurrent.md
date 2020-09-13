@@ -160,12 +160,22 @@ a loot change and converging the dock. Skipping this step is exactly how the #24
 drift started: #230, #233, and the loot-site docs were landed with raw git and
 never ferried, so the loot mirror fell behind `origin/main`.
 
+**Name your work first if you have any.** Folding the ingested commit in means
+merging, and a merge **signs your working change** as its parent — so an
+un-described one makes the pass refuse and point at `describe -m` (#275). Nothing
+is lost: the capture happens, the disk is untouched, and re-running after naming
+completes the pass. Edits you never captured take two passes, since naming *is*
+capturing.
+
 ### `loot adopt`/`ferry` after lane-lands (the primary drifts otherwise)
 
 See "Catch the primary up" above. The two habits are the same discipline stated
 twice because they fail the same way: **the loot mirror silently falls behind git
 `origin/main`**, and the next lane spawned from the stale position projects a
-*revert* of landed work. A drift guard now warns loudly on
+*revert* of landed work. The catch-up folds any local line in with a merge, so the
+same rule applies: name the working change first, or the catch-up refuses rather
+than sign it (#275). With nothing pending — the usual state in the primary right
+after a lane land — it fast-forwards and never asks. A drift guard now warns loudly on
 `loot-first status`/`review`/`land`/`tag` when the shared mirror's `main` has
 fallen *behind* real `origin/main`, or *diverged* from it (#243) — treat that
 warning as a hard stop: reconcile before you land.

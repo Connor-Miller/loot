@@ -140,6 +140,13 @@ loot — all absorb through the same converge+ingest path:
   unauthored, preserving their git author.
 - **A break-glass local commit** (see guard rails) — same ingest.
 
+When one of these lands while you have local work, the ferry folds your line in
+with a merge — which **signs your work** to make it a merge parent. So it needs a
+name first: an un-described working change makes `ferry` (and `dock merge`, and
+the `adopt` catch-up) refuse, pointing at `describe -m` (#275). Nothing is lost —
+the capture happens, the disk is untouched, and re-running after naming completes
+the pass. Edits you never captured take two passes, because naming *is* capturing.
+
 A genuine same-path conflict is held at its last clean state in git (ADR 0028) and
 surfaced by `loot conflicts`; that change can't land until you resolve it in loot.
 

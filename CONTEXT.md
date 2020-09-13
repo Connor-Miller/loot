@@ -18,8 +18,14 @@ visibility. Permissions attach here, not to the repo.
 the working change and `new` finalizes it and starts a fresh one on top. It is
 **un-described** until named — carrying no message, or the `(working change)`
 placeholder an internal carry-along capture stored. Naming stays after-the-fact,
-but `new` **refuses to sign** an un-described change (#174, ADR 0030 amendment):
-a signed message is permanent and becomes the subject on git `main`. Under
+but **nothing signs an un-described change** (#174/#275, ADR 0030 amendments): a
+signed message is permanent and becomes the subject on git `main`. `new` refuses;
+so do the merges that would seal it as a parent in passing (`dock merge`, the
+`adopt` catch-up, a `ferry` over a git `main` that moved). Every refusal lands
+*after* the capture — the edits are held, only the signature waits for a name.
+The merge **nodes** themselves are exempt: they are machine-authored and carry an
+honest mechanical subject (`merge dock 'x' into 'main'`). Mechanical content may
+be named mechanically; authored content may not. Under
 implicit auto-snapshot (ADR 0030, #144) every **mutating** verb (`new`,
 `describe`, `grant`, `maroon`, `migrate`, and — since #219 — `pull`/`apply`)
 captures the tree first, so edits are never lost between commands and no manual

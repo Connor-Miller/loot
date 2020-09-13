@@ -111,22 +111,55 @@ requirement anywhere; naming is always after-the-fact.
 > so both inherit the refusal: the "run `loot describe -m` before landing" ritual
 > is now enforced rather than remembered.
 >
-> **The residual, named honestly.** The refusal is on the *deliberate* finalize,
-> not on every path that can sign. `merge_dock` and the bridge's
-> `reconcile_capture` capture-and-`finalize_working` in passing, to make a signed
-> merge parent — and what they sign is the operator's own authored working
-> change; only the *trigger* is mechanical. So a `dock merge`/`ferry` over dirty
-> un-described work can still mint a signed `(working change)` subject and
-> project it onto `main` — #174's exact harm, on a rarer path. Extending the
-> refusal there is **not** obviously right: this ADR already rejected
-> refuse-on-dirt for the sync verbs (#219, "it nags the mid-work-sync case"), and
-> a ferry that refuses is a ferry that blocks a land. The naming these paths want
-> is probably a *prompt* or an auto-subject at projection, not a refusal — which
-> is a different decision than this one. Tracked as
-> [#275](https://github.com/Connor-Miller/loot/issues/275) rather than guessed at
-> here. What is settled: the placeholder is minted in exactly one
-> place (`working_message_or_placeholder`) and tested in exactly one place
-> (`is_undescribed`), so wherever the rule ends up, it has one seam to move.
+> **The residual, and its closure.** #174's refusal was on the *deliberate*
+> finalize only. `fold_line_in` (`loot dock merge`, the `loot adopt` catch-up)
+> and the bridge's `reconcile_capture` (`loot ferry` over a git `main` that
+> moved) capture-and-`finalize_working` **in passing**, to make a signed merge
+> parent — and what they sign is the operator's own authored working change; only
+> the *trigger* is mechanical. So they could still mint a signed
+> `(working change)` subject and project it onto `main` — #174's exact harm, on a
+> rarer path. Reproduced against the pre-fix binary: a `ferry` over unnamed disk
+> work landed the literal subject `(working change)` on git `main` in one silent
+> pass.
+>
+> **Amended 2026-07-15 (#275): the same refusal extends to those merges.** Both
+> paths now refuse an un-described merge parent
+> ([`REFUSE_UNDESCRIBED_PARENT`]) after capturing. Two arguments this ADR made
+> for *not* doing that were checked and dropped:
+>
+> - *"A ferry that refuses is a ferry that blocks a land"* — **false**.
+>   `loot-first land` finalizes (and thus names) **before** it ferries, so a land
+>   never reaches these paths dirty. Nothing about landing changes.
+> - *"#219 rejected refuse-on-dirt for the sync verbs"* — that rejection was
+>   about being forced to **capture/finalize** to sync, which costs a decision.
+>   Being asked for a **name** is not the same ask, and it only arises when the
+>   sync must seal your work into permanent history anyway. Capture stays
+>   implicit; only *signing* asks.
+>
+> The prompt and auto-subject-at-projection options were dropped with it: loot is
+> process-per-command and agent-driven (ADR 0023), so a prompt is hostile to the
+> callers it would fire on, and a mechanical subject over *authored* content is
+> the same "history nobody wrote" this ADR rejected for `new`.
+>
+> The cost is honest and small: **uncaptured** dirt cannot be named in advance —
+> naming *is* capturing — so a `ferry`/`adopt` over never-captured edits now takes
+> two passes (refuse+capture, then `describe -m` and re-run). The refusal is
+> safe to abandon mid-pass: the capture persists (it is what saves the edits),
+> the materialize never runs so nothing is clobbered, and the pass's ingest is
+> simply redone on the re-run — graph append is idempotent.
+>
+> **`loot-first review` is in scope, and that is deliberate.** Review projects
+> through the same ferry, so a review taken while git `main` has moved under it
+> must reconcile — which signs our side as a merge parent — and therefore asks
+> for a name. This does *not* make review a post-`describe` verb: with `main`
+> where you left it (the ordinary case) nothing is signed, nothing is asked, and
+> `resolve_title`'s un-described fallback still names the PR. Only the merge asks.
+>
+> The merge **nodes** these paths mint (`merge_tips` in `fold_line_in`,
+> `converge_heads`, `reconcile_merge`) are untouched: they are machine-authored
+> and already carry an honest mechanical subject (`merge dock 'x' into 'main'`,
+> `ferry: reconcile git main`). That is the line — *mechanical content* may be
+> named mechanically; *authored content* may not.
 
 ### `log` and `status` go columnar
 

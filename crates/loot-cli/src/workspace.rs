@@ -628,6 +628,52 @@ impl Workspace {
         self.working_message().is_none_or(|m| is_undescribed(&m))
     }
 
+    /// Nothing signs an un-described change (#174, extended to the merges by
+    /// #275) — one rule, two refusals, because the two callers must explain
+    /// themselves very differently. [`REFUSE_UNDESCRIBED`] answers a deliberate
+    /// `loot new`; [`REFUSE_UNDESCRIBED_PARENT`] answers a merge that seals the
+    /// operator's work as a parent in passing (`fold_line_in` for
+    /// `loot dock merge` / the `loot adopt` catch-up, `reconcile_capture` for a
+    /// `loot ferry` over a git `main` that moved), where a bare "name it" would
+    /// read as a non-sequitur.
+    ///
+    /// The merge *nodes* those paths mint (`merge_tips`) never come through here:
+    /// they are machine-authored and carry an honest mechanical subject.
+    ///
+    /// Every caller must sit **below** its capture (so the refusal costs the
+    /// signature, never the work) and **below** its redundant-capture drop (see
+    /// [`drop_capture_if_redundant`](Self::drop_capture_if_redundant)) — a pass
+    /// with no real work to sign must stay a no-op, not become a nag.
+    fn refuse_if_undescribed(&self, refusal: &str) -> Result<(), String> {
+        if self.working.is_some() && self.working_is_undescribed() {
+            return Err(refusal.to_string());
+        }
+        Ok(())
+    }
+
+    /// Drop the working capture `id` when it adds nothing over `against` (the
+    /// tip, and for the bridge the incoming target too): empty, or content-identical
+    /// to something already held. Returns whether it was dropped.
+    ///
+    /// The shared shape behind three sites that must not mint a redundant signed
+    /// change: `finalize_capturing` (a bare `new` on a clean tree), `fold_line_in`
+    /// (a `dock merge` with nothing pending), and `reconcile_capture` (the
+    /// co-located checkout after a `git pull` already holds the incoming tree).
+    /// It is also what keeps [`refuse_if_undescribed`](Self::refuse_if_undescribed)
+    /// honest — without it, those passes would demand a name for work that does
+    /// not exist.
+    fn drop_capture_if_redundant(&mut self, id: &Oid, against: &[&Oid]) -> Result<bool, String> {
+        let empty = self.repo.change_tree(id).is_none_or(|t| t.is_empty());
+        let redundant =
+            empty || against.iter().any(|o| self.repo.same_tree_content(o, id, self.now));
+        if redundant {
+            self.repo.drop_working(id);
+            self.working = None;
+            self.persist()?;
+        }
+        Ok(redundant)
+    }
+
     /// `loot new` under implicit snapshot (ADR 0030): capture any edits made
     /// since the last command into the working change *first* — so `edit; new`
     /// never loses work — then finalize. A snapshot that adds nothing over the
@@ -654,21 +700,12 @@ impl Workspace {
             let msg = self.working_message().unwrap_or_else(|| UNDESCRIBED_MESSAGE.to_string());
             let (id, _) = self.snapshot_allowing(&msg, allow_demote)?;
             let anchor = self.anchor();
-            let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
-            let duplicate = empty
-                || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &id, self.now));
-            if duplicate {
-                self.repo.drop_working(&id);
-                self.working = None;
-                self.persist()?;
-            }
+            self.drop_capture_if_redundant(&id, anchor.as_ref().as_slice())?;
         }
         // Sits below the empty/duplicate drop above: a bare `new` on a clean tree
         // has no working change left by here, mints no signed change, and so has
         // no subject to get wrong — it must stay a no-op, not become a refusal.
-        if self.working.is_some() && self.working_is_undescribed() {
-            return Err(REFUSE_UNDESCRIBED.to_string());
-        }
+        self.refuse_if_undescribed(REFUSE_UNDESCRIBED)?;
         let finalized = self.working.clone();
         self.finalize_working()?;
         Ok(finalized)
@@ -2295,10 +2332,19 @@ impl Workspace {
         }
         // Capture and finalize any in-progress work so our side of the merge is a
         // signed tip (a merge parent must be finalized to travel in a bundle).
+        // Capture first, then refuse an un-described parent (#275) — the edits
+        // are held either way, and only the signature waits for a name. A capture
+        // that adds nothing over our tip is dropped rather than signed (and so
+        // never nagged about), exactly as `finalize_capturing` and the bridge's
+        // `reconcile_capture` do.
         if self.working.is_some() {
             let m = self.working_message_or_placeholder();
-            self.snapshot(&m)?;
-            self.finalize_working()?;
+            let (id, _) = self.snapshot(&m)?;
+            let anchor = self.anchor();
+            if !self.drop_capture_if_redundant(&id, anchor.as_ref().as_slice())? {
+                self.refuse_if_undescribed(REFUSE_UNDESCRIBED_PARENT)?;
+                self.finalize_working()?;
+            }
         }
         let ours = self
             .anchor()
@@ -2774,18 +2820,14 @@ impl Workspace {
     ) -> Result<Option<Oid>, String> {
         let msg = self.working_message_or_placeholder();
         let (id, _) = self.snapshot_from(base, &msg, &[])?;
-        let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
-        let duplicate = empty
-            || [base, target]
-                .into_iter()
-                .flatten()
-                .any(|o| self.repo.same_tree_content(o, &id, self.now));
-        if duplicate {
-            self.repo.drop_working(&id);
-            self.working = None;
-            self.persist()?;
+        let against: Vec<&Oid> = [base, target].into_iter().flatten().collect();
+        if self.drop_capture_if_redundant(&id, &against)? {
             Ok(None)
         } else {
+            // Real local work, about to be signed as our merge parent — it needs
+            // a name (#275). Below the duplicate drop above, so the common
+            // nothing-new pass never asks for one.
+            self.refuse_if_undescribed(REFUSE_UNDESCRIBED_PARENT)?;
             self.finalize_working()?;
             Ok(Some(id))
         }
@@ -2909,6 +2951,21 @@ const REFUSE_UNDESCRIBED: &str = "refusing to sign an un-described working chang
      becomes the permanent subject on git `main`\n  name it:        loot describe -m \"<subject>\"\n  \
      or in one step: loot new -m \"<subject>\"\n  (your edits are captured and safe — only the \
      signature was withheld)";
+
+/// The [`REFUSE_UNDESCRIBED`] twin for the merges that seal the operator's work
+/// as a parent in passing (#275): same rule, but it must say *why a sync verb is
+/// suddenly asking for a name*, or it reads as a non-sequitur.
+///
+/// It promises the capture survives, and nothing more. That is the one thing
+/// verified to outlive the erroring process (`snapshot_from` persists; loot is
+/// process-per-command, so an in-memory guarantee would be a lie). A refused
+/// pass's *ingest* does not persist — it is simply redone on the re-run, which
+/// is why the whole pass is safe to abandon here.
+const REFUSE_UNDESCRIBED_PARENT: &str =
+    "refusing to sign your un-described working change as a merge parent — this merge seals \
+     your local work into signed history, and its message becomes the permanent subject on \
+     git `main`\n  name it:  loot describe -m \"<subject>\"\n  then re-run the same command\n  \
+     (your edits are captured and safe — only the merge waits for the name)";
 
 /// Resolve visibility for `path` under an explicit `.lootattributes` text.
 /// The bridge classifies ingested files under the *ingested commit's own*
@@ -4446,6 +4503,21 @@ mod tests {
         ws.record_op("seed", "harbor advanced to f", false);
         seed_mirror_main(&ws, &"7".repeat(40), &f);
 
+        // Uncaptured dirt cannot be named in advance — naming *is* capturing — so
+        // since #275 this case always takes two passes. Pass 1 captures the edit
+        // (the #250 guarantee this test exists for) and refuses to sign it
+        // nameless; the materialize never runs, so nothing is clobbered.
+        let err = ws.adopt_harbor().unwrap_err();
+        assert!(err.contains("describe"), "nameless dirt holds the merge: {err}");
+        assert!(ws.working_id().is_some(), "pass 1 captured the edit — #250's whole point");
+        assert_eq!(
+            std::fs::read(dir.join("local.txt")).unwrap(),
+            b"my work",
+            "and the refusal did not clobber it either",
+        );
+
+        // Pass 2, once named: the fold happens exactly as it always did.
+        ws.snapshot("feat: my local line").unwrap();
         let report = ws.adopt_harbor().unwrap();
         assert!(report.merged, "the dirty local line was folded in");
         assert_eq!(
@@ -4498,6 +4570,97 @@ mod tests {
             b"landed",
             "the landed content materialized into the primary tree"
         );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    // -----------------------------------------------------------------------
+    // #275 — the #174 residual: a merge must not seal un-described work either.
+    //
+    // #174 guarded the *deliberate* finalize (`loot new` / `loot-first land`).
+    // These two paths sign the operator's own working change **in passing**, to
+    // make a signed merge parent — only the trigger is mechanical, so the
+    // placeholder could still reach `main` as a permanent subject.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn catch_up_refuses_to_seal_undescribed_local_work_as_a_merge_parent() {
+        // `fold_line_in` — reached by the no-arg `loot adopt` catch-up and by
+        // `loot dock merge`. Local work diverges from landed main, so the
+        // catch-up must fold it in — sealing it signed, under whatever name it
+        // has. Un-described, that name is the placeholder (#275).
+        let (area, dir, _c2) = landed_from_lane("275-adopt-undescribed");
+        std::fs::write(dir.join("local.txt"), b"my unnamed work").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let before = ws.finalized_anchor();
+        let err = ws.adopt_harbor().unwrap_err();
+        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+
+        // Safe, not lossy: the capture happened, only the signature was withheld.
+        // The working change is still a placeholder-named head — that is fine and
+        // is what `status` shows; what must not happen is *signing* it.
+        assert!(ws.working_id().is_some(), "the local work is captured, not dropped");
+        assert_eq!(ws.finalized_anchor(), before, "nothing was signed onto the line");
+
+        // And naming it clears the refusal — the catch-up then folds it in.
+        ws.snapshot("feat: my local line").unwrap();
+        assert!(ws.adopt_harbor().unwrap().merged, "named work folds in");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn catch_up_folds_described_local_work_in_as_before() {
+        // The guard is about the *name*, not the fold: named work still merges.
+        let (area, dir, _c2) = landed_from_lane("275-adopt-described");
+        std::fs::write(dir.join("local.txt"), b"my work").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        ws.snapshot("feat: my local line").unwrap();
+        let report = ws.adopt_harbor().unwrap();
+
+        assert!(report.merged, "described local work still folds in");
+        let tip = ws.anchor().expect("a merge tip");
+        let subject = ws.repo().change_message(&tip).unwrap_or_default();
+        assert!(
+            subject.starts_with("adopt: catch up to landed main"),
+            "the merge node keeps its own mechanical subject — it is machine-authored: {subject}",
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn ferry_reconcile_refuses_to_seal_undescribed_local_work_as_a_merge_parent() {
+        // `reconcile_capture` — reached by `loot ferry` when git `main` moved
+        // externally (a browser edit, an outside PR merge, a break-glass commit)
+        // while un-described work sat on the disk.
+        let (area, dir, c2) = landed_from_lane("275-ferry-undescribed");
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let ours = ws.finalized_anchor();
+        std::fs::write(dir.join("local.txt"), b"my unnamed work").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
+
+        let err = ws
+            .reconcile_onto(Some(&c2), ours.as_ref(), true, "ferry: reconcile git main")
+            .unwrap_err();
+        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        assert!(ws.working_id().is_some(), "the local work is captured, not dropped");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn ferry_reconcile_seals_described_local_work_as_before() {
+        let (area, dir, c2) = landed_from_lane("275-ferry-described");
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let ours = ws.finalized_anchor();
+        std::fs::write(dir.join("local.txt"), b"my work").unwrap();
+        ws.snapshot("feat: my local line").unwrap();
+
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), true, "ferry: reconcile git main")
+            .expect("described work reconciles");
+        let tip = ws.anchor().expect("the dock advanced onto a merge");
+        assert!(ws.graph().is_ancestor(&c2, &tip), "the landed side is folded in");
         let _ = std::fs::remove_dir_all(&area);
     }
 
@@ -4590,6 +4753,10 @@ mod tests {
         std::fs::write(dir.join("local.txt"), b"my work").unwrap();
 
         let mut ws = Workspace::open_at(&dir).unwrap();
+        // Named, because the fold signs it as a merge parent (#275). The name is
+        // not what this test is about — that the work is folded in rather than
+        // clobbered is; the refusal has its own tests.
+        ws.snapshot("feat: my local line").unwrap();
         let report = ws.adopt_harbor().unwrap();
         assert!(report.merged, "the local line was folded in");
         let tip = ws.anchor().unwrap();
@@ -5446,6 +5613,63 @@ mod tests {
     }
 
     // --- CA2: local dock merge ---
+
+    #[test]
+    fn dock_merge_does_not_nag_for_a_name_when_there_is_no_real_work_to_sign() {
+        // The #275 refusal must fire on *work*, never on a capture that adds
+        // nothing over the tip — otherwise `dock merge` demands a name for
+        // content that will never be signed. The sibling sites (`finalize_capturing`,
+        // `reconcile_capture`) sit below such a drop; `fold_line_in` now does too.
+        let (dir, mut ws) = dock_repo("merge-no-nag");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("feature work").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("main").unwrap();
+        // An un-described capture that duplicates the tip: the operator's edit,
+        // reverted before merging. Real state, no real work.
+        std::fs::write(dir.join("scratch.txt"), b"tmp").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
+        std::fs::remove_file(dir.join("scratch.txt")).unwrap();
+
+        let (src, _outcomes) = ws
+            .merge_dock("feature")
+            .expect("nothing to sign, so nothing to name — the merge just runs");
+        assert_eq!(src, "feature");
+        assert!(
+            ws.repo().change_message(&ws.anchor().unwrap()).is_some_and(|m| !is_undescribed(&m)),
+            "and no placeholder-named change was signed as a parent",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_merge_refuses_to_seal_undescribed_work_as_a_merge_parent() {
+        // The other half: with real un-described work pending, `dock merge` asks
+        // for a name rather than signing the placeholder as its parent (#275).
+        let (dir, mut ws) = dock_repo("merge-undescribed");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("feature work").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("home.txt"), b"my unnamed work").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
+
+        let err = ws.merge_dock("feature").map(|_| ()).unwrap_err();
+        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn dock_merge_converges_disjoint_edits() {

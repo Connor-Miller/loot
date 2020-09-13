@@ -1681,8 +1681,33 @@ mod tests {
         let git = git2::Repository::open(&mirror).unwrap();
         git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
 
+        // The merge would seal this WIP as its signed parent, so it needs a name
+        // first (#275). The refusal is the subject of the #275 tests; here it is
+        // the setup for the real assertion — that the capture is what saves the
+        // edits, and refusing costs only the signature.
+        let refused = match run(&mut ws, Some(mirror.to_str().unwrap()), None, false) {
+            Err(e) => e,
+            Ok(_) => panic!("un-described WIP must hold the merge (#275)"),
+        };
+        assert!(refused.contains("describe"), "un-described WIP holds the merge: {refused}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("wip.txt")).unwrap(),
+            "uncaptured\n",
+            "the refusal never clobbers the disk"
+        );
+        // The capture is durable across the refusal — loot is process-per-command,
+        // so "your edits are captured and safe" only means anything if it survives
+        // the erroring process. Re-open to prove it does.
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        assert!(ws.working_id().is_some(), "the capture outlived the refused pass");
+        ws.snapshot("wip: my uncaptured work, now named").unwrap();
+
+        // Re-running after naming completes the pass. The refused pass's *ingest*
+        // did not persist (the error unwound before its state was written), so it
+        // is simply redone here — the pass is idempotent, which is why refusing
+        // mid-ferry is safe rather than a half-applied mess.
         let report = ferry(&mut ws, &mirror);
-        assert_eq!(report.ingested, 1);
+        assert_eq!(report.ingested, 1, "the refused pass's ingest is redone, not lost");
         assert!(
             !report.outcomes.values().any(|o| matches!(o, MergeOutcome::Conflict { .. })),
             "disjoint paths merge cleanly: {:?}",
@@ -1838,6 +1863,38 @@ mod tests {
         let resolved_tree = resolved_tip.tree().unwrap();
         let blob = resolved_tree.get_name("shared.txt").unwrap();
         assert_eq!(git.find_blob(blob.id()).unwrap().content(), b"resolved\n");
+    }
+
+    #[test]
+    fn a_review_projection_needs_no_name_until_git_main_moves_under_it() {
+        // `loot-first review` is deliberately the pre-`describe` verb — it reviews
+        // *unsigned* WIP, and `resolve_title` has a fallback title for exactly the
+        // un-described case. So the #275 refusal must not reach the ordinary
+        // review: with git `main` where we left it, nothing is signed and no name
+        // is asked for.
+        let (mut ws, dir, mirror) = setup("wip-review-275");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        put_file(&dir, "wip.txt", "unnamed\n");
+        let report = ferry_wip(&mut ws, &mirror);
+        assert!(report.review.is_some(), "un-described WIP still projects a review lane");
+
+        // But when git `main` has moved under it, the pass must reconcile — which
+        // means *signing* our side as a merge parent. That is the one thing a name
+        // is required for, review or not (#275).
+        let git = git2::Repository::open(&mirror).unwrap();
+        git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
+        let refused = match run(&mut ws, Some(mirror.to_str().unwrap()), None, true) {
+            Err(e) => e,
+            Ok(_) => panic!("a review that must merge has to name its merge parent (#275)"),
+        };
+        assert!(refused.contains("describe"), "and it says so: {refused}");
+
+        // Named, it projects again — the review lane is not lost, just deferred.
+        ws.snapshot("wip: named for the merge").unwrap();
+        assert!(ferry_wip(&mut ws, &mirror).review.is_some(), "review resumes once named");
     }
 
     #[test]
