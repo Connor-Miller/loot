@@ -16,7 +16,7 @@ use crate::workspace::{
     WorkingRow,
 };
 use loot_core::manifest::GrantEntry;
-use loot_core::{verdict, MergeOutcome, Oid, Visibility};
+use loot_core::{verdict, MergeOutcome, Oid, QuarantinedGrant, Visibility};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -443,6 +443,37 @@ pub fn render_embargo_status(path: &Path, vis: &Visibility, now: u64) -> String 
     }
 }
 
+/// `loot grants --quarantined` (#12): every grant `pull-grants` held back from
+/// an unregistered sender, one row per (sender, oid). Both hexes print in
+/// full (not shortened) so either copy-pastes straight into `loot grants
+/// --trust <pubkey-hex>`.
+pub fn render_quarantined(entries: &[QuarantinedGrant]) -> String {
+    let mut out = String::new();
+    if entries.is_empty() {
+        let _ = writeln!(out, "no quarantined grants");
+        return out;
+    }
+    let _ = writeln!(out, "{} quarantined grant(s):", entries.len());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{:<64} {:<64} received", "sender (pubkey hex)", "oid");
+    let _ = writeln!(out, "{}", "-".repeat(150));
+    for e in entries {
+        let _ = writeln!(
+            out,
+            "{:<64} {:<64} {}",
+            e.sender_hex,
+            e.oid_hex,
+            civil_datetime(e.received_at)
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "run `loot grants --trust <pubkey-hex>` to register a sender and re-apply their grants"
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,5 +833,45 @@ mod tests {
         let vis = Visibility::Restricted(vec!["alice".into()]);
         let out = render_embargo_status(&PathBuf::from("secret.env"), &vis, 0);
         assert_eq!(out, "secret.env: not embargoed\n");
+    }
+
+    // --- `loot grants --quarantined` (#12) ---
+
+    fn quarantined(sender_hex: &str, oid_hex: &str, received_at: u64) -> QuarantinedGrant {
+        QuarantinedGrant {
+            sender_hex: sender_hex.to_string(),
+            oid_hex: oid_hex.to_string(),
+            received_at,
+            bundle_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_quarantined_reports_none_when_empty() {
+        assert_eq!(render_quarantined(&[]), "no quarantined grants\n");
+    }
+
+    #[test]
+    fn render_quarantined_lists_sender_oid_and_received_time_in_full_hex() {
+        let alice = "aa".repeat(32);
+        let oid = "11".repeat(32);
+        let entries = [quarantined(&alice, &oid, 1_799_971_200)];
+        let out = render_quarantined(&entries);
+
+        // Full hex, never shortened — the point is copy-paste into `--trust`.
+        assert!(out.contains(&alice), "{out}");
+        assert!(out.contains(&oid), "{out}");
+        assert!(out.contains("2027-01-15"), "{out}");
+        assert!(out.contains("loot grants --trust <pubkey-hex>"), "{out}");
+    }
+
+    #[test]
+    fn render_quarantined_lists_every_entry() {
+        let a = quarantined(&"aa".repeat(32), &"11".repeat(32), 1_000);
+        let b = quarantined(&"bb".repeat(32), &"22".repeat(32), 2_000);
+        let out = render_quarantined(&[a, b]);
+        assert!(out.contains("2 quarantined grant(s)"), "{out}");
+        assert!(out.lines().any(|l| l.starts_with(&"aa".repeat(32))), "{out}");
+        assert!(out.lines().any(|l| l.starts_with(&"bb".repeat(32))), "{out}");
     }
 }

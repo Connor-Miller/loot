@@ -8084,4 +8084,119 @@ mod tests {
     // sealed lane, reaped by `loot lane rm` (`remove_lane`, covered by
     // `lane_spawn_requires_a_keyed_repo_and_the_primary` and the lane-lifecycle
     // tests) and spawned by `loot lane new` (`lane_spawn_materializes_…`).
+
+    // --- quarantined grants: review + trust (#12) ---
+
+    /// The full round trip `cmd_pull_grants`/`cmd_grants_trust` compose:
+    /// a sealed grant from a sender Bob has never registered is held in
+    /// quarantine (never applied), `--quarantined` lists it, and `--trust`
+    /// registers the sender as a peer, re-applies the grant, and clears the
+    /// entry. Driven at the `Workspace`/`RepoStore` level (no relay/HTTP
+    /// mailbox — the SealedGrant bundle is built directly via
+    /// `deposit_sealed_grant`, capturing its bytes instead of delivering them,
+    /// exactly what `pull-grants` would have handed to the quarantine gate
+    /// after unwrapping the envelope).
+    #[test]
+    fn quarantine_then_trust_reapplies_and_clears_the_entry() {
+        let dir_a = std::env::temp_dir().join(format!("loot-12-trust-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        // `authored_ws` always names its identity "connor" (see the helper) —
+        // restrict to that name so Alice, the sealer, actually holds the key
+        // she is about to grant (unlike the `restricted=alice` fixture used
+        // elsewhere, which deliberately seals to a name nobody present holds).
+        std::fs::write(dir_a.join(".lootattributes"), "secret.txt restricted=connor\n").unwrap();
+        std::fs::write(dir_a.join("secret.txt"), b"top secret").unwrap();
+        alice.snapshot("seal a path").unwrap();
+        alice.finalize_working().unwrap();
+        let head = alice.heads()[0].clone();
+        let (oid, _vis) = alice
+            .repo()
+            .change_tree(&head)
+            .unwrap()
+            .get(Path::new("secret.txt"))
+            .unwrap()
+            .clone();
+
+        let dir_b = std::env::temp_dir().join(format!("loot-12-trust-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+
+        let alice_pubkey = loot_identity::load_or_missing(alice.dot()).unwrap().public_key_bytes();
+        let bob_pubkey = loot_identity::load_or_missing(bob.dot()).unwrap().public_key_bytes();
+        let bob_x25519 = loot_identity::x25519_pubkey_from_ed25519_bytes(&bob_pubkey).unwrap();
+
+        // A real SealedGrant, addressed to Bob — captured rather than
+        // delivered, standing in for what an envelope-unwrap would yield.
+        let mut captured: Option<Vec<u8>> = None;
+        alice
+            .deposit_sealed_grant(
+                &oid,
+                "bob",
+                bob_pubkey,
+                alice_pubkey,
+                0,
+                |key| {
+                    loot_identity::seal_key(key, &bob_x25519)
+                        .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+                },
+                |bytes| {
+                    captured = Some(bytes);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let bundle_bytes = captured.expect("the deliver closure ran");
+
+        // Bob has never registered Alice — `pull-grants` would quarantine
+        // this rather than apply it.
+        let sender_hex = loot_core::hex::encode(&alice_pubkey);
+        let oid_hex = loot_core::hex::encode(&oid.0);
+        let received_at = 1_700_000_000;
+        bob.store()
+            .write_quarantine_entry(&sender_hex, &oid_hex, received_at, &bundle_bytes)
+            .unwrap();
+
+        // `--quarantined`: lists sender pubkey hex, oid, received timestamp.
+        let listed = bob.store().read_quarantine();
+        assert_eq!(listed.len(), 1, "one quarantined grant");
+        assert_eq!(listed[0].sender_hex, sender_hex);
+        assert_eq!(listed[0].oid_hex, oid_hex);
+        assert_eq!(listed[0].received_at, received_at);
+
+        // Not yet applied: Bob's keyring holds no key for the sealed content.
+        assert!(
+            bob.repo().get(&oid, bob.identity(), received_at).is_err(),
+            "a quarantined grant is never applied"
+        );
+
+        // `--trust <pubkey-hex>`: register the sender, re-apply every grant
+        // of theirs still quarantined, and clear each one out as it succeeds.
+        let openssh_line =
+            loot_identity::PeerRegistry::openssh_line_from_pubkey_bytes(alice_pubkey).unwrap();
+        let mut reg = loot_identity::PeerRegistry::load(bob.dot());
+        reg.add(&sender_hex, &openssh_line);
+        reg.save().unwrap();
+
+        for entry in bob.store().read_quarantine_for_sender(&sender_hex) {
+            bob.apply_sealed_grant(entry.bundle_bytes.clone(), alice_pubkey).unwrap();
+            bob.store().remove_quarantine_entry(&sender_hex, &entry.oid_hex).unwrap();
+        }
+
+        assert!(bob.store().read_quarantine().is_empty(), "re-applied grant leaves quarantine empty");
+        assert!(
+            !bob.store().quarantine_sender_dir(&sender_hex).exists(),
+            "the trusted sender's now-empty subdirectory is cleaned up"
+        );
+
+        // Bob can now read what Alice sealed to him.
+        let bytes = bob.repo().get(&oid, bob.identity(), received_at).unwrap();
+        assert_eq!(bytes, b"top secret");
+
+        // The peer registry recognizes Alice going forward — a second
+        // `pull-grants` from her would apply directly, not quarantine again.
+        let reg = loot_identity::PeerRegistry::load(bob.dot());
+        assert_eq!(reg.pubkey_bytes(&sender_hex).unwrap(), Some(alice_pubkey));
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
 }

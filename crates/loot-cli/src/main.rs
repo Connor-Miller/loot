@@ -140,7 +140,7 @@ const COMMANDS: &[Verb] = &[
     verb("push", &["--remote"], &[], cmd_push),
     verb("pull", &["--remote"], &["--no-surface", "--porcelain", "--json"], cmd_pull),
     verb("pull-grants", &["--remote"], &[], cmd_pull_grants),
-    verb("grants", &["--remote"], &[], cmd_grants),
+    verb("grants", &["--remote", "--trust"], &["--quarantined"], cmd_grants),
     verb("clone", &["--identity"], &[], cmd_clone),
     verb("config", &[], &[], cmd_config),
     verb("id", &[], &[], cmd_id),
@@ -186,7 +186,9 @@ usage:
   loot grant-status <path>                  list current grantees for <path> — grantor, delivery method, granted_at (sanity check before `loot maroon`, #5)
   loot embargo-status <path>                show whether <path> is embargoed (sealed until a unix timestamp, shown with its human-readable date/time too), revealed (embargo passed), or not embargoed at all (#15); checks history too, not just the working tree — useful when troubleshooting why a file isn't visible after a pull
   loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
-  loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
+  loot grants --quarantined                 list grants quarantined from unregistered senders (sender pubkey, oid, received time) (#12)
+  loot grants --trust <pubkey-hex>          register the sender as a peer and re-apply their quarantined grants (#12)
+  loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay; quarantines any from an unregistered sender to `.loot/quarantine/`
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
   loot lane new [--ticket <n>] [--name <n>] [--at <dir>] [--porcelain|--json]  spawn a sealed ephemeral lane over the shared store (primary-only, keyed repos; ADR 0034); --ticket derives the handle (t<n>) for the claim-to-lane flow (#232)
@@ -1952,6 +1954,16 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_grants(args: &[String]) -> Result<(), String> {
+    // `--quarantined`/`--trust` are local-only review of what `pull-grants`
+    // already fetched (#12) — neither touches the network, unlike the default
+    // mailbox-peek below, so they're dispatched before any remote resolves.
+    if has_flag(args, "--quarantined") {
+        return cmd_grants_quarantined();
+    }
+    if let Some(pubkey_hex) = flag(args, "--trust") {
+        return cmd_grants_trust(pubkey_hex);
+    }
+
     let ws = Workspace::open()?;
     let dot = ws.dot().to_owned();
     let url = resolve_remote(args, &ws)?;
@@ -1963,6 +1975,85 @@ fn cmd_grants(args: &[String]) -> Result<(), String> {
         println!("{count} grant(s) pending at {url} — run `loot pull-grants` to receive");
     }
     Ok(())
+}
+
+/// `loot grants --quarantined` (#12): list every grant `pull-grants` held back
+/// from an unregistered sender, purely local (no network, no mutation).
+fn cmd_grants_quarantined() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let entries = ws.store().read_quarantine();
+    print!("{}", render::render_quarantined(&entries));
+    Ok(())
+}
+
+/// `loot grants --trust <pubkey-hex>` (#12): register the sender as a peer,
+/// then re-apply every grant of theirs still quarantined, moving each one out
+/// of quarantine as it succeeds. A grant that fails to re-apply (e.g. it can no
+/// longer be unsealed, or has since expired — #20's `apply_sealed_grant` rejects
+/// an expired sealed grant the same way whether it arrived fresh or waited in
+/// quarantine) stays quarantined rather than being silently dropped.
+fn cmd_grants_trust(pubkey_hex: &str) -> Result<(), String> {
+    let pubkey = loot_core::hex::decode_array::<32>(pubkey_hex)
+        .ok_or_else(|| format!("--trust requires a 64-character hex pubkey, got '{pubkey_hex}'"))?;
+    // Canonical (lowercase) form — the quarantine directory's real key, so a
+    // mixed-case argument still finds entries `pull-grants` wrote in lowercase.
+    let sender_hex = loot_core::hex::encode(&pubkey);
+
+    let mut ws = Workspace::open()?;
+    let dot = ws.dot().to_owned();
+
+    let entries = ws.store().read_quarantine_for_sender(&sender_hex);
+    if entries.is_empty() {
+        return Err(format!("no quarantined grants from {sender_hex}"));
+    }
+
+    // Register the sender as a peer — the name it gets is its own pubkey hex,
+    // since `--trust` supplies a bare key, not a nickname (`loot peer add`
+    // remains the way to give a sender a friendly name).
+    let openssh_line = identity::PeerRegistry::openssh_line_from_pubkey_bytes(pubkey)
+        .map_err(|e| e.to_string())?;
+    let mut reg = identity::PeerRegistry::load(&dot);
+    reg.add(&sender_hex, &openssh_line);
+    reg.save().map_err(|e| e.to_string())?;
+    println!("registered peer '{sender_hex}'");
+
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    for entry in &entries {
+        match ws.apply_sealed_grant(entry.bundle_bytes.clone(), pubkey) {
+            Ok(()) => {
+                let _ = ws.store().remove_quarantine_entry(&sender_hex, &entry.oid_hex);
+                applied += 1;
+            }
+            Err(e) => {
+                eprintln!("loot: failed to re-apply quarantined grant {}: {e}", entry.oid_hex);
+                failed += 1;
+            }
+        }
+    }
+
+    println!("re-applied {applied}/{} quarantined grant(s) from {sender_hex}", entries.len());
+    if failed > 0 {
+        println!("  {failed} still quarantined (re-apply failed) — see the error(s) above");
+    }
+    if applied > 0 {
+        println!("run `loot surface` to materialize newly-accessible content");
+        // Same barrier reasoning as `pull-grants`: this files keys into the
+        // keyring, which `undo` never touches (ADR 0031).
+        ws.record_op("grants", &format!("grants --trust {sender_hex} ({applied} applied)"), true);
+    }
+    Ok(())
+}
+
+/// Decode a sealed-grant bundle's target oid without unsealing anything — the
+/// key a quarantined grant (#12) is filed under, and what `--quarantined`
+/// displays. Pure and total, like [`loot_core::bundle_codec::Frame::decode`]
+/// itself; errors on anything that isn't a well-formed tag-3 bundle.
+fn sealed_grant_oid(bundle_bytes: &[u8]) -> Result<Oid, String> {
+    match loot_core::bundle_codec::Frame::decode(bundle_bytes).map_err(|e| e.to_string())? {
+        loot_core::bundle_codec::Frame::SealedGrant { oid, .. } => Ok(oid),
+        _ => Err("not a sealed-key grant bundle (tag 3)".into()),
+    }
 }
 
 fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
@@ -2003,11 +2094,29 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
                     .map_or(false, |pk| pk == grantor_pubkey)
             });
         if !grantor_known {
-            eprintln!(
-                "loot: quarantined grant from unknown key {} — run `loot peer add <name> <pubkey>` to trust",
-                hex_short(&grantor_pubkey)
-            );
-            quarantined += 1;
+            let sender_hex = loot_core::hex::encode(&grantor_pubkey);
+            match sealed_grant_oid(bundle_bytes) {
+                Ok(oid) => {
+                    let oid_hex = loot_core::hex::encode(&oid.0);
+                    match ws.store().write_quarantine_entry(&sender_hex, &oid_hex, ws.now(), bundle_bytes) {
+                        Ok(()) => {
+                            eprintln!(
+                                "loot: quarantined grant from unknown key {} — run `loot grants --trust {sender_hex}` to trust and re-apply",
+                                hex_short(&grantor_pubkey)
+                            );
+                            quarantined += 1;
+                        }
+                        Err(e) => eprintln!(
+                            "loot: could not quarantine grant from {}: {e}",
+                            hex_short(&grantor_pubkey)
+                        ),
+                    }
+                }
+                Err(e) => eprintln!(
+                    "loot: skipping grant from unknown key {} (not quarantinable): {e}",
+                    hex_short(&grantor_pubkey)
+                ),
+            }
             continue;
         }
 
@@ -3057,6 +3166,44 @@ mod tests {
         assert_eq!(mark(&Visibility::Public), "public");
         assert_eq!(mark(&Visibility::Restricted(vec!["a".into(), "b".into()])), "restricted=a,b");
         assert_eq!(mark(&Visibility::Embargoed { reveal_at: 5 }), "embargoed@5");
+    }
+
+    // --- quarantined grants (#12) ---
+
+    /// #12: the oid `pull-grants` files a quarantined entry under, and what
+    /// `--quarantined` displays, without unsealing anything.
+    #[test]
+    fn sealed_grant_oid_decodes_the_target_oid() {
+        let body = loot_core::bundle_codec::BundleBody {
+            changes: Vec::new(),
+            objs: Default::default(),
+            keys: Default::default(),
+            attestations: Vec::new(),
+        };
+        let bytes = loot_core::bundle_codec::Frame::SealedGrant {
+            grantee_pubkey: [7; 32],
+            wrapped_key: [9; 80],
+            oid: Oid([5; 32]),
+            reveal_at: 0,
+            expires_at: None,
+            body,
+        }
+        .encode();
+        assert_eq!(sealed_grant_oid(&bytes).unwrap(), Oid([5; 32]));
+    }
+
+    /// A bundle of the wrong tag (e.g. a plain `Sync` frame) is not
+    /// quarantinable — `sealed_grant_oid` refuses rather than guessing.
+    #[test]
+    fn sealed_grant_oid_rejects_a_non_sealed_grant_frame() {
+        let body = loot_core::bundle_codec::BundleBody {
+            changes: Vec::new(),
+            objs: Default::default(),
+            keys: Default::default(),
+            attestations: Vec::new(),
+        };
+        let bytes = loot_core::bundle_codec::Frame::Sync { purges: Vec::new(), body }.encode();
+        assert!(sealed_grant_oid(&bytes).is_err());
     }
 
     fn args(items: &[&str]) -> Vec<String> {

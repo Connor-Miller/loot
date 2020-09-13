@@ -29,6 +29,7 @@
 //! ops          local-only operation log for undo (LOCAL) (oplog, ADR 0031)
 //! abandoned     local-only set of abandoned version ids (LOCAL) (S3, ADR 0029)
 //! lost         acknowledged-lost object addresses (LOCAL)  (#335)
+//! quarantine/  grants held back from an unregistered sender (#12, ADR 0015)
 //! id, id.pub   the ed25519 keypair                      (loot-identity, ADR 0014)
 //! peers        nickname -> pubkey registry              (loot-identity, ADR 0014)
 //! ```
@@ -193,6 +194,9 @@ const ABANDONED: &str = "abandoned";
 /// Acknowledged-lost content addresses (#335). Shared-store-rooted; see
 /// [`RepoStore::lost`].
 const LOST: &str = "lost";
+/// Directory of grants quarantined at `pull-grants` from an unregistered
+/// sender (#12). Shared-store-rooted; see [`RepoStore::quarantine_dir`].
+const QUARANTINE: &str = "quarantine";
 /// The shared-store metadata lock (#293). `save_to` persists the append-only
 /// shared surface (graph, keyring, …) by a read-modify-write of whole files;
 /// without serialization two concurrent writers lose one another's appends. A
@@ -433,6 +437,113 @@ impl RepoStore {
             bytes.extend_from_slice(&id.0);
         }
         atomic_write(&self.lost(), &bytes)
+    }
+
+    // --- quarantined grants (#12, ADR 0015) ---
+    //
+    // `pull-grants` quarantines a grant bundle from a pubkey the peer registry
+    // doesn't recognize rather than dropping it — the operator can review it
+    // (`loot grants --quarantined`) and later trust the sender (`loot grants
+    // --trust <pubkey-hex>`), which re-applies every held bundle. Shared-store
+    // rooted like `keyring`/`manifest` (one identity's mailbox, not a lane
+    // concern), keyed by the sender's pubkey hex and then the grant's target
+    // oid hex — disjoint per-(sender, oid) filenames, so concurrent
+    // quarantines from different senders (or different grants) are lock-free,
+    // the same reasoning as loose object storage (ADR 0012).
+
+    /// The quarantine root: one subdirectory per sender pubkey hex.
+    pub fn quarantine_dir(&self) -> PathBuf { self.dot.join(QUARANTINE) }
+
+    /// One sender's quarantined grants.
+    pub fn quarantine_sender_dir(&self, sender_hex: &str) -> PathBuf {
+        self.quarantine_dir().join(sender_hex)
+    }
+
+    /// One quarantined grant bundle: `<sender pubkey hex>/<oid hex>`.
+    pub fn quarantine_entry_path(&self, sender_hex: &str, oid_hex: &str) -> PathBuf {
+        self.quarantine_sender_dir(sender_hex).join(oid_hex)
+    }
+
+    /// Persist one quarantined grant bundle. `received_at` is the injected
+    /// clock's reading at receipt (a value, not a call, per the ADR 0006 clock
+    /// discipline), stored as an 8-byte little-endian prefix ahead of the raw
+    /// bundle bytes so `--trust` can re-apply exactly what arrived.
+    pub fn write_quarantine_entry(
+        &self,
+        sender_hex: &str,
+        oid_hex: &str,
+        received_at: u64,
+        bundle_bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let path = self.quarantine_entry_path(sender_hex, oid_hex);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut bytes = Vec::with_capacity(8 + bundle_bytes.len());
+        bytes.extend_from_slice(&received_at.to_le_bytes());
+        bytes.extend_from_slice(bundle_bytes);
+        atomic_write(&path, &bytes)
+    }
+
+    /// Every quarantined grant across every sender, sorted by sender then oid
+    /// hex for deterministic listing. A malformed entry (too short to carry
+    /// the 8-byte timestamp header) is skipped rather than failing the whole
+    /// listing — best-effort, like `read_abandoned`/`read_lost`.
+    pub fn read_quarantine(&self) -> Vec<QuarantinedGrant> {
+        let mut out = Vec::new();
+        let Ok(senders) = std::fs::read_dir(self.quarantine_dir()) else { return out };
+        let mut sender_hexes: Vec<String> = senders
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        sender_hexes.sort();
+        for sender_hex in sender_hexes {
+            out.extend(self.read_quarantine_for_sender(&sender_hex));
+        }
+        out
+    }
+
+    /// Every quarantined grant from one sender, sorted by oid hex.
+    pub fn read_quarantine_for_sender(&self, sender_hex: &str) -> Vec<QuarantinedGrant> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.quarantine_sender_dir(sender_hex)) else {
+            return out;
+        };
+        let mut oid_hexes: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        oid_hexes.sort();
+        for oid_hex in oid_hexes {
+            let path = self.quarantine_entry_path(sender_hex, &oid_hex);
+            let Ok(bytes) = read_replaced(&path) else { continue };
+            if bytes.len() < 8 {
+                continue;
+            }
+            let mut ts = [0u8; 8];
+            ts.copy_from_slice(&bytes[..8]);
+            out.push(QuarantinedGrant {
+                sender_hex: sender_hex.to_string(),
+                oid_hex,
+                received_at: u64::from_le_bytes(ts),
+                bundle_bytes: bytes[8..].to_vec(),
+            });
+        }
+        out
+    }
+
+    /// Remove one quarantined grant — it has been re-applied (or is being
+    /// discarded). Idempotent (a missing entry is not an error). Also removes
+    /// the sender's subdirectory once it is empty, so a fully-trusted sender
+    /// leaves no trace under `quarantine/`.
+    pub fn remove_quarantine_entry(&self, sender_hex: &str, oid_hex: &str) -> std::io::Result<()> {
+        let path = self.quarantine_entry_path(sender_hex, oid_hex);
+        let _ = std::fs::remove_file(&path);
+        // Best-effort: fails (harmlessly) if other entries remain.
+        let _ = std::fs::remove_dir(self.quarantine_sender_dir(sender_hex));
+        Ok(())
     }
 
     /// Read the working-change id (32 raw bytes) for `dock` if one is in
@@ -728,6 +839,21 @@ impl LaneEntry {
     }
 }
 
+/// One grant `pull-grants` quarantined because its sender wasn't a registered
+/// peer (#12, ADR 0015), as read back from `.loot/quarantine/<sender_hex>/`.
+/// `bundle_bytes` is exactly what arrived — the `Frame::SealedGrant`-encoded
+/// bytes `apply_sealed_grant` expects — so `--trust` re-applies it verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedGrant {
+    /// The sender's pubkey, lowercase hex.
+    pub sender_hex: String,
+    /// The grant's target content oid, lowercase hex.
+    pub oid_hex: String,
+    /// Unix seconds when this grant was quarantined.
+    pub received_at: u64,
+    pub bundle_bytes: Vec<u8>,
+}
+
 /// Validate a name for a *new* lane or its promoted dock-name (#253/ADR 0034).
 /// The charset (ASCII alphanumerics plus `-`/`_`) is deliberately narrow so a
 /// name can never traverse or escape a directory when it seeds a lane directory
@@ -873,6 +999,55 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_round_trips_keyed_by_sender_and_oid() {
+        let dir = std::env::temp_dir().join(format!("loot-store-qn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = RepoStore::new(&dir);
+
+        assert!(s.read_quarantine().is_empty(), "nothing quarantined yet");
+
+        let alice = "aa".repeat(32);
+        let bob = "bb".repeat(32);
+        let oid1 = "11".repeat(32);
+        let oid2 = "22".repeat(32);
+
+        s.write_quarantine_entry(&alice, &oid1, 1_000, b"alice-grant-1").unwrap();
+        s.write_quarantine_entry(&alice, &oid2, 2_000, b"alice-grant-2").unwrap();
+        s.write_quarantine_entry(&bob, &oid1, 3_000, b"bob-grant-1").unwrap();
+
+        let all = s.read_quarantine();
+        assert_eq!(all.len(), 3, "every sender's every grant is listed");
+        // Sorted by sender then oid — deterministic listing.
+        assert_eq!(all[0].sender_hex, alice);
+        assert_eq!(all[0].oid_hex, oid1);
+        assert_eq!(all[0].received_at, 1_000);
+        assert_eq!(all[0].bundle_bytes, b"alice-grant-1");
+        assert_eq!(all[1].sender_hex, alice);
+        assert_eq!(all[1].oid_hex, oid2);
+        assert_eq!(all[2].sender_hex, bob);
+
+        let alice_only = s.read_quarantine_for_sender(&alice);
+        assert_eq!(alice_only.len(), 2, "one sender's grants only");
+
+        // Re-applying one grant removes just that entry.
+        s.remove_quarantine_entry(&alice, &oid1).unwrap();
+        let after = s.read_quarantine();
+        assert_eq!(after.len(), 2, "removed exactly one entry");
+        assert!(!after.iter().any(|g| g.sender_hex == alice && g.oid_hex == oid1));
+
+        // Removing the sender's last entry drops the now-empty subdirectory.
+        s.remove_quarantine_entry(&alice, &oid2).unwrap();
+        assert!(!s.quarantine_sender_dir(&alice).exists(), "empty sender dir is cleaned up");
+        assert_eq!(s.read_quarantine().len(), 1, "bob's grant is untouched");
+
+        // Removing an already-gone entry is a no-op, not an error (idempotent).
+        s.remove_quarantine_entry(&alice, &oid1).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn lane_store_routes_private_state_to_the_lane_root() {
         // The ADR 0034 partition: lane-owned files under the lane's `.loot/`,
         // shared/single-writer artifacts under the store root.
@@ -910,6 +1085,7 @@ mod tests {
             s.id(),
             s.peers(),
             s.lanes_dir(),
+            s.quarantine_dir(),
         ] {
             assert!(
                 shared.starts_with("/repo/.loot"),

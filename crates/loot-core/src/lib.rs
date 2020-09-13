@@ -29,7 +29,7 @@ pub use engine::{
     MissingObject, MissingRef, VerifyReport,
 };
 pub use oplog::{BarrierRefusal, Operation, StepError, Stepped, View};
-pub use store::{valid_dock_name, LaneEntry, RepoStore, HOME_DOCK};
+pub use store::{valid_dock_name, LaneEntry, QuarantinedGrant, RepoStore, HOME_DOCK};
 pub use verdict::{PathVerdict, VERDICT_CONTRACT};
 
 /// Content identity. A stable handle to a unit of content, independent of

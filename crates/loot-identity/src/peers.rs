@@ -74,6 +74,17 @@ impl PeerRegistry {
         Ok(ed_key.0)
     }
 
+    /// Build an OpenSSH public-key line from raw ed25519 bytes — the inverse of
+    /// [`Self::parse_pubkey_bytes_from_line`]. Used to register a peer from a
+    /// bare pubkey rather than a full OpenSSH line, e.g. `loot grants --trust
+    /// <pubkey-hex>` (#12) trusting a quarantined grant's sender, who has no
+    /// pubkey line on file — only the raw bytes a sealed-grant envelope carried.
+    pub fn openssh_line_from_pubkey_bytes(bytes: [u8; 32]) -> Result<String, IdentityError> {
+        let key_data = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(bytes));
+        let pub_key = ssh_key::PublicKey::new(key_data, "");
+        pub_key.to_openssh().map_err(|e| IdentityError::Format(e.to_string()))
+    }
+
     /// Persist to disk.
     pub fn save(&self) -> Result<(), IdentityError> {
         let mut out = String::new();
@@ -138,5 +149,19 @@ mod tests {
         reg.add("bob", line.trim());
         let bytes = reg.pubkey_bytes("bob").unwrap().unwrap();
         assert_eq!(bytes, id.public_key_bytes());
+    }
+
+    /// #12: `--trust <pubkey-hex>` only has raw bytes, not an OpenSSH line — the
+    /// round trip through [`PeerRegistry::openssh_line_from_pubkey_bytes`] and
+    /// [`PeerRegistry::parse_pubkey_bytes_from_line`] must recover the same bytes.
+    #[test]
+    fn openssh_line_from_pubkey_bytes_round_trips() {
+        let id = crate::Identity::generate();
+        let bytes = id.public_key_bytes();
+
+        let line = PeerRegistry::openssh_line_from_pubkey_bytes(bytes).unwrap();
+        assert!(line.starts_with("ssh-ed25519 "), "{line}");
+        let recovered = PeerRegistry::parse_pubkey_bytes_from_line(&line).unwrap();
+        assert_eq!(recovered, bytes);
     }
 }
