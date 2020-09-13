@@ -1984,6 +1984,13 @@ fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
 // before the next re-negotiate checkpoint (ADR 0024).
 const OBJECTS_PER_BATCH: usize = 32;
 
+// Byte cap per push batch (#309): the relay buffers each request body whole
+// and refuses one over loot_net::MAX_BODY_BYTES, so batches stay well under it
+// — the 8× headroom absorbs the change delta, keys, and envelope that ride on
+// top of the counted object ciphertext. A single object larger than this still
+// ships alone (only the relay's hard limit can refuse it).
+const BYTES_PER_BATCH: usize = loot_net::MAX_BODY_BYTES / 8;
+
 fn cmd_push(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
@@ -2013,7 +2020,7 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
     // only the objects not yet stowed. The empty-wants case always produces one
     // bundle so the change delta and attestations propagate even when no new
     // objects are needed.
-    let bundles = ws.bundle_wanted_batched(&have, &wants, OBJECTS_PER_BATCH)?;
+    let bundles = ws.bundle_wanted_batched(&have, &wants, OBJECTS_PER_BATCH, BYTES_PER_BATCH)?;
     let batch_count = bundles.len();
     for bundle in bundles {
         loot_net::push(&url, bundle.0, &id).map_err(|e| e.to_string())?;
@@ -2635,7 +2642,7 @@ mod tests {
         assert!(!contains_key(&grant.0, &raw_key), "grant frame must carry only the wrapped key");
 
         let offered = alice.offered_objects(&[]);
-        let bundles = alice.bundle_wanted_batched(&[], &offered, 8).unwrap();
+        let bundles = alice.bundle_wanted_batched(&[], &offered, 8, usize::MAX).unwrap();
         assert!(!bundles.is_empty());
         for b in &bundles {
             assert!(!contains_key(&b.0, &raw_key), "push bundles must never carry the raw key");

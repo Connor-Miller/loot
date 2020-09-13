@@ -30,6 +30,14 @@ mod relay_store;
 mod mailbox;
 pub use relay_store::{is_relay, RelayStore};
 
+/// Maximum request body the relay buffers, replacing axum's implicit 2 MiB
+/// `DefaultBodyLimit` that 413'd any push batch over it (#309). Push batches
+/// are byte-capped client-side well below this (an eighth), so the limit only
+/// refuses a single object too large to batch around — the one case that
+/// would need a chunked-object protocol. Exported so the client cap derives
+/// from it and the two can never drift apart.
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum NetError {
     Io(String),
@@ -192,6 +200,9 @@ async fn serve_async(store: RelayStore, dir: PathBuf, addr: &str, allowed_keys: 
         .route("/grant", post(handle_deposit_grant))
         .route("/pull-grants", post(handle_pull_grants))
         .route("/grants/peek", post(handle_peek_grants))
+        // Every endpoint buffers its body whole; without this layer axum's
+        // implicit 2 MiB default applied and large stows 413'd forever (#309).
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -367,7 +378,16 @@ pub fn push(base_url: &str, bundle_bytes: Vec<u8>, id: &identity::Identity) -> R
     if !resp.status().is_success() {
         let code = resp.status();
         let msg = resp.text().unwrap_or_default();
-        return Err(NetError::Http(format!("relay rejected push ({code}): {msg}")));
+        // 413 means one bundle exceeded the relay's request-body buffer.
+        // Batches are byte-capped below MAX_BODY_BYTES, so either the relay
+        // predates the raised limit (#309) or a single object outgrows it.
+        let hint = if code == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            "\n  the relay's body limit is smaller than this bundle — upgrade the relay \
+             (a pre-#309 build caps at 2 MiB), or a single object exceeds its limit"
+        } else {
+            ""
+        };
+        return Err(NetError::Http(format!("relay rejected push ({code}): {msg}{hint}")));
     }
     Ok(())
 }

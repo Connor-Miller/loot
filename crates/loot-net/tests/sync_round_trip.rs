@@ -77,6 +77,44 @@ fn push_then_pull_syncs_public_content_through_a_keyless_relay() {
     assert!(loot_net::is_relay(&relay_dir), "relay dir must be marked as a relay");
 }
 
+/// Regression for #309: axum's implicit 2 MiB `DefaultBodyLimit` applied to
+/// `/stow`, so any push whose bundle exceeded it bounced with 413 forever (the
+/// closure only grows). The relay must accept bodies up to its own explicit
+/// limit — well above one client batch.
+#[test]
+fn relay_accepts_a_push_larger_than_two_mib() {
+    let relay_dir = tmp("relay-large");
+    let addr = "127.0.0.1:47200";
+    let base = format!("http://{addr}");
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
+    });
+    wait_for_relay(&base);
+
+    let alice_id = alice_identity();
+    let alice_dir = tmp("alice-large");
+    let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
+    // Restricted content is never compressed (ADR 0020), so the bundle really
+    // carries all 3 MiB over the wire.
+    let restricted = Visibility::Restricted(vec!["alice".into()]);
+    let oid = alice.put(&vec![0xA5u8; 3 * 1024 * 1024], restricted.clone()).unwrap();
+    let mut tree = BTreeMap::new();
+    tree.insert(PathBuf::from("big.bin"), (oid.clone(), restricted));
+    alice
+        .record(Change { id: Oid([0; 32]), parents: vec![], message: "big".into(), tree })
+        .unwrap();
+
+    loot_net::push(&base, alice.bundle(&[]).unwrap().0, &alice_id)
+        .expect("a >2 MiB push must be accepted, not 413'd");
+
+    let relay_repo = DagRepo::load(&relay_dir, relay_dir.clone()).unwrap();
+    assert!(
+        relay_repo.missing_objects(&[oid.clone()]).is_empty(),
+        "the relay must have stowed the large object"
+    );
+}
+
 #[test]
 fn relay_cannot_read_restricted_content_it_relays() {
     let relay_dir = tmp("relay-restricted");

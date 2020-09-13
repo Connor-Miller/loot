@@ -434,14 +434,18 @@ impl Workspace {
     }
 
     /// The batched bundles shipping `wants` to a peer holding `have` (S6,
-    /// resumable transfer — each batch stows independently, ADR 0024).
+    /// resumable transfer — each batch stows independently, ADR 0024). A batch
+    /// closes at `per_batch` objects or `batch_bytes` of ciphertext (#309).
     pub fn bundle_wanted_batched(
         &self,
         have: &[Oid],
         wants: &[Oid],
         per_batch: usize,
+        batch_bytes: usize,
     ) -> Result<Vec<loot_core::SyncBundle>, String> {
-        self.repo.bundle_wanted_batched(have, wants, per_batch).map_err(|e| e.to_string())
+        self.repo
+            .bundle_wanted_batched(have, wants, per_batch, batch_bytes)
+            .map_err(|e| e.to_string())
     }
 
     /// The full sneakernet bundle (`loot bundle`): have = [], apply idempotent.

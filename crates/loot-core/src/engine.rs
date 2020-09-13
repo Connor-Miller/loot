@@ -2151,11 +2151,21 @@ impl DagRepo {
     /// empty one bundle is returned (carrying the change delta and attestations
     /// with no object bytes) so the caller always makes at least one round-trip
     /// to propagate metadata.
+    ///
+    /// A batch closes at `batch_size` objects (resume granularity, ADR 0024) or
+    /// when its object ciphertext would exceed `batch_bytes` (#309: a relay
+    /// buffers the whole request body, so a batch must stay under its body
+    /// limit). Byte accounting is ciphertext-only — the per-bundle change
+    /// delta and framing ride on top, so callers pick `batch_bytes` with
+    /// headroom below the transport limit. An object larger than the whole
+    /// budget still ships, alone in its own bundle: the cap bounds packing,
+    /// it never wedges a transfer.
     pub fn bundle_wanted_batched(
         &self,
         have: &[Oid],
         wants: &[Oid],
         batch_size: usize,
+        batch_bytes: usize,
     ) -> Result<Vec<SyncBundle>, RepoError> {
         if wants.is_empty() {
             // One metadata-only bundle: change delta + attestations, no objects.
@@ -2164,12 +2174,26 @@ impl DagRepo {
         // Pre-partition objects across all batches in one pass over the wants list,
         // then build each bundle independently. This avoids iterating all_objects
         // once per batch (which would be O(total_objects × num_batches)).
-        wants
-            .chunks(batch_size)
-            .map(|batch| {
-                let batch_set: std::collections::BTreeSet<Oid> = batch.iter().cloned().collect();
-                self.bundle_impl(have, Some(&batch_set))
-            })
+        let mut batches: Vec<std::collections::BTreeSet<Oid>> = Vec::new();
+        let mut cur: std::collections::BTreeSet<Oid> = Default::default();
+        let mut cur_bytes = 0usize;
+        for oid in wants {
+            // An address we do not hold contributes no bytes; bundle_impl skips
+            // it anyway, so it costs nothing to carry in a batch set.
+            let size = self.object(oid).map(|o| o.ciphertext.len()).unwrap_or(0);
+            if !cur.is_empty() && (cur.len() >= batch_size || cur_bytes + size > batch_bytes) {
+                batches.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur.insert(oid.clone());
+            cur_bytes += size;
+        }
+        if !cur.is_empty() {
+            batches.push(cur);
+        }
+        batches
+            .iter()
+            .map(|batch_set| self.bundle_impl(have, Some(batch_set)))
             .collect()
     }
 
@@ -5512,6 +5536,75 @@ mod tests {
         relay.stow(&bundle).unwrap(); // re-run of a completed transfer
         assert!(relay.object(&a).is_ok());
         assert_eq!(relay.offered_objects(&[]).len(), 1, "no duplication on re-stow");
+    }
+
+    #[test]
+    fn batched_bundles_respect_the_byte_budget() {
+        // #309: a batch of 32 large objects can exceed a relay's request-body
+        // limit, so batching must cap bytes as well as object count. Restricted
+        // content is never compressed (ADR 0020), so ciphertext size tracks
+        // plaintext size and the packing decision is deterministic.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let vis = Visibility::Restricted(vec!["alice".into()]);
+        let mut tree = BTreeMap::new();
+        let mut oids = Vec::new();
+        for i in 0..5u8 {
+            let oid = alice.put(&vec![i; 40_000], vis.clone()).unwrap();
+            tree.insert(PathBuf::from(format!("f{i}")), (oid.clone(), vis.clone()));
+            oids.push(oid);
+        }
+        alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+
+        // The budget fits two ~40 KB objects per bundle; the 32-object count cap
+        // alone would pack all five into one bundle — the byte cap must split.
+        let budget = 100_000;
+        let bundles = alice.bundle_wanted_batched(&[], &oids, 32, budget).unwrap();
+        assert!(
+            bundles.len() >= 3,
+            "five ~40 KB objects under a 100 KB budget need at least 3 bundles, got {}",
+            bundles.len()
+        );
+
+        // Every want ships exactly once, and no bundle's object payload exceeds
+        // the budget.
+        let mut seen = std::collections::BTreeSet::new();
+        for b in &bundles {
+            let objs = objs_in(b);
+            let bytes: usize = objs.values().map(|o| o.ciphertext.len()).sum();
+            assert!(bytes <= budget, "bundle object payload {bytes} exceeds budget {budget}");
+            for oid in objs.keys() {
+                assert!(seen.insert(oid.clone()), "object shipped twice");
+            }
+        }
+        assert_eq!(seen.len(), 5, "all wanted objects must ship");
+    }
+
+    #[test]
+    fn an_object_larger_than_the_byte_budget_ships_alone() {
+        // The byte cap must never wedge a push: an object bigger than the whole
+        // budget still travels, alone in its own bundle (the relay's limit is
+        // the only ceiling that can refuse it).
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let vis = Visibility::Restricted(vec!["alice".into()]);
+        let big = alice.put(&vec![9u8; 50_000], vis.clone()).unwrap();
+        let small = alice.put(b"tiny", vis.clone()).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("big"), (big.clone(), vis.clone()));
+        tree.insert(PathBuf::from("small"), (small.clone(), vis.clone()));
+        alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+
+        let bundles = alice
+            .bundle_wanted_batched(&[], &[big.clone(), small.clone()], 32, 1_000)
+            .unwrap();
+        assert_eq!(bundles.len(), 2, "oversized object ships alone; the small one follows");
+        let first = objs_in(&bundles[0]);
+        assert_eq!(first.len(), 1);
+        assert!(first.contains_key(&big), "the oversized object still travels");
+        assert!(objs_in(&bundles[1]).contains_key(&small));
     }
 
     #[test]

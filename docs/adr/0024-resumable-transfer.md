@@ -68,3 +68,36 @@ change delta and attestations still propagate.
   the round-trips entirely.
 - **No format change.** S6 is pure client orchestration over the S5 negotiation
   and the append-only, idempotent `stow` (ADR 0011); `FORMAT_MAJOR` stays 4.
+
+## Amendment (2026-07-18, #309): batches are byte-capped too
+
+The 32-object count cap said nothing about *bytes*, and the relay silently ran
+under axum's implicit 2 MiB `DefaultBodyLimit` — so a batch of large objects
+(the #307 land: a closure with two big `.rs` files) bounced with `413 Payload
+Too Large` on every retry. The closure only grows, so one oversized land wedged
+relay sync permanently.
+
+Two changes, one per side:
+
+- **Relay: an explicit body limit.** `serve` sets
+  `DefaultBodyLimit::max(MAX_BODY_BYTES)` (64 MiB) on every route. The limit is
+  a deliberate, exported constant instead of a framework default nobody chose.
+- **Client: a byte cap on batching.** `bundle_wanted_batched` closes a batch at
+  32 objects (resume granularity, unchanged) **or** when its object ciphertext
+  would exceed the byte budget — `loot push` passes `MAX_BODY_BYTES / 8`, so
+  the change delta, keys, and envelope riding on top of the counted ciphertext
+  fit in the headroom. An object larger than the whole budget ships alone in
+  its own bundle: the cap bounds packing, it never wedges a transfer.
+
+Why not a client-only cap under the old 2 MiB default (which would have
+unwedged the incident with no relay upgrade)? Because the per-bundle change
+delta is uncapped and rides every batch — once it alone nears 2 MiB no client
+cap can help, and a sub-2 MiB budget multiplies that repeated overhead across
+many more batches. The relay is ours to upgrade, so both sides move and the
+limit becomes an explicit contract instead of an inherited default. The
+deployed relay must be rebuilt at this change before large pushes succeed.
+
+The residual: a *single object* larger than 64 MiB still cannot cross (batching
+cannot split one object; that would need a chunked-object protocol — not built
+until a real repo needs it). The client's 413 error now says which side to fix.
+Still no format change; both caps are transport orchestration.
