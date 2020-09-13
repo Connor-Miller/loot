@@ -932,6 +932,42 @@ impl Workspace {
         })
     }
 
+    /// Roll back changes an aborting ferry pass minted (#307): walk them into
+    /// the abandoned set, children first, so no dangling ingested head
+    /// survives the abort — the next `snapshot` would fold such a head under
+    /// the working change, making `anchor()` claim the dock covers git main
+    /// while the disk never materialized it. The nodes stay in the shared
+    /// graph (append-only union store, like every abandonment); the re-run
+    /// simply re-ingests. This is the recovery ritual the live incident ran
+    /// by hand (`loot abandon --head` to the fixpoint), mechanized.
+    pub fn rollback_ingested(&mut self, minted: &[Oid]) -> Result<(), String> {
+        if minted.is_empty() {
+            return Ok(());
+        }
+        let mut abandoned = self.store.read_abandoned();
+        for id in minted.iter().rev() {
+            self.repo.abandon_head(id);
+            abandoned.insert(id.clone());
+        }
+        self.store
+            .write_abandoned(&abandoned)
+            .map_err(|e| format!("write abandoned: {e}"))?;
+        self.persist()
+    }
+
+    /// Load `tip`'s lineage from the shared graph into this position's view
+    /// ([`DagRepo::ingest_shared_lineage`], the #265 catch-up primitive),
+    /// returning whether the tip is now loaded. Named "load", not "ingest":
+    /// on the bridge, ingest means minting persistent changes — this is a
+    /// view catch-up, not a store mutation, and nothing persists. It is the
+    /// bridge's guard before composing an ingest: a change landed from a lane
+    /// sits outside the lineage-filtered load, and composing over its
+    /// silently-missing tree minted a delta-only change that read as a tree
+    /// wipe (#307).
+    pub fn load_shared_lineage(&mut self, tip: &Oid) -> Result<bool, String> {
+        self.repo.ingest_shared_lineage(&self.store, tip).map_err(|e| e.to_string())
+    }
+
     /// Record one bridge-ingested change (ADR 0028): apply `acts` over
     /// `parent_tree` — sealing new content *at ingest* under the ingested
     /// commit's own policy — then record it authored (as self) or unauthored

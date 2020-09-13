@@ -168,8 +168,27 @@ pub fn run(
         // ingested change becomes a graph head itself, so the post-ingest
         // anchor can't tell fast-forward from true divergence.
         let ours = ws.finalized_anchor();
-        for sha in new_shas {
-            ingest_commit(ws, &git, &sha, &mut marks, &id_map, &mut report)?;
+        // Each ingest persists its change to the shared graph as it goes,
+        // while the marks naming them persist only with the spine at the end
+        // of the pass — so an abort anywhere between used to strand the
+        // ingested changes as unmarked heads. The next pass re-walked and
+        // re-ingested them (fresh ids), and worse: the next *snapshot* folded
+        // the dangling head under the working change, making `anchor()` claim
+        // the dock covers git main while the disk never materialized it
+        // (#307). So an aborted pass rolls back what it minted — the changes
+        // walk into the abandoned set, children first — and the spine stays
+        // untouched (#201): the re-run simply redoes the ingest.
+        let mut minted: Vec<Oid> = Vec::new();
+        let mut ingest_err: Option<String> = None;
+        for sha in &new_shas {
+            if let Err(e) = ingest_commit(ws, &git, sha, &mut marks, &id_map, &mut minted, &mut report)
+            {
+                ingest_err = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = ingest_err {
+            return Err(rollback_note(ws.rollback_ingested(&minted), e));
         }
         let target = marks.change_for(tip).cloned().map(|(t, _)| t);
 
@@ -185,12 +204,25 @@ pub fn run(
         // change into this catch-up merge (that finalizes the WIP and leaves the
         // empty minted change to "review" — #292). `preserve_wip` refuses that
         // fold; a plain ferry/land (with_wip=false) keeps the fold.
-        report.outcomes = ws.reconcile_onto(
+        report.outcomes = match ws.reconcile_onto(
             target.as_ref(),
             ours.as_ref(),
             "ferry: reconcile git main",
             /* preserve_wip */ with_wip,
-        )?;
+        ) {
+            Ok(outcomes) => outcomes,
+            // A reconcile refusal (#275/#292) aborts the pass — roll the
+            // freshly ingested changes back with it (#307, above).
+            Err(e) => return Err(rollback_note(ws.rollback_ingested(&minted), e)),
+        };
+        // Past the reconcile the ingested changes are folded into the dock's
+        // line — rollback is no longer safe, so their marks persist NOW,
+        // not at end-of-pass: a later abort (projection, refs) must never
+        // strand integrated changes unmarked (#307's "never one without the
+        // other", the persist arm).
+        if !minted.is_empty() {
+            write_spine(&marks_path, &marks.encode())?;
+        }
     }
 
     // --- project: every travel-worthy change gets a mirrored commit ---
@@ -452,7 +484,7 @@ pub fn run(
             }
         }
     }
-    std::fs::write(&wip_path, wip.encode()).map_err(|e| format!("write wip: {e}"))?;
+    write_spine(&wip_path, &wip.encode())?;
 
     // --- persist the spine ---
     state.git_main = git
@@ -461,8 +493,8 @@ pub fn run(
         .and_then(|r| r.target())
         .map(|o| o.to_string());
     state.loot_heads = ws.heads();
-    std::fs::write(&marks_path, marks.encode()).map_err(|e| format!("write marks: {e}"))?;
-    std::fs::write(&state_path, state.encode()).map_err(|e| format!("write state: {e}"))?;
+    write_spine(&marks_path, &marks.encode())?;
+    write_spine(&state_path, &state.encode())?;
     write_kv(&cfg_path, &cfg)?;
     Ok(report)
 }
@@ -544,15 +576,27 @@ fn walk_new_commits(
     Ok(out)
 }
 
+/// Append the rollback's own outcome to an aborting pass's error: the abort
+/// reason leads, and a rollback failure must not silently eat it (#307).
+fn rollback_note(rollback: Result<(), String>, abort: String) -> String {
+    match rollback {
+        Ok(()) => abort,
+        Err(re) => format!("{abort}\n(rolling back this pass's ingested changes also failed: {re})"),
+    }
+}
+
 /// Ingest one new commit: a trailered commit maps straight back to its change
 /// (lossless round-trip); a git-native commit becomes a loot change sealed at
-/// ingest via `.lootattributes` (ADR 0028).
+/// ingest via `.lootattributes` (ADR 0028). A change recorded here is pushed
+/// onto `minted` the moment it persists, so an aborting pass can roll it back
+/// (#307) — even when the abort is this very call's signing step.
 fn ingest_commit(
     ws: &mut Workspace,
     git: &git2::Repository,
     sha: &str,
     marks: &mut MarkMap,
     id_map: &BTreeMap<String, String>,
+    minted: &mut Vec<Oid>,
     report: &mut FerryReport,
 ) -> Result<(), String> {
     if marks.contains_sha(sha) {
@@ -589,7 +633,10 @@ fn ingest_commit(
     if let Some(id_hex) = bridge::parse_trailer(&message, TRAILER_CHANGE_ID) {
         let id = bridge::parse_oid_hex(&id_hex)
             .ok_or_else(|| format!("commit {sha}: malformed {TRAILER_CHANGE_ID} trailer"))?;
-        if ws.graph().tree(&id).is_some() {
+        // The named change may sit outside this position's lineage-filtered
+        // load (landed from a lane, #265) — pull its line in before judging it
+        // absent, or a merely-out-of-view change re-mints as a duplicate (#307).
+        if ws.load_shared_lineage(&id)? {
             marks.insert(sha.to_string(), id, MarkOrigin::Loot);
             return Ok(());
         }
@@ -618,10 +665,29 @@ fn ingest_commit(
             ));
         }
     }
-    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = parents_loot
-        .first()
-        .and_then(|p| ws.graph().tree(p))
-        .unwrap_or_default();
+    // The full parent tree is the base the diff composes over — every loot
+    // change records its complete tree. A mapped parent outside the
+    // lineage-filtered load (landed from a lane, #265) is pulled in from the
+    // shared graph first; a parent whose tree still cannot be loaded is a
+    // refusal, never a silent empty base: composing over nothing mints a
+    // delta-only change that reads as a wipe of everything the diff did not
+    // touch, and adopting or projecting it deletes the working tree (#307).
+    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = match parents_loot.first() {
+        None => BTreeMap::new(), // a true root commit composes over the empty tree
+        Some(p) => {
+            ws.load_shared_lineage(p)?;
+            ws.graph().tree(p).ok_or_else(|| {
+                format!(
+                    "commit {}: mapped loot parent {} has no loadable tree — refusing to \
+                     mint a delta-only change that would read as a tree wipe (#307); if \
+                     the parent was pruned, delete .loot/git-mirror/marks to rebuild the \
+                     spine from trailers",
+                    &sha[..12],
+                    hex::short(&p.0, 8)
+                )
+            })?
+        }
+    };
 
     // Diff against the first git parent — only touched paths re-seal (#98).
     let commit_tree = commit.tree().map_err(|e| e.to_string())?;
@@ -637,13 +703,19 @@ fn ingest_commit(
     let ignore_text = blob_text(git, &commit_tree, ".lootignore");
 
     use crate::workspace::IngestAct as Act;
+    // Git diff paths are `/`-separated; recorded tree keys are native (a disk
+    // capture mints `\` on Windows). PathBuf comparison is component-wise, so
+    // lookups match either spelling — but the keys this ingest *records* are
+    // normalized to native components so an ingested change's manifest is
+    // spelled exactly like a captured one (#307).
+    let native = |p: &Path| -> PathBuf { p.components().collect() };
     let mut acts: Vec<(PathBuf, Act)> = Vec::new();
     for delta in diff.deltas() {
         let (old_path, new_path) = (delta.old_file().path(), delta.new_file().path());
         match delta.status() {
             git2::Delta::Deleted => {
                 if let Some(p) = old_path {
-                    acts.push((p.to_path_buf(), Act::Remove));
+                    acts.push((native(p), Act::Remove));
                 }
             }
             git2::Delta::Added | git2::Delta::Modified | git2::Delta::Typechange
@@ -651,7 +723,7 @@ fn ingest_commit(
                 if delta.status() == git2::Delta::Renamed {
                     if let Some(p) = old_path {
                         if old_path != new_path {
-                            acts.push((p.to_path_buf(), Act::Remove));
+                            acts.push((native(p), Act::Remove));
                         }
                     }
                 }
@@ -691,14 +763,14 @@ fn ingest_commit(
                                 ));
                             }
                             if old_bytes == bytes && old_entry.1 == vis {
-                                acts.push((p.to_path_buf(), Act::Reuse { entry: old_entry.clone() }));
+                                acts.push((native(p), Act::Reuse { entry: old_entry.clone() }));
                                 continue;
                             }
                         }
                         Err(_) => {}
                     }
                 }
-                acts.push((p.to_path_buf(), Act::Put { bytes, vis }));
+                acts.push((native(p), Act::Put { bytes, vis }));
             }
             _ => {}
         }
@@ -728,11 +800,12 @@ fn ingest_commit(
     };
 
     let change_id = ws.ingest_change(parent_tree, acts, parents_loot, &loot_message, is_self)?;
+    minted.push(change_id.clone());
+    marks.insert(sha.to_string(), change_id.clone(), MarkOrigin::Git);
+    report.ingested += 1;
     if is_self {
         ws.sign_change(&change_id)?;
     }
-    marks.insert(sha.to_string(), change_id, MarkOrigin::Git);
-    report.ingested += 1;
     Ok(())
 }
 
@@ -1336,8 +1409,23 @@ fn split_name_email(value: &str) -> Option<(String, String)> {
     Some((name.to_string(), email.to_string()))
 }
 
+/// Read a spine file, tolerating the Windows rename-replace delete-pending
+/// window ([`store::read_replaced`], #293 tail) — spine writes are atomic
+/// rename-replaces (#307), and a transient `PermissionDenied` read as "empty
+/// marks" would silently re-ingest/re-project everything.
 fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
+    loot_core::store::read_replaced(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// Persist one spine file (marks/state/config/wip) atomically
+/// ([`store::atomic_write`]): a crash mid-write must never truncate the spine
+/// — a torn marks file that still parses is silently-missing marks, the
+/// "persisted change without its mark" state #307 forbids.
+fn write_spine(path: &Path, text: &str) -> Result<(), String> {
+    loot_core::store::atomic_write(path, text.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Resolve the configured mirror `gitdir` to a path usable from any cwd. A
@@ -1400,7 +1488,7 @@ fn write_kv(path: &Path, entries: &BTreeMap<String, String>) -> Result<(), Strin
     for (k, v) in entries {
         out.push_str(&format!("{k} = {v}\n"));
     }
-    std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
+    write_spine(path, &out)
 }
 
 #[cfg(test)]
@@ -1468,12 +1556,14 @@ mod tests {
         message: &str,
     ) -> String {
         let parent = main_commit(git);
-        let mut builder = git.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        let mut builder = git2::build::TreeUpdateBuilder::new();
         for (rel, content) in files {
             let blob = git.blob(content.as_bytes()).unwrap();
-            builder.insert(rel, blob, 0o100644).unwrap();
+            builder.upsert(rel, blob, git2::FileMode::Blob);
         }
-        let tree = git.find_tree(builder.write().unwrap()).unwrap();
+        let tree = git
+            .find_tree(builder.create_updated(git, &parent.tree().unwrap()).unwrap())
+            .unwrap();
         let sig = git2::Signature::now(author.0, author.1).unwrap();
         git.commit(Some(MAIN_REF), &sig, &sig, message, &tree, &[&parent])
             .unwrap()
@@ -1684,6 +1774,161 @@ mod tests {
         assert_eq!((after.ingested, after.projected), (0, 0));
     }
 
+    #[test]
+    fn ingest_composes_the_full_tree_when_the_mapped_parent_is_outside_the_loaded_lineage() {
+        // #307, in miniature: a lane lands a child into the shared graph (the
+        // primary's heads never move), the landed commit is marked on the git
+        // side, and a break-glass commit lands on top of it. The primary's
+        // lineage-filtered load has never seen the child, so the ingest's
+        // parent-tree lookup came back None and `unwrap_or_default()` silently
+        // composed the new change over an EMPTY tree — a delta-only change
+        // that reads as a tree wipe. (The suspected separator mechanism was
+        // falsified: PathBuf comparison is component-wise, so `/`- and
+        // `\`-keyed lookups match on Windows. The hole was the missing
+        // lineage, not the separators — nested paths here keep that pinned.)
+        let (mut ws, dir, mirror) = setup("ingest-307");
+        put_file(&dir, "top.txt", "top\n");
+        put_file(&dir, "src/a.txt", "a v1\n");
+        put_file(&dir, "src/deep/b.txt", "b v1\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+        let git = git2::Repository::open(&mirror).unwrap();
+
+        // A lane lands a child in the shared graph; the primary stays behind.
+        let lane_dir = dir.parent().unwrap().join("lane-307");
+        let spawned = ws.spawn_lane(None, Some(&lane_dir)).unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        put_file(&spawned.dir, "src/a.txt", "a v2\n");
+        lw.snapshot("child: touch src/a.txt").unwrap();
+        lw.finalize_working().unwrap();
+        let child = lw.heads()[0].clone();
+
+        // The landed child reaches git main, and the spine records the mark —
+        // the state a lane-side land leaves behind for the primary.
+        let sha_child =
+            git_native_commit(&git, &[("src/a.txt", "a v2\n")], ("Alice", "alice@loot"), "child");
+        let marks_path = ws.store().git_marks();
+        let seeded = format!(
+            "{}{sha_child} {} git\n",
+            read_or_empty(&marks_path),
+            hex::encode(&child.0)
+        );
+        std::fs::write(&marks_path, seeded).unwrap();
+
+        // Break-glass on top, touching a different nested path.
+        let sha_fix = git_native_commit(
+            &git,
+            &[("src/deep/b.txt", "b v2 from git\n")],
+            ("Bob", "bob@example.com"),
+            "hotfix b",
+        );
+
+        // Fresh primary open — the child is outside the loaded lineage.
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        assert!(
+            ws.repo().change_tree(&child).is_none(),
+            "precondition: the landed child is outside the loaded lineage"
+        );
+
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!(report.ingested, 1);
+
+        // The ingested change records the FULL tree — parent carry + diff,
+        // never the delta alone. A modify-only commit ingests as mods-only
+        // against its parent: same key set, exactly one entry changed.
+        let marks = MarkMap::parse(&read_or_empty(&marks_path)).unwrap();
+        let (ingested, _) = marks.change_for(&sha_fix).expect("the hotfix ingested").clone();
+        let tree = ws.repo().change_tree(&ingested).expect("ingested change is loaded");
+        let child_tree = ws.repo().change_tree(&child).expect("lineage was pulled in");
+        assert_eq!(
+            tree.keys().collect::<Vec<_>>(),
+            child_tree.keys().collect::<Vec<_>>(),
+            "a modify-only commit keeps its parent's whole manifest"
+        );
+        let changed: Vec<&PathBuf> = tree
+            .iter()
+            .filter(|(k, v)| child_tree.get(k.as_path()) != Some(v))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![&PathBuf::from("src/deep/b.txt")],
+            "mods-only: exactly the touched path differs from the parent"
+        );
+
+        // And the reconcile materialized the full tree — nothing was wiped.
+        assert_eq!(std::fs::read_to_string(dir.join("top.txt")).unwrap(), "top\n");
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.txt")).unwrap(), "a v2\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/deep/b.txt")).unwrap(),
+            "b v2 from git\n"
+        );
+    }
+
+    #[test]
+    fn ingest_refuses_a_mapped_parent_whose_tree_cannot_be_loaded() {
+        // The refusal arm of the #307 guard: a mark that names a change nobody
+        // holds (pruned after an unadopted land, a corrupted spine) must stop
+        // the pass — composing over a silently-empty parent tree mints the
+        // delta-only wipe the guard exists to prevent.
+        let (mut ws, dir, mirror) = setup("ingest-307-refuse");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+        let base_heads = ws.heads();
+        let git = git2::Repository::open(&mirror).unwrap();
+
+        // Corrupt the spine: the marked tip now names an absent change.
+        let sha_base = main_commit(&git).id().to_string();
+        std::fs::write(
+            ws.store().git_marks(),
+            format!("{sha_base} {} git\n", "ab".repeat(32)),
+        )
+        .unwrap();
+        git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
+
+        let err = match run(&mut ws, Some(mirror.to_str().unwrap()), None, false) {
+            Err(e) => e,
+            Ok(_) => panic!("a parent with no loadable tree must refuse the pass"),
+        };
+        assert!(err.contains("no loadable tree") && err.contains("#307"), "{err}");
+        assert_eq!(ws.heads(), base_heads, "nothing was minted onto the line");
+    }
+
+    #[test]
+    fn ingested_manifest_keys_are_native_spelled() {
+        // #307's separator hygiene: PathBuf comparison is component-wise, so a
+        // `/`-spelled key *works* on Windows — but the keys an ingest records
+        // are normalized to native components, so an ingested manifest is
+        // spelled exactly like a captured one and manifests never mix spellings.
+        let (mut ws, dir, mirror) = setup("ingest-307-sep");
+        put_file(&dir, "src/a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        let git = git2::Repository::open(&mirror).unwrap();
+        git_native_commit(
+            &git,
+            &[("src/deep/new.txt", "added\n")],
+            ("Bob", "bob@example.com"),
+            "add nested",
+        );
+        ferry(&mut ws, &mirror);
+
+        let head = ws.finalized_anchor().unwrap();
+        let tree = ws.repo().change_tree(&head).unwrap();
+        let native = Path::new("src").join("deep").join("new.txt");
+        let spelled = tree
+            .keys()
+            .find(|k| ***k == *native)
+            .expect("the added path is in the manifest");
+        assert_eq!(
+            spelled.to_string_lossy(),
+            native.to_string_lossy(),
+            "the recorded key is spelled with native separators, like a capture"
+        );
+    }
+
     /// Recursive directory copy (no std one-liner exists).
     fn copy_dir(src: &Path, dst: &Path) {
         std::fs::create_dir_all(dst).unwrap();
@@ -1775,17 +2020,31 @@ mod tests {
             "uncaptured\n",
             "the refusal never clobbers the disk"
         );
+        // The refused pass rolled its ingest back (#307): the mark never
+        // persisted AND the ingested change is no dangling live head. Before
+        // the rollback, the orphan head survived for the *next snapshot* to
+        // fold under the working change — after which `anchor()` claimed the
+        // dock covered git main while the disk never materialized it.
+        assert!(
+            !read_or_empty(&ws.store().git_marks()).contains(&main_commit(&git).id().to_string()),
+            "an aborted pass leaves the spine untouched (#201/#307)"
+        );
         // The capture is durable across the refusal — loot is process-per-command,
         // so "your edits are captured and safe" only means anything if it survives
         // the erroring process. Re-open to prove it does.
         let mut ws = Workspace::open_at(&dir).unwrap();
         assert!(ws.working_id().is_some(), "the capture outlived the refused pass");
+        assert_eq!(
+            ws.heads().len(),
+            1,
+            "the rolled-back ingest left no dangling head beside the capture (#307)"
+        );
         ws.snapshot("wip: my uncaptured work, now named").unwrap();
 
-        // Re-running after naming completes the pass. The refused pass's *ingest*
-        // did not persist (the error unwound before its state was written), so it
-        // is simply redone here — the pass is idempotent, which is why refusing
-        // mid-ferry is safe rather than a half-applied mess.
+        // Re-running after naming completes the pass. The refused pass's ingest
+        // was rolled back with the refusal, so it is simply redone here — the
+        // pass is idempotent, which is why refusing mid-ferry is safe rather
+        // than a half-applied mess.
         let report = ferry(&mut ws, &mirror);
         assert_eq!(report.ingested, 1, "the refused pass's ingest is redone, not lost");
         assert!(

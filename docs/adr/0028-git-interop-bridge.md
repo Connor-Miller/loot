@@ -199,3 +199,43 @@ stands (never delete or conflict blind). This retires the "the merge is what
 resurrects files deleted upstream" warning for the no-arg adopt/reconcile merge:
 that merge now honors deletions. `adopt <version>`'s no-content-merge behavior
 keeps its own, independent rationale (discard a divergent line wholesale).
+
+## Amendment (#307): ingest composes over the full parent tree, or refuses; an aborted pass rolls its ingest back
+
+Hit live 2026-07-17, reconciling the primary after the #253 break-glass land:
+four ingested git-origin changes each recorded **only the paths their commit
+touched** — `loot diff` read the last one as a 162-file tree wipe — because
+the ingest composed the new manifest over `graph().tree(parent)` with
+`unwrap_or_default()`, and the mapped parent (landed from a lane) sat outside
+the primary's lineage-filtered load, so the base tree was silently empty. (The
+suspected `/`-vs-`\` mechanism was falsified: `PathBuf` comparison is
+component-wise, so either spelling matches. The recorded keys are still
+normalized to native components now, so an ingested manifest is spelled like a
+captured one.) Three rules close the hole:
+
+- **Full tree or refuse.** The ingest pulls the mapped parent's line in from
+  the shared graph (`ingest_shared_lineage`, the #265 catch-up primitive; the
+  trailer round-trip arm does the same before judging a change absent) and
+  **refuses the pass** when the parent's tree still cannot be loaded. Only a
+  true root commit composes over an empty tree.
+- **An aborted pass rolls its ingest back.** Each ingested change persists to
+  the shared graph as it is minted, but its mark persists only with the
+  end-of-pass spine (#201) — so an abort between (an ingest refusal, the
+  #275/#292 reconcile refusals) used to strand unmarked orphan heads, which
+  the next pass re-ingested under fresh ids and — worse — the next *snapshot*
+  folded under the working change, making `anchor()` claim the dock covered
+  git main while the disk never materialized it. Now the abort walks the
+  pass's minted changes into the abandoned set (children first — the recovery
+  ritual, mechanized), the spine stays untouched, and the re-run redoes the
+  ingest cleanly. Once the reconcile has folded the ingested changes into the
+  dock's line, rollback is no longer safe, so their marks persist immediately
+  — never a persisted change without its mark past that point.
+- **Line endings: byte-faithful, no conversion.** loot stores and materializes
+  exactly the bytes it is given, everywhere. An ingested blob carries the git
+  commit's bytes (typically LF); a disk capture carries the working tree's
+  bytes (possibly CRLF on Windows). The bridge deliberately does **no**
+  `autocrlf`-style normalization in either direction: when a git-side commit
+  re-records a path with different line endings, the ingest is an honest
+  modification and the reconcile materializes those bytes over the disk. A
+  repo that wants uniform endings enforces it at the working tree (editor
+  config, `.gitattributes` on the GitHub side), not in the bridge.

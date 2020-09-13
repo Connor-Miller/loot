@@ -61,10 +61,11 @@ static STORE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// rename over `path`. A crash mid-write or a concurrent reader therefore never
 /// observes a torn or truncated file — a reader always sees the whole
 /// prior-or-next version, never a partial one (#252, extended to the lane-owned
-/// process files in #293). The temp name is unique per (process, call) so two
-/// writers never clobber each other's staging file; staging in the *same*
+/// process files in #293, and public since #307 for the bridge's spine files
+/// under `.loot/git-mirror/`). The temp name is unique per (process, call) so
+/// two writers never clobber each other's staging file; staging in the *same*
 /// directory keeps the rename atomic.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -82,7 +83,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// writer would error even though the file is never torn (#293 tail). Retry
 /// briefly on `PermissionDenied` only: `NotFound` keeps meaning "absent", and a
 /// persistent permission error still propagates after the retries.
-pub(crate) fn read_replaced(path: &Path) -> std::io::Result<Vec<u8>> {
+pub fn read_replaced(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut delay = Duration::from_millis(1);
     for _ in 0..8 {
         match std::fs::read(path) {
