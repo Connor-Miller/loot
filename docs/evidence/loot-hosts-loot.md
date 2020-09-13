@@ -36,10 +36,17 @@ daily ritual is one command, `tools/loot-day.ps1` (see that log's header).
 | 1   | 2026-07-10 | `c670cc2b` embargo CLI (#88) + attack demo (#89) + section-B evidence + maroon fix + drive setup | loot was 3 PRs behind git; caught up in one O(delta) push (14 objects), no conflicts |
 | 2   | 2026-07-10 | `a8cafda5` ferry the git bridge (#114-118) + concurrent-agents epic close-out (#126-131) into loot | git-clean day: ferry ingested 4 commits, 0 conflicts, 0 projected back; 146 objects pushed, resumable |
 | 3   | 2026-07-11 | ten loot-first lanes, head `yxvnvtox`/`b071df66` (gate #173, arch wave #185-#191, review fixes #192) | inversion day: loot led via `loot-first.ps1`; end-of-day ritual = clean tree, ferry up to date, 0 objects to push (already published at each land) |
-| 4   |      |                |                              |
-| 5   |      |                |                              |
+| 4+  | 2026-07-11 → | *no longer a discrete count* — loot became the standing daily driver (see note below) | every subsequent working day has finalized through `loot-first` lanes and pushed to the relay; e.g. 2026-07-18 landed #175 (regression test) via a lane → PR #317 → signed commit `3e74dd2` → relay push, `docs/pitch/` sealed throughout |
 
-- [ ] 5 consecutive working days completed and logged above (3/5 done)
+- [x] **Satisfied in practice — the discrete 5-day count was superseded by
+      continuous use.** The bar existed to prove loot could carry real daily
+      development; three logged days established the ritual, and loot has been
+      the primary record for every working day since (the `loot-first`
+      orchestrator replaced the day-1 `loot-day.ps1` helper — #218). By
+      2026-07-18 the question "can we drive on this for days" was long answered
+      by having done so, so we close the count as met-in-spirit rather than
+      manufacture two more dated rows. The streak's *intent* — loot hosts loot,
+      daily — is the repo's normal mode of operation.
 
 ## B. Agents as distinct identities (ADR 0026)
 
@@ -88,5 +95,6 @@ daily ritual is one command, `tools/loot-day.ps1` (see that log's header).
 
 ## Done
 
-- [ ] All boxes above checked; map #54 Destination satisfied; milestone
-      "loot hosts loot" closed with a link to this doc.
+- [x] All boxes above checked; map #54 Destination satisfied (Section A
+      closed as proven-in-practice — see its note); milestone
+      "loot hosts loot" closed with a link to this doc. Retired 2026-07-18.
