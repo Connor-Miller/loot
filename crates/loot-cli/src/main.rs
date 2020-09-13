@@ -129,7 +129,7 @@ const COMMANDS: &[Verb] = &[
     verb("resolve", &[], &[], cmd_resolve),
     verb("remote", &[], &[], cmd_remote),
     verb("keygen", &[], &[], |_| cmd_keygen()),
-    verb("whoami", &[], &[], |_| cmd_whoami()),
+    verb("whoami", &[], &["--pubkey"], cmd_whoami),
     verb("peer", &[], &[], cmd_peer),
     verb("serve", &["--dir", "--addr", "--allow"], &[], cmd_serve),
     verb("push", &["--remote"], &[], cmd_push),
@@ -195,10 +195,10 @@ usage:
   loot remote remove <name>                 forget a named relay
   loot remote list                          show all named relays
   loot keygen                               generate an identity keypair (backfills existing repos)
-  loot whoami                               show this repo's public key
+  loot whoami [--pubkey]                    show this repo's public key (with the flag: bare OpenSSH line only, for scripting)
   loot id export <file>                     export keypair to <file>, passphrase-encrypted
   loot id import <file>                     import keypair from passphrase-encrypted <file>
-  loot peer add <name> <pubkey>             register a peer's public key
+  loot peer add <name> <pubkey>             register a peer's public key (<pubkey> of `-` reads the key from stdin)
   loot peer remove <name>                   forget a peer
   loot peer list                            show all known peers
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
@@ -1908,7 +1908,7 @@ fn cmd_keygen() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_whoami() -> Result<(), String> {
+fn cmd_whoami(args: &[String]) -> Result<(), String> {
     let ws = Workspace::open()?;
     let dot = ws.dot();
     if !identity::keypair_exists(dot) {
@@ -1917,11 +1917,49 @@ fn cmd_whoami() -> Result<(), String> {
     let pub_line = std::fs::read_to_string(dot.join("id.pub"))
         .map_err(|e| format!("read id.pub: {e}"))?;
     let pub_line = pub_line.trim();
-    println!("identity: {}", ws.identity());
-    println!("pubkey:   {pub_line}");
-    println!();
-    println!("share with peers:  loot peer add {} {pub_line}", ws.identity());
+    // `--pubkey`: emit only the bare OpenSSH line so it pipes cleanly into
+    // `loot peer add <name> -` on another box (#4). No labels, no trailer.
+    let pubkey_only = args.iter().any(|a| a == "--pubkey");
+    print!("{}", render_whoami(&ws.identity(), pub_line, pubkey_only));
     Ok(())
+}
+
+/// The `loot whoami` output. `--pubkey` (`pubkey_only`) yields the bare
+/// OpenSSH line and nothing else, so a pipe into `loot peer add <name> -`
+/// sees exactly one line; the default is the labelled human block (#4).
+fn render_whoami(identity: &str, pub_line: &str, pubkey_only: bool) -> String {
+    if pubkey_only {
+        format!("{pub_line}\n")
+    } else {
+        format!(
+            "identity: {identity}\npubkey:   {pub_line}\n\n\
+             share with peers:  loot peer add {identity} {pub_line}\n"
+        )
+    }
+}
+
+/// Resolve a `peer add` pubkey argument: a literal key passes through, while
+/// `-` means "read it from `read`" — stdin in production (#4), a fixture in
+/// tests. The reader is only touched for `-`, so a literal never blocks on it.
+fn resolve_pubkey_arg(
+    arg: &str,
+    read: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    if arg == "-" { read() } else { Ok(arg.to_string()) }
+}
+
+/// Read a pubkey from stdin (the whole stream, trimmed), the production reader
+/// for a `-` argument, so `loot whoami --pubkey | loot peer add <name> -` feeds
+/// directly.
+fn read_stdin_key() -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).map_err(|e| format!("read stdin: {e}"))?;
+    let key = buf.trim().to_string();
+    if key.is_empty() {
+        return Err("peer add: `-` given but stdin was empty".into());
+    }
+    Ok(key)
 }
 
 fn cmd_peer(args: &[String]) -> Result<(), String> {
@@ -1932,10 +1970,12 @@ fn cmd_peer(args: &[String]) -> Result<(), String> {
                 return Err("peer add requires <name> <pubkey>".into());
             }
             let name = &args[1];
-            let pubkey = &args[2];
+            // `<pubkey>` of `-` reads the key from stdin, so a piped
+            // `loot whoami --pubkey | loot peer add alice -` works (#4).
+            let pubkey = resolve_pubkey_arg(&args[2], read_stdin_key)?;
             let ws = Workspace::open()?;
             let mut reg = identity::PeerRegistry::load(ws.dot());
-            reg.add(name, pubkey);
+            reg.add(name, &pubkey);
             reg.save().map_err(|e| e.to_string())?;
             println!("registered peer '{name}'");
             Ok(())
@@ -2376,6 +2416,46 @@ mod tests {
     fn check(verb: &str, argv: &[&str]) -> Result<FlagCheck, String> {
         let v = COMMANDS.iter().find(|v| v.spec.name == verb).expect("a dispatched verb");
         v.spec.check(&args(argv))
+    }
+
+    // --- #4: `loot whoami --pubkey` + `loot peer add <name> -` (stdin) ---
+
+    /// `--pubkey` must be a declared flag on `whoami` (else the #67 gate would
+    /// reject it), and no stray flag sneaks through.
+    #[test]
+    fn whoami_pubkey_flag_is_wired() {
+        assert_eq!(check("whoami", &["--pubkey"]), Ok(FlagCheck::Proceed));
+        assert!(check("whoami", &["--bogus"]).is_err());
+    }
+
+    /// `--pubkey` prints the bare OpenSSH line and *nothing else* — exactly one
+    /// line, so it pipes into `loot peer add <name> -` without a label to strip.
+    #[test]
+    fn whoami_pubkey_prints_only_the_key_line() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyBytesHere connor@loot";
+        let out = render_whoami("connor", key, true);
+        assert_eq!(out, format!("{key}\n"));
+        // The default block still labels and coaches — unchanged behavior.
+        let full = render_whoami("connor", key, false);
+        assert!(full.contains("identity: connor") && full.contains("pubkey:   "));
+        assert!(full.contains("loot peer add connor "));
+    }
+
+    /// `peer add <name> -` reads the key from the reader; a literal key never
+    /// touches it (so a normal add never blocks on stdin).
+    #[test]
+    fn peer_add_dash_reads_from_the_reader() {
+        let piped = resolve_pubkey_arg("-", || Ok("ssh-ed25519 PIPED connor@loot".into())).unwrap();
+        assert_eq!(piped, "ssh-ed25519 PIPED connor@loot");
+
+        let literal =
+            resolve_pubkey_arg("ssh-ed25519 LITERAL a@b", || panic!("reader must not run for a literal"))
+                .unwrap();
+        assert_eq!(literal, "ssh-ed25519 LITERAL a@b");
+
+        // An empty pipe is a loud error, not a silent empty registration.
+        let err = resolve_pubkey_arg("-", || Err("peer add: `-` given but stdin was empty".into()));
+        assert!(err.unwrap_err().contains("stdin was empty"));
     }
 
     /// The finding itself (pilot finding 11): `loot log --path README.md`
