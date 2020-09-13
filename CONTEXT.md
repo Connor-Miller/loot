@@ -520,6 +520,22 @@ identity can't open the content now); `Some(plaintext)` is what the merger uses
 to tell a clean *Merged* from a *Conflict*. The classifier never sees keys or
 ciphertext — only this oracle.
 
+**Custody** (`engine::custody`, #323) — the module that is "permissioning is
+key management" made literal in code: a `Custody` struct bundling the four
+artifacts that make grants and maroons work — the [[Keyring]], the [[Escrow]],
+the [[Manifest]], and the pending purge log (old-oid, marooned-identity pairs
+awaiting a hard maroon's downstream cleanup) — behind the verbs that mutate
+them: `grant`, `grant_sealed`, `apply_sealed_grant`, `maroon`, `maroon_hard`,
+`migrate`, `flush_escrow`. `DagRepo` holds one `Custody` and delegates to it;
+the object-store/change-graph plumbing those verbs also need (`store`'s
+key-routing between Keyring and Escrow, `object`) stays in the engine proper,
+shared with the Reconcile and Sync-negotiation faces rather than
+custody-exclusive. Extracted mechanically off `engine.rs`'s doc-labelled
+"Custody face" (#179) — a 5,656-line file's single largest cohesive block —
+with zero public-interface or behavior change (ADR 0003/0007/0008/0009/0010/
+0027 are the design decisions Custody *enforces*; the extraction itself made
+none).
+
 **Grant** — a key handoff event: the act of making an existing content key available to a new identity. Grants travel as targeted bundles (the grantor controls delivery by choosing who receives the bundle); the key itself rides sealed to the recipient's pubkey (ECIES, ADR 0014). A grant is **signed by the grantor** (the push envelope, ADR 0014) so the recipient and every downstream peer can verify who issued it — an unauthenticated grant would let any party forge audit history. The grantee is identified by **pubkey**, not local name: the key is sealed to that pubkey and `apply` accepts the grant iff the recipient's own key unseals it (the cryptographic unseal *is* the authorization gate; there is no name compare). Names are local nicknames resolved to pubkeys via the [[Peer registry]] before a grant is ever issued. The primitive underlying marooning and visibility migration. CLI: `loot grant <path> <identity>`.
 
 **Manifest** — an append-only record of grant events (`oid`, `grantee_pubkey`, `grantor_pubkey`, `granted_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who granted what to whom. Both parties are recorded as **pubkeys** (the only globally-stable identity; names are local), resolved to friendly names only at display time. Carries only the *fact* of a grant, never the key itself. The grantor pubkey is bound by the grant's signature, so the trail is forge-evident. Named for a ship's manifest recording what cargo was loaded and by whom.
