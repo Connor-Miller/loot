@@ -8,6 +8,7 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
+use crate::position::Position;
 use loot_core::bridge::{FerryState, MarkMap};
 use loot_core::{
     oplog, valid_dock_name, DagRepo, LaneEntry, MergeOutcome, Oid, Operation, Repo, RepoStore,
@@ -47,20 +48,15 @@ pub struct Workspace {
     root: PathBuf,
     identity: String,
     repo: DagRepo,
-    /// The dock this workspace is on — always `HOME_DOCK` now that named docks
-    /// are retired (#253/ADR 0034): the primary and every lane use the root
-    /// `.loot/` process files of their own store instance, so a repo that never
-    /// spawns a lane is byte-for-byte unchanged on disk.
-    dock: String,
+    /// Where this workspace sits — dock, lane id, pinned tip — owned by
+    /// [`Position`] (#324, ADR 0034 "position is place, not state"). The
+    /// primary and every lane use the root `.loot/` process files of their own
+    /// store instance, so a repo that never spawns a lane is byte-for-byte
+    /// unchanged on disk.
+    position: Position,
     /// The working change being rewritten in place, if one is in progress.
     /// `None` right after `init` or `apply` (finalized history, no WIP change).
     working: Option<Oid>,
-    /// The finalized change this position forks from — new snapshots parent on it
-    /// (ADR 0022). `None` on a fresh primary that never pinned a tip, selecting
-    /// the pre-dock behavior (fork from all heads) and keeping existing repos
-    /// byte-for-byte unchanged; a lane, or a primary `adopt`/`lane merge` seeded,
-    /// tracks it ([`tracks_tip`](Self::tracks_tip)).
-    tip: Option<Oid>,
     /// The durable change id `loot new` minted eagerly for the *next* change
     /// (ADR 0029/0030), before any snapshot has recorded it. The fresh working
     /// change already has a handle to print and show in `status`/`log`; the
@@ -72,12 +68,6 @@ pub struct Workspace {
     /// changes and signs at finalization (S3, ADR 0018). `None` for a keyless
     /// repo, which then produces unauthored (legacy) changes.
     signer: Option<Identity>,
-    /// The registry id of the spawned lane this workspace is, or `None` on the
-    /// primary directory (lane #0). A lane's `.loot` is a directory carrying a
-    /// `store` pointer plus every lane-owned file (ADR 0034); store-mutating
-    /// verbs with one owner (`gc`, remotes, the dock family, lane spawn/reap)
-    /// refuse from a lane.
-    lane_id: Option<String>,
     /// Injected clock — a value, not a call, so tests can drive embargo timing.
     now: u64,
 }
@@ -165,10 +155,9 @@ impl Workspace {
     ) -> Result<Self, String> {
         let mut repo = DagRepo::load_from(&store, root.clone()).map_err(|e| e.to_string())?;
         let identity = read_to_string(&store.identity())?;
-        let dock_opt = opt(&dock);
-        let working = store.read_working(dock_opt);
-        let tip = store.read_tip(dock_opt);
-        let next_change_id = store.read_next_change(dock_opt);
+        let position = Position::load(&store, dock, lane_id);
+        let working = store.read_working(position.dock_opt());
+        let next_change_id = store.read_next_change(position.dock_opt());
         // Load the signing keypair if present and stamp its pubkey as the author,
         // so new changes are attributable and signable (S3, ADR 0018). A keyless
         // repo stays unauthored (legacy ids), which keeps older repos working.
@@ -185,12 +174,10 @@ impl Workspace {
             root,
             identity,
             repo,
-            dock,
+            position,
             working,
-            tip,
             next_change_id,
             signer,
-            lane_id,
             now,
         })
     }
@@ -547,7 +534,7 @@ impl Workspace {
         message: &str,
         allow_demote: &[PathBuf],
     ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
-        let tip = self.tip.clone();
+        let tip = self.position.tip().cloned();
         self.snapshot_from(tip.as_ref(), message, allow_demote)
     }
 
@@ -757,12 +744,11 @@ impl Workspace {
         // tip) there is nothing to finalize — leave the dock's tip intact.
         //
         // A seeded tip must always advance, even on the pristine-looking home
-        // dock — [`tracks_tip`](Self::tracks_tip) names the predicate and the
-        // stuck-tip bug class it exists for (#229, #234, #265).
-        if self.tracks_tip() {
+        // dock — `Position::tracks_tip` names the predicate and the stuck-tip
+        // bug class it exists for (#229, #234, #265).
+        if self.position.tracks_tip() {
             if self.working.is_some() {
-                self.tip = self.working.take();
-                let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+                self.position.advance(&self.store, self.working.take());
             }
         } else {
             self.working = None;
@@ -839,7 +825,7 @@ impl Workspace {
         let head = self
             .working
             .clone()
-            .or_else(|| self.tip.clone())
+            .or_else(|| self.position.tip().cloned())
             .or_else(|| self.repo.heads().into_iter().next())
             .ok_or("nothing to surface yet (no changes recorded)")?;
         let (written, skipped) = self.repo
@@ -1047,7 +1033,8 @@ impl Workspace {
     /// must refuse to cross. Best-effort: a log-write failure never fails the
     /// command it records (undo history is a convenience layer, not repo data).
     pub fn record_op(&self, command: &str, description: &str, barrier: bool) {
-        let _ = oplog::record(&self.store, command, &self.dock, description, barrier, self.now);
+        let _ =
+            oplog::record(&self.store, command, self.position.dock_name(), description, barrier, self.now);
     }
 
     /// The full operation log, oldest first (`loot op log`).
@@ -1075,7 +1062,7 @@ impl Workspace {
         f: impl FnOnce(&RepoStore, &str, u64) -> Result<oplog::Stepped, oplog::StepError>,
     ) -> Result<StepReport, String> {
         let old_paths = self.ambient_visible_paths();
-        let stepped = f(&self.store, &self.dock, self.now).map_err(step_error)?;
+        let stepped = f(&self.store, self.position.dock_name(), self.now).map_err(step_error)?;
         self.reload()?;
         self.resurface(old_paths)?;
         Ok(StepReport {
@@ -1092,7 +1079,7 @@ impl Workspace {
         let tip = self
             .working
             .clone()
-            .or_else(|| self.tip.clone())
+            .or_else(|| self.position.tip().cloned())
             .or_else(|| self.repo.heads().into_iter().next());
         tip.map(|t| self.repo.visible_paths_at(&t, &self.identity, self.now))
             .unwrap_or_default()
@@ -1124,7 +1111,7 @@ impl Workspace {
         let to = self
             .working
             .clone()
-            .or_else(|| self.tip.clone())
+            .or_else(|| self.position.tip().cloned())
             .or_else(|| self.repo.heads().into_iter().next());
         let written = match &to {
             Some(to) => self
@@ -1249,7 +1236,7 @@ impl Workspace {
     /// Refuses honestly when the dock has diverged onto several heads with no
     /// working change or pinned tip to disambiguate — naming them to paste.
     fn resolve_head(&self) -> Result<Oid, String> {
-        if self.tip.is_none() && self.working.is_none() {
+        if self.position.tip().is_none() && self.working.is_none() {
             let heads = self.heads();
             if heads.len() > 1 {
                 let ids: Vec<String> = heads.iter().map(short_version).collect();
@@ -1520,11 +1507,10 @@ impl Workspace {
         // tip the ambient dock sits on. Hop to the surviving live version —
         // otherwise the tip names a dead version and the next snapshot forks
         // from it. Captured by the op view (per-dock tips), so undo restores it.
-        if self.tip.as_ref() == Some(version) {
+        if self.position.tip() == Some(version) {
             let survivor = live.into_iter().find(|v| v != version);
             if let Some(s) = survivor {
-                self.tip = Some(s);
-                let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+                self.position.advance(&self.store, Some(s));
             }
         }
         self.persist()?;
@@ -1576,14 +1562,13 @@ impl Workspace {
         self.store
             .write_abandoned(&abandoned)
             .map_err(|e| format!("write abandoned: {e}"))?;
-        if self.tip.as_ref() == Some(version) {
+        if self.position.tip() == Some(version) {
             let survivor = self
                 .repo
                 .heads()
                 .into_iter()
                 .find(|v| v != version && !abandoned.contains(v));
-            self.tip = survivor;
-            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            self.position.advance(&self.store, survivor);
         }
         self.persist()?;
         self.record_op("abandon", &format!("abandon fork head {}", short_version(version)), false);
@@ -1730,8 +1715,7 @@ impl Workspace {
             .map_err(|e| format!("write abandoned: {e}"))?;
 
         // Settle the dock on T with a fresh (empty) working change, ADR 0006.
-        self.tip = Some(target.clone());
-        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        self.position.seed(&self.store, Some(target.clone()));
         self.persist()?;
         self.record_op(
             "adopt",
@@ -1973,17 +1957,14 @@ impl Workspace {
         // 0006 — after `edit`, the tip is the parent and the working change is
         // the reopened version). The cleanliness guard proved the disk already
         // shows the target's tree, so nothing materializes. Re-anchoring is
-        // gated on [`tracks_tip`](Self::tracks_tip) so a pristine primary that
-        // never pinned a tip stays byte-for-byte unchanged on disk (the compat
-        // guarantee) — a lane, or a primary that `adopt`/`lane merge` seeded,
-        // re-anchors and so amends as a sibling.
+        // gated on `Position::tracks_tip` (via `advance`) so a pristine primary
+        // that never pinned a tip stays byte-for-byte unchanged on disk (the
+        // compat guarantee) — a lane, or a primary that `adopt`/`lane merge`
+        // seeded, re-anchors and so amends as a sibling.
         let reopened = self.repo.reopen_change(&target).map_err(|e| e.to_string())?;
         let parent = self.repo.parents_of(&target).into_iter().next();
         self.working = Some(reopened.clone());
-        if self.tracks_tip() {
-            self.tip = parent;
-            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
-        }
+        self.position.advance(&self.store, parent);
         // Prime the snapshot-idempotence hash for the reopened content so the
         // next command doesn't spuriously re-record an unchanged tree.
         let msg = self.repo.change_message(&reopened).unwrap_or_default();
@@ -2000,7 +1981,7 @@ impl Workspace {
     /// The named-remote registry (`.loot/config`, ADR 0013) as one small value —
     /// the four Workspace forwarders it replaces were interface padding (#177).
     pub fn remotes(&self) -> Remotes {
-        Remotes { path: self.store.config(), lane: self.lane_id.clone() }
+        Remotes { path: self.store.config(), lane: self.position.lane_id().map(str::to_string) }
     }
 
     /// Create a fresh repo inside `dir`, owned by `identity`. `dir` is created if
@@ -2022,14 +2003,12 @@ impl Workspace {
             identity: identity.to_string(),
             repo,
             // A fresh repo starts on the home dock with pre-dock semantics.
-            dock: HOME_DOCK.to_string(),
+            position: Position::fresh(HOME_DOCK.to_string()),
             working: None,
-            tip: None,
             next_change_id: None,
             // A freshly-initialized repo has no keypair yet (`loot keygen` adds one);
             // its early changes are unauthored until then (S3, ADR 0018).
             signer: None,
-            lane_id: None,
             now: real_now(),
         };
         ws.persist()?;
@@ -2037,17 +2016,18 @@ impl Workspace {
     }
 
     // --- positions (ADR 0034) ---
+    //
+    // Where this workspace sits is owned by [`Position`] (#324): these stay as
+    // thin delegating accessors so nothing below (or outside this file) needs
+    // to change, and every call site keeps reading position through the same
+    // seam it always has.
 
     /// The ambient dock name, or `None` on the primary (which the CLI displays
     /// as `main`). Named docks are retired (#253/ADR 0034) and in-place
     /// switching died in layer 1, so a lane opens as the home dock too — this is
     /// `None` everywhere now, kept as the seam loot-first's land gate reads.
     pub fn current_dock(&self) -> Option<&str> {
-        if self.dock == HOME_DOCK {
-            None
-        } else {
-            Some(&self.dock)
-        }
+        self.position.current_dock()
     }
 
     /// The store selector for this position's process files: always the home
@@ -2055,33 +2035,14 @@ impl Workspace {
     /// 0034). A lane's files resolve against its own `.loot/` — its store
     /// instance's lane root — under the same home selector.
     fn dock_opt(&self) -> Option<&str> {
-        opt(&self.dock)
-    }
-
-    /// Whether this position tracks a pinned tip that every tip-moving verb
-    /// must advance: a lane (born with a spawn-seeded tip), or a primary that
-    /// `adopt`/`lane merge` seeded. Leaving a seeded tip behind is the stuck-tip
-    /// bug class — `anchor()` stays at the seed while `heads` moves on, so the
-    /// next ferry aims git-main backward and the #195/#201 guards refuse (#229,
-    /// #234, #265: three verbs hit it independently before this predicate was
-    /// extracted). `tip.is_some()` subsumes the lane case; both are kept
-    /// explicit for the reader. (Named docks — the former third arm,
-    /// `docks_active()` — are retired with #253.)
-    fn tracks_tip(&self) -> bool {
-        self.lane_id.is_some() || self.tip.is_some()
+        self.position.dock_opt()
     }
 
     /// The finalized change the ambient dock currently sits on — a new dock forks
     /// from here. Uses the pinned tip when present, else derives it from the
     /// graph (the pre-dock home case): the working change's parent, or the head.
     fn anchor(&self) -> Option<Oid> {
-        if let Some(t) = &self.tip {
-            return Some(t.clone());
-        }
-        match &self.working {
-            Some(w) => self.repo.parents_of(w).into_iter().next(),
-            None => self.repo.heads().into_iter().next(),
-        }
+        self.position.anchor(&self.repo, self.working.as_ref())
     }
 
     // Named docks and in-place switching are fully retired (#253/ADR 0034):
@@ -2104,14 +2065,14 @@ impl Workspace {
 
     /// The registry id of this lane, or `None` on the primary.
     pub fn lane_id(&self) -> Option<&str> {
-        self.lane_id.as_deref()
+        self.position.lane_id()
     }
 
     /// Refuse a single-owner store mutation from a lane (ADR 0034): a lane owns
     /// only its own position; `gc`, remotes, the dock family, and lane
     /// spawn/reap belong to the primary.
     pub fn ensure_primary(&self, verb: &str) -> Result<(), String> {
-        match &self.lane_id {
+        match self.position.lane_id() {
             Some(id) => Err(format!(
                 "{verb} must run from the primary directory — this is lane '{id}', \
                  which owns only its own position (ADR 0034)"
@@ -2169,7 +2130,7 @@ impl Workspace {
             .ok_or("nothing to fork yet — record a change first (`loot new`)")?;
         // Pin the primary's tip before the graph gains sibling heads (see
         // dock_goto): a later `status` here must never merge the lane's line.
-        if self.dock == HOME_DOCK && self.tip.is_none() {
+        if self.position.dock_name() == HOME_DOCK && self.position.tip().is_none() {
             let _ = self.store.write_tip(None, Some(&anchor));
         }
 
@@ -2234,7 +2195,7 @@ impl Workspace {
     /// gc-sweep never touches it. Lane-side on purpose: the registry entry is
     /// per-entry single-writer, and the entry's writer is its own lane.
     pub fn name_lane(&self, name: &str) -> Result<(), String> {
-        let id = self.lane_id.as_deref().ok_or(
+        let id = self.position.lane_id().ok_or(
             "`loot lane name` runs inside a lane — the primary is not a lane \
              (`loot lane new` spawns one)",
         )?;
@@ -2509,7 +2470,7 @@ impl Workspace {
             ));
         }
 
-        let msg = format!("merge lane '{}' into '{}'", entry.id, self.dock);
+        let msg = format!("merge lane '{}' into '{}'", entry.id, self.position.dock_name());
         let outcomes = self.fold_line_in(&their, &msg)?;
         Ok((entry.id, outcomes))
     }
@@ -2527,12 +2488,12 @@ impl Workspace {
     /// Test-only: pin this position's tip at its current finalized anchor — the
     /// state a real `adopt`/`lane merge`/land leaves behind. Named docks are
     /// retired (#253), so an amend is a *sibling* only when the position
-    /// [`tracks_tip`](Self::tracks_tip); the old ferry amend-projection tests
-    /// got that for free from `docks_active` on a non-home dock.
+    /// tracks a tip (`Position::tracks_tip`); the old ferry amend-projection
+    /// tests got that for free from `docks_active` on a non-home dock.
     #[cfg(test)]
     pub fn pin_tip_at_anchor(&mut self) {
-        self.tip = self.anchor();
-        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        let anchor = self.anchor();
+        self.position.seed(&self.store, anchor);
     }
 
     /// Fold a finalized line `their` into this dock's current line, returning the
@@ -2609,8 +2570,7 @@ impl Workspace {
         self.repo
             .materialize(Some(from), target, &self.identity, self.now)
             .map_err(|e| e.to_string())?;
-        self.tip = Some(target.clone());
-        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        self.position.seed(&self.store, Some(target.clone()));
         self.persist()
     }
 
@@ -2788,10 +2748,7 @@ impl Workspace {
                     if disk_dirty {
                         return Err(REFUSE_UNCAPTURED_TREE.into());
                     }
-                    if self.tracks_tip() {
-                        self.tip = Some(survivor.clone());
-                        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
-                    }
+                    self.position.advance(&self.store, Some(survivor.clone()));
                     self.repo
                         .materialize(from.as_ref(), &survivor, &self.identity, self.now)
                         .map_err(|e| e.to_string())?;
@@ -2828,7 +2785,7 @@ impl Workspace {
         let mut acc = ours;
         let mut all: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
         for h in others {
-            let msg = format!("converge diverged head into '{}'", self.dock);
+            let msg = format!("converge diverged head into '{}'", self.position.dock_name());
             let (merge_id, outcomes) = self
                 .repo
                 .merge_tips(&acc, &h, &msg, self.now)
@@ -2858,7 +2815,7 @@ impl Workspace {
     /// against all heads; finalize with `loot new`). Returns the resolution
     /// content oid, for display.
     pub fn resolve_conflict(&mut self, path: &Path, resolution: &[u8], vis: Visibility) -> Result<Oid, String> {
-        let base = self.tip.clone();
+        let base = self.position.tip().cloned();
         let (change_id, content) = self
             .repo
             .resolve(base.as_ref(), path, resolution, vis, self.now)
@@ -2881,9 +2838,9 @@ impl Workspace {
         }
         // On any tip-tracking position, the resolution also advances the tip so
         // it isn't orphaned and the next snapshot builds on it —
-        // [`tracks_tip`](Self::tracks_tip) covers the adopt/merge-seeded home
-        // dock this arm used to miss (the #229/#234/#265 stuck-tip class).
-        if self.tracks_tip() {
+        // `Position::tracks_tip` covers the adopt/merge-seeded home dock this
+        // arm used to miss (the #229/#234/#265 stuck-tip class).
+        if self.position.tracks_tip() {
             // Reflect ONLY the resolved path on disk (#233). The rest of the
             // merged tree is already materialized — the merge that produced the
             // conflicts wrote it — and the operator may be holding uncommitted
@@ -2900,8 +2857,7 @@ impl Workspace {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             std::fs::write(&dest, resolution).map_err(|e| e.to_string())?;
-            self.tip = Some(change_id);
-            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            self.position.advance(&self.store, Some(change_id));
         }
         self.persist()?;
         Ok(content)
@@ -2917,7 +2873,7 @@ impl Workspace {
 
     /// The ambient dock's display name (`main` for home).
     pub fn dock_name(&self) -> &str {
-        &self.dock
+        self.position.dock_name()
     }
 
     /// The finalized change the ambient dock sits on, without disturbing any
@@ -3126,11 +3082,8 @@ impl Workspace {
         // `adopt`, or `dock merge` carries one even with no named docks, and
         // leaving it behind keeps `anchor()` at the seed forever: the ferry
         // right after this adopt then aims git-main backward and the #201
-        // guard refuses every pass (#265). [`tracks_tip`](Self::tracks_tip).
-        if self.tracks_tip() {
-            self.tip = Some(new_tip.clone());
-            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
-        }
+        // guard refuses every pass (#265). [`Position::advance`] is the guard.
+        self.position.advance(&self.store, Some(new_tip.clone()));
         self.store.clear_tree_hash(self.dock_opt());
         self.persist()
     }
@@ -3277,14 +3230,6 @@ fn fold_worst(
     }
 }
 
-/// Store selector for a dock name: `home` maps to the root files (`None`).
-fn opt(name: &str) -> Option<&str> {
-    if name == HOME_DOCK {
-        None
-    } else {
-        Some(name)
-    }
-}
 
 // --- lane lifecycle plumbing (ADR 0034, #231) ---
 

@@ -13,5 +13,6 @@
 pub mod ferry;
 pub mod flags;
 pub mod ledger;
+mod position;
 pub mod render;
 pub mod workspace;
