@@ -141,10 +141,18 @@ surfaced by `loot conflicts`; that change can't land until you resolve it in loo
   (see above). The rule is trust: a dock shares the store's keyring, so anything
   that must be sealed from an agent requires a clone.
 - **Landing serializes at the harbor.** `main` tracks the harbor (the integrator
-  dock, CA2). Lanes land by merging their tip into it — same-store docks via
-  `loot dock merge <lane>` (local), cross-identity changes via `loot pull` +
-  `converge_heads`. Two lanes finalizing at once converge *before* projection, so
-  `main` stays linear and the two-writer fork the CA epic fixed cannot reappear.
+  line). The harbor is an **on-demand lock**, not a daemon (#229, ADR 0036):
+  `loot-first land` takes a brief shared-store lock (`.loot/git-mirror/harbor.lock`)
+  across the git-`main`-critical section — ferry's projection, the FF push, the
+  PR-head collapse — and releases it. A concurrent land from another lane blocks
+  on the lock, then ferries against the `main` this one moved, so its converge is
+  against the *landed* tip and its push is a clean fast-forward. Two lanes
+  finalizing at once thus land one behind the other, `main` stays linear, and the
+  two-writer fork the CA epic fixed cannot reappear. If a change conflicts with
+  what landed while the lane worked, the land **bounces** — nothing is pushed, the
+  signed change is safe, and you reconcile (`loot resolve …`) and re-run `land`.
+  And a land that does not actually move `main` now **refuses** rather than
+  reporting a false `landed:` (the #195 guard).
 
 ## Abandonment
 

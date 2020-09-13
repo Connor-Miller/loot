@@ -71,10 +71,11 @@ pub fn run(
             report.notes.push(format!("mirror main now tracks dock '{dock}' (was '{prev}')"));
         }
     }
-    let git_dir = cfg
-        .get("gitdir")
-        .cloned()
-        .ok_or("no mirror bound — run `loot ferry --git-dir <path>` once to bind one")?;
+    let git_dir = resolve_gitdir(
+        cfg.get("gitdir")
+            .ok_or("no mirror bound — run `loot ferry --git-dir <path>` once to bind one")?,
+        ws.store().dot(),
+    );
     let main_dock = cfg.get("dock").cloned().unwrap_or_else(|| "main".to_string());
     // The config persists with the spine at the END of the pass, not here: a
     // flag on a run that then fails must not rebind future bare passes (#201
@@ -1196,6 +1197,46 @@ fn split_name_email(value: &str) -> Option<(String, String)> {
 
 fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Resolve the configured mirror `gitdir` to a path usable from any cwd. A
+/// relative gitdir (the default `.loot/git-mirror/mirror.git`) is resolved
+/// against the **shared store's repo root** (`dot`'s parent), never the process
+/// cwd — so a `loot ferry` / land run from a lane directory reaches the one
+/// shared harbor mirror instead of spawning a stray lane-local one (ADR 0036:
+/// the harbor owns the single git-mirror). An absolute gitdir (a custom
+/// `--git-dir`) passes through unchanged. For the primary, `dot`'s parent *is*
+/// the cwd, so the resolved path is byte-identical to the old behaviour.
+fn resolve_gitdir(raw: &str, dot: &Path) -> String {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return raw.to_string();
+    }
+    dot.parent().unwrap_or(dot).join(p).to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod resolve_gitdir_tests {
+    use super::resolve_gitdir;
+    use std::path::Path;
+
+    #[test]
+    fn relative_gitdir_resolves_against_store_root_not_cwd() {
+        // A lane's `dot` is the SHARED store's `.loot`; a relative gitdir must
+        // land beside it, wherever the lane process is running.
+        let dot = std::env::temp_dir().join("repo").join(".loot");
+        let got = resolve_gitdir(".loot/git-mirror/mirror.git", &dot);
+        let want = dot.parent().unwrap().join(".loot/git-mirror/mirror.git");
+        assert_eq!(got, want.to_string_lossy());
+    }
+
+    #[test]
+    fn absolute_gitdir_passes_through() {
+        // A custom `--git-dir` (absolute) is used verbatim.
+        let abs = std::env::temp_dir().join("custom-mirror.git");
+        let raw = abs.to_string_lossy().into_owned();
+        assert_eq!(resolve_gitdir(&raw, Path::new("/anywhere/.loot")), raw);
+    }
 }
 
 /// `key = value` files under `.loot/git-mirror/` (config, identity map).
