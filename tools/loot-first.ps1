@@ -212,16 +212,27 @@ exit 0
                 gh pr close $Pr --comment "Landed via loot as change ``$($lane.Change)`` -> mirror main ``$sha``. GitHub main had diverged; reconcile with 'loot ferry' then push." | Out-Null
             } else {
                 git -C $Mirror push --force --quiet $url "${sha}:refs/heads/${branch}"
-                # Reachability flip is async on GitHub's side; poll briefly.
-                $merged = $false
+                # GitHub reacts to the collapse asynchronously. Live finding
+                # on PR #166: a head force-pushed to an already-landed commit
+                # AUTO-CLOSES the PR (zero-diff) rather than marking it
+                # Merged - that auto-close IS the landing signal. Poll for a
+                # terminal state, then attach the audit pointer either way.
+                $state = 'OPEN'
                 foreach ($i in 1..10) {
                     Start-Sleep -Seconds 2
-                    $st = (gh pr view $Pr --json state -q .state 2>&1 | Out-String).Trim()
-                    if ($st -eq 'MERGED') { $merged = $true; break }
+                    $state = (gh pr view $Pr --json state -q .state 2>&1 | Out-String).Trim()
+                    if ($state -ne 'OPEN') { break }
                 }
-                if (-not $merged) {
+                $pointer = "Landed via loot as change ``$($lane.Change)`` -> main ``$sha``."
+                if ($state -eq 'MERGED') {
+                    $status = 'merged'
+                    gh pr comment $Pr --body $pointer | Out-Null
+                } elseif ($state -eq 'CLOSED') {
+                    $status = 'closed-by-collapse'
+                    gh pr comment $Pr --body "$pointer GitHub auto-closed on the zero-diff collapse - this close is the landing signal (map #148); the signed commit on main is the authoritative record." | Out-Null
+                } else {
                     $status = 'closed-with-pointer'
-                    gh pr close $Pr --comment "Landed via loot as change ``$($lane.Change)`` -> main ``$sha`` (reachability flip did not register; closing with pointer)." | Out-Null
+                    gh pr close $Pr --comment $pointer | Out-Null
                 }
                 git -C $Mirror push --quiet $url ":refs/heads/${branch}" 2>$null
             }

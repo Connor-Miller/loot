@@ -57,9 +57,17 @@ workflow worked: no git commit ever created this file.
    so the reviewer sees "changes since your last review" (#150). The run is
    **PR #166**, review lane `f0acc001…` (the durable change id), round-1
    version `d86bdc1b` — this very sentence is what round 2 changed.
-6. **Land.** On approval, `loot-first.ps1 land` finalized, ferried, pushed
-   `main`, collapsed the PR head to the landed sha, and pushed the relay.
-   The `landed:` verdict is recorded on ticket #155.
+6. **Land — which falsified one more design guess.** `loot-first.ps1 land`
+   finalized (`loot new`, git-quiet), ferried (the signed projection
+   `3851fef7` became `main`, the lane reaped), fast-forward-pushed GitHub
+   `main`, collapsed the PR head onto the landed sha, and pushed the relay:
+   `landed: change_id=f0acc001… main=3851fef7 pr=#166`. But #150's
+   "reachability-merge" prediction was wrong: GitHub **auto-closes** a PR
+   whose head is force-pushed to an already-landed commit (zero diff) — it
+   never flips to purple Merged. The auto-close *is* the landing signal;
+   the tool now attaches the pointer comment (change id → landed sha) as
+   the audit trail, and this very amendment landed as the run's second
+   loot-first lane.
 
 ## Friction found live (dogfood data, not failure)
 
@@ -87,9 +95,19 @@ workflow worked: no git commit ever created this file.
   only Windows PowerShell 5.1. The scripts run fine under 5.1 (by design,
   ASCII-only) — invoke as `powershell -File` or `& .\tools\loot-first.ps1`.
 
+- **GitHub "Merged" is unreachable for rewritten-oid landings** — the
+  falsified #150 guess above. Closed-by-collapse + pointer comment is the
+  honest mechanism; a purple badge would require GitHub's own merge
+  machinery, which loot rejects by design (git never merges).
+- **The landed commit subject was `wip`** — the working change's default
+  message became `main`'s commit subject. Run `loot describe -m` before
+  `land` (or pass a message through the tool) so the landed subject reads
+  like history. Cosmetic, but worth folding into the ritual.
+
 ## Verdict
 
 Every box of the map's destination is exercised by this file's own history:
 originated in loot, reviewed as projected unsigned WIP, landed by loot
-finalize, git `main` projected downstream, relay pushed the same day. loot
-led; git followed.
+finalize, git `main` projected downstream, relay pushed the same day — twice
+(the evidence lane `f0acc001…`/PR #166 and the reconcile-fix lane that landed
+this amendment). loot led; git followed.

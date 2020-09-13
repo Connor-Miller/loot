@@ -51,12 +51,15 @@ code path; **every change lands through a PR** (you self-approve your own).
 5. **Approve.** Approve the PR on GitHub.
 6. **Finalize.** `loot new` signs the change (ADR 0018) and starts the next one.
    This is **git-quiet** — no mirror I/O, so parallel lanes never contend here.
-7. **Land.** `loot-day land --pr <n>` detects the approval
-   (`reviewDecision == APPROVED`), projects the one **signed** commit onto `main`,
-   points the PR head at it, and GitHub marks the PR **Merged** by reachability —
-   no merge button, no merge commit. The provisional review branch collapses and
-   is reaped. A `landed: change_id=… version_id=… main=<sha> pr=#<n> status=merged`
-   verdict is emitted.
+7. **Land.** `loot-first.ps1 land -Pr <n>` detects the approval
+   (`reviewDecision == APPROVED`, or the self-authored fast path — GitHub forbids
+   approving your own PR), projects the one **signed** commit onto `main`, and
+   collapses the PR head onto it. GitHub **auto-closes the PR on the zero-diff
+   collapse** — that close *is* the landing signal (live finding of the #155 run;
+   see below), and the tool attaches a pointer comment (change id → landed sha)
+   as the audit trail. No merge button, no merge commit. The provisional branch
+   is reaped. A `landed: change_id=… main=<sha> pr=#<n> status=…` verdict is
+   emitted.
 
 ## The review-projection mechanic
 
@@ -66,12 +69,16 @@ code path; **every change lands through a PR** (you self-approve your own).
   trailer is the machine-checkable "not finalized yet." Sealed paths are omitted
   from every projected commit, so the branch's whole object closure is safe to
   push to GitHub.
-- **Landing the PR** (#150): a finalized commit can never share the provisional
-  commit's oid (it adds the signature, drops the provisional marker). Every GitHub
-  *merge button* would rewrite oids or add a merge commit loot would have to
-  ingest — so we don't use it. Instead loot lands the signed commit on `main` and
-  points the PR head at it; GitHub's **Merged** is reachability-based, so it flips
-  automatically. `main` gets exactly **one clean commit per change**.
+- **Landing the PR** (#150, amended by the #155 live run): a finalized commit can
+  never share the provisional commit's oid (it adds the signature, drops the
+  provisional marker). Every GitHub *merge button* would rewrite oids or add a
+  merge commit loot would have to ingest — so we don't use it. Instead loot lands
+  the signed commit on `main` and collapses the PR head onto it. #150 predicted a
+  reachability-based **Merged** flip; the live run falsified that — GitHub
+  **auto-closes** a PR whose head is force-pushed to an already-landed commit
+  (zero diff) instead of marking it Merged. The auto-close is therefore the
+  landing signal, and the pointer comment carries the audit trail (PR ↔ change id
+  ↔ landed sha). `main` still gets exactly **one clean commit per change**.
 
 ## Cross-identity agents (clones)
 
