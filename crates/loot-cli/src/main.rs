@@ -189,7 +189,7 @@ const COMMANDS: &[Verb] = &[
     verb("whoami", &[], &["--pubkey"], cmd_whoami),
     verb("peer", &[], &[], cmd_peer),
     verb("serve", &["--dir", "--addr", "--allow"], &[], cmd_serve),
-    verb("push", &["--remote"], &[], cmd_push),
+    verb("push", &["--remote"], &["--dry-run"], cmd_push),
     verb("pull", &["--remote"], &["--no-surface", "--porcelain", "--json"], cmd_pull),
     verb("pull-grants", &["--remote"], &[], cmd_pull_grants),
     verb("grants", &["--remote", "--trust"], &["--quarantined"], cmd_grants),
@@ -3020,6 +3020,12 @@ const BYTES_PER_BATCH: usize = loot_net::MAX_BODY_BYTES / 8;
 
 fn cmd_push(args: &[String]) -> Emitted {
     let mut ws = open_repo()?;
+    // `--dry-run` (#11): report what a push *would* send and contact no relay.
+    // It branches before `resolve_remote` so a dry run needs no configured
+    // remote and never resolves a URL — one more guarantee no HTTP is attempted.
+    if has_flag(args, "--dry-run") {
+        return push_dry_run(&ws);
+    }
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
     // S5: offer our object addresses; the relay replies with the subset it is
@@ -3069,6 +3075,59 @@ fn cmd_push(args: &[String]) -> Emitted {
     // push streams its progress directly (network I/O, incl. the deposit
     // helper's per-grant lines); nothing left to render.
     msg("")
+}
+
+/// `loot push --dry-run` (#11): report the bundle a push would build — how many
+/// changes and objects it carries and its size in bytes — while making no HTTP
+/// request to any relay.
+///
+/// The bundle is built with the very computation the live push uses
+/// (`DagRepo::bundle_wanted`, over the shared `bundle_impl`), so the counts are
+/// exactly what would be sent. What is skipped is the relay `wants` negotiation:
+/// a dry run cannot ask a relay which objects it already holds without a network
+/// round-trip, so it treats the relay as holding none of our history — the
+/// first-push case the live path already offers everything for — by using
+/// `offered_objects` (every object we would offer) as the `wants` set. No remote
+/// need be configured.
+fn push_dry_run(ws: &Workspace) -> Emitted {
+    let have: Vec<Oid> = Vec::new();
+    let offered = ws.offered_objects(&have);
+    let bundle = ws.repo().bundle_wanted(&have, &offered).map_err(CliError::from)?;
+    let (changes, objects) = bundle_change_object_counts(&bundle)?;
+    let bytes = bundle.0.len();
+
+    if changes == 0 && objects == 0 {
+        // Distinguish "you have an unsigned working change" (the fixable case the
+        // live push errors on) from a genuinely up-to-date repo. Either way a dry
+        // run is a query, so it reports and exits 0 rather than failing.
+        if ws.has_unsigned_tip() {
+            return msg(
+                "nothing to push: your working change has not been signed yet.\n\
+                 Run `loot new` (or sign the current change) before pushing.",
+            );
+        }
+        return msg("nothing to push: no unsent changes or objects.");
+    }
+
+    msg(format!(
+        "dry run — would push to a relay (no request made):\n\
+         \x20 changes:     {changes}\n\
+         \x20 objects:     {objects}\n\
+         \x20 bundle size: {bytes} bytes"
+    ))
+}
+
+/// The (changes, objects) a freshly built push bundle carries, read back from the
+/// bundle bytes so the dry-run report counts exactly what was bundled. A push
+/// bundle is always a `Sync` frame; any other shape (never produced here) counts
+/// as zero.
+fn bundle_change_object_counts(bundle: &loot_core::SyncBundle) -> Result<(usize, usize), CliError> {
+    match loot_core::bundle_codec::Frame::decode(&bundle.0)? {
+        loot_core::bundle_codec::Frame::Sync { body, .. } => {
+            Ok((body.changes.len(), body.objs.len()))
+        }
+        _ => Ok((0, 0)),
+    }
 }
 
 /// One planned hard-embargo deposit: a timed grant for `oid` to `peer`.
@@ -3559,6 +3618,9 @@ mod tests {
         assert_eq!(check("conflicts", &["--json"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("serve", &["--dir", "d", "--addr", "a", "--allow", "k"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("push", &["--remote", "origin"]), Ok(FlagCheck::Proceed));
+        // #11: `--dry-run` is a bare push flag and composes with `--remote`.
+        assert_eq!(check("push", &["--dry-run"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("push", &["--remote", "origin", "--dry-run"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("pull", &["--remote", "origin", "--porcelain"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("pull", &["--no-surface"]), Ok(FlagCheck::Proceed));
         // #3: registering `--no-surface` must not loosen the gate — a typo'd
@@ -4365,5 +4427,82 @@ mod tests {
     fn completions_takes_no_flags() {
         assert_eq!(check("completions", &["bash"]), Ok(FlagCheck::Proceed));
         assert!(check("completions", &["--bogus"]).is_err());
+    }
+
+    // --- `loot push --dry-run` (#11) --------------------------------------
+    //
+    // These drive the dry-run seam over a real workspace built at an explicit
+    // tempdir via `init_at`/`open_at` (never `Workspace::open`), so no test
+    // walks up to the primary `.loot` — the loot-cli cwd shared-store hazard.
+    // A dry run makes NO relay request, so these workspaces have no remote
+    // configured and no server running: a successful preview is itself the
+    // proof no HTTP is attempted.
+
+    /// An authored workspace at `dir` with a keypair, so its changes carry a
+    /// durable change id and can be signed (the same shape as workspace.rs's
+    /// `authored_ws`).
+    fn authored_ws(dir: &std::path::Path) -> Workspace {
+        let _ = std::fs::remove_dir_all(dir);
+        Workspace::init_at(dir, "connor").unwrap();
+        identity::generate_and_save(&dir.join(".loot"), "connor@loot").unwrap();
+        let mut ws = Workspace::open_at(dir).unwrap();
+        ws.start_fresh_change().unwrap();
+        ws
+    }
+
+    #[test]
+    fn dry_run_reports_changes_objects_and_bytes_for_signed_content() {
+        let dir =
+            std::env::temp_dir().join(format!("loot-push-dryrun-signed-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        std::fs::write(dir.join("b.txt"), b"world").unwrap();
+        ws.snapshot("two files").unwrap();
+        ws.finalize_working().unwrap(); // sign the change so it would travel
+
+        // The bundle counts read back exactly what was bundled: two files ->
+        // two objects, and at least the signed change.
+        let offered = ws.offered_objects(&[]);
+        let bundle = ws.repo().bundle_wanted(&[], &offered).unwrap();
+        let (changes, objects) = bundle_change_object_counts(&bundle).unwrap();
+        assert_eq!(objects, 2, "two files seal to two objects");
+        assert!(changes >= 1, "at least the signed change travels, got {changes}");
+
+        // The rendered report carries all three numbers and does not error even
+        // though no remote is configured and no relay is running.
+        let out = push_dry_run(&ws).unwrap().render(OutFmt::Human);
+        assert!(out.contains("dry run"), "report: {out}");
+        assert!(out.contains(&format!("changes:     {changes}")), "report: {out}");
+        assert!(out.contains("objects:     2"), "report: {out}");
+        assert!(
+            out.contains(&format!("bundle size: {} bytes", bundle.0.len())),
+            "report: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dry_run_on_an_unsigned_working_change_says_sign_first() {
+        let dir =
+            std::env::temp_dir().join(format!("loot-push-dryrun-unsigned-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"pending").unwrap();
+        ws.snapshot("wip").unwrap(); // captured but NOT finalized -> nothing travels
+
+        let out = push_dry_run(&ws).unwrap().render(OutFmt::Human);
+        assert!(out.contains("nothing to push"), "report: {out}");
+        assert!(out.contains("has not been signed"), "report: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dry_run_on_an_empty_repo_says_nothing_to_push() {
+        let dir =
+            std::env::temp_dir().join(format!("loot-push-dryrun-empty-{}", std::process::id()));
+        let ws = authored_ws(&dir);
+
+        let out = push_dry_run(&ws).unwrap().render(OutFmt::Human);
+        assert!(out.contains("nothing to push"), "report: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

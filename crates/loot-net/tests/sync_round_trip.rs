@@ -77,6 +77,53 @@ fn push_then_pull_syncs_public_content_through_a_keyless_relay() {
     assert!(loot_net::is_relay(&relay_dir), "relay dir must be marked as a relay");
 }
 
+/// `GET /info` (#10): a live relay serves its discovery JSON over real HTTP —
+/// the allowlist (as hex), the format version, and a null relay pubkey. Proves
+/// the client `info()` fn decodes exactly what the handler serialized.
+#[test]
+fn info_endpoint_reports_allowlist_and_format_version() {
+    let relay_dir = tmp("relay-info");
+    let addr = "127.0.0.1:47202";
+    let base = format!("http://{addr}");
+
+    // Relay configured with a single allowlisted key.
+    let alice_id = Identity::generate();
+    let alice_pubkey = alice_id.public_key_bytes();
+    let allowed = vec![alice_pubkey];
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, allowed);
+    });
+    wait_for_relay(&base);
+
+    let info = loot_net::info(&base).expect("GET /info must succeed against a live relay");
+    assert_eq!(info.format_major, loot_core::format::FORMAT_MAJOR);
+    assert_eq!(info.format_minor, loot_core::format::FORMAT_MINOR);
+    assert_eq!(
+        info.allowed_pubkeys,
+        vec![loot_core::hex::encode(&alice_pubkey)],
+        "the allowlist is reported as hex pubkeys"
+    );
+    assert_eq!(info.relay_pubkey, None, "a zero-knowledge relay has no pubkey");
+    assert!(info.version.contains("format v"));
+}
+
+/// An open relay (no allowlist) reports an empty pubkey list over `/info`.
+#[test]
+fn info_endpoint_reports_empty_allowlist_for_open_relay() {
+    let relay_dir = tmp("relay-info-open");
+    let addr = "127.0.0.1:47203";
+    let base = format!("http://{addr}");
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
+    });
+    wait_for_relay(&base);
+
+    let info = loot_net::info(&base).unwrap();
+    assert!(info.allowed_pubkeys.is_empty(), "open relay reports no allowlisted keys");
+}
+
 /// Regression for #309: axum's implicit 2 MiB `DefaultBodyLimit` applied to
 /// `/stow`, so any push whose bundle exceeded it bounced with 413 forever (the
 /// closure only grows). The relay must accept bodies up to its own explicit
