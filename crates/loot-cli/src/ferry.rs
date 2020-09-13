@@ -927,12 +927,15 @@ struct WipEntry {
     round: u64,
 }
 
-struct WipState {
+/// The `wip` ledger. `ferry` owns writes; the loot-first orchestrator (#218)
+/// reads it in-process through this same type — the single typed owner of the
+/// on-disk format, so there is no parallel parser to drift against.
+pub struct WipState {
     entries: Vec<WipEntry>,
 }
 
 impl WipState {
-    fn parse(text: &str) -> Self {
+    pub fn parse(text: &str) -> Self {
         let mut entries = Vec::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
@@ -960,6 +963,39 @@ impl WipState {
             ));
         }
         out
+    }
+
+    /// The full version the review lane last projected for `(change, dock)` —
+    /// the reviewed version the land path compares the live version against
+    /// (the review-currency guard, ADR 0033). Full hex, not the 8-char review
+    /// line truncation.
+    pub fn reviewed_version(&self, change: &str, dock: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.change == change && e.dock == dock)
+            .map(|e| e.version.as_str())
+    }
+}
+
+#[cfg(test)]
+mod wip_state_tests {
+    use super::WipState;
+
+    #[test]
+    fn round_trips_and_reads_reviewed_version() {
+        let text = "aabb ferry deadbeef cafef00d 3\nccdd list f00dcafe abadidea 1\n";
+        let wip = WipState::parse(text);
+        assert_eq!(wip.entries.len(), 2);
+        // Full version, not truncated.
+        assert_eq!(wip.reviewed_version("aabb", "ferry"), Some("cafef00d"));
+        assert_eq!(wip.reviewed_version("aabb", "other-dock"), None);
+        assert_eq!(wip.encode(), text);
+    }
+
+    #[test]
+    fn skips_short_rows() {
+        // A 4-field row (missing round) is not a lane.
+        assert_eq!(WipState::parse("aabb ferry deadbeef cafef00d\n").entries.len(), 0);
     }
 }
 

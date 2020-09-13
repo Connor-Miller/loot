@@ -1,0 +1,21 @@
+[package]
+name = "loot-first"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "loot-first: the land-policy orchestrator that fronts loot's GitHub review lane (map #148, #218)"
+
+# The orchestrator is a SEPARATE binary from `loot`, on purpose: loot itself
+# never talks to GitHub — every `gh` / `git push` call lives here, behind the
+# Forge seam. loot-first reads loot state IN-PROCESS via the loot-cli library
+# face (Workspace, ferry), replacing the ps1 predecessor's stdout scraping.
+[[bin]]
+name = "loot-first"
+path = "src/main.rs"
+
+[dependencies]
+loot-cli.workspace = true
+loot-core.workspace = true
