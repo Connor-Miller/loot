@@ -65,8 +65,12 @@ pub struct MigrateResult {
 
 /// One re-issued grant in a rotation wave (`loot id rotate`, #16): the object
 /// it covers, the original grant's `expires_at` carried forward **exactly**
-/// (rotation never extends a lapsing grant — the maroon re-grant property,
-/// #20), and the targeted grant bundle to hand to the new key's machine.
+/// in the rotating machine's manifest (rotation never extends a lapsing grant
+/// — the maroon re-grant property, #20), and the targeted grant bundle to
+/// hand to the new key's machine. The expiry does NOT ride in the bundle: a
+/// tag-1 grant carries no wire expiry (#352), so the applying machine records
+/// none — the CLI's rotate ritual warns per expiring re-grant (#368) rather
+/// than pretend the expiry traveled.
 pub struct RotateRegrant {
     pub oid: Oid,
     pub expires_at: Option<u64>,
@@ -436,7 +440,9 @@ impl DagRepo {
     /// - each re-grant carries the original grant's `expires_at` **exactly**
     ///   (never extend a lapsing grant via rotation), and the manifest's
     ///   first-write-wins `record` means the original audit entry — grantor,
-    ///   timestamp, expiry — is untouched;
+    ///   timestamp, expiry — is untouched. That preservation is local to the
+    ///   rotating machine: the tag-1 bundle itself carries no expiry (#352),
+    ///   so the applied side records none — callers must surface that (#368);
     /// - an already-expired grant is skipped, not revived;
     /// - a grant whose key this repo no longer holds (hard-marooned away, or
     ///   still escrowed behind an embargo) is skipped and reported.

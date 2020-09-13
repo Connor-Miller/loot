@@ -2282,8 +2282,12 @@ fn cmd_id(args: &[String]) -> Result<(), String> {
 /// + a re-grant wave**, not cryptographic key-succession. In order:
 ///
 /// 1. re-issue every still-live grant this identity holds as a targeted
-///    bundle in `[dir]` (default `.`), each carrying its original
-///    `expires_at` exactly — rotation never extends a lapsing grant (#20);
+///    bundle in `[dir]` (default `.`) — an already-expired grant is skipped,
+///    never revived (#20). The original `expires_at` is preserved in THIS
+///    machine's manifest only: a tag-1 file bundle carries no expiry on the
+///    wire (#352), so the applying machine records none — the ritual output
+///    warns loudly per expiring re-grant (#368; wire-enforced expiry is the
+///    relay's sealed-grant lane alone);
 /// 2. archive the old key files (`.loot/id` → `.loot/id.rotated-<ts>`, never
 ///    deleted — the emergency-rollback artifact);
 /// 3. generate a fresh ed25519 keypair as the active identity;
@@ -2305,7 +2309,7 @@ fn cmd_id_rotate(args: &[String]) -> Result<(), String> {
 
     // 1) The re-grant wave, while the repo state is still the old key's.
     let report = ws.rotate_regrants()?;
-    let mut bundle_files: Vec<std::path::PathBuf> = Vec::new();
+    let mut bundle_files: Vec<(std::path::PathBuf, Option<u64>)> = Vec::new();
     if !report.regrants.is_empty() {
         std::fs::create_dir_all(out_dir)
             .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
@@ -2313,7 +2317,7 @@ fn cmd_id_rotate(args: &[String]) -> Result<(), String> {
             let dest = out_dir.join(format!("regrant-{}.bundle", short(&r.oid)));
             std::fs::write(&dest, &r.bundle.0)
                 .map_err(|e| format!("write {}: {e}", dest.display()))?;
-            bundle_files.push(dest);
+            bundle_files.push((dest, r.expires_at));
         }
     }
 
@@ -2349,11 +2353,15 @@ fn cmd_id_rotate(args: &[String]) -> Result<(), String> {
 
 /// The `loot id rotate` report + operator instructions (#16): everything the
 /// human must do by hand after the mechanical steps succeeded. Pure, so the
-/// coaching is testable without a repo.
+/// coaching is testable without a repo. Each bundle rides with its original
+/// grant's `expires_at`, and any expiring re-grant triggers the #368 warning:
+/// a tag-1 file bundle carries no expiry on the wire (#352), so the machine
+/// that applies it records none — the ritual says so loudly rather than let
+/// the rotation silently un-expire a lapsing grant where it is consumed.
 fn render_rotate_instructions(
     identity: &str,
     new_pub_line: &str,
-    bundle_files: &[std::path::PathBuf],
+    bundle_files: &[(std::path::PathBuf, Option<u64>)],
     skipped_expired: usize,
     skipped_unheld: usize,
     archived_key: &std::path::Path,
@@ -2371,11 +2379,41 @@ fn render_rotate_instructions(
             let _ = writeln!(s, "  re-grant wave: nothing to re-issue (no live grants held by this identity)");
         }
         n => {
-            let _ = writeln!(s, "  re-grant wave: {n} bundle(s), each keeping its original expiry (#20):");
-            for f in bundle_files {
-                let _ = writeln!(s, "    {}", f.display());
+            let _ = writeln!(s, "  re-grant wave: {n} bundle(s), skip-expired honored (#20):");
+            for (f, expires_at) in bundle_files {
+                match expires_at {
+                    Some(ts) => {
+                        let _ = writeln!(s, "    {}  (original grant expires at {ts})", f.display());
+                    }
+                    None => {
+                        let _ = writeln!(s, "    {}", f.display());
+                    }
+                }
             }
         }
+    }
+    if bundle_files.iter().any(|(_, e)| e.is_some()) {
+        let _ = writeln!(
+            s,
+            "  warning: expiry does not travel in a file bundle (#368). The expiries above are"
+        );
+        let _ = writeln!(
+            s,
+            "    recorded only in THIS machine's manifest; the machine that applies such a"
+        );
+        let _ = writeln!(
+            s,
+            "    re-grant records no expiry (tag-1 limitation, #352) — the applied copy is"
+        );
+        let _ = writeln!(
+            s,
+            "    effectively unexpiring. If the expiry must be enforced where the grant is"
+        );
+        let _ = writeln!(
+            s,
+            "    consumed, have the original grantor re-issue it with `loot grant --relay`"
+        );
+        let _ = writeln!(s, "    (the only wire that enforces expiry, #20).");
     }
     if skipped_expired > 0 {
         let _ = writeln!(
@@ -3136,7 +3174,7 @@ mod tests {
     #[test]
     fn rotate_instructions_cover_the_whole_operator_ritual() {
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINewRotatedKey alice@loot";
-        let bundles = [std::path::PathBuf::from("regrant-abcd1234.bundle")];
+        let bundles = [(std::path::PathBuf::from("regrant-abcd1234.bundle"), None)];
         let out = render_rotate_instructions(
             "alice",
             key,
@@ -3153,6 +3191,44 @@ mod tests {
         assert!(out.contains("maroon the old key"), "the closing revocation step");
         // Nothing was skipped, so the skip lines must not appear.
         assert!(!out.contains("skipped"), "no skip noise when nothing was skipped: {out}");
+        // No re-grant carries an expiry, so the #368 warning must not appear.
+        assert!(
+            !out.contains("expiry does not travel"),
+            "no expiry warning when nothing expires: {out}"
+        );
+    }
+
+    /// #368: a re-grant that carries an expiry names it AND warns that the
+    /// expiry does not travel in a tag-1 file bundle — the applied side
+    /// records none, so the ritual must say so where the operator reads it,
+    /// and point at the one wire that enforces expiry (`grant --relay`, #20).
+    #[test]
+    fn rotate_instructions_warn_when_an_expiring_regrant_cannot_carry_its_expiry() {
+        let bundles = [
+            (std::path::PathBuf::from("regrant-abcd1234.bundle"), Some(4200u64)),
+            (std::path::PathBuf::from("regrant-ef567890.bundle"), None),
+        ];
+        let out = render_rotate_instructions(
+            "alice",
+            "ssh-ed25519 KEY alice@loot",
+            &bundles,
+            0,
+            0,
+            std::path::Path::new(".loot/id.rotated-1234"),
+        );
+        assert!(
+            out.contains("regrant-abcd1234.bundle  (original grant expires at 4200)"),
+            "the expiring bundle is named with its expiry: {out}"
+        );
+        assert!(out.contains("expiry does not travel in a file bundle (#368)"), "{out}");
+        assert!(
+            out.contains("records no expiry (tag-1 limitation, #352)"),
+            "names the limitation and why: {out}"
+        );
+        assert!(
+            out.contains("loot grant --relay"),
+            "points at the one wire that enforces expiry: {out}"
+        );
     }
 
     /// Skipped grants are reported, not silently dropped — and the expired
