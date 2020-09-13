@@ -113,11 +113,12 @@ since your last review," map #148).
 
 `loot edit` reopens a *finalized* change, so an approved review can be
 amended and then landed without the reviewer seeing the amendment. The land
-orchestrator (`tools/loot-first.ps1`, not loot core — loot stays git-agnostic)
+orchestrator (`crates/loot-first`, not loot core — loot stays git-agnostic)
 therefore checks, before it finalizes: the dock's current working-change
-version (`loot status --porcelain`, read-only, no snapshot) against the
-version the review lane last projected (`WipEntry.version`). If they differ,
-`land` refuses — "run `loot-first.ps1 review` and re-approve before landing."
+version (read in-process via `Workspace::live_working_row`, no snapshot —
+#218 retired the `loot status --porcelain` scrape) against the version the
+review lane last projected (`ferry::WipState`). If they differ, `land`
+refuses — "run `loot-first review` and re-approve before landing."
 An **empty** working change (already finalized, nothing pending) skips the
 check; the guard exists to catch a *reopened* lane, which is always non-empty.
 

@@ -52,6 +52,20 @@ fn hex8(s: Option<&str>) -> String {
     }
 }
 
+/// The dock git-main tracks, from the mirror config (`dock = <name>`, default
+/// `main`). The land gate refuses a lane on any other dock (see [`LandFacts`]).
+fn tracked_dock(config_path: &Path) -> String {
+    let text = std::fs::read_to_string(config_path).unwrap_or_default();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "dock" {
+                return v.trim().to_string();
+            }
+        }
+    }
+    "main".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // review
 // ---------------------------------------------------------------------------
@@ -143,6 +157,11 @@ pub struct LandFacts<'a> {
     pub lane_dock: &'a str,
     /// The dock currently ambient in the workspace (main normalized to `main`).
     pub ambient_dock: &'a str,
+    /// The dock git-main tracks (mirror config `dock`, default `main`). A lane on
+    /// any other dock cannot be projected to main by a bare `ferry` — it must be
+    /// merged into the tracked dock first (the gap that made the first #218 land
+    /// a silent no-op that still reported success).
+    pub tracked_dock: &'a str,
     /// The version the review lane last projected (from the `wip` ledger).
     pub reviewed_version: Option<&'a str>,
     /// The live working-change version now (`None` when the change is empty).
@@ -178,6 +197,18 @@ pub fn land_gate(forge: &dyn Forge, f: &LandFacts) -> Result<Gate, String> {
             "ambient dock is '{}', not '{}' — run 'loot dock {}' first \
              (land refuses to finalize another lane)",
             f.ambient_dock, f.lane_dock, f.lane_dock
+        )));
+    }
+    // The lane must be on the dock git-main tracks; a side-lane change cannot be
+    // projected to main by a bare `ferry`, so landing it would finalize + reap
+    // the lane while git-main never moves (the false-success gap the first #218
+    // land hit). Refuse and point at the merge-first path.
+    if f.lane_dock != f.tracked_dock {
+        return Ok(Gate::Refuse(format!(
+            "PR #{}'s review lane is on dock '{}', but git-main tracks '{}' — a \
+             side-lane change can't project to main directly. Merge it in first: \
+             `loot dock {}` then `loot dock merge {}`, and land from '{}'.",
+            f.pr, f.lane_dock, f.tracked_dock, f.tracked_dock, f.lane_dock, f.tracked_dock
         )));
     }
     if review_currency(f.reviewed_version, f.current_version) == Currency::Stale {
@@ -276,6 +307,7 @@ pub fn land(
         .ok_or_else(|| format!("PR #{pr} is not in the pr-map ledger (was it opened by 'review'?)"))?;
 
     let ambient = ws.current_dock().unwrap_or("main").to_string();
+    let tracked = tracked_dock(&ws.store().git_config());
     let reviewed = WipState::parse(&std::fs::read_to_string(&p.wip).unwrap_or_default())
         .reviewed_version(&lane.change, &lane.dock)
         .map(str::to_string);
@@ -287,6 +319,7 @@ pub fn land(
         pr,
         lane_dock: &lane.dock,
         ambient_dock: &ambient,
+        tracked_dock: &tracked,
         reviewed_version: reviewed.as_deref(),
         current_version: current.as_deref(),
     };
@@ -466,7 +499,16 @@ mod tests {
         reviewed: Option<&'a str>,
         current: Option<&'a str>,
     ) -> LandFacts<'a> {
-        LandFacts { pr: 218, lane_dock, ambient_dock: ambient, reviewed_version: reviewed, current_version: current }
+        // Default the tracked dock to the lane's own dock, so these tests
+        // exercise the other guards; the tracked-dock guard has its own test.
+        LandFacts {
+            pr: 218,
+            lane_dock,
+            ambient_dock: ambient,
+            tracked_dock: lane_dock,
+            reviewed_version: reviewed,
+            current_version: current,
+        }
     }
 
     #[test]
@@ -513,6 +555,25 @@ mod tests {
             panic!("expected refuse");
         };
         assert!(why.contains("ambient dock"), "{why}");
+    }
+
+    #[test]
+    fn gate_refuses_side_lane_not_on_tracked_dock() {
+        // The exact first-#218-land bug: lane and ambient agree, but git-main
+        // tracks a different dock — a bare ferry would no-op yet report success.
+        let f = FakeForge::new().with_view(view(ReviewDecision::Approved, "someone", PrState::Open));
+        let facts = LandFacts {
+            pr: 218,
+            lane_dock: "loot-first",
+            ambient_dock: "loot-first",
+            tracked_dock: "main",
+            reviewed_version: None,
+            current_version: None,
+        };
+        let Gate::Refuse(why) = land_gate(&f, &facts).unwrap() else {
+            panic!("expected refuse");
+        };
+        assert!(why.contains("side-lane") && why.contains("git-main tracks 'main'"), "{why}");
     }
 
     #[test]
