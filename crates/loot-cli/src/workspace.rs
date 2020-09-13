@@ -1017,6 +1017,36 @@ impl Workspace {
         Ok(Some(written))
     }
 
+    /// The plaintext of every path the current identity can open at `target`
+    /// (a #305 selector — `@`, `HEAD`, `HEAD~<n>`, an id prefix; the current
+    /// head when `None`), paired with the count of paths skipped because they
+    /// are sealed/embargoed to this identity — the content `loot grep` searches
+    /// (#391). Read-only: it flushes escrow first so a now-revealed embargo is
+    /// searchable, but it never captures a snapshot and never writes the working
+    /// tree, so grep runs freely alongside concurrent agents. Every path is
+    /// decrypted through the engine's key oracle ([`DagRepo::readable_tree`]),
+    /// so grep sees plaintext it is authorised to read and nothing else.
+    pub fn readable_tree_at(
+        &mut self,
+        target: Option<&str>,
+    ) -> Result<(Oid, Vec<(PathBuf, Vec<u8>)>, usize), CliError> {
+        self.repo.flush_escrow(self.now);
+        let head = match target {
+            Some(sel) => self.resolve_selector(sel)?,
+            None => self
+                .working
+                .clone()
+                .or_else(|| self.position.tip().cloned())
+                .or_else(|| self.repo.heads().into_iter().next())
+                .ok_or("nothing to search yet (no changes recorded)")?,
+        };
+        let (readable, skipped) = self
+            .repo
+            .readable_tree(&head, &self.identity, self.now)
+            .map_err(CliError::from)?;
+        Ok((head, readable, skipped))
+    }
+
     /// The id of the current working change, if one is in progress.
     pub fn working_id(&self) -> Option<&Oid> {
         self.working.as_ref()
