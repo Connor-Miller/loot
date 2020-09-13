@@ -80,7 +80,8 @@ try {
     $date = [DateTime]::Now.ToString("yyyy-MM-dd")
 
     # loot-vs-git divergence at the START of the day: loot head vs git HEAD.
-    $lootHeadBefore = ((& $Loot log 2>&1 | Select-Object -First 1) | Out-String).Trim()
+    # Skip 1: since the columnar log (PR #159) the first line is a header row.
+    $lootHeadBefore = ((& $Loot log 2>&1 | Select-Object -Skip 1 -First 1) | Out-String).Trim()
     $gitHead = (git rev-parse --short HEAD).Trim()
     $gitSubject = (git log -1 --pretty=%s).Trim()
 
@@ -121,8 +122,9 @@ try {
         Write-Host ">>> $ferryLine" -ForegroundColor Yellow
     }
 
-    # The day's finalized/reconciled change is now loot's head.
-    $lootHead = ((& $Loot log 2>&1 | Select-Object -First 1) | Out-String).Trim()
+    # The day's finalized/reconciled change is now loot's head (skip the
+    # columnar header row, PR #159).
+    $lootHead = ((& $Loot log 2>&1 | Select-Object -Skip 1 -First 1) | Out-String).Trim()
     $changeId = ($lootHead -split '\s+')[0]
 
     $pushed = "(dry run - not pushed)"

@@ -35,11 +35,11 @@ daily ritual is one command, `tools/loot-day.ps1` (see that log's header).
 |-----|------|----------------|------------------------------|
 | 1   | 2026-07-10 | `c670cc2b` embargo CLI (#88) + attack demo (#89) + section-B evidence + maroon fix + drive setup | loot was 3 PRs behind git; caught up in one O(delta) push (14 objects), no conflicts |
 | 2   | 2026-07-10 | `a8cafda5` ferry the git bridge (#114-118) + concurrent-agents epic close-out (#126-131) into loot | git-clean day: ferry ingested 4 commits, 0 conflicts, 0 projected back; 146 objects pushed, resumable |
-| 3   |      |                |                              |
+| 3   | 2026-07-11 | ten loot-first lanes, head `yxvnvtox`/`b071df66` (gate #173, arch wave #185-#191, review fixes #192) | inversion day: loot led via `loot-first.ps1`; end-of-day ritual = clean tree, ferry up to date, 0 objects to push (already published at each land) |
 | 4   |      |                |                              |
 | 5   |      |                |                              |
 
-- [ ] 5 consecutive working days completed and logged above (2/5 done)
+- [ ] 5 consecutive working days completed and logged above (3/5 done)
 
 ## B. Agents as distinct identities (ADR 0026)
 
