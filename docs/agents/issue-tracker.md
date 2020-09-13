@@ -40,5 +40,7 @@ cd <path from the row>                     # work here until the ticket lands
 - Land through `loot-first review` / `land` as usual (workflow.md). Landing
   marks the lane; `loot lane gc` from the primary reaps it afterwards —
   don't delete the directory by hand.
-- Caveats: spawn is primary-only and needs a keyed repo; until the harbor
-  ships (#229), lands are unserialized — one `loot-first land` at a time.
+- Caveats: spawn is primary-only and needs a keyed repo. Lands are serialized
+  by the harbor lock (#229, ADR 0036): `loot-first land` takes a brief
+  shared-store lock across the git-main projection, so concurrent lands queue
+  rather than race — no manual one-at-a-time discipline needed.

@@ -187,6 +187,14 @@ impl RepoStore {
     pub fn git_wip(&self) -> PathBuf { self.git_mirror_dir().join("wip") }
     pub fn git_pr_map(&self) -> PathBuf { self.git_mirror_dir().join("pr-map") }
 
+    /// The **harbor lock** (ADR 0036): the on-demand mutex a `land` holds while
+    /// it projects a signed change to git-main and pushes. Shared-store-rooted
+    /// (`self.dot`, never the lane) so every lane over one store contends on the
+    /// same file — that single-writer window is what serializes N concurrent
+    /// agents' lands into a linear git-main. Local-only, like the rest of
+    /// `git-mirror/`; never bundled, never pushed.
+    pub fn harbor_lock(&self) -> PathBuf { self.git_mirror_dir().join("harbor.lock") }
+
     // --- operation log (S4, ADR 0031) ---
     //
     // Local-only, append-only history of view-changing operations backing

@@ -199,12 +199,13 @@ convention, not a gated branch (branches stay a permanent non-goal). Merging is
 direct and local — `loot dock merge <name>` applies one dock's tip onto
 another's working change in-process, reusing the `apply`/converge path with no
 relay hop, because docks share one object store. The relay remains the path for
-*remote* agents only. *(Promoted by ADR 0034 from convention to **owner**,
-build pending: the harbor — physically the primary directory, lane #0 — is
-the sole serialized integrator to git-main and the single writer of the
-entire `git-mirror/` directory. Lanes never touch it; review/land become
-in-process requests through the harbor seam. Mechanism — daemon vs on-demand
-lock — is #229's decision.)* _Avoid_: main, master, trunk.
+*remote* agents only. *(Promoted by ADR 0034 from convention to **owner**, and
+**shipped** by #229/ADR 0036 as an **on-demand lock** — not a daemon: a land
+takes a brief shared-store lock (`.loot/git-mirror/harbor.lock`) across the
+git-main projection + push, so N lanes' lands serialize into a linear main
+rather than racing. A land that would not move main refuses (closes #195); a
+change conflicting with newly-landed main bounces back to its agent to
+reconcile, never blocking the queue.)* _Avoid_: main, master, trunk.
 
 **Verdict** *(CA3 shipped, 2026-07-07)* — the machine-readable form of a
 reconciliation outcome. The [[Convergence classifier]] already computes a
