@@ -659,7 +659,29 @@ impl DagRepo {
         // base, those classified as conflicts whenever our line had moved on.
         let batch: BTreeMap<&Oid, &ChangeNode> = changes.iter().map(|n| (&n.id, n)).collect();
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
+        let superseded = self.superseded_versions();
         for node in &changes {
+            // An incoming co-version of a change id we already hold live is
+            // not an independent line meeting ours — it is (or exposes)
+            // divergence, one two-writer event the durable handle already
+            // carries as the `!` marker (#198/#203, amending ADR 0032).
+            // Classifying its tree against ours would mint a phantom per-path
+            // conflict that converge no longer merges away; `loot abandon`
+            // is the settle. The node still ingests below: divergence is
+            // data, not an error. A version the incoming node supersedes is
+            // exempt — that is the clean-replacement path, classified as
+            // today.
+            let forms_divergence = node.change_id.is_some_and(|cid| {
+                self.graph.in_order().into_iter().any(|held| {
+                    held.id != node.id
+                        && held.change_id == Some(cid)
+                        && !superseded.contains(&held.id)
+                        && !node.predecessors.contains(&held.id)
+                })
+            });
+            if forms_divergence {
+                continue;
+            }
             let base_tree = self.incoming_base_tree(node, &batch);
             let per_change =
                 converge::classify(&local_before, &node.tree, base_tree.as_ref(), self, now);
@@ -3676,6 +3698,71 @@ mod tests {
             "divergent edits must produce Conflict"
         );
         assert!(bob.conflicts.contains_key(Path::new("f.txt")), "conflict must be recorded");
+    }
+
+    #[test]
+    fn no_conflict_recorded_when_apply_forms_a_divergence() {
+        // #198/#203: an incoming co-version of a change id we already hold
+        // live is ONE two-writer event, carried by the `!` marker — apply must
+        // not additionally classify its tree against ours into a per-path
+        // conflict. Both peers amend the same handle from a shared base; bob
+        // pulls alice's amend.
+        let cid = [7u8; 16];
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+
+        // Shared base carrying the handle.
+        let oid_base = alice.put(b"base\n", Visibility::Public).unwrap();
+        let mut base_tree = BTreeMap::new();
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        let x = alice
+            .record_carrying(
+                Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree },
+                Some(cid),
+            )
+            .unwrap();
+        let seed = alice.bundle(&[]).unwrap();
+        bob.apply(&seed, 0).unwrap();
+
+        // Concurrent amends of the SAME handle, same path: each supersedes the
+        // base, neither the other.
+        let oid_alice = alice.put(b"alice's take\n", Visibility::Public).unwrap();
+        let mut alice_tree = BTreeMap::new();
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice
+            .record_superseding(
+                Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "amend".into(), tree: alice_tree },
+                Some(cid),
+                vec![x.clone()],
+            )
+            .unwrap();
+
+        let oid_bob = bob.put(b"bob's take\n", Visibility::Public).unwrap();
+        let mut bob_tree = BTreeMap::new();
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob, Visibility::Public));
+        bob.record_superseding(
+            Change { id: Oid([0; 32]), parents: vec![x.clone()], message: "amend".into(), tree: bob_tree },
+            Some(cid),
+            vec![x.clone()],
+        )
+        .unwrap();
+
+        let alice_bundle = alice.bundle(&bob.heads()).unwrap();
+        let outcomes = bob.apply(&alice_bundle, 0).unwrap();
+
+        assert!(
+            !matches!(outcomes.get(Path::new("f.txt")), Some(MergeOutcome::Conflict { .. })),
+            "a divergent co-version is not classified into a per-path conflict"
+        );
+        assert!(
+            !bob.conflicts.contains_key(Path::new("f.txt")),
+            "no conflict recorded — the ! marker carries the two-writer event"
+        );
+        assert_eq!(
+            bob.divergent_change_ids(&Default::default()).len(),
+            1,
+            "the handle IS divergent — the event is represented exactly once"
+        );
     }
 
     // --- relay stow (ADR 0011) ---

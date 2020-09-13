@@ -89,6 +89,24 @@ amendments' content, so abandoning a version clears the marker but does not
 un-merge the tree. Whether divergence resolution should eventually be an
 explicit multi-predecessor amend instead is map fog.
 
+> **Amended 2026-07-12 (#198 → #203): divergence stays flat.** The #172 live
+> proof showed the content-merge half of this clause re-represents the one
+> two-writer event twice — the `!` marker *and* a per-path conflict on a
+> signed `converge diverged head` merge that `abandon` cannot un-mint (the
+> wart above, live). Converge now merges only genuinely **independent**
+> concurrent heads: two live versions of one `change_id` are excluded from
+> the merge set (the same shape as the superseded-head drop) and stay flat
+> as live heads; ingest (`apply_sync`) likewise skips per-path classification
+> for a divergence-forming co-version, so `loot conflicts` stays empty. The
+> dock's tip stays on ours and `loot abandon` is the whole tree-settle — the
+> survivor's tree materializes, including when the abandoned side is the
+> dock's own tip. A head that is a sibling dock's parked *working* change is
+> likewise excluded from the merge set — in-flight WIP is not a line to
+> converge. This does not revive the rejected "hold same-cid forks
+> side-by-side" alternative's problem: the single-tip invariant (ADR 0006)
+> holds because the co-version is a live head, never the tip. The travelling
+> multi-predecessor collapse remains map #169 fog.
+
 ### `loot edit` refuses rather than guesses
 
 Three guard clauses, no magic:

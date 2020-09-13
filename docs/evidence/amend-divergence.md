@@ -43,64 +43,72 @@ pull sees the amended version **replace** the original.
 - [x] **`agent` clones `dev`'s base change** — `doc.txt = v1` on clone (run
       lines 36–39).
 - [x] **`dev` reopens the landed change with `loot edit`** — the durable handle
-      `pxpzumlw` is carried; the working change supersedes version `ab8182ed`
+      `knvkmrlm` is carried; the working change supersedes version `7de50c42`
       (lines 41–43), finalized + pushed (45–48).
 - [x] **`agent`'s pull is a clean supersession — no `!`, no content-merge** —
-      after pull + surface, `loot log` shows the single change `pxpzumlw` at the
-      amended version `2bdc944e`, no divergence marker, no "diverged" fork, and
+      after pull + surface, `loot log` shows the single change `knvkmrlm` at the
+      amended version `cbadfe5c`, no divergence marker, no "diverged" fork, and
       `doc.txt` is `dev`'s amended line (not a merge of old + new): converge
       dropped the superseded head (lines 50–66). This is ADR 0032's
       supersession-travels property — a solo amend is invisible as divergence.
 
 ## Act 2 — divergence: two identities amend the same change (`!` / abandon / undo)
 
-Both peers share a base change `xvnvrkul`. Each `loot edit`s it and finalizes a
+Both peers share a base change `mzlxpytq`. Each `loot edit`s it and finalizes a
 **different** amend on its own store — two live versions of one handle — then
 pushes. `agent` pulls `dev`'s amend, so one graph holds both.
 
 - [x] **Both peers share the base change** — `agent` pulls it, `feat.txt`
-      present, single version (lines 72–86).
+      present, single version (lines 78–86).
 - [x] **Concurrent amends → two versions of one handle** — `dev` amends
-      `feat.txt` to *dev's take* and pushes (relay tip 1, lines 88–95); `agent`,
+      `feat.txt` to *dev's take* and pushes (relay tip 1, lines 88–96); `agent`,
       from the same base and *before* pulling `dev`'s amend, amends to *agent's
-      take* and pushes (relay tip 2, lines 97–104).
-- [x] **One pull puts both live versions in one graph → the `!` marker** —
-      `agent`'s pull ingests `dev`'s amend; `loot log` renders the durable handle
-      `xvnvrkul!` twice, once per live version (`b38f4b62`, `2fffd634`), as a
-      **flat listing** — not a "run `loot apply` to converge" fork — and
-      `loot status` agrees the handle is divergent (lines 106–129).
-- [x] **`loot abandon <version-id>` collapses the divergence** — abandoning
-      `dev`'s version leaves the handle with `agent`'s single live version; the
-      `!` is gone, the `change_id` survives (lines 131–142). Nothing is deleted.
+      take* and pushes (relay tip 2, lines 98–104).
+- [x] **One pull puts both live versions in one graph → the `!` marker, FLAT**
+      — `agent`'s pull ingests `dev`'s amend; `loot log` renders the durable
+      handle `mzlxpytq!` twice, once per live version (`57a84e20`, `2f370248`),
+      as a **flat listing** — not a "run `loot apply` to converge" fork — and
+      `loot status` agrees the handle is divergent (lines 106–127). Converge
+      minted **no merge** ([#203](https://github.com/Connor-Miller/loot/issues/203)):
+      `loot conflicts` reports nothing (lines 121–122) and the working tree is
+      clean on `agent`'s own side (line 126).
+- [x] **`loot abandon <version-id>` is the whole settle** — abandoning `dev`'s
+      version leaves the handle with `agent`'s single live version; the `!` is
+      gone, the `change_id` survives, `loot conflicts` is still empty, and the
+      survivor's tree stands clean (lines 129–144). Nothing is deleted.
 - [x] **`loot undo` restores it — nothing was destroyed** — one undo walks the
-      abandon back and the `!` returns with both versions (lines 150–160).
+      abandon back and the `!` returns with both versions (lines 146–155).
 
 ## What the run surfaced
 
-Running the proof (not the read-only spec) surfaced one behaviour worth
-recording:
+The first run of this proof (2026-07-12, pre-#203) surfaced one behaviour worth
+recording — since **resolved**:
 
-- **`abandon` collapses the handle-level divergence, but not the tree-level
+- **`abandon` collapsed the handle-level divergence, but not the tree-level
   conflict `converge` created.** Because both amends edited the *same line*,
-  `agent`'s pull ran `converge_heads`, which folded the two divergent versions
-  under one merge head *and* raised a per-**path** content conflict on `feat.txt`
-  (lines 106–110, 123–126). The `!` divergence (per-`change_id`, ADR 0032) and
-  the content conflict (per-path, ADR 0001) are **orthogonal** representations of
-  the one two-writer event. `loot abandon` settles the *handle* — the `!`
-  collapses — but the graph head is still the conflicted converge merge, so
-  `loot conflicts` still reports `feat.txt` afterward (lines 144–148): settling
-  the *tree* is a separate step. This is the "converge content-combination wart"
-  already flagged in map #169's Fog; the signed, travelling resolution (one amend
-  naming *both* live versions as predecessors) is the deferred
+  the pull's `converge_heads` folded the two divergent versions under one
+  signed merge head *and* raised a per-**path** content conflict on `feat.txt`
+  that survived `abandon` — the one two-writer event represented twice, by two
+  orthogonal mechanisms (per-`change_id` divergence, ADR 0032; per-path
+  conflict, ADR 0001), settled by two separate steps. That was the "converge
+  content-combination wart" flagged in map #169's Fog. **Resolved by
+  [#198](https://github.com/Connor-Miller/loot/issues/198) →
+  [#203](https://github.com/Connor-Miller/loot/issues/203)** (amending ADR
+  0032): converge merges only genuinely independent heads — two live versions
+  of one `change_id` stay flat as live heads, no merge is minted, no per-path
+  conflict exists, and `loot abandon` is the whole settle. The committed run
+  above is the post-#203 rerun proving it. The signed, travelling resolution
+  (one amend naming *both* live versions as predecessors) remains the deferred
   [multi-predecessor path](https://github.com/Connor-Miller/loot/issues/169).
-  Filed as a follow-up. The ticket's claim — the `!` divergence marker collapses
-  under `abandon` and restores under `undo` — holds regardless.
 
 ## Done
 
 - [x] Both acts pass in a committed, re-runnable script
-      ([run](runs/amend-divergence-demo.txt), 2026-07-12) — divergence arises
-      from ordinary concurrent work (control + real two-identity amend), renders
-      with `!`, collapses via `abandon`, restores via `undo`, with no white-box
-      construction. Resolves map #169's proof ticket
-      [#172](https://github.com/Connor-Miller/loot/issues/172).
+      ([run](runs/amend-divergence-demo.txt), rerun 2026-07-12 post-#203) —
+      divergence arises from ordinary concurrent work (control + real
+      two-identity amend), renders with `!` **flat** (no converge merge, no
+      per-path conflict), collapses via `abandon` (the whole settle), restores
+      via `undo`, with no white-box construction. Resolves map #169's proof
+      ticket [#172](https://github.com/Connor-Miller/loot/issues/172); the
+      divergence act doubles as the live proof for
+      [#203](https://github.com/Connor-Miller/loot/issues/203).

@@ -23,8 +23,10 @@
     two live versions of one durable handle, neither superseding the other.
     `agent` pulls dev's amend: one graph now holds both. `loot log`/`status`
     render the `!` marker on the divergent change (flat listing, not a
-    "run apply" fork); `loot abandon <version-id>` collapses it to one live
-    version; `loot undo` brings the divergence back. Divergence is cross-STORE
+    "run apply" fork); converge minted NO merge (#203), so there is no per-path
+    conflict and the tree stays clean on the agent's own side; `loot abandon
+    <version-id>` collapses it to one live version -- the whole settle;
+    `loot undo` brings the divergence back. Divergence is cross-STORE
     (build finding #171): two docks in one store cannot produce it, so the proof
     uses two identities over the relay.
 
@@ -250,17 +252,21 @@ try {
     $divStatus = Run "agent: loot status (agrees: the working change's handle is divergent)" $AgentDir {
         & $Loot status
     }
-    # The two amends touched the same line, so alongside the per-change-id
-    # divergence (!), converge surfaces a per-PATH content conflict on feat.txt
-    # (ADR 0001). The two are orthogonal representations of the one two-writer
-    # event: divergence is the durable-handle data state, the conflict is the
-    # tree-merge state. `loot abandon` (picking a side) resolves both at once.
-    $divConflicts = Run "agent: loot conflicts (the per-PATH conflict, orthogonal to the per-cid divergence)" $AgentDir {
+    # The two amends touched the same line -- but the divergence is ONE
+    # two-writer event, already rendered by the ! marker. Converge leaves the
+    # co-versions FLAT (#198/#203, amending ADR 0032): no `converge diverged
+    # head` merge is minted, so no per-path conflict exists, the tip stays on
+    # the agent's own side, and the tree is clean. `loot abandon` is the whole
+    # settle.
+    $divConflicts = Run "agent: loot conflicts (EMPTY -- converge minted no merge, so no per-path conflict)" $AgentDir {
         & $Loot conflicts
     }
 
     Check ($divLog -match ([regex]::Escape($divCid) + "!")) "DIVERGENCE: log renders the ! marker on the divergent change_id"
     Check ($divLog -notmatch "run .loot apply. to converge") "DIVERGENCE: it is a flat divergent listing, not a 'run apply' fork"
+    Check ($divConflicts -notmatch "feat.txt") "DIVERGENCE STAYS FLAT (#203): no per-path conflict -- converge minted no merge of the co-versions"
+    $agentFeat = [System.IO.File]::ReadAllText((Join-Path $AgentDir "feat.txt"))
+    Check ($agentFeat -match "agent's take") "DIVERGENCE STAYS FLAT (#203): the working tree is clean on OURS (agent's own amend)"
 
     # Two live version ids under the divergent change id -- capture them to abandon one.
     $verIds = @()
@@ -272,8 +278,9 @@ try {
 
     if ($verIds.Count -ge 2) {
         # Abandon the FIRST-listed version (dev's side, per the log's author
-        # column) -- agent keeps its own amend. Picking a side collapses the
-        # divergence AND settles the content conflict in one undoable op.
+        # column) -- agent keeps its own amend. Picking a side is the WHOLE
+        # settle (#203): the survivor's tree stands, no per-path conflict
+        # exists before or after, one undoable op.
         $abandonVer = $verIds[0]
         $abandonOut = Run "agent: loot abandon $abandonVer (collapse the divergence -- keep agent's side)" $AgentDir {
             & $Loot abandon $abandonVer
@@ -284,17 +291,15 @@ try {
         Check ($afterAbandon -notmatch ([regex]::Escape($divCid) + "!")) "ABANDON: the ! marker is gone -- divergence collapsed to one live version"
         Check ($afterAbandon -match [regex]::Escape($divCid)) "ABANDON: the change_id survives with its remaining live version"
 
-        # FINDING (surfaced by this run): abandon collapses the per-cid
-        # divergence, but the graph head is still the conflicted CONVERGE merge
-        # converge_heads built from both sides -- so the per-PATH conflict on
-        # feat.txt PERSISTS. The handle-level divergence (abandon) and the
-        # tree-level conflict (converge's content-combination wart, deferred in
-        # map #169's Fog) are settled by *separate* mechanisms; the ticket's
-        # claim -- the ! divergence marker collapses -- holds regardless.
-        $afterConflicts = Run "agent: loot conflicts (FINDING: still conflicted -- abandon settles the handle, not the tree)" $AgentDir {
+        # #203 closes the #172 finding: with no converge merge minted, abandon
+        # settles the ONE two-writer event completely -- the tree is the clean
+        # survivor, and there is no standing per-path conflict left behind.
+        $afterConflicts = Run "agent: loot conflicts (still empty -- abandon left a clean tree, nothing to resolve)" $AgentDir {
             & $Loot conflicts
         }
-        Check ($afterConflicts -match "feat.txt") "FINDING: abandon collapses the divergence marker; converge's per-path feat.txt conflict is a separate, still-open state"
+        Check ($afterConflicts -notmatch "feat.txt") "ABANDON IS THE WHOLE SETTLE (#203): no standing per-path conflict after the collapse"
+        $survivorFeat = [System.IO.File]::ReadAllText((Join-Path $AgentDir "feat.txt"))
+        Check ($survivorFeat -match "agent's take") "ABANDON IS THE WHOLE SETTLE (#203): the survivor's tree stands (agent's take, clean)"
 
         $undoOut = Run "agent: loot undo (walk the abandon back)" $AgentDir {
             & $Loot undo
@@ -314,9 +319,11 @@ try {
     Log "         supersession-travels property."
     Log "  Act 2 (divergence): two identities each 'loot edit' the SAME change_id"
     Log "         and finalize different amends; one pull puts both live versions"
-    Log "         in one graph; 'loot log'/'status' render the ! marker; 'loot abandon'"
-    Log "         collapses it; 'loot undo' restores it. Divergence is cross-STORE"
-    Log "         (two docks in one store cannot produce it, #171)."
+    Log "         in one graph -- FLAT (#203): no converge merge, no per-path"
+    Log "         conflict, tree clean on ours; 'loot log'/'status' render the !"
+    Log "         marker; 'loot abandon' is the whole settle; 'loot undo' restores"
+    Log "         it. Divergence is cross-STORE (two docks in one store cannot"
+    Log "         produce it, #171)."
     Log ""
     Log "Honesty (ADR 0026): one machine, one OS user; two keyring-separated"
     Log "identities cooperating over a hermetic local relay."

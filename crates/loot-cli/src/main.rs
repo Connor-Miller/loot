@@ -1760,9 +1760,13 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     let url = resolve_remote(args, &ws)?;
     let identity = ws.identity().to_string();
     let have = ws.heads();
-    // Our side before the pull — the tip the working directory reflects. After
-    // ingesting a peer's divergent tip we collapse onto this (#128).
-    let ours_before = have.first().cloned();
+    // Our side before the pull — the tip the working directory reflects: the
+    // ambient dock's finalized anchor, NOT whichever head sorts first. Under
+    // multiple pre-pull heads (e.g. a sibling dock's parked WIP, #203) the
+    // first head can be a line this dock never materialized — converging onto
+    // it would merge the dock's own tip INTO foreign WIP and rewrite the disk.
+    // After ingesting a peer's divergent tip we collapse onto this (#128).
+    let ours_before = ws.finalized_anchor().or_else(|| have.first().cloned());
     // S5: negotiate object addresses before any object bytes move. The relay
     // offers the closure it would send; we reply with only the addresses we
     // lack; fetch returns a bundle limited to those. A re-pull with nothing new

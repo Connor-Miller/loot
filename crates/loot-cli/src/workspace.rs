@@ -1017,6 +1017,17 @@ impl Workspace {
         self.store
             .write_abandoned(&abandoned)
             .map_err(|e| format!("write abandoned: {e}"))?;
+        // Divergence stays flat (#203), so the abandoned version may be the very
+        // tip the ambient dock sits on. Hop to the surviving live version —
+        // otherwise the tip names a dead version and the next snapshot forks
+        // from it. Captured by the op view (per-dock tips), so undo restores it.
+        if self.tip.as_ref() == Some(version) {
+            let survivor = self.repo.versions_of_change(&cid, &abandoned).into_iter().next();
+            if let Some(s) = survivor {
+                self.tip = Some(s);
+                let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            }
+        }
         self.persist()?;
         self.record_op("abandon", &format!("abandon version {}", short_version(version)), false);
         self.reload()?;
@@ -1435,7 +1446,10 @@ impl Workspace {
     /// is in the graph but never materialized). This is the peer-side analogue
     /// of `merge_dock` (ADR 0011: keyholders collapse forks on pull+apply): fold
     /// every other head into our line via `merge_tips`, signing each merge so it
-    /// travels, then materialize the merged tree.
+    /// travels, then materialize the merged tree. Only genuinely independent
+    /// heads fold: superseded heads drop (ADR 0032), and divergent co-versions
+    /// of one `change_id` — plus sibling docks' parked working changes — stay
+    /// flat as live heads, never content-merged (#198/#203).
     ///
     /// `base` names our side — the tip the working directory already reflects
     /// (the caller's pre-pull head); materialize is diffed from it so a stale
@@ -1482,13 +1496,44 @@ impl Workspace {
             }
             return Ok(BTreeMap::new());
         }
+        // Converge merges genuinely INDEPENDENT concurrent heads — two live
+        // versions of one change id are not that (#198/#203, amending ADR
+        // 0032). Each concurrent amend supersedes the *original*, never its
+        // sibling, so neither co-version lands in the superseded drop above;
+        // folding them into a content-merge would re-represent the one
+        // two-writer event as a per-path conflict on a signed merge that
+        // `abandon` cannot un-mint. They stay flat as live heads (the `!`
+        // listing), the tip stays on ours, and `loot abandon` is the
+        // tree-settle. Likewise a head that is a sibling dock's parked
+        // *working* change is in-flight WIP, not a line to converge — that
+        // dock's next snapshot rewrites it in place.
+        let divergent = self.repo.divergent_change_ids(&self.store.read_abandoned());
+        let parked: Vec<Oid> = self
+            .store
+            .list_docks()
+            .iter()
+            .filter(|name| name.as_str() != self.dock)
+            .filter_map(|name| self.store.read_working(opt(name)))
+            .collect();
+        // `ours` must be a line this dock actually materialized — never a
+        // sibling dock's parked WIP (the live #203 footgun: a caller passing
+        // "first head" as the base handed converge the parked head as OURS,
+        // and the dock's own tip was merged INTO foreign in-flight work).
         let ours = base
             .cloned()
-            .filter(|b| heads.contains(b))
-            .or_else(|| self.anchor().filter(|a| heads.contains(a)))
+            .filter(|b| heads.contains(b) && !parked.contains(b))
+            .or_else(|| self.anchor().filter(|a| heads.contains(a) && !parked.contains(a)))
+            .or_else(|| heads.iter().find(|h| !parked.contains(h)).cloned())
             .or_else(|| heads.first().cloned())
             .ok_or("nothing to converge onto")?;
-        let others: Vec<Oid> = heads.into_iter().filter(|h| h != &ours).collect();
+        let others: Vec<Oid> = heads
+            .into_iter()
+            .filter(|h| h != &ours)
+            .filter(|h| !parked.contains(h))
+            .filter(|h| {
+                !self.repo.change_change_id(h).is_some_and(|cid| divergent.contains(&cid))
+            })
+            .collect();
         if others.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -3466,6 +3511,143 @@ mod tests {
             "the amend materialized"
         );
         assert!(ws.divergent_change_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store shaped like a divergent pull (#198/#203): our amend `x2` is the
+    /// line the tree shows; the peer's concurrent amend of the same handle sits
+    /// beside it as a head (white-box, as the S3 tests construct divergence —
+    /// the live cross-store proof is the amend-divergence demo). Both name `x`
+    /// in `predecessors`, neither names the other, and both share `x`'s
+    /// parentage shape (the home dock finalizes an amend as `x`'s child).
+    fn divergent_ws(tag: &str) -> (PathBuf, Workspace, Oid, Oid, [u8; 16]) {
+        use loot_core::Change;
+        let (dir, mut ws, x, cid) = amendable_ws(tag);
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir.join("a.txt"), b"target amended").unwrap();
+        ws.snapshot("target").unwrap();
+        ws.finalize_working().unwrap();
+        let x2 = ws
+            .repo()
+            .versions_of_change(&cid, &Default::default())
+            .into_iter()
+            .next()
+            .unwrap();
+        let theirs = ws
+            .with_repo(|repo| {
+                repo.record_superseding(
+                    Change {
+                        id: Oid([0; 32]),
+                        parents: vec![x.clone()],
+                        message: "their amend".into(),
+                        tree: Default::default(),
+                    },
+                    Some(cid),
+                    vec![x.clone()],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        (dir, ws, x2, theirs, cid)
+    }
+
+    #[test]
+    fn converge_heads_leaves_divergent_co_versions_flat() {
+        // #198/#203: two live versions of one change id are ONE two-writer
+        // event, already rendered by the `!` marker — converge must not
+        // re-represent it as a per-path conflict on a signed merge that
+        // `abandon` cannot un-mint. The co-versions stay live heads, the tip
+        // stays on ours, and the tree is clean.
+        let (dir, mut ws, x2, theirs, cid) = divergent_ws("convflat");
+        let nodes_before = ws.repo().log_detailed().len();
+        let outcomes = ws.converge_heads(Some(&x2)).unwrap();
+        assert!(outcomes.is_empty(), "divergence is not a merge");
+        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "no merge node was minted");
+        let heads = ws.repo().heads();
+        assert!(
+            heads.contains(&x2) && heads.contains(&theirs) && heads.len() == 2,
+            "both co-versions stay flat as live heads"
+        );
+        assert!(ws.divergent_change_ids().contains(&cid), "the ! marker state persists");
+        assert!(ws.repo().conflicts().is_empty(), "no per-path conflict is minted");
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"target amended",
+            "the tree stays clean on ours"
+        );
+
+        // The canonical tree-settle: abandon the peer's side. One live version
+        // remains, the tree is already the survivor's — nothing to re-merge.
+        ws.abandon(&theirs).unwrap();
+        assert_eq!(ws.repo().heads(), vec![x2.clone()], "the survivor is the sole head");
+        assert!(!ws.divergent_change_ids().contains(&cid), "abandon collapsed the divergence");
+        assert!(ws.repo().conflicts().is_empty(), "no standing conflict to settle");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"target amended");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandoning_our_own_side_materializes_the_survivor() {
+        // Flat divergence means either side can be the one abandoned — including
+        // the version the ambient dock sits on. The dock must hop to the
+        // survivor and materialize its tree, not keep forking from a dead tip.
+        let (dir, mut ws, x2, theirs, cid) = divergent_ws("convflat-ours");
+        ws.converge_heads(Some(&x2)).unwrap();
+        ws.abandon(&x2).unwrap();
+        assert_eq!(ws.repo().heads(), vec![theirs.clone()], "the peer's side survives");
+        assert!(!ws.divergent_change_ids().contains(&cid));
+        assert!(
+            !dir.join("a.txt").exists(),
+            "the survivor's tree materialized (its empty tree pruned ours)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn converge_heads_skips_a_sibling_docks_parked_working_change() {
+        // The bd926e81 specimen (#199 finding → #203): a dock switched away
+        // from mid-work leaves its unsigned working change parked as a head in
+        // the shared graph. Converge on another dock must not fold that
+        // in-flight WIP into a content-merge — the parked dock's next snapshot
+        // rewrites it in place.
+        let (dir, mut ws) = dock_repo("convpark");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("side").unwrap();
+        std::fs::write(dir.join("side.txt"), b"parked WIP").unwrap();
+        ws.snapshot("side wip").unwrap(); // in progress, never finalized
+        ws.dock_goto("main").unwrap(); // parks it on the side dock
+        let parked = ws
+            .store()
+            .read_working(Some("side"))
+            .expect("the side dock parked its working change");
+
+        // main advances so a real fork exists beside the parked WIP.
+        std::fs::write(dir.join("ours.txt"), b"O").unwrap();
+        ws.snapshot("ours").unwrap();
+        ws.finalize_working().unwrap();
+
+        let nodes_before = ws.repo().log_detailed().len();
+        let ours = ws.anchor();
+        let outcomes = ws.converge_heads(ours.as_ref()).unwrap();
+        assert!(outcomes.is_empty(), "parked WIP is not a line to converge");
+        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "no merge node minted");
+        assert!(
+            ws.repo().heads().contains(&parked),
+            "the parked working change stays the side dock's live head"
+        );
+        assert!(!dir.join("side.txt").exists(), "the parked WIP never entered main's tree");
+
+        // The live #203 footgun: `pull` used to pass "first head" as the
+        // base, handing converge the parked head as OURS — the dock's own tip
+        // was then merged INTO foreign in-flight WIP. A parked base must never
+        // become the merge side.
+        let outcomes = ws.converge_heads(Some(&parked)).unwrap();
+        assert!(outcomes.is_empty(), "a parked base never becomes the merge side");
+        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "still no merge node");
+        assert!(ws.repo().heads().contains(&parked), "the parked head survives");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
