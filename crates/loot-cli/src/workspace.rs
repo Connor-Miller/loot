@@ -4307,6 +4307,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #175: the fresh-empty working state — a working node minted over a
+    /// *described* tip, tree-identical to it — must render under its **own** ids,
+    /// never fall back to the signed tip's. The live finding was the tip labelled
+    /// `(working change)` under its own change/version while the real (empty)
+    /// working node vanished. `history()` must keep the two nodes distinct: the
+    /// tip stays a finalized row carrying its authored subject, and the working
+    /// row carries the working node's handle with `empty = true`.
+    #[test]
+    fn history_keeps_the_empty_tip_duplicate_working_row_distinct_from_the_tip() {
+        let dir = std::env::temp_dir().join(format!("loot-175-empty-working-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+
+        // A described, finalized tip.
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("real work").unwrap();
+        ws.finalize_working().unwrap();
+        let tip = ws.repo().heads()[0].clone();
+        let tip_cid = ws.repo().change_change_id(&tip);
+
+        // A fresh working node over the *unchanged* tree — the tip-duplicate the
+        // report hit. It gets the freshly-minted next handle, distinct from the
+        // tip's, and its live row is empty (same content as the anchor).
+        ws.snapshot("real work").unwrap();
+        let working = ws.working_id().cloned().expect("snapshot minted a working node");
+        let working_cid = ws.repo().change_change_id(&working);
+        assert_ne!(working_cid, tip_cid, "the working node carries its own handle, not the tip's");
+
+        let hist = ws.history().unwrap();
+
+        // The working row is present, under the working node's ids, marked empty.
+        let row = hist.working.expect("the fresh working change renders a live row");
+        assert_eq!(row.change_id, working_cid, "the working row shows the working node's handle");
+        assert!(row.empty, "a tip-duplicate working change is empty");
+
+        // The tip survives as a finalized row with its authored subject — not
+        // relabelled `(working change)`, and its message is not hidden.
+        let tip_row = hist
+            .rows
+            .iter()
+            .find(|r| r.version == tip)
+            .expect("the signed tip stays a finalized row");
+        assert_eq!(tip_row.change_id, tip_cid);
+        assert_eq!(tip_row.message, "real work", "the tip keeps its authored subject");
+
+        // The working node never doubles as a finalized row (the S2 dedupe holds).
+        assert!(
+            !hist.rows.iter().any(|r| r.version == working),
+            "the working node renders once, as the live row — never among the finalized rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn undo_walks_the_view_back_and_prunes_disk() {
         let dir = std::env::temp_dir().join(format!("loot-s4-undo-{}", std::process::id()));
