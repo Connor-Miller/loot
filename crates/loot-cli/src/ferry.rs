@@ -531,20 +531,32 @@ fn ingest_commit(
         ));
     }
 
-    // Trailer short-circuit: this commit *is* a loot change we projected.
+    // Trailer short-circuit: normally this commit *is* a loot change we still
+    // hold, so re-mark it 1:1 (the lossless round-trip). If the change is *gone* —
+    // pruned by gc after a land the primary never adopted (#263) — it cannot be
+    // reconstructed byte-identically: a version-id hashes the tree's store-local,
+    // randomly-addressed object oids (`sealed::seal` mints a fresh nonce per put),
+    // which the projection does not carry. So instead of refusing, fall through to
+    // the git-native path below and adopt the commit's *content* as a fresh change
+    // marked as represented by this commit. Because it is marked, it is never
+    // re-projected, so git `main` stays exactly where it is (no force-push); the
+    // dock advances onto the recovered content and future work builds on it. This
+    // is the baseline-anchor recovery — the same move the bootstrap makes for
+    // pre-bridge history, extended to a trailered commit whose change was lost.
     if let Some(id_hex) = bridge::parse_trailer(&message, TRAILER_CHANGE_ID) {
         let id = bridge::parse_oid_hex(&id_hex)
             .ok_or_else(|| format!("commit {sha}: malformed {TRAILER_CHANGE_ID} trailer"))?;
-        if ws.graph().tree(&id).is_none() {
-            return Err(format!(
-                "commit {} names loot change {} which this repo does not have — \
-                 is the mirror bound to a different loot repo?",
-                &sha[..12],
-                hex::short(&id.0, 8)
-            ));
+        if ws.graph().tree(&id).is_some() {
+            marks.insert(sha.to_string(), id, MarkOrigin::Loot);
+            return Ok(());
         }
-        marks.insert(sha.to_string(), id, MarkOrigin::Loot);
-        return Ok(());
+        report.notes.push(format!(
+            "loot change {} named by commit {} is absent (gc'd after an unadopted land, #263) — \
+             adopting the commit's content as a fresh change; git main is unchanged",
+            hex::short(&id.0, 8),
+            &sha[..12]
+        ));
+        // fall through: adopt as git-native content
     }
 
     // Map git parents to loot parents (the pre-bridge baseline carries a mark
@@ -1594,6 +1606,65 @@ mod tests {
         // Round-trip: the ingested change is marked, never re-emitted.
         let after = ferry(&mut ws, &mirror);
         assert_eq!((after.ingested, after.projected), (0, 0));
+    }
+
+    /// Recursive directory copy (no std one-liner exists).
+    fn copy_dir(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dst.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn adopts_a_gc_pruned_change_as_content_when_its_object_is_gone() {
+        // #263: a landed change pruned from the store (gc after a land the primary
+        // never adopted) cannot be reconstructed byte-identically — a version-id
+        // hashes the tree's store-local, randomly-addressed oids. So ferry adopts
+        // the commit's *content* as a fresh change marked as represented by the
+        // commit: git `main` never moves (no force-push) and the dock gains the
+        // recovered content. Modeled by a store frozen at the parent state.
+        let (mut a, adir, mirror) = setup("adopt-a");
+        put_file(&adir, "a.txt", "base\n");
+        seal_change(&mut a, "base");
+        ferry(&mut a, &mirror);
+
+        // B = A frozen at base: it holds `base` (and its mark) but not the child.
+        let bdir = adir.parent().unwrap().join("repo-b");
+        let _ = std::fs::remove_dir_all(&bdir);
+        copy_dir(&adir.join(".loot"), &bdir.join(".loot"));
+        let mut b = Workspace::open_at(&bdir).unwrap();
+
+        // A lands a change (CRLF content and message — the byte-identical case that
+        // is impossible) and projects it.
+        put_file(&adir, "a.txt", "landed\r\ncontent\r\n");
+        seal_change(&mut a, "add feature (#999)\r\n");
+        ferry(&mut a, &mirror);
+        let git = git2::Repository::open(&mirror).unwrap();
+        let landed_sha = main_commit(&git).id();
+
+        // B ferries: the landed change is loot-origin but absent, so B adopts its
+        // content as a fresh git-native change rather than refusing.
+        let report = ferry(&mut b, &mirror);
+        assert_eq!(report.ingested, 1, "adopted the absent change as content");
+
+        // The content came through — B's dock materialized the recovered file.
+        assert_eq!(
+            std::fs::read_to_string(bdir.join("a.txt")).unwrap(),
+            "landed\r\ncontent\r\n"
+        );
+
+        // And git `main` never moved: the adopted change is marked, so it is not
+        // re-projected — no force-push, no divergence. A second pass is a no-op.
+        let second = ferry(&mut b, &mirror);
+        assert_eq!(main_commit(&git).id(), landed_sha, "git main is untouched");
+        assert_eq!((second.ingested, second.projected), (0, 0), "and stable");
     }
 
     #[test]
