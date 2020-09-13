@@ -156,13 +156,6 @@ impl Workspace {
         Ok(())
     }
 
-    /// This repo's own signing pubkey, if it has a keypair (S3, ADR 0018). Lets
-    /// `log` resolve a change *this* identity authored to its own name rather
-    /// than a bare hex prefix — the peer registry holds peers, not self.
-    pub fn identity_pubkey(&self) -> Option<[u8; 32]> {
-        self.signer.as_ref().map(|s| s.public_key_bytes())
-    }
-
     /// The `.loot/` directory for this repo (used by identity keypair commands).
     pub fn dot(&self) -> &std::path::Path {
         &self.dot
@@ -209,7 +202,7 @@ impl Workspace {
     /// abandoned versions dropped and the working node excluded (it renders
     /// once, as the live row), authors as pubkeys (name resolution is display),
     /// divergence marks, and — when heads sit on ≥2 *distinct change lines*
-    /// (ADR 0029) — the per-head branch view instead of the flat list.
+    /// (ADR 0029) — the per-head fork view instead of the flat list.
     pub fn history(&mut self) -> Result<HistoryView, String> {
         let working = self.live_working_row()?;
         let working_node = self.working.clone();
@@ -294,7 +287,7 @@ impl Workspace {
     /// absent locally, for `--verbose`.
     pub fn buoy_resolution(&self, role: &str) -> BuoyResolution {
         let reg = loot_identity::PeerRegistry::load(&self.dot);
-        let my_pubkey = self.identity_pubkey();
+        let my_pubkey = self.author_pubkey();
         let trusted = |pk: &[u8; 32]| -> bool {
             if my_pubkey.as_ref() == Some(pk) {
                 return true;
@@ -305,8 +298,7 @@ impl Workspace {
                     .unwrap_or(false)
             })
         };
-        let present: std::collections::BTreeSet<Oid> =
-            self.repo.log().into_iter().map(|(id, _)| id).collect();
+        let present: std::collections::BTreeSet<Oid> = self.version_ids().into_iter().collect();
         let parents_fn = |id: &Oid| self.repo.parents_of(id);
         let all = self.repo.all_attestations();
         let excluded = all
@@ -361,20 +353,24 @@ impl Workspace {
         self.repo.embargoed_paths()
     }
 
-    /// Sync negotiation reads (S5/S6): what we'd offer, what we lack, whether
-    /// the tip is unsigned, and the batched bundles for a want set.
+    /// Object addresses we'd offer a peer holding `have` (S5 negotiation).
     pub fn offered_objects(&self, have: &[Oid]) -> Vec<Oid> {
         self.repo.offered_objects(have)
     }
 
+    /// The subset of a relay's `offered` addresses this repo lacks (S5).
     pub fn missing_objects(&self, offered: &[Oid]) -> Vec<Oid> {
         self.repo.missing_objects(offered)
     }
 
+    /// True when an authored-but-unsigned change exists — such changes never
+    /// travel (ADR 0018), so a push would silently transfer nothing.
     pub fn has_unsigned_tip(&self) -> bool {
         self.repo.has_unsigned_tip()
     }
 
+    /// The batched bundles shipping `wants` to a peer holding `have` (S6,
+    /// resumable transfer — each batch stows independently, ADR 0024).
     pub fn bundle_wanted_batched(
         &self,
         have: &[Oid],
@@ -767,18 +763,78 @@ impl Workspace {
     /// Run a closure that mutates the repo, then persist. The single path for
     /// "mutation ⇒ save" — callers can't forget to persist (e.g. `apply`).
     ///
-    /// Scope: the **reconciliation family** (`apply`/`pull`/`resolve`/dock
-    /// merge/ferry), whose capture disciplines are their own and deliberately
-    /// not the implicit snapshot. A **snapshotting verb** (grant/maroon/
-    /// migrate, ADR 0030) must not call this directly — it mutates through the
-    /// [`Snapshotted`] handle, whose construction *is* the capture.
-    pub fn with_repo<T>(
+    /// **Private** (#177, retired as an interface): verbs mutate through the
+    /// named methods on this type or the [`Snapshotted`] handle (whose
+    /// construction *is* the ADR 0030 capture). This stays as the shared
+    /// implementation underneath both.
+    fn with_repo<T>(
         &mut self,
         f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
     ) -> Result<T, String> {
         let out = f(&mut self.repo)?;
         self.persist()?;
         Ok(out)
+    }
+
+    /// Raw mutate-then-persist — **compiled only for tests**: the mutation
+    /// twin of [`Workspace::repo`], for white-box state seeding. Production
+    /// code cannot call it (R1, #177).
+    #[cfg(test)]
+    pub fn with_repo_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_repo(f)
+    }
+
+    /// Promote any due embargoed keys into the Keyring and persist (ADR 0007)
+    /// — the bridge calls this before reading content, exactly as every
+    /// content-reading verb does.
+    pub fn flush_due_escrow(&mut self) -> Result<(), String> {
+        let now = self.now;
+        self.with_repo(|repo| {
+            repo.flush_escrow(now);
+            Ok(())
+        })
+    }
+
+    /// Record one bridge-ingested change (ADR 0028): apply `acts` over
+    /// `parent_tree` — sealing new content *at ingest* under the ingested
+    /// commit's own policy — then record it authored (as self) or unauthored
+    /// (preserving the git author, ADR 0018), and persist. The ingest loop's
+    /// one mutation, named (#177).
+    pub fn ingest_change(
+        &mut self,
+        parent_tree: BTreeMap<PathBuf, (Oid, Visibility)>,
+        acts: Vec<(PathBuf, IngestAct)>,
+        parents: Vec<Oid>,
+        message: &str,
+        authored: bool,
+    ) -> Result<Oid, String> {
+        let message = message.to_string();
+        self.with_repo(|repo| {
+            let mut tree = parent_tree;
+            for (path, act) in acts {
+                match act {
+                    IngestAct::Remove => {
+                        tree.remove(&path);
+                    }
+                    IngestAct::Reuse { entry } => {
+                        tree.insert(path, entry);
+                    }
+                    IngestAct::Put { bytes, vis } => {
+                        let oid = repo.put(&bytes, vis.clone()).map_err(|e| e.to_string())?;
+                        tree.insert(path, (oid, vis));
+                    }
+                }
+            }
+            let change = loot_core::Change { id: Oid([0; 32]), parents, message, tree };
+            if authored {
+                repo.record(change).map_err(|e| e.to_string())
+            } else {
+                repo.record_unauthored(change).map_err(|e| e.to_string())
+            }
+        })
     }
 
     /// The one door to the snapshotting (mutating) verbs (ADR 0030): capture
@@ -789,14 +845,10 @@ impl Workspace {
     /// cannot mutate, so the invariant is a type, not a hand-maintained call
     /// list (which had drifted across main.rs and ferry.rs — #182). Preserves
     /// a `describe`d name: an implicit capture must not clobber it.
-    pub fn snapshotted(
-        &mut self,
-        allow_demote: &[PathBuf],
-        skip: bool,
-    ) -> Result<Snapshotted<'_>, String> {
-        if !skip {
+    pub fn snapshotted(&mut self, opts: &SnapshotOpts) -> Result<Snapshotted<'_>, String> {
+        if !opts.skip {
             let msg = self.working_message().unwrap_or_else(|| "(working change)".to_string());
-            self.snapshot_allowing(&msg, allow_demote)?;
+            self.snapshot_allowing(&msg, &opts.allow_demote)?;
         }
         Ok(Snapshotted { ws: self })
     }
@@ -965,31 +1017,10 @@ impl Workspace {
         Ok(())
     }
 
-    /// Read the URL for a named remote (e.g. "origin") from `.loot/config`.
-    /// Returns `None` if the remote is not set.
-    pub fn remote_url(&self, name: &str) -> Option<String> {
-        Config::load(&self.store.config()).get(name)
-    }
-
-    /// Add or update a named remote in `.loot/config`.
-    pub fn remote_add(&self, name: &str, url: &str) -> Result<(), String> {
-        let path = self.store.config();
-        let mut cfg = Config::load(&path);
-        cfg.set(name, url);
-        cfg.save(&path)
-    }
-
-    /// Remove a named remote from `.loot/config`. No-ops if not present.
-    pub fn remote_remove(&self, name: &str) -> Result<(), String> {
-        let path = self.store.config();
-        let mut cfg = Config::load(&path);
-        cfg.remove(name);
-        cfg.save(&path)
-    }
-
-    /// List all named remotes from `.loot/config`.
-    pub fn remote_list(&self) -> Vec<(String, String)> {
-        Config::load(&self.store.config()).entries()
+    /// The named-remote registry (`.loot/config`, ADR 0013) as one small value —
+    /// the four Workspace forwarders it replaces were interface padding (#177).
+    pub fn remotes(&self) -> Remotes {
+        Remotes { path: self.store.config() }
     }
 
     /// Create a fresh repo inside `dir`, owned by `identity`. `dir` is created if
@@ -1427,26 +1458,26 @@ impl Workspace {
         capture: bool,
         label: &str,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
-        let wip = if capture { self.ferry_capture(pinned, target)? } else { None };
+        let wip = if capture { self.reconcile_capture(pinned, target)? } else { None };
         let Some(target) = target else {
             return Ok(BTreeMap::new());
         };
         match (wip, pinned) {
-            (Some(w), _) => self.ferry_merge(&w, target, label),
+            (Some(w), _) => self.reconcile_merge(&w, target, label),
             (None, None) => {
-                self.ferry_adopt(target)?;
+                self.reconcile_adopt(target)?;
                 Ok(BTreeMap::new())
             }
             (None, Some(o)) if o == target || self.graph().is_ancestor(target, o) => {
                 Ok(BTreeMap::new())
             }
             (None, Some(o)) if self.graph().is_ancestor(o, target) => {
-                self.ferry_adopt(target)?;
+                self.reconcile_adopt(target)?;
                 Ok(BTreeMap::new())
             }
             (None, Some(o)) => {
                 let ours = o.clone();
-                self.ferry_merge(&ours, target, label)
+                self.reconcile_merge(&ours, target, label)
             }
         }
     }
@@ -1466,7 +1497,7 @@ impl Workspace {
     /// again, so no redundant change is minted and no stray head is left for
     /// reconcile or a later pass's anchor derivation to trip over. Returns
     /// the captured change when real work was finalized.
-    fn ferry_capture(
+    fn reconcile_capture(
         &mut self,
         base: Option<&Oid>,
         target: Option<&Oid>,
@@ -1497,7 +1528,7 @@ impl Workspace {
     /// Fast-forward the ambient dock to `new_tip` (an ingested change that
     /// descends from the current anchor) and materialize its tree. The bridge's
     /// no-fork path: git advanced, loot didn't.
-    fn ferry_adopt(&mut self, new_tip: &Oid) -> Result<(), String> {
+    fn reconcile_adopt(&mut self, new_tip: &Oid) -> Result<(), String> {
         let from = self.anchor();
         self.repo
             .materialize(from.as_ref(), new_tip, &self.identity, self.now)
@@ -1512,12 +1543,12 @@ impl Workspace {
 
     /// Merge an ingested head into `ours` (the dock tip the bridge pinned
     /// before ingest) — `merge_dock`'s reconcile step with the source being
-    /// the bridge instead of a dock. Caller runs [`ferry_capture`] first.
+    /// the bridge instead of a dock. Caller runs [`reconcile_capture`] first.
     /// Conflicts flow through the shared `conflicts`/`resolve` path. Returns
     /// the per-path outcomes.
     ///
-    /// [`ferry_capture`]: Workspace::ferry_capture
-    fn ferry_merge(
+    /// [`reconcile_capture`]: Workspace::reconcile_capture
+    fn reconcile_merge(
         &mut self,
         ours: &Oid,
         their: &Oid,
@@ -1717,7 +1748,7 @@ pub struct HistoryRow {
 
 /// What `log` renders (R1). `graph: None` is the flat, newest-first listing in
 /// `rows`; `Some` means heads sit on ≥2 distinct change lines (a real fork,
-/// ADR 0029) and the branch view renders instead.
+/// ADR 0029) and the fork view renders instead.
 pub struct HistoryView {
     pub rows: Vec<HistoryRow>,
     pub divergent: std::collections::BTreeSet<[u8; 16]>,
@@ -1747,6 +1778,59 @@ pub struct BuoyResolution {
     /// the local store (not candidates — you cannot build from what you do not
     /// hold).
     pub excluded: Vec<Oid>,
+}
+
+/// `.loot/config`'s `name = url` remote registry (ADR 0013), detached from the
+/// Workspace surface as one small value (#177): resolve, add, remove, list.
+pub struct Remotes {
+    path: PathBuf,
+}
+
+impl Remotes {
+    /// The URL for a named remote (e.g. "origin"), or `None` if unset.
+    pub fn url(&self, name: &str) -> Option<String> {
+        Config::load(&self.path).get(name)
+    }
+
+    /// Add or update a named remote.
+    pub fn add(&self, name: &str, url: &str) -> Result<(), String> {
+        let mut cfg = Config::load(&self.path);
+        cfg.set(name, url);
+        cfg.save(&self.path)
+    }
+
+    /// Remove a named remote. No-ops if not present.
+    pub fn remove(&self, name: &str) -> Result<(), String> {
+        let mut cfg = Config::load(&self.path);
+        cfg.remove(name);
+        cfg.save(&self.path)
+    }
+
+    /// Every named remote, as `(name, url)` pairs.
+    pub fn list(&self) -> Vec<(String, String)> {
+        Config::load(&self.path).entries()
+    }
+}
+
+/// One path's action when the bridge ingests a git commit (ADR 0028): new or
+/// changed bytes seal fresh, an untouched path reuses its `(oid, visibility)`
+/// (#98), a deleted path leaves the tree.
+pub enum IngestAct {
+    Put { bytes: Vec<u8>, vis: Visibility },
+    Reuse { entry: (Oid, Visibility) },
+    Remove,
+}
+
+/// The two global controls every snapshotting verb honors under implicit
+/// auto-snapshot (ADR 0030): the demotion allowlist (#62) and the
+/// `--no-snapshot`/`--ignore-working-copy` escape. The CLI parses its flags
+/// into this; [`Workspace::snapshotted`] consumes it.
+#[derive(Default)]
+pub struct SnapshotOpts {
+    /// Paths permitted to re-seal more readably on this snapshot.
+    pub allow_demote: Vec<PathBuf>,
+    /// Skip the implicit capture, acting on the last recorded working change.
+    pub skip: bool,
 }
 
 /// Proof-of-capture handle for the snapshotting verbs (ADR 0030), constructed

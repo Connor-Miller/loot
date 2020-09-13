@@ -18,7 +18,7 @@ use loot_core::bridge::{
     self, FerryState, MarkMap, MarkOrigin, TRAILER_AUTHOR, TRAILER_CHANGE_ID, TRAILER_GIT_AUTHOR,
     TRAILER_PROVISIONAL, TRAILER_SIGNATURE,
 };
-use loot_core::{hex, MergeOutcome, Oid, Repo, RepoError, Visibility};
+use loot_core::{hex, MergeOutcome, Oid, RepoError, Visibility};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -120,11 +120,7 @@ pub fn run(
 
     // Promote any due embargoed keys before reading content, as every
     // content-reading verb does (ADR 0007) — a due path projects readable.
-    let now = ws.now();
-    ws.with_repo(|repo| {
-        repo.flush_escrow(now);
-        Ok(())
-    })?;
+    ws.flush_due_escrow()?;
 
     // Bootstrap: pre-bridge git history (no trailers, no state) is adopted as
     // the baseline, not ingested — the dogfood repo's dual-run past stays
@@ -281,7 +277,7 @@ pub fn run(
         // unchanged tree a no-op, and the demotion guard applies exactly as on
         // any snapshot (#135). The handle drops immediately; the projection
         // below reads the captured working change.
-        let _ = ws.snapshotted(&[], false)?;
+        let _ = ws.snapshotted(&crate::workspace::SnapshotOpts::default())?;
         match ws.working_id().cloned() {
             None => {
                 report.review =
@@ -505,11 +501,7 @@ fn ingest_commit(
     let attrs_text = blob_text(git, &commit_tree, ".lootattributes");
     let ignore_text = blob_text(git, &commit_tree, ".lootignore");
 
-    enum Act {
-        Put { bytes: Vec<u8>, vis: Visibility },
-        Reuse { entry: (Oid, Visibility) },
-        Remove,
-    }
+    use crate::workspace::IngestAct as Act;
     let mut acts: Vec<(PathBuf, Act)> = Vec::new();
     for delta in diff.deltas() {
         let (old_path, new_path) = (delta.old_file().path(), delta.new_file().path());
@@ -600,34 +592,7 @@ fn ingest_commit(
         )
     };
 
-    let change_id = ws.with_repo(|repo| {
-        let mut tree = parent_tree.clone();
-        for (path, act) in acts {
-            match act {
-                Act::Remove => {
-                    tree.remove(&path);
-                }
-                Act::Reuse { entry } => {
-                    tree.insert(path, entry);
-                }
-                Act::Put { bytes, vis } => {
-                    let oid = repo.put(&bytes, vis.clone()).map_err(|e| e.to_string())?;
-                    tree.insert(path, (oid, vis));
-                }
-            }
-        }
-        let change = loot_core::Change {
-            id: Oid([0; 32]),
-            parents: parents_loot.clone(),
-            message: loot_message.clone(),
-            tree,
-        };
-        if is_self {
-            repo.record(change).map_err(|e| e.to_string())
-        } else {
-            repo.record_unauthored(change).map_err(|e| e.to_string())
-        }
-    })?;
+    let change_id = ws.ingest_change(parent_tree, acts, parents_loot, &loot_message, is_self)?;
     if is_self {
         ws.sign_change(&change_id)?;
     }
@@ -1143,6 +1108,7 @@ fn write_kv(path: &Path, entries: &BTreeMap<String, String>) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loot_core::Repo;
 
     /// A fresh keyed loot repo + a mirror path, isolated per test.
     fn setup(tag: &str) -> (Workspace, PathBuf, PathBuf) {

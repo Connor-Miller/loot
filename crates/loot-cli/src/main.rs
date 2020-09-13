@@ -14,10 +14,10 @@ use loot_core::{
 };
 use loot_identity as identity;
 use render::{
-    change_col, outcome_rows, render_buoy_human, render_history, short, short_change, short_oid,
+    change_col, outcome_rows, render_buoy_human, render_history, seal_hint, short, short_change,
 };
 use std::process::ExitCode;
-use workspace::{GlobalConfig, StepReport, Workspace};
+use workspace::{GlobalConfig, SnapshotOpts, StepReport, Workspace};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -201,24 +201,13 @@ fn first_positional(args: &[String]) -> Option<&str> {
     args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
 }
 
-/// The two global controls every snapshotting (mutating) verb honors under
-/// implicit auto-snapshot (ADR 0030): the demotion allowlist and the
-/// skip-the-snapshot escape hatch.
-struct SnapshotOpts {
-    /// `--allow-demote <path>` (repeatable): paths permitted to re-seal more
-    /// readably on this snapshot (#62). The demotion guard aborts on any other.
-    allow_demote: Vec<std::path::PathBuf>,
-    /// `--no-snapshot` / `--ignore-working-copy`: skip the implicit capture for
-    /// this one invocation, acting on the last recorded working change as-is.
-    skip: bool,
-}
-
-impl SnapshotOpts {
-    fn parse(args: &[String]) -> Self {
-        Self {
-            allow_demote: flag_values(args, "--allow-demote").into_iter().map(Into::into).collect(),
-            skip: has_flag(args, "--no-snapshot") || has_flag(args, "--ignore-working-copy"),
-        }
+/// Parse the two snapshotting-verb globals (ADR 0030) — `--allow-demote <path>`
+/// (repeatable, #62) and `--no-snapshot`/`--ignore-working-copy` — into the
+/// [`SnapshotOpts`] the Workspace's proof-of-capture door consumes.
+fn parse_snapshot_opts(args: &[String]) -> SnapshotOpts {
+    SnapshotOpts {
+        allow_demote: flag_values(args, "--allow-demote").into_iter().map(Into::into).collect(),
+        skip: has_flag(args, "--no-snapshot") || has_flag(args, "--ignore-working-copy"),
     }
 }
 
@@ -373,7 +362,7 @@ fn cmd_describe(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_new(args: &[String]) -> Result<(), String> {
-    let opts = SnapshotOpts::parse(args);
+    let opts = parse_snapshot_opts(args);
     let mut ws = Workspace::open()?;
     // Convenience `new -m <msg>`: name the working change before finalizing, so
     // finalize-and-name is one step (ADR 0030). It is a mutating snapshot, so it
@@ -597,7 +586,7 @@ fn cmd_log() -> Result<(), String> {
     // Resolve author pubkeys to display names (peer registry + self); the
     // rendering itself lives in render.rs and is tested there (R5, #181).
     let reg = identity::PeerRegistry::load(ws.dot());
-    let own = ws.identity_pubkey();
+    let own = ws.author_pubkey();
     let name_of = |author: Option<&[u8; 32]>| match author {
         Some(pk) if own.as_ref() == Some(pk) => identity.clone(),
         Some(pk) => resolve_pubkey_name(&reg, pk),
@@ -605,16 +594,6 @@ fn cmd_log() -> Result<(), String> {
     };
     print!("{}", render_history(&view, &identity, &name_of));
     Ok(())
-}
-
-/// Annotate a change with its sealed/embargoed file counts, or "" if all public.
-fn seal_hint(total: usize, restricted: usize, embargoed: usize) -> String {
-    match (restricted, embargoed) {
-        (0, 0) => String::new(),
-        (r, 0) => format!("  [{r}/{total} sealed]"),
-        (0, e) => format!("  [{e}/{total} embargoed]"),
-        (r, e) => format!("  [{r} sealed, {e} embargoed / {total}]"),
-    }
 }
 
 fn cmd_bundle(args: &[String]) -> Result<(), String> {
@@ -711,11 +690,11 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
     let grantee = pos[1];
     let out = pos[2];
 
-    let opts = SnapshotOpts::parse(args);
+    let opts = parse_snapshot_opts(args);
     let mut ws = Workspace::open()?;
     // Capture the working tree first (ADR 0030) so the grant seals what is on
     // disk now, not a stale last-`status` snapshot — the handle is the proof.
-    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let mut snap = ws.snapshotted(&opts)?;
     let now = snap.ws().now();
 
     let oid = snap
@@ -754,11 +733,11 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     let path = positional[0];
     let grantee = positional[1];
 
-    let opts = SnapshotOpts::parse(args);
+    let opts = parse_snapshot_opts(args);
     let mut ws = Workspace::open()?;
     // Capture the working tree first (ADR 0030) so the sealed grant covers the
     // path's current on-disk content — the handle is the proof.
-    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let mut snap = ws.snapshotted(&opts)?;
     let dot = snap.ws().dot().to_owned();
 
     // Resolve the relay URL via the shared helper (consistent with push/pull).
@@ -832,7 +811,7 @@ fn cmd_clone(args: &[String]) -> Result<(), String> {
 
     // Register origin so subsequent push/pull work out-of-the-box.
     let mut ws = Workspace::open_at(dir)?;
-    ws.remote_add("origin", url)?;
+    ws.remotes().add("origin", url)?;
 
     // Pull from the relay and surface what this identity can see.
     let have = ws.heads();
@@ -897,11 +876,11 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
         .map(|s| std::path::Path::new(*s))
         .unwrap_or(std::path::Path::new("."));
 
-    let opts = SnapshotOpts::parse(args);
+    let opts = parse_snapshot_opts(args);
     let mut ws = Workspace::open()?;
     // Re-seal against the working tree as it is now (ADR 0030) — the handle is
     // the proof of capture.
-    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let mut snap = ws.snapshotted(&opts)?;
     let now = snap.ws().now();
     let result: MaroonResult = snap.mutate(|repo| {
         if hard {
@@ -983,11 +962,11 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
         .map(|s| std::path::Path::new(*s))
         .unwrap_or(std::path::Path::new("."));
 
-    let opts = SnapshotOpts::parse(args);
+    let opts = parse_snapshot_opts(args);
     let mut ws = Workspace::open()?;
     // Re-classify against the current on-disk tree (ADR 0030) — the handle is
     // the proof of capture.
-    let mut snap = ws.snapshotted(&opts.allow_demote, opts.skip)?;
+    let mut snap = ws.snapshotted(&opts)?;
     let now = snap.ws().now();
     let result: MigrateResult = snap.mutate(|repo| {
         repo.migrate(path, new_vis.clone(), now).map_err(|e| e.to_string())
@@ -1108,7 +1087,7 @@ fn cmd_manifest() -> Result<(), String> {
         } else {
             "(file)".to_string()
         };
-        println!("{:<12} {:<16} {:<16} {}", e.granted_at, e.grantee, grantor, short_oid(&e.oid));
+        println!("{:<12} {:<16} {:<16} {}", e.granted_at, e.grantee, grantor, short(&e.oid));
     }
 
     // Attestations (S4, ADR 0018): advisory sign-offs over changes, by pubkey.
@@ -1119,7 +1098,7 @@ fn cmd_manifest() -> Result<(), String> {
         for a in attestations {
             println!(
                 "  {}  {} ({})",
-                short_oid(&a.change_id),
+                short(&a.change_id),
                 resolve_pubkey_name(&reg, &a.attester),
                 a.role
             );
@@ -1514,20 +1493,20 @@ fn cmd_remote(args: &[String]) -> Result<(), String> {
             let name = &args[1];
             let url = &args[2];
             let ws = Workspace::open()?;
-            ws.remote_add(name, url)?;
+            ws.remotes().add(name, url)?;
             println!("remote '{name}' → {url}");
             Ok(())
         }
         "remove" | "rm" => {
             let name = args.get(1).ok_or("remote remove requires <name>")?;
             let ws = Workspace::open()?;
-            ws.remote_remove(name)?;
+            ws.remotes().remove(name)?;
             println!("removed remote '{name}'");
             Ok(())
         }
         "list" | "ls" => {
             let ws = Workspace::open()?;
-            let remotes = ws.remote_list();
+            let remotes = ws.remotes().list();
             if remotes.is_empty() {
                 println!("no remotes configured  (use `loot remote add origin <url>`)");
             } else {
@@ -1590,7 +1569,7 @@ fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
         return Ok(url.to_string());
     }
     let name = flag(args, "--remote").unwrap_or("origin");
-    ws.remote_url(name)
+    ws.remotes().url(name)
         .ok_or_else(|| format!("no remote '{name}' configured — use `loot remote add {name} <url>` or pass a URL directly"))
 }
 
@@ -1695,9 +1674,9 @@ fn plan_embargo_deposits(
 }
 
 /// Deposit a timed SealedGrant at the relay mailbox for every planned
-/// (embargoed oid × peer) pair. Each deposit seals + delivers inside one
-/// `with_repo` closure so a failed delivery never persists its manifest
-/// record — the next push retries it instead of skipping it forever.
+/// (embargoed oid × peer) pair. Each deposit seals + delivers atomically
+/// (`Workspace::deposit_sealed_grant`) so a failed delivery never persists its
+/// manifest record — the next push retries it instead of skipping it forever.
 fn deposit_embargo_grants(
     ws: &mut Workspace,
     url: &str,
@@ -1727,7 +1706,7 @@ fn deposit_embargo_grants(
     }
 
     let my_pubkey = id.public_key_bytes();
-    let plan = plan_embargo_deposits(&ws.embargoed_paths(), ws.manifest(), &peers, my_pubkey);
+    let plan = plan_embargo_deposits(&embargoed, ws.manifest(), &peers, my_pubkey);
     if plan.is_empty() {
         return Ok(());
     }
@@ -2095,7 +2074,7 @@ mod tests {
         let due_vis = Visibility::Embargoed { reveal_at: wall.saturating_sub(60) };
         let future_vis = Visibility::Embargoed { reveal_at: wall + 3600 };
         let due_oid = ws
-            .with_repo(|repo| {
+            .with_repo_mut(|repo| {
                 let a = repo.put(b"due\n", due_vis.clone()).map_err(|e| e.to_string())?;
                 let b = repo.put(b"future\n", future_vis.clone()).map_err(|e| e.to_string())?;
                 let mut tree = std::collections::BTreeMap::new();
@@ -2147,12 +2126,12 @@ mod tests {
     /// `--allow-demote` is repeatable; either skip flag sets `skip`.
     #[test]
     fn snapshot_opts_parse_globals() {
-        let o = SnapshotOpts::parse(&args(&["--allow-demote", "a.txt", "--allow-demote", "b.txt"]));
+        let o = parse_snapshot_opts(&args(&["--allow-demote", "a.txt", "--allow-demote", "b.txt"]));
         assert_eq!(o.allow_demote, vec![std::path::PathBuf::from("a.txt"), std::path::PathBuf::from("b.txt")]);
         assert!(!o.skip);
-        assert!(SnapshotOpts::parse(&args(&["--no-snapshot"])).skip);
-        assert!(SnapshotOpts::parse(&args(&["--ignore-working-copy"])).skip);
-        assert!(!SnapshotOpts::parse(&args(&["x"])).skip);
+        assert!(parse_snapshot_opts(&args(&["--no-snapshot"])).skip);
+        assert!(parse_snapshot_opts(&args(&["--ignore-working-copy"])).skip);
+        assert!(!parse_snapshot_opts(&args(&["x"])).skip);
     }
 
     /// The verb's own positionals survive with the `--allow-demote <path>` pair
@@ -2213,7 +2192,7 @@ mod tests {
         assert_eq!(ws.working_message().as_deref(), Some("the intro"));
 
         std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
-        let _ = ws.snapshotted(&[], false).unwrap();
+        let _ = ws.snapshotted(&SnapshotOpts::default()).unwrap();
         assert_eq!(ws.working_message().as_deref(), Some("the intro"), "name survives implicit capture");
     }
 
@@ -2231,10 +2210,10 @@ mod tests {
         let before = ws.working_id().cloned();
 
         std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
-        let _ = ws.snapshotted(&[], true).unwrap();
+        let _ = ws.snapshotted(&SnapshotOpts { allow_demote: vec![], skip: true }).unwrap();
         assert_eq!(ws.working_id(), before.as_ref(), "skip leaves the working change untouched");
 
-        let _ = ws.snapshotted(&[], false).unwrap();
+        let _ = ws.snapshotted(&SnapshotOpts::default()).unwrap();
         assert_ne!(ws.working_id(), before.as_ref(), "a real capture moves the working change");
     }
 }

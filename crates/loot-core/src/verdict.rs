@@ -265,6 +265,12 @@ impl BuoyVerdict {
     /// JSON (ADR 0025, frozen): `{"contract":<n>,"role":...,"status":"resolved",
     /// "buoy":"<hex>","attesters":[...]}` / `"status":"ambiguous","candidates":
     /// [{"change":"<hex>","attesters":[...]},...]` / `"status":"none"`.
+    ///
+    /// Escaping note (ratified with R4, #180): roles now escape through the
+    /// shared [`json_string`], which handles control characters the pre-R4
+    /// inline encoder passed through raw — those bytes were **invalid JSON**,
+    /// so no conforming parser depended on them; every role that previously
+    /// produced valid JSON serializes byte-identically.
     pub fn json(&self) -> String {
         let mut s = String::new();
         s.push_str("{\"contract\":");
