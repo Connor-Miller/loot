@@ -2640,7 +2640,7 @@ mod tests {
         // bob applied alice's bundle: he holds the embargoed ciphertext and the
         // tree, but no key (v5 bundles have no embargoed-key lane, ADR 0027) —
         // so he has nothing to deposit for anyone.
-        let (mut alice, _) = embargoed_repo("plan-nonkey", 9_999);
+        let (alice, _) = embargoed_repo("plan-nonkey", 9_999);
         let bundle = alice.bundle(&[]).unwrap();
         let mut bob = DagRepo::init(tmp("plan-nonkey-bob").join("work"), "bob").unwrap();
         bob.apply(&bundle, 0).unwrap();
