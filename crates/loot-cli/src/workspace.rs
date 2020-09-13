@@ -547,7 +547,9 @@ impl Workspace {
         let peer = peer.to_string();
         self.with_repo(|repo| {
             let bundle = repo
-                .grant_sealed(&oid, &peer, peer_pubkey, grantor_pubkey, reveal_at, now, seal)
+                // Push-time embargo deposits (ADR 0027) don't set an explicit
+                // grant expiry — only the embargo's own reveal_at applies.
+                .grant_sealed(&oid, &peer, peer_pubkey, grantor_pubkey, reveal_at, None, now, seal)
                 .map_err(|e| e.to_string())?;
             deliver(bundle.0)
         })

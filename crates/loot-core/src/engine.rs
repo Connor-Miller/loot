@@ -1645,6 +1645,11 @@ impl DagRepo {
         let mut skipped = 0usize;
 
         for (path, (oid, vis)) in &node.tree {
+            // Grant expiry gate (#20) — see the trait `surface`'s twin check.
+            if self.grant_expired_for(oid, reader, now) {
+                skipped += 1;
+                continue;
+            }
             let bytes = match self.get(oid, reader, now) {
                 Ok(b) => b,
                 Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => {
@@ -1677,7 +1682,11 @@ impl DagRepo {
         };
         node.tree
             .iter()
-            .filter(|(_, (oid, _))| self.get(oid, reader, now).is_ok())
+            .filter(|(_, (oid, _))| {
+                // Grant expiry gate (#20) — must match `surface`'s twin check,
+                // or a dock switch could leave an expired-grant path materialized.
+                !self.grant_expired_for(oid, reader, now) && self.get(oid, reader, now).is_ok()
+            })
             .map(|(path, _)| path.clone())
             .collect()
     }
@@ -1835,6 +1844,13 @@ impl Repo for DagRepo {
             .ok_or_else(|| RepoError::NotFound(change.clone()))?;
 
         for (path, (oid, _vis)) in &node.tree {
+            // Grant expiry gate (#20), checked before the key/visibility gate:
+            // skip a path whose grant to this reader has expired, even though
+            // the key may still sit in the keyring (defense-in-depth, parallel
+            // to embargo).
+            if self.grant_expired_for(oid, reader, now) {
+                continue;
+            }
             // Materialize only the visible slice: skip content this reader
             // cannot see rather than erroring on it.
             let bytes = match self.get(oid, reader, now) {
@@ -4297,7 +4313,7 @@ mod tests {
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from(".env"), (oid.clone(), Visibility::Restricted(vec!["alice".into()])));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree }).unwrap();
-        let grant = alice.grant(&oid, "bob", 0).unwrap();
+        let grant = alice.grant(&oid, "bob", 0, None).unwrap();
 
         let mut relay = DagRepo::init(tmp(), "relay").unwrap();
         assert!(matches!(relay.stow(&grant), Err(RepoError::Backend(_))), "relay must reject grant bundles");
@@ -4314,7 +4330,7 @@ mod tests {
         tree.insert(PathBuf::from("src.rs"), (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into()])));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree }).unwrap();
         // Grant bob so the manifest knows him, then hard-maroon him.
-        alice.grant(&oid, "bob", 0).unwrap();
+        alice.grant(&oid, "bob", 0, None).unwrap();
         alice.maroon_hard(Path::new("src.rs"), "bob", 1).unwrap();
 
         let mut relay = DagRepo::init(tmp(), "relay").unwrap();

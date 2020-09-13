@@ -708,6 +708,7 @@ mod tests {
             grantee_pubkey: [0xee; 32],
             grantor_pubkey,
             granted_at,
+            expires_at: None,
         }
     }
 

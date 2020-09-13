@@ -69,6 +69,13 @@ pub enum RepoError {
     Unauthorized(Oid),
     #[error("content still embargoed until {0}")]
     Embargoed(u64),
+    /// A grant whose `expires_at` has already passed as of the applying
+    /// clock (#20). Parallel to `Embargoed`, but the other direction in time
+    /// and a harder stop: an embargoed key merely isn't visible *yet* (it
+    /// still stages), whereas an expired grant is rejected outright —
+    /// `apply_sealed_grant` installs nothing for it.
+    #[error("grant expired at {0}")]
+    Expired(u64),
     #[error("unsupported format version v{found} — upgrade loot (this build reads up to v{supported})")]
     UnsupportedFormat { found: u8, supported: u8 },
     #[error("change {0:?} has a missing or invalid author signature")]

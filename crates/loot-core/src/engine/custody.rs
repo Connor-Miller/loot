@@ -80,9 +80,21 @@ impl DagRepo {
     /// and records the event in the local manifest (ADR 0008). The caller must
     /// hold the key for `oid`; if not, returns `Unauthorized`.
     ///
+    /// `expires_at` (`None` = never expires, #20) rides only in the local
+    /// manifest record here — a tag-1 grant is a file delivered out of band, so
+    /// there is no wire header to carry it; `surface` on this repo's own future
+    /// reads is what enforces it (parallel to `grant_sealed`'s wire-carried
+    /// `expires_at`, enforced by the recipient's `apply_sealed_grant` too).
+    ///
     /// The bundle carries only the objects and key for this single grant — it is
     /// a targeted hand-off, not a full sync. Apply it on the grantee side.
-    pub fn grant(&mut self, oid: &Oid, grantee: &str, now: u64) -> Result<SyncBundle, RepoError> {
+    pub fn grant(
+        &mut self,
+        oid: &Oid,
+        grantee: &str,
+        now: u64,
+        expires_at: Option<u64>,
+    ) -> Result<SyncBundle, RepoError> {
         // Must hold the key ourselves before we can grant it.
         let key = self
             .custody
@@ -111,6 +123,7 @@ impl DagRepo {
             UNKNOWN_PUBKEY,
             UNKNOWN_PUBKEY,
             now,
+            expires_at,
         );
 
         Ok(SyncBundle(
@@ -135,8 +148,13 @@ impl DagRepo {
     /// grant the relay withholds until its own clock passes it (hard embargo,
     /// ADR 0027). For embargoed content the originator's key sits in the local
     /// Escrow (pre-reveal staging, ADR 0007), so the lookup falls back there.
+    /// `expires_at` — `None` for a grant that never expires (the default, and
+    /// the only behavior before #20); `Some(t)` makes the recipient's
+    /// `apply_sealed_grant` reject the grant outright once `now >= t`. Rides in
+    /// the frame header (v8), inside the grantor-signed envelope, so it cannot
+    /// be widened or dropped by a tampered copy.
     ///
-    /// Wire format: `[3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][reveal_at(8)][payload]`
+    /// Wire format: `[3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][reveal_at(8)][expires_at][payload]`
     pub fn grant_sealed(
         &mut self,
         oid: &Oid,
@@ -144,6 +162,7 @@ impl DagRepo {
         grantee_pubkey: [u8; 32],
         grantor_pubkey: [u8; 32],
         reveal_at: u64,
+        expires_at: Option<u64>,
         now: u64,
         seal: impl FnOnce(&[u8; 32]) -> Result<[u8; 80], RepoError>,
     ) -> Result<SyncBundle, RepoError> {
@@ -179,6 +198,7 @@ impl DagRepo {
             grantee_pubkey,
             grantor_pubkey,
             now,
+            expires_at,
         );
         Ok(SyncBundle(
             Frame::SealedGrant {
@@ -186,6 +206,7 @@ impl DagRepo {
                 wrapped_key: wrapped,
                 oid: oid.clone(),
                 reveal_at,
+                expires_at,
                 body,
             }
             .encode(),
@@ -200,6 +221,10 @@ impl DagRepo {
     ///
     /// Authorization is purely cryptographic: if `unseal` succeeds, the grant
     /// was addressed to us. There is no name-compare gate (ADR 0015).
+    ///
+    /// A grant past its `expires_at` (#20) is rejected outright — `Err`, with
+    /// nothing stored or filed — checked before `unseal` so an expired grant is
+    /// refused whether or not it was even addressed to us.
     pub fn apply_sealed_grant(
         &mut self,
         bundle: &SyncBundle,
@@ -213,6 +238,7 @@ impl DagRepo {
             wrapped_key,
             oid,
             reveal_at,
+            expires_at,
             body,
         } = Frame::decode(&bundle.0)?
         else {
@@ -220,6 +246,12 @@ impl DagRepo {
                 "not a sealed-key grant bundle (tag 3)".into(),
             ));
         };
+
+        if let Some(t) = expires_at {
+            if now >= t {
+                return Err(RepoError::Expired(t));
+            }
+        }
 
         // Cryptographic gate: unseal fails if this grant wasn't addressed to us.
         let key = unseal(&wrapped_key)?;
@@ -253,6 +285,7 @@ impl DagRepo {
             grantee_pubkey,
             grantor_pubkey,
             now,
+            expires_at,
         );
         Ok(())
     }
@@ -339,18 +372,21 @@ impl DagRepo {
         let change_id = self.record(change)?;
 
         // Produce grant bundles for remaining identities.
-        let remaining_grantees: Vec<String> = self
+        // Carry each remaining grantee's own expires_at (if any) forward onto
+        // the re-seal (#20) — a maroon must not accidentally un-expire a grant
+        // that was already due to lapse.
+        let remaining_grantees: Vec<(String, Option<u64>)> = self
             .custody
             .manifest
             .grants_for(&old_oid)
             .into_iter()
             .filter(|e| e.grantee != marooned && e.grantee != self.identity)
-            .map(|e| e.grantee.clone())
+            .map(|e| (e.grantee.clone(), e.expires_at))
             .collect();
 
         let mut grants = Vec::new();
-        for grantee in remaining_grantees {
-            if let Ok(bundle) = self.grant(&new_oid, &grantee, now) {
+        for (grantee, expires_at) in remaining_grantees {
+            if let Ok(bundle) = self.grant(&new_oid, &grantee, now, expires_at) {
                 grants.push((grantee, bundle));
             }
         }
@@ -409,7 +445,9 @@ impl DagRepo {
 
         let mut grants = Vec::new();
         for grantee in grants_needed {
-            if let Ok(bundle) = self.grant(&new_oid, &grantee, now) {
+            // A migration to Restricted mints a fresh oid with no prior grant
+            // to inherit an expiry from — an ordinary, non-expiring grant.
+            if let Ok(bundle) = self.grant(&new_oid, &grantee, now, None) {
                 grants.push((grantee, bundle));
             }
         }
@@ -420,6 +458,20 @@ impl DagRepo {
     /// The grant audit trail.
     pub fn manifest(&self) -> &Manifest {
         &self.custody.manifest
+    }
+
+    /// True if `reader`'s own recorded grant for `oid` has expired as of `now`
+    /// (#20). A miss — no grant recorded at all for this `(oid, reader)` pair,
+    /// e.g. an owner's own content or a tag-1 recipient who never separately
+    /// recorded one — is not an expiry (`false`). The one check shared by
+    /// `surface`/`surface_with_report` (skip the path) and `visible_paths_at`
+    /// (ADR 0022's "matches what surface put there" invariant), so the three
+    /// can't drift apart on what counts as expired.
+    pub(super) fn grant_expired_for(&self, oid: &Oid, reader: &str, now: u64) -> bool {
+        self.custody
+            .manifest
+            .grant_for(oid, reader)
+            .is_some_and(|g| g.is_expired(now))
     }
 
     /// Every embargoed path in the current tree whose content key this repo
@@ -461,6 +513,14 @@ pub(super) fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
         out.extend_from_slice(&e.grantee_pubkey);
         out.extend_from_slice(&e.grantor_pubkey);
         out.extend_from_slice(&e.granted_at.to_le_bytes());
+        // v8 (#20): optional grant expiry, presence byte + value.
+        match e.expires_at {
+            Some(t) => {
+                out.push(1);
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+            None => out.push(0),
+        }
     }
     out
 }
@@ -468,7 +528,7 @@ pub(super) fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
 pub(super) fn decode_manifest(b: &[u8]) -> Result<Manifest, RepoError> {
     use crate::format::Cursor;
     let mut c = Cursor { b, i: 0 };
-    crate::format::read_version(&mut c)?;
+    let (major, _minor) = crate::format::read_version(&mut c)?;
     let mut m = Manifest::new();
     let n = c.u32()?;
     for _ in 0..n {
@@ -477,7 +537,13 @@ pub(super) fn decode_manifest(b: &[u8]) -> Result<Manifest, RepoError> {
         let grantee_pubkey = c.arr32()?;
         let grantor_pubkey = c.arr32()?;
         let granted_at = c.u64()?;
-        m.record(oid, grantee, grantee_pubkey, grantor_pubkey, granted_at);
+        // v8 (#20): pre-v8 manifests predate expiry — never expire.
+        let expires_at = if major >= 8 {
+            if c.take(1)?[0] != 0 { Some(c.u64()?) } else { None }
+        } else {
+            None
+        };
+        m.record(oid, grantee, grantee_pubkey, grantor_pubkey, granted_at, expires_at);
     }
     Ok(m)
 }
@@ -707,7 +773,7 @@ mod tests {
                 .unwrap();
             repo.custody
                 .manifest
-                .record(oid.clone(), "bob".to_string(), [0u8; 32], [0u8; 32], 42);
+                .record(oid.clone(), "bob".to_string(), [0u8; 32], [0u8; 32], 42, None);
             repo.save(&dir).unwrap();
         }
 
@@ -753,7 +819,7 @@ mod tests {
             .put(b"secret data", Visibility::Restricted(vec!["alice".into()]))
             .unwrap();
 
-        let bundle = alice.grant(&oid, "bob", 100).unwrap();
+        let bundle = alice.grant(&oid, "bob", 100, None).unwrap();
 
         // Manifest should record the grant.
         let grants = alice.custody.manifest.grants_for(&oid);
@@ -780,7 +846,7 @@ mod tests {
         let alice = DagRepo::init(tmp(), "alice").unwrap();
         let unknown_oid = Oid([99; 32]);
         let mut repo = alice;
-        let result = repo.grant(&unknown_oid, "bob", 0);
+        let result = repo.grant(&unknown_oid, "bob", 0, None);
         assert!(
             matches!(result, Err(RepoError::Unauthorized(_))),
             "must fail without key"
@@ -797,12 +863,197 @@ mod tests {
             .put(b"data2", Visibility::Restricted(vec!["alice".into()]))
             .unwrap();
 
-        alice.grant(&oid1, "bob", 10).unwrap();
-        alice.grant(&oid2, "carol", 20).unwrap();
+        alice.grant(&oid1, "bob", 10, None).unwrap();
+        alice.grant(&oid2, "carol", 20, None).unwrap();
 
         assert_eq!(alice.custody.manifest.grants_for(&oid1).len(), 1);
         assert_eq!(alice.custody.manifest.grants_for(&oid2).len(), 1);
         assert_eq!(alice.custody.manifest.iter().count(), 2);
+    }
+
+    // --- grant expiry (#20) ---
+    //
+    // A trivial fixed-position seal/unseal pair stands in for real ECIES here
+    // (identity crypto is deliberately outside the engine, ADR 0014) — only
+    // the wire path and the expiry gate are under test.
+    fn fake_seal(key: &[u8; 32]) -> Result<[u8; 80], RepoError> {
+        let mut w = [0u8; 80];
+        w[..32].copy_from_slice(key);
+        Ok(w)
+    }
+    fn fake_unseal(wrapped: &[u8; 80]) -> Result<[u8; 32], RepoError> {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&wrapped[..32]);
+        Ok(k)
+    }
+
+    #[test]
+    fn apply_sealed_grant_rejects_a_grant_past_its_expires_at() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice
+            .put(b"secret data", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        let bundle = alice
+            .grant_sealed(&oid, "bob", [0xbb; 32], [0xaa; 32], 0, Some(100), 50, fake_seal)
+            .unwrap();
+
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        let obj = alice.objects.get(&oid).unwrap().clone();
+        bob.objects.put(oid.clone(), obj);
+
+        let result = bob.apply_sealed_grant(&bundle, [0xaa; 32], 100, fake_unseal);
+        match &result {
+            Err(RepoError::Expired(t)) => assert_eq!(*t, 100),
+            other => panic!("expected Err(Expired(100)), got {other:?}"),
+        }
+        assert!(
+            !bob.custody.keyring.holds(&oid),
+            "an expired grant must install nothing"
+        );
+        assert!(
+            bob.custody.manifest.grant_for(&oid, "bob").is_none(),
+            "an expired grant must not even be recorded"
+        );
+    }
+
+    #[test]
+    fn apply_sealed_grant_accepts_a_grant_before_its_expires_at() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice
+            .put(b"secret data", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        let bundle = alice
+            .grant_sealed(&oid, "bob", [0xbb; 32], [0xaa; 32], 0, Some(100), 50, fake_seal)
+            .unwrap();
+
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        let obj = alice.objects.get(&oid).unwrap().clone();
+        bob.objects.put(oid.clone(), obj);
+
+        bob.apply_sealed_grant(&bundle, [0xaa; 32], 99, fake_unseal)
+            .unwrap();
+        assert!(
+            bob.custody.keyring.holds(&oid),
+            "a not-yet-expired grant must file the key"
+        );
+        assert_eq!(bob.get(&oid, "bob", 99).unwrap(), b"secret data");
+        assert_eq!(
+            bob.custody.manifest.grant_for(&oid, "bob").unwrap().expires_at,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn apply_sealed_grant_with_no_expires_at_behaves_as_before() {
+        // The field is optional (#20): a grant that never sets expires_at must
+        // behave exactly as it did before this feature existed.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice
+            .put(b"secret data", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        let bundle = alice
+            .grant_sealed(&oid, "bob", [0xbb; 32], [0xaa; 32], 0, None, 50, fake_seal)
+            .unwrap();
+
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        let obj = alice.objects.get(&oid).unwrap().clone();
+        bob.objects.put(oid.clone(), obj);
+
+        bob.apply_sealed_grant(&bundle, [0xaa; 32], u64::MAX, fake_unseal)
+            .unwrap();
+        assert!(bob.custody.keyring.holds(&oid), "an unexpiring grant is never rejected");
+    }
+
+    fn surface_tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("loot-surface-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn surface_skips_a_path_whose_grant_has_expired() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice
+            .put(b"secret", Visibility::Restricted(vec!["alice".into(), "bob".into()]))
+            .unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(
+            PathBuf::from("s.txt"),
+            (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into()])),
+        );
+        let change_id = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree })
+            .unwrap();
+
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(surface_tmp("expired"), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+        // Bob holds the key directly and his own manifest records an already-
+        // expired grant for it — the state `apply_sealed_grant` would have left
+        // him in before `now` passed `expires_at`.
+        let key = alice.custody.keyring.key_for(&oid).unwrap();
+        bob.custody.keyring.insert(oid.clone(), key);
+        bob.custody
+            .manifest
+            .record(oid.clone(), "bob".to_string(), [0u8; 32], [0u8; 32], 0, Some(100));
+
+        let (written, skipped) = bob.surface_with_report(&change_id, "bob", 100).unwrap();
+        assert!(written.is_empty(), "the expired path must not be materialized: {written:?}");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn surface_keeps_a_path_whose_grant_has_not_yet_expired() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice
+            .put(b"secret", Visibility::Restricted(vec!["alice".into(), "bob".into()]))
+            .unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(
+            PathBuf::from("s.txt"),
+            (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into()])),
+        );
+        let change_id = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree })
+            .unwrap();
+
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(surface_tmp("not-yet-expired"), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+        let key = alice.custody.keyring.key_for(&oid).unwrap();
+        bob.custody.keyring.insert(oid.clone(), key);
+        bob.custody
+            .manifest
+            .record(oid.clone(), "bob".to_string(), [0u8; 32], [0u8; 32], 0, Some(100));
+
+        let (written, skipped) = bob.surface_with_report(&change_id, "bob", 99).unwrap();
+        assert_eq!(written.len(), 1, "not yet expired: the path must surface");
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn surface_ignores_expiry_check_when_no_grant_is_recorded() {
+        // An owner reading their own content: no manifest entry for
+        // (oid, "alice") was ever recorded (an owner doesn't grant to
+        // themselves), so the miss must not read as an expiry no matter how
+        // far `now` runs.
+        let mut alice = DagRepo::init(surface_tmp("owner"), "alice").unwrap();
+        let oid = alice
+            .put(b"mine", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(
+            PathBuf::from("m.txt"),
+            (oid.clone(), Visibility::Restricted(vec!["alice".into()])),
+        );
+        let change_id = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree })
+            .unwrap();
+
+        let (written, skipped) = alice.surface_with_report(&change_id, "alice", u64::MAX).unwrap();
+        assert_eq!(written.len(), 1, "an owner's own content is unaffected by the expiry gate");
+        assert_eq!(skipped, 0);
     }
 
     // --- forward maroon (ADR 0009/0010) ---
@@ -853,14 +1104,19 @@ mod tests {
             )
             .unwrap();
         // Record grant of old oid to bob and carol so maroon can find them.
+        // Carol's grant carries an expiry (#20) — the re-grant must preserve it.
         alice
             .custody
             .manifest
-            .record(oid.clone(), "bob".to_string(), [0u8; 32], [0u8; 32], 1);
-        alice
-            .custody
-            .manifest
-            .record(oid.clone(), "carol".to_string(), [0u8; 32], [0u8; 32], 1);
+            .record(oid.clone(), "bob".to_string(), [0u8; 32], [0u8; 32], 1, None);
+        alice.custody.manifest.record(
+            oid.clone(),
+            "carol".to_string(),
+            [0u8; 32],
+            [0u8; 32],
+            1,
+            Some(9_999),
+        );
         let mut tree = BTreeMap::new();
         tree.insert(
             PathBuf::from("s.txt"),
@@ -888,6 +1144,13 @@ mod tests {
         assert!(
             !result.grants.iter().any(|(g, _)| g == "bob"),
             "bob must not receive a re-grant bundle"
+        );
+        // The re-grant to carol must carry her original expiry forward (#20) —
+        // a maroon must not accidentally un-expire a lapsing grant.
+        assert_eq!(
+            alice.custody.manifest.grant_for(&result.new_oid, "carol").and_then(|e| e.expires_at),
+            Some(9_999),
+            "carol's re-grant must preserve her original expires_at"
         );
     }
 
@@ -1254,7 +1517,7 @@ mod tests {
 
     fn sample_manifest() -> Manifest {
         let mut m = Manifest::new();
-        m.record(Oid([1; 32]), "bob".to_string(), [2u8; 32], [3u8; 32], 42);
+        m.record(Oid([1; 32]), "bob".to_string(), [2u8; 32], [3u8; 32], 42, None);
         m
     }
 
@@ -1291,22 +1554,59 @@ mod tests {
     }
 
     #[test]
-    fn golden_v4_manifest_matches_and_round_trips() {
-        // v5 changed only the bundle body (ADR 0027); durable layouts are
-        // byte-identical to v4 apart from the marker.
-        let mut golden_v5 = GOLDEN_MANIFEST_V4.to_vec();
-        golden_v5[0] = crate::format::FORMAT_MAJOR;
+    fn v4_manifest_still_decodes() {
+        // v5/v6/v7 durable manifest layouts stayed byte-identical to v4 apart
+        // from the marker; v8 (#20) is the first layout change since v1 (an
+        // appended optional expires_at) — a v8 reader still reads v4 bytes,
+        // filling expires_at = None (never expires, the pre-#20 behavior).
+        let back = decode_manifest(&GOLDEN_MANIFEST_V4).unwrap();
+        let entries = back.grants_for(&Oid([1; 32]));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expires_at, None);
+    }
+
+    #[test]
+    fn golden_v8_manifest_matches_and_round_trips_without_expiry() {
+        // v8 (#20) appends an expires_at presence byte (+ 8-byte value when
+        // present) per entry — the first manifest layout change since v1. An
+        // entry without expires_at costs exactly one extra zero byte over the
+        // v4 layout.
+        let mut expected = GOLDEN_MANIFEST_V4.to_vec();
+        expected[0] = crate::format::FORMAT_MAJOR;
+        expected.push(0); // expires_at presence = absent
         assert_eq!(
             encode_manifest(&sample_manifest()),
-            golden_v5,
-            "v5 manifest layout must not drift"
+            expected,
+            "v8 manifest layout (no expiry) must not drift"
         );
+        let back = decode_manifest(&expected).unwrap();
+        assert_eq!(back.grants_for(&Oid([1; 32]))[0].expires_at, None);
+    }
+
+    #[test]
+    fn golden_v8_manifest_matches_and_round_trips_with_expiry() {
+        let mut m = Manifest::new();
+        m.record(
+            Oid([1; 32]),
+            "bob".to_string(),
+            [2u8; 32],
+            [3u8; 32],
+            42,
+            Some(0x0102_0304_0506_0708),
+        );
+        let mut expected = GOLDEN_MANIFEST_V4.to_vec();
+        expected[0] = crate::format::FORMAT_MAJOR;
+        expected.push(1); // expires_at presence = present
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(
-            decode_manifest(&GOLDEN_MANIFEST_V4)
-                .unwrap()
-                .grants_for(&Oid([1; 32]))
-                .len(),
-            1
+            encode_manifest(&m),
+            expected,
+            "v8 manifest layout (with expiry) must not drift"
+        );
+        let back = decode_manifest(&expected).unwrap();
+        assert_eq!(
+            back.grants_for(&Oid([1; 32]))[0].expires_at,
+            Some(0x0102_0304_0506_0708)
         );
     }
 

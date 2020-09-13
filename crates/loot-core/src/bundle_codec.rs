@@ -308,13 +308,17 @@ pub enum Frame {
     /// recipient's pubkey and carried in `wrapped_key`, not `body`. `reveal_at`
     /// (v5, ADR 0027) makes it a *timed* grant: the relay withholds it from the
     /// mailbox until its own clock passes `reveal_at`; `0` means untimed
-    /// (deliver immediately). It rides inside the grantor-signed envelope, so a
-    /// recipient cannot alter it without breaking the signature.
+    /// (deliver immediately). `expires_at` (v8, #20) is the parallel in the
+    /// other direction: `None` never expires; `Some(t)` makes
+    /// `apply_sealed_grant` reject the grant outright once `now >= t`. Both
+    /// ride inside the grantor-signed envelope, so a recipient cannot alter
+    /// either without breaking the signature.
     SealedGrant {
         grantee_pubkey: [u8; 32],
         wrapped_key: [u8; 80],
         oid: Oid,
         reveal_at: u64,
+        expires_at: Option<u64>,
         body: BundleBody,
     },
 }
@@ -355,12 +359,20 @@ impl Frame {
                 put_bytes(&mut out, grantee.as_bytes());
                 out.extend_from_slice(&encode_body(body));
             }
-            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, body } => {
+            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, expires_at, body } => {
                 out.push(3);
                 out.extend_from_slice(grantee_pubkey);
                 out.extend_from_slice(wrapped_key);
                 out.extend_from_slice(&oid.0);
                 out.extend_from_slice(&reveal_at.to_le_bytes()); // v5 (ADR 0027)
+                // v8 (#20): optional grant expiry, presence byte + value.
+                match expires_at {
+                    Some(t) => {
+                        out.push(1);
+                        out.extend_from_slice(&t.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
                 out.extend_from_slice(&encode_body(body));
             }
         }
@@ -408,8 +420,14 @@ impl Frame {
                 // v5 (ADR 0027): timed grants carry reveal_at in the header.
                 // Pre-v5 sealed grants predate it — untimed (0).
                 let reveal_at = if major >= 5 { c.u64()? } else { 0 };
+                // v8 (#20): pre-v8 sealed grants predate expiry — never expire.
+                let expires_at = if major >= 8 {
+                    if c.take(1)?[0] != 0 { Some(c.u64()?) } else { None }
+                } else {
+                    None
+                };
                 let body = decode_body(&c.b[c.i..], major)?;
-                Ok(Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, body })
+                Ok(Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, expires_at, body })
             }
             t => Err(RepoError::Backend(format!("unknown bundle tag {t}"))),
         }
@@ -524,11 +542,16 @@ mod tests {
     }
 
     #[test]
-    fn golden_v7_sync_bundle_matches_and_round_trips() {
+    fn golden_v8_sync_bundle_matches_and_round_trips() {
+        // v8 (#20) only touched the SealedGrant frame header; an empty Sync
+        // bundle is byte-identical to v7 apart from the marker.
+        let mut expected = GOLDEN_SYNC_V7.to_vec();
+        expected[0] = format::FORMAT_MAJOR;
         let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
-        assert_eq!(bytes, GOLDEN_SYNC_V7, "v7 wire layout must not drift");
+        assert_eq!(bytes, expected, "v8 wire layout must not drift");
+        assert!(matches!(Frame::decode(&expected).unwrap(), Frame::Sync { .. }));
+        // A v8 build still reads the committed v7/v6/v5 empty bundles (newer reads older).
         assert!(matches!(Frame::decode(&GOLDEN_SYNC_V7).unwrap(), Frame::Sync { .. }));
-        // A v7 build still reads the committed v6/v5 empty bundles (newer reads older).
         assert!(matches!(Frame::decode(&GOLDEN_SYNC_V6).unwrap(), Frame::Sync { .. }));
         assert!(matches!(Frame::decode(&GOLDEN_SYNC_V5).unwrap(), Frame::Sync { .. }));
     }
@@ -762,16 +785,38 @@ mod tests {
             wrapped_key: [2; 80],
             oid: Oid([3; 32]),
             reveal_at: 12345,
+            expires_at: None,
             body: empty_body(),
         };
         let bytes = f.encode();
         assert_eq!(bytes[2], 3, "sealed-grant tag follows the 2-byte version marker");
         match Frame::decode(&bytes).unwrap() {
-            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, .. } => {
+            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, expires_at, .. } => {
                 assert_eq!(grantee_pubkey, [1; 32]);
                 assert_eq!(wrapped_key, [2; 80]);
                 assert_eq!(oid, Oid([3; 32]));
                 assert_eq!(reveal_at, 12345, "reveal_at must survive the frame (ADR 0027)");
+                assert_eq!(expires_at, None, "an unset expiry stays unset");
+            }
+            _ => panic!("expected SealedGrant"),
+        }
+    }
+
+    #[test]
+    fn sealed_grant_frame_round_trips_expiry() {
+        // #20: a set expires_at must survive the frame too, parallel to reveal_at.
+        let f = Frame::SealedGrant {
+            grantee_pubkey: [1; 32],
+            wrapped_key: [2; 80],
+            oid: Oid([3; 32]),
+            reveal_at: 0,
+            expires_at: Some(99_999),
+            body: empty_body(),
+        };
+        let bytes = f.encode();
+        match Frame::decode(&bytes).unwrap() {
+            Frame::SealedGrant { expires_at, .. } => {
+                assert_eq!(expires_at, Some(99_999));
             }
             _ => panic!("expected SealedGrant"),
         }
@@ -793,9 +838,34 @@ mod tests {
         put_u32(&mut bytes, 0); // changes
         put_u32(&mut bytes, 0); // attestations (v4)
         match Frame::decode(&bytes).unwrap() {
-            Frame::SealedGrant { reveal_at, oid, .. } => {
+            Frame::SealedGrant { reveal_at, oid, expires_at, .. } => {
                 assert_eq!(reveal_at, 0, "pre-v5 grants are untimed");
                 assert_eq!(oid, Oid([3; 32]));
+                assert_eq!(expires_at, None, "pre-v8 grants never expire");
+            }
+            _ => panic!("expected SealedGrant"),
+        }
+    }
+
+    #[test]
+    fn pre_v8_sealed_grant_decodes_as_unexpiring() {
+        // A v7 sealed grant has reveal_at but no expires_at in its header; a v8
+        // reader treats it as never-expiring and keeps the body aligned (#20).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[7, 0, 3]); // v7 marker + SealedGrant tag
+        bytes.extend_from_slice(&[1; 32]); // grantee pubkey
+        bytes.extend_from_slice(&[2; 80]); // wrapped key
+        bytes.extend_from_slice(&[3; 32]); // oid
+        bytes.extend_from_slice(&777u64.to_le_bytes()); // reveal_at (v5+)
+        put_u32(&mut bytes, 0); // objs
+        put_u32(&mut bytes, 0); // keys
+        put_u32(&mut bytes, 0); // changes
+        put_u32(&mut bytes, 0); // attestations
+        match Frame::decode(&bytes).unwrap() {
+            Frame::SealedGrant { reveal_at, oid, expires_at, .. } => {
+                assert_eq!(reveal_at, 777, "reveal_at still reads from a v7 header");
+                assert_eq!(oid, Oid([3; 32]));
+                assert_eq!(expires_at, None, "a pre-v8 grant never expires");
             }
             _ => panic!("expected SealedGrant"),
         }

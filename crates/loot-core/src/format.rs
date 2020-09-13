@@ -99,13 +99,20 @@ impl<'a> Cursor<'a> {
 ///   signature widens to cover it. Additive: a v≤6 change decodes as
 ///   predecessors-empty, and an empty list adds nothing to either hash or
 ///   signature, so every existing id and signature is unchanged.
+/// - v8 (#20) added an optional `expires_at` to a grant record — the durable
+///   `GrantEntry` (manifest codec) and the SealedGrant frame header (tag 3) —
+///   parallel to embargo's `reveal_at` but gating whether the grant is honored
+///   at all rather than when its key becomes visible. Additive: a v≤7 manifest
+///   entry or SealedGrant decodes with `expires_at = None` (never expires, the
+///   pre-#20 behavior), and an unset `expires_at` adds nothing beyond one
+///   presence byte, so existing grants are unaffected.
 ///
 /// Each was a change an older reader cannot parse, so each bumped the major. A
-/// v7 reader still reads v1–v6 artifacts (missing fields default to absent;
+/// v8 reader still reads v1–v7 artifacts (missing fields default to absent;
 /// a v4 escrow section is parsed for cursor correctness but its plaintext keys
 /// are DROPPED, never filed); an older reader cleanly rejects a newer major
 /// rather than mis-parsing.
-pub const FORMAT_MAJOR: u8 = 7;
+pub const FORMAT_MAJOR: u8 = 8;
 /// The compatible revision this build writes.
 pub const FORMAT_MINOR: u8 = 0;
 /// Bytes the version marker occupies at the front of an artifact.

@@ -299,7 +299,7 @@ fn sealed_grant_relay_round_trip() {
     // Alice produces a sealed grant bundle (tag 3): grantee_pubkey + wrapped_key
     // + oid + reveal_at(0 = untimed) + payload.
     let sealed_bundle = alice_repo.grant_sealed(
-        &oid, "bob", bob_ed_pubkey, alice_pubkey, 0, now,
+        &oid, "bob", bob_ed_pubkey, alice_pubkey, 0, None, now,
         |content_key| {
             key_seal::seal_key(content_key, &bob_x25519)
                 .map_err(|e| RepoError::Backend(e.to_string()))
@@ -377,12 +377,12 @@ fn relay_withholds_timed_grant_until_reveal() {
     // A grant embargoed until far in the future, and one already due.
     let far_future = wall_now + 3600;
     let withheld = alice_repo
-        .grant_sealed(&oid, "bob", bob_ed_pubkey, alice_pubkey, far_future, 0, |k| {
+        .grant_sealed(&oid, "bob", bob_ed_pubkey, alice_pubkey, far_future, None, 0, |k| {
             key_seal::seal_key(k, &bob_x25519).map_err(|e| RepoError::Backend(e.to_string()))
         })
         .unwrap();
     let due = alice_repo
-        .grant_sealed(&oid, "bob", bob_ed_pubkey, alice_pubkey, wall_now.saturating_sub(60), 0, |k| {
+        .grant_sealed(&oid, "bob", bob_ed_pubkey, alice_pubkey, wall_now.saturating_sub(60), None, 0, |k| {
             key_seal::seal_key(k, &bob_x25519).map_err(|e| RepoError::Backend(e.to_string()))
         })
         .unwrap();
@@ -430,7 +430,7 @@ fn tampered_reveal_at_breaks_the_envelope_signature() {
     let bob_x25519 = bob_id.x25519_pubkey_bytes();
 
     let timed = alice_repo
-        .grant_sealed(&oid, "bob", bob_id.public_key_bytes(), alice_pubkey, 999_999, 0, |k| {
+        .grant_sealed(&oid, "bob", bob_id.public_key_bytes(), alice_pubkey, 999_999, None, 0, |k| {
             key_seal::seal_key(k, &bob_x25519).map_err(|e| RepoError::Backend(e.to_string()))
         })
         .unwrap();

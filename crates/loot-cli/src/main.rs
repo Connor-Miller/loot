@@ -123,7 +123,7 @@ const COMMANDS: &[Verb] = &[
     verb("verify", &[], &["--accept-loss"], cmd_verify),
     verb("bundle", &[], &[], cmd_bundle),
     verb("apply", &[], OUT, cmd_apply),
-    verb("grant", &["--relay", "--allow-demote"], SKIP, cmd_grant),
+    verb("grant", &["--relay", "--allow-demote", "--expires"], SKIP, cmd_grant),
     verb("grant-status", &[], &[], cmd_grant_status),
     verb("embargo-status", &[], &[], cmd_embargo_status),
     verb("maroon", DEMOTE, &["--hard", "--no-snapshot", "--ignore-working-copy"], cmd_maroon),
@@ -181,8 +181,8 @@ usage:
   loot verify [--accept-loss]               integrity-check the object store: rehash every object, find missing ones with their referencing changes (exits 1 on problems); --accept-loss records current losses as acknowledged
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
-  loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
-  loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
+  loot grant <path> <identity> <file> [--expires <ts>]  write a targeted grant bundle for <identity> (file delivery); --expires makes future `surface`/`apply_sealed_grant` reject the grant once now >= ts (#20)
+  loot grant --relay <name> <path> <identity> [--expires <ts>]  seal and deliver a grant via relay mailbox
   loot grant-status <path>                  list current grantees for <path> — grantor, delivery method, granted_at (sanity check before `loot maroon`, #5)
   loot embargo-status <path>                show whether <path> is embargoed (sealed until a unix timestamp, shown with its human-readable date/time too), revealed (embargo passed), or not embargoed at all (#15); checks history too, not just the working tree — useful when troubleshooting why a file isn't visible after a pull
   loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
@@ -270,6 +270,19 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
 /// True if `name` appears as a bare flag anywhere in `args`.
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// `grant --expires <timestamp>` (#20): the unix timestamp after which the
+/// issued grant is no longer honored, or `None` if the flag is absent (the
+/// default — a grant that never expires, unchanged from before #20).
+fn parse_expires_flag(args: &[String]) -> Result<Option<u64>, String> {
+    match flag(args, "--expires") {
+        Some(v) => v
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("--expires expects a unix timestamp, got '{v}'")),
+        None => Ok(None),
+    }
 }
 
 /// Which output format the verb should emit. `--json` wins over `--porcelain`;
@@ -1094,7 +1107,15 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--relay") {
         return cmd_grant_relay(args);
     }
-    let pos = positionals(args);
+    let expires_at = parse_expires_flag(args)?;
+    // `positionals()` only special-cases `--allow-demote <path>`; any other
+    // valued flag's value reads as a bare positional, so filter it out here
+    // too (the same pattern `cmd_grant_relay` uses for `--relay`'s value).
+    let expires_str = flag(args, "--expires");
+    let pos: Vec<&str> = positionals(args)
+        .into_iter()
+        .filter(|a| Some(*a) != expires_str)
+        .collect();
     if pos.len() < 3 {
         return Err("grant requires <path> <identity> <file>\n  or: grant --relay <remote> <path> <identity>".into());
     }
@@ -1115,7 +1136,7 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
     let bundle = snap.mutate(|repo| {
-        repo.grant(&oid, grantee, now).map_err(|e| e.to_string())
+        repo.grant(&oid, grantee, now, expires_at).map_err(|e| e.to_string())
     })?;
     std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
     println!(
@@ -1124,20 +1145,25 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
         bundle.0.len()
     );
     println!("  {path} → {grantee} (recorded in manifest)");
+    if let Some(t) = expires_at {
+        println!("  expires at {t} — surface skips this path for {grantee} after that (#20)");
+    }
     // A grant hands a content key to a peer — one-way (ADR 0031). Barrier.
     snap.record_op("grant", &format!("grant {path} → {grantee}"), true);
     Ok(())
 }
 
 fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
-    // Usage: grant --relay <remote-name-or-url> <path> <identity>
+    // Usage: grant --relay <remote-name-or-url> <path> <identity> [--expires <ts>]
     let relay_target = flag(args, "--relay")
         .ok_or("grant --relay requires a relay name or URL after --relay")?;
-    // Drop flags (and `--allow-demote`'s value) and the `--relay` target, leaving
-    // the verb's own positionals.
+    let expires_at = parse_expires_flag(args)?;
+    let expires_str = flag(args, "--expires");
+    // Drop flags (and `--allow-demote`'s value), the `--relay` target, and
+    // `--expires`'s value, leaving the verb's own positionals.
     let positional: Vec<&str> = positionals(args)
         .into_iter()
-        .filter(|a| *a != relay_target)
+        .filter(|a| *a != relay_target && Some(*a) != expires_str)
         .collect();
     if positional.len() < 2 {
         return Err("grant --relay <remote> <path> <identity>".into());
@@ -1184,7 +1210,7 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     };
 
     let bundle = snap.mutate(|repo| {
-        repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, reveal_at, now, |content_key| {
+        repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, reveal_at, expires_at, now, |content_key| {
             identity::seal_key(content_key, &recipient_x25519)
                 .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
         }).map_err(|e| e.to_string())
@@ -1199,6 +1225,9 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     println!("  {path} → {grantee} (sealed, signed, recorded in manifest)");
     if reveal_at > 0 {
         println!("  timed: the relay withholds the key until {reveal_at} (hard embargo, ADR 0027)");
+    }
+    if let Some(t) = expires_at {
+        println!("  expires at {t} — `apply_sealed_grant` rejects it for the recipient after that (#20)");
     }
     println!("  recipient runs `loot pull-grants` to receive it");
     // Sealed grant delivered to the relay — a one-way disclosure (ADR 0031).
@@ -3116,7 +3145,7 @@ mod tests {
     fn plan_skips_already_granted_peers_and_the_originator() {
         let (mut repo, oid) = embargoed_repo("plan-dedupe", 9_999);
         // bob already got his timed grant on an earlier push (manifest records it).
-        repo.grant_sealed(&oid, "bob", [0xbb; 32], [0xaa; 32], 9_999, 0, |_| Ok([0u8; 80]))
+        repo.grant_sealed(&oid, "bob", [0xbb; 32], [0xaa; 32], 9_999, None, 0, |_| Ok([0u8; 80]))
             .unwrap();
         // alice's own key is registered as a peer too (e.g. a second machine).
         let peers = vec![peer("alice", 0xaa), peer("bob", 0xbb), peer("carol", 0xcc)];
@@ -3168,7 +3197,7 @@ mod tests {
 
         let mut raw_key = [0u8; 32];
         let grant = alice
-            .grant_sealed(&oid, "bob", bob.public_key_bytes(), [0xaa; 32], 9_999_999, 0, |k| {
+            .grant_sealed(&oid, "bob", bob.public_key_bytes(), [0xaa; 32], 9_999_999, None, 0, |k: &[u8; 32]| {
                 raw_key = *k;
                 identity::seal_key(k, &bob_x25519)
                     .map_err(|e| loot_core::RepoError::Backend(e.to_string()))

@@ -502,9 +502,11 @@ events + the change/object/key body — the plaintext escrow section is gone as
 of v5, ADR 0027), *Grant* (tag 1, a targeted key
 handoff whose key rides in the body), and *SealedGrant* (tag 3, the content key
 ECIES-wrapped to a recipient pubkey, carried beside the body with a `reveal_at`
-— `0` untimed; nonzero makes it a relay-withheld timed grant). All wire framing
+— `0` untimed; nonzero makes it a relay-withheld timed grant — and, since v8
+(#20), an optional `expires_at`: `None` never expires; past it,
+`apply_sealed_grant` rejects the grant outright). All wire framing
 — the tag byte, the Sync purge prefix, the Grant grantee prefix, the SealedGrant
-`[pubkey·wrapped·oid·reveal_at]` header, and every length/offset — lives behind
+`[pubkey·wrapped·oid·reveal_at·expires_at]` header, and every length/offset — lives behind
 `bundle_codec::Frame::{decode, encode}`; the engine does no byte arithmetic. Both
 `apply` (keyholder merge) and `stow` (relay ingest) decode to a `Frame` and match;
 `stow` accepts only *Sync*. A `SealedGrant`'s wrapped key is surfaced verbatim and
@@ -586,7 +588,9 @@ none).
 
 **Grant** — a key handoff event: the act of making an existing content key available to a new identity. Grants travel as targeted bundles (the grantor controls delivery by choosing who receives the bundle); the key itself rides sealed to the recipient's pubkey (ECIES, ADR 0014). A grant is **signed by the grantor** (the push envelope, ADR 0014) so the recipient and every downstream peer can verify who issued it — an unauthenticated grant would let any party forge audit history. The grantee is identified by **pubkey**, not local name: the key is sealed to that pubkey and `apply` accepts the grant iff the recipient's own key unseals it (the cryptographic unseal *is* the authorization gate; there is no name compare). Names are local nicknames resolved to pubkeys via the [[Peer registry]] before a grant is ever issued. The primitive underlying marooning and visibility migration. CLI: `loot grant <path> <identity>`.
 
-**Manifest** — an append-only record of grant events (`oid`, `grantee_pubkey`, `grantor_pubkey`, `granted_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who granted what to whom. Both parties are recorded as **pubkeys** (the only globally-stable identity; names are local), resolved to friendly names only at display time. Carries only the *fact* of a grant, never the key itself. The grantor pubkey is bound by the grant's signature, so the trail is forge-evident. Named for a ship's manifest recording what cargo was loaded and by whom.
+**Grant expiry** *(#20)* — an optional `expires_at` (unix seconds) on a [[Grant]], parallel to `Embargoed`'s `reveal_at` but the mirror image and a harder stop: past `expires_at`, `apply_sealed_grant` **rejects the sealed grant outright** (nothing installed — not merely staged, as an unrevealed embargo key is), and `surface` skips a path whose recorded grant to the reader has expired even though the key may still sit locally (defense-in-depth). A grant with no `expires_at` behaves exactly as before this existed. Rides in the `SealedGrant` frame header (tag 3, v8) alongside `reveal_at`, inside the grantor-signed envelope. `loot grant [--relay <name>] <path> <identity> --expires <ts>` sets it when issuing; a re-grant (e.g. maroon's re-grant of remaining identities) preserves the original grantee's `expires_at` rather than silently un-expiring it.
+
+**Manifest** — an append-only record of grant events (`oid`, `grantee_pubkey`, `grantor_pubkey`, `granted_at`, `expires_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who granted what to whom. Both parties are recorded as **pubkeys** (the only globally-stable identity; names are local), resolved to friendly names only at display time. Carries only the *fact* of a grant, never the key itself. The grantor pubkey is bound by the grant's signature, so the trail is forge-evident. Named for a ship's manifest recording what cargo was loaded and by whom.
 
 **Maroon** — to cut off an identity's access to a path. Two levels:
 
