@@ -89,8 +89,11 @@ pub trait Forge {
 // ---------------------------------------------------------------------------
 
 /// Shells out to `gh` / `git`, exactly as `tools/loot-first.ps1` did. `root` is
-/// the checkout (for `remote get-url origin`); `mirror` is the bare private
-/// mirror the pushes originate from (`.loot/git-mirror/mirror.git`).
+/// the **shared store's checkout** (for `remote get-url origin` *and* the cwd
+/// every `gh` runs in) — so a land driven from a lane directory, which is not
+/// itself a git repo, still resolves `origin` and the GitHub repo through the
+/// primary's git context (ADR 0036). `mirror` is the bare private mirror the
+/// pushes originate from (`.loot/git-mirror/mirror.git`).
 pub struct GhForge {
     root: PathBuf,
     mirror: PathBuf,
@@ -137,7 +140,7 @@ impl Forge for GhForge {
     fn viewer_login(&self) -> Result<String, String> {
         run(
             "gh api user",
-            std::process::Command::new("gh").args(["api", "user", "-q", ".login"]),
+            std::process::Command::new("gh").current_dir(&self.root).args(["api", "user", "-q", ".login"]),
         )
     }
 
@@ -156,7 +159,7 @@ impl Forge for GhForge {
     fn create_pr(&self, head: &str, base: &str, title: &str, body: &str) -> Result<u64, String> {
         let out = run(
             "gh pr create",
-            std::process::Command::new("gh").args([
+            std::process::Command::new("gh").current_dir(&self.root).args([
                 "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body,
             ]),
         )?;
@@ -168,7 +171,7 @@ impl Forge for GhForge {
         // One call, tab-separated, to keep the round-trips down.
         let out = run(
             "gh pr view",
-            std::process::Command::new("gh").args([
+            std::process::Command::new("gh").current_dir(&self.root).args([
                 "pr",
                 "view",
                 &pr.to_string(),
@@ -194,7 +197,7 @@ impl Forge for GhForge {
     fn pr_state(&self, pr: u64) -> Result<PrState, String> {
         let out = run(
             "gh pr view",
-            std::process::Command::new("gh").args([
+            std::process::Command::new("gh").current_dir(&self.root).args([
                 "pr",
                 "view",
                 &pr.to_string(),
@@ -210,7 +213,7 @@ impl Forge for GhForge {
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), String> {
         run(
             "gh pr close",
-            std::process::Command::new("gh").args([
+            std::process::Command::new("gh").current_dir(&self.root).args([
                 "pr",
                 "close",
                 &pr.to_string(),
@@ -224,7 +227,7 @@ impl Forge for GhForge {
     fn comment_pr(&self, pr: u64, body: &str) -> Result<(), String> {
         run(
             "gh pr comment",
-            std::process::Command::new("gh").args([
+            std::process::Command::new("gh").current_dir(&self.root).args([
                 "pr",
                 "comment",
                 &pr.to_string(),
