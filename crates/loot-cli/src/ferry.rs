@@ -16,7 +16,7 @@
 use crate::workspace::Workspace;
 use loot_core::bridge::{
     self, FerryState, MarkMap, MarkOrigin, TRAILER_AUTHOR, TRAILER_CHANGE_ID, TRAILER_GIT_AUTHOR,
-    TRAILER_PROVISIONAL, TRAILER_SIGNATURE,
+    TRAILER_PREDECESSORS, TRAILER_PROVISIONAL, TRAILER_SIGNATURE,
 };
 use loot_core::{hex, MergeOutcome, Oid, RepoError, Visibility};
 use std::collections::BTreeMap;
@@ -269,17 +269,25 @@ pub fn run(
     let mut wip = WipState::parse(&read_or_empty(&wip_path));
     let dock_sel_wip = |name: &str| if name == "main" { None } else { Some(name.to_string()) };
     wip.entries.retain(|e| {
-        let landed = ws.graph().ids_topo().iter().any(|c| {
-            ws.graph().signature(c).is_some()
-                && wip_key(ws, c) == e.change
-                && ws.graph().author(c).is_some()
-        });
+        // A lane is live iff its dock's *current* working change still carries
+        // this change id and is unfinalized (ADR 0033). The old change-id-wide
+        // "a signed version exists" test reaped a reopened lane every pass:
+        // after `loot edit`, the superseded signed X still exists under the
+        // change id forever (ADR 0018), so it stayed true even though the dock
+        // had reopened the change (as a live working change X′) to re-review.
         let current = ws
             .store()
             .read_working(dock_sel_wip(&e.dock).as_deref())
             .map(|w| wip_key(ws, &w));
-        let live = !landed && current.as_deref() == Some(e.change.as_str());
+        let live = current.as_deref() == Some(e.change.as_str());
         if !live {
+            // Reap reason, for the note only: a signed version under this
+            // change id means it landed; otherwise it was abandoned/superseded.
+            let landed = ws.graph().ids_topo().iter().any(|c| {
+                ws.graph().signature(c).is_some()
+                    && ws.graph().author(c).is_some()
+                    && wip_key(ws, c) == e.change
+            });
             let ref_name = format!("refs/heads/review/{}", e.dock);
             if let Ok(mut r) = git.find_reference(&ref_name) {
                 let _ = r.delete();
@@ -644,9 +652,37 @@ fn project_change(
 ) -> Result<(String, Vec<String>), String> {
     let g = ws.graph();
 
+    // Predecessor-conditional git threading (ADR 0033). A superseding version
+    // X′ (predecessors = [X]) is a *sibling* of X in loot's DAG (both children
+    // of P), but git wants a linear fix-up. Thread X′ onto X's commit when X is
+    // *landed* — it has a mark and is an ancestor of the current git main — so
+    // main stays a fast-forward and the amend reads as its own commit on top.
+    // Otherwise (X unmarked / not on main: the local finalize→amend churn)
+    // thread onto the loot sibling parent P, leaving X on refs/loot/heads/<X>.
+    // The delta base tracks the git parent so the projected tree is exact: the
+    // change's delta is computed against whichever line it threads onto. The
+    // ordering wrinkle (X′ names X in predecessors, not parents, so ids_topo
+    // need not place X first) resolves itself — "ancestor of the *current* main"
+    // can only hold if X landed in a prior pass and so already has a mark.
+    // (main is only moved *after* this projection loop, so reading it here
+    // yields the pre-pass tip regardless of projection order.)
+    let main_tip = git.find_reference(MAIN_REF).ok().and_then(|r| r.target());
+    let loot_parents = g.parents(id);
+    let landed_predecessor = g.predecessors(id).into_iter().find(|x| {
+        let Some(xsha) = marks.sha_for(x) else { return false };
+        let Ok(xoid) = git2::Oid::from_str(xsha) else { return false };
+        main_tip.is_some_and(|tip| {
+            tip == xoid || git.graph_descendant_of(tip, xoid).unwrap_or(false)
+        })
+    });
+    let (git_parent_ids, delta_base): (Vec<Oid>, Option<Oid>) = match landed_predecessor {
+        Some(x) => (vec![x.clone()], Some(x)),
+        None => (loot_parents.clone(), loot_parents.first().cloned()),
+    };
+
     let mut parent_commits = Vec::new();
-    for p in g.parents(id) {
-        let sha = marks.sha_for(&p).ok_or_else(|| {
+    for p in &git_parent_ids {
+        let sha = marks.sha_for(p).ok_or_else(|| {
             format!(
                 "change {}: parent {} has no mirrored commit yet",
                 hex::short(&id.0, 8),
@@ -661,7 +697,8 @@ fn project_change(
     let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
 
     let parent_git_tree = parent_commits.first().and_then(|c| c.tree().ok());
-    let (tree, skipped) = public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean)?;
+    let (tree, skipped) =
+        public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean, delta_base.as_ref())?;
 
     let (name, email) = author_name_email(ws, g.author(id), id_map);
     let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
@@ -673,6 +710,17 @@ fn project_change(
     }
     if let Some(sig64) = g.signature(id) {
         trailers.push((TRAILER_SIGNATURE, hex::encode(&sig64)));
+    }
+    let predecessors = g.predecessors(id);
+    if !predecessors.is_empty() {
+        trailers.push((
+            TRAILER_PREDECESSORS,
+            predecessors
+                .iter()
+                .map(|p| hex::encode(&p.0))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
     }
     let message = bridge::append_trailers(
         &g.message(id).unwrap_or_default(),
@@ -715,16 +763,17 @@ fn public_delta_tree<'g>(
     id: &Oid,
     git_parent: Option<&git2::Tree>,
     last_clean: Option<&git2::Tree>,
+    delta_base: Option<&Oid>,
 ) -> Result<(git2::Tree<'g>, Vec<String>), String> {
     let g = ws.graph();
     let change_tree = g
         .tree(id)
         .ok_or_else(|| format!("unknown change {}", hex::short(&id.0, 8)))?;
-    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = g
-        .parents(id)
-        .first()
-        .and_then(|p| g.tree(p))
-        .unwrap_or_default();
+    // The loot change whose tree the delta is measured against — normally the
+    // loot first parent, but an amend threaded onto its predecessor X measures
+    // against X so the result lands exactly on X's git tree (ADR 0033).
+    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> =
+        delta_base.and_then(|p| g.tree(p)).unwrap_or_default();
     let conflicts = g.conflicts();
 
     // Start from the git parent's flat path -> (blob, filemode) map. Modes
@@ -819,7 +868,13 @@ fn project_wip(
     let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
 
     let parent_git_tree = parent_commits.first().and_then(|c| c.tree().ok());
-    let (tree, skipped) = public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean)?;
+    // A provisional review commit measures its delta against the loot first
+    // parent (round 1) and appends onto the previous provisional commit's git
+    // tree in later rounds — supersession threading (ADR 0033) is a finalized-
+    // projection concern; the review lane resumes as a new round regardless.
+    let wip_base = g.parents(id).first().cloned();
+    let (tree, skipped) =
+        public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean, wip_base.as_ref())?;
 
     let (name, email) = author_name_email(ws, g.author(id), id_map);
     let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
@@ -1649,6 +1704,185 @@ mod tests {
         // And the pass after that is a full no-op.
         let r5 = ferry(&mut ws, &mirror);
         assert_eq!((r5.ingested, r5.projected), (0, 0));
+    }
+
+    /// Ferry designating `dock` as the git-main dock — the binding pass. Using
+    /// a named dock (not the home dock) also activates dock semantics, so
+    /// `loot edit` re-anchors to the sibling parent exactly as in production.
+    fn ferry_on(ws: &mut Workspace, mirror: &Path, dock: &str) -> FerryReport {
+        run(ws, Some(mirror.to_str().unwrap()), Some(dock), false).unwrap()
+    }
+
+    /// Reopen the change carrying version `v`, amend `a.txt`, finalize; returns
+    /// the superseding version X′.
+    fn amend_change(ws: &mut Workspace, dir: &Path, v: &Oid, content: &str) -> Oid {
+        let cid = ws.graph().change_id(v).unwrap();
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        put_file(dir, "a.txt", content);
+        ws.snapshot("feature").unwrap();
+        ws.finalize_working().unwrap();
+        ws.repo()
+            .versions_of_change(&cid, &Default::default())
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn amend_of_landed_threads_onto_predecessor_as_a_fast_forward() {
+        // ADR 0033: amending a *landed* change X projects X′ as a linear
+        // fix-up on top of X's commit — main fast-forwards, no fork, no
+        // force-push — and the commit records the supersession in a trailer.
+        let (mut ws, dir, mirror) = setup("amend-landed");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base"); // P, on the home dock
+        ws.dock_goto("work").unwrap(); // work forks from P; activates dock semantics
+        ferry_on(&mut ws, &mirror, "work");
+        put_file(&dir, "a.txt", "feature\n");
+        put_file(&dir, "b.txt", "added\n");
+        let x = seal_change(&mut ws, "feature"); // X, child of P
+        ferry(&mut ws, &mirror);
+        let git = git2::Repository::open(&mirror).unwrap();
+        let x_sha = main_commit(&git).id(); // main == X
+
+        // Reopen X and amend it, then finalize the superseding sibling X′.
+        let xprime = amend_change(&mut ws, &dir, &x, "feature amended\n");
+        assert_ne!(xprime, x, "the amend minted a new version");
+        assert_eq!(ws.graph().predecessors(&xprime), vec![x.clone()], "X′ supersedes X");
+        assert_eq!(ws.graph().parents(&xprime), ws.graph().parents(&x), "X′ is a sibling (parent P)");
+
+        let rep = ferry(&mut ws, &mirror);
+        assert!(rep.projected >= 1, "X′ projects");
+        let head = main_commit(&git);
+        // Threaded onto X: X′'s single git parent is X's commit, and main is a
+        // fast-forward (it descends from X) even though X′ is a loot *sibling*.
+        assert_eq!(head.parent_ids().count(), 1);
+        assert_eq!(head.parent_id(0).unwrap(), x_sha, "X′ threads onto X, not the loot parent P");
+        assert!(
+            git.graph_descendant_of(head.id(), x_sha).unwrap(),
+            "main fast-forwards over X"
+        );
+        // The projected tree is exactly X′'s public tree (delta vs X): the
+        // amended path lands and the unchanged path carries.
+        let tree = head.tree().unwrap();
+        assert_eq!(
+            git.find_blob(tree.get_name("a.txt").unwrap().id()).unwrap().content(),
+            b"feature amended\n"
+        );
+        assert!(tree.get_name("b.txt").is_some(), "unchanged path carried onto X");
+        // The supersession travels as a trailer naming X's version id.
+        let msg = head.message().unwrap();
+        assert_eq!(
+            bridge::parse_trailer(msg, TRAILER_PREDECESSORS),
+            Some(hex::encode(&x.0)),
+            "Loot-Predecessors names the superseded version"
+        );
+        assert_eq!(
+            bridge::parse_trailer(msg, TRAILER_CHANGE_ID),
+            Some(hex::encode(&xprime.0))
+        );
+    }
+
+    #[test]
+    fn local_finalize_then_amend_collapses_onto_the_sibling_parent() {
+        // ADR 0033: when X was finalized but never ferried (not on git main),
+        // the amend threads onto the loot sibling parent P — main fast-forwards
+        // P -> X′ and the intermediate X stays reachable on a loot head ref.
+        let (mut ws, dir, mirror) = setup("amend-local");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base"); // P, on the home dock
+        ws.dock_goto("work").unwrap(); // work forks from P; activates dock semantics
+        ferry_on(&mut ws, &mirror, "work");
+        let git = git2::Repository::open(&mirror).unwrap();
+        let p_sha = main_commit(&git).id(); // main == P
+
+        // Finalize X locally, do NOT ferry it, then amend to the sibling X′.
+        put_file(&dir, "a.txt", "feature\n");
+        let x = seal_change(&mut ws, "feature");
+        let xprime = amend_change(&mut ws, &dir, &x, "feature amended\n");
+        assert_eq!(ws.graph().parents(&xprime), ws.graph().parents(&x), "X′ is a sibling of X");
+
+        ferry(&mut ws, &mirror);
+        let head = main_commit(&git);
+        // X′ threads onto P (its sibling parent), NOT onto the unmarked X.
+        assert_eq!(head.parent_id(0).unwrap(), p_sha, "X′ collapses onto P");
+        assert!(git.graph_descendant_of(head.id(), p_sha).unwrap());
+        assert_eq!(
+            git.find_blob(head.tree().unwrap().get_name("a.txt").unwrap().id())
+                .unwrap()
+                .content(),
+            b"feature amended\n"
+        );
+        // The superseded intermediate X is parked reachable off-main.
+        assert!(
+            git.find_reference(&format!("refs/loot/heads/{}", hex::encode(&x.0))).is_ok(),
+            "the superseded intermediate stays reachable on a loot head ref"
+        );
+    }
+
+    #[test]
+    fn a_reopened_review_lane_survives_a_ferry_pass() {
+        // ADR 0033: a review lane is live iff the dock's current working change
+        // still carries its change id. After landing X and reopening it with
+        // `loot edit`, the reopened lane must NOT be reaped — the old
+        // change-id-wide "a signed version exists" test reaped it every pass.
+        let (mut ws, dir, mirror) = setup("reopen-lane");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base"); // P, on the home dock
+        ws.dock_goto("work").unwrap(); // work forks from P; activates dock semantics
+        ferry_on(&mut ws, &mirror, "work");
+        let dock = ws.dock_name().to_string();
+        let git = git2::Repository::open(&mirror).unwrap();
+
+        // Open a review lane for a feature, then finalize + land it (lane reaps).
+        put_file(&dir, "a.txt", "feature\n");
+        let (xw, _) = ws.snapshot("feature").unwrap();
+        let cid = ws.graph().change_id(&xw).unwrap();
+        ferry_wip(&mut ws, &mirror);
+        assert!(git.find_reference(&format!("refs/heads/review/{dock}")).is_ok());
+        ws.finalize_working().unwrap();
+        let x = ws
+            .repo()
+            .versions_of_change(&cid, &Default::default())
+            .into_iter()
+            .next()
+            .unwrap();
+        let landed = ferry(&mut ws, &mirror);
+        assert!(
+            landed.notes.iter().any(|n| n.contains("reaped review/") && n.contains("landed")),
+            "the landed lane reaps: {:?}",
+            landed.notes
+        );
+        assert!(
+            git.find_reference(&format!("refs/heads/review/{dock}")).is_err(),
+            "lane retired on land"
+        );
+
+        // Reopen X (amend), re-open the review lane, then a plain ferry pass
+        // must LEAVE the lane in place — the reopened change is live WIP again.
+        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
+        put_file(&dir, "a.txt", "feature amended\n");
+        ws.snapshot("feature").unwrap();
+        assert_eq!(ws.store().read_working(Some(&dock)).map(|w| ws.graph().change_id(&w)), Some(Some(cid)),
+            "the reopened working change carries X's handle");
+        let _ = x;
+        let reopened = ferry_wip(&mut ws, &mirror);
+        assert!(
+            reopened.review.unwrap().contains("op="),
+            "the lane re-opens for the reopened change"
+        );
+        assert!(git.find_reference(&format!("refs/heads/review/{dock}")).is_ok());
+
+        let pass = ferry(&mut ws, &mirror);
+        assert!(
+            !pass.notes.iter().any(|n| n.contains("reaped review/")),
+            "the reopened lane must survive the pass: {:?}",
+            pass.notes
+        );
+        assert!(
+            git.find_reference(&format!("refs/heads/review/{dock}")).is_ok(),
+            "reopened review lane survives the ferry pass"
+        );
     }
 
     #[test]

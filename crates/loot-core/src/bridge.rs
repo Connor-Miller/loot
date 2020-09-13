@@ -24,6 +24,13 @@ pub const TRAILER_GIT_AUTHOR: &str = "Git-Author";
 /// missing signature is the machine-checkable "not finalized" marker — and it
 /// never enters the round-trip: ingest refuses it, mark rebuilds skip it.
 pub const TRAILER_PROVISIONAL: &str = "Loot-Provisional";
+/// Trailer key carrying the version ids a change supersedes (ADR 0032/0033),
+/// space-separated hex. Present only on an amend's projected commit — a
+/// faithful echo of loot's `predecessors` for lossless round-trip. Projection
+/// and the mark-map rebuild both read supersession from loot's graph, never
+/// this trailer (`Loot-Change-Id` still carries the version id the rebuild
+/// keys on); it is faithfulness, not mechanism.
+pub const TRAILER_PREDECESSORS: &str = "Loot-Predecessors";
 
 /// Base of the deterministic commit-date scheme (loot changes carry no
 /// timestamp, ADR 0028): committer = author date = `BASE_EPOCH + generation`,
@@ -290,6 +297,21 @@ mod tests {
         assert_eq!(parse_trailer(&out, TRAILER_CHANGE_ID), Some(id_hex));
         assert_eq!(parse_trailer(&out, TRAILER_AUTHOR), Some("cd".repeat(32)));
         assert_eq!(parse_trailer(&out, TRAILER_SIGNATURE), None);
+        assert_eq!(strip_trailers(&out), msg);
+    }
+
+    #[test]
+    fn predecessors_trailer_round_trips_space_separated() {
+        let msg = "amend the flux capacitor\n\nbody";
+        let preds = format!("{} {}", "12".repeat(32), "34".repeat(32));
+        let out = append_trailers(msg, &[
+            (TRAILER_CHANGE_ID, "ab".repeat(32)),
+            (TRAILER_SIGNATURE, "cd".repeat(64)),
+            (TRAILER_PREDECESSORS, preds.clone()),
+        ]);
+        assert_eq!(parse_trailer(&out, TRAILER_PREDECESSORS), Some(preds));
+        // A space-separated value does not disturb the neighbouring trailers.
+        assert_eq!(parse_trailer(&out, TRAILER_CHANGE_ID), Some("ab".repeat(32)));
         assert_eq!(strip_trailers(&out), msg);
     }
 

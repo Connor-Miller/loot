@@ -61,6 +61,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Loot = Join-Path $Root "target\release\loot.exe"
 $Mirror = Join-Path $Root ".loot\git-mirror\mirror.git"
 $PrMap = Join-Path $Root ".loot\git-mirror\pr-map"
+$WipFile = Join-Path $Root ".loot\git-mirror\wip"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
@@ -195,6 +196,34 @@ exit 0
             if ($current -and $current -notmatch [regex]::Escape($lane.Dock)) {
                 Fail "ambient dock is not '$($lane.Dock)' - run 'loot dock $($lane.Dock)' first (land refuses to finalize another lane)"
             }
+            # Review-currency guard (ADR 0033): `loot edit` can amend an already-
+            # approved change after review. Refuse to land a working change whose
+            # version differs from the one the review lane last projected - the
+            # reviewer approved a now-stale version. Orchestrator-side; loot core
+            # stays git-agnostic. An empty working change (already finalized,
+            # nothing pending) has no live version and skips the check.
+            $reviewedVersion = ""
+            if (Test-Path $WipFile) {
+                foreach ($wl in Get-Content $WipFile) {
+                    $wf = $wl.Trim() -split '\s+'
+                    if ($wf.Count -eq 5 -and $wf[0] -eq $lane.Change -and $wf[1] -eq $lane.Dock) {
+                        $reviewedVersion = $wf[3]
+                    }
+                }
+            }
+            $statusLine = ((& $Loot status --porcelain 2>&1 | Out-String) -split "`r?`n" |
+                Where-Object { $_ -match '^@' } | Select-Object -First 1)
+            $currentVersion = ""
+            if ($statusLine) {
+                $cols = $statusLine -split "`t"
+                if ($cols.Count -ge 3 -and $cols[2] -ne '-') { $currentVersion = $cols[2] }
+            }
+            if ($reviewedVersion -and $currentVersion -and ($currentVersion -ne $reviewedVersion)) {
+                Fail ("working change amended since the last review round " +
+                    "(version {0} != reviewed {1}) - run 'tools/loot-first.ps1 review' and re-approve before landing" -f `
+                    $currentVersion.Substring(0, 8), $reviewedVersion.Substring(0, 8))
+            }
+
             if ($DryRun) { Write-Host "(dry run) stopping before finalize"; break }
 
             # Pre-land gate (#155 follow-up): review approved projected WIP,
