@@ -169,9 +169,9 @@ state — so shared-surface tooling excludes the lane-owned file set by name, no
 directory. _Avoid_: repo state, global state (they blur the writer classes).
 
 **Adopt** *(ADR 0034 accepted 2026-07-12; `<version>` arm shipped #244,
-2026-07-14; no-arg arm build pending)* — `loot adopt` settles a dock/[[Lane]]
-onto landed work, in **two arms** that share the harbor-lineage fence but split
-on *how*. **No-arg** `loot adopt` (build pending): catch a lane up to everything
+2026-07-14; no-arg catch-up arm shipped #250, 2026-07-14)* — `loot adopt` settles
+a dock/[[Lane]] onto landed work, in **two arms** that share the harbor-lineage
+fence but split on *how*. **No-arg** `loot adopt`: catch a lane up to everything
 landed, by extending its view frontier with the [[Harbor]]'s heads and running
 the existing in-process converge — a **merge** that folds the local line in; no
 network (objects already in the shared store); all-or-nothing (per-change

@@ -7,13 +7,13 @@ change reaches `main`) and [identity.md](identity.md) (who agents are), and it i
 the operational face of ADRs 0034 (sealed lanes), 0035 (lane lifecycle) and 0036
 (the harbor).
 
-> **Status (2026-07-14): LIVE, with two known build gaps.** Lanes, the lane
-> registry, `loot lanes`, `loot lane new --ticket`, the harbor lock, and
-> `loot adopt <version>` are shipped (#231/#232/#229/#244). Still pending: the
-> no-arg `loot adopt` catch-up merge, and retiring legacy in-place dock
-> *switching* from the primary (it survives only because today's landing ritual
-> runs on the `main` dock). Where a gap bites, this doc says so and gives the
-> workaround.
+> **Status (2026-07-14): LIVE, with one known build gap.** Lanes, the lane
+> registry, `loot lanes`, `loot lane new --ticket`, the harbor lock, and both
+> `loot adopt` arms — `<version>` take-wholesale and the no-arg catch-up merge —
+> are shipped (#231/#232/#229/#244/#250). Still pending: retiring legacy in-place
+> dock *switching* from the primary (it survives only because today's landing
+> ritual runs on the `main` dock). Where a gap bites, this doc says so and gives
+> the workaround.
 
 ## The one rule everything else follows
 
@@ -125,16 +125,18 @@ loot adopt <landed-version>     # take-wholesale onto the landed change (#244)
 
 `loot adopt <version>` abandons the primary's competing heads down to the shared
 anchor and materializes the landed tree — no content merge (the merge is what
-resurrects files deleted upstream). Once the no-arg `loot adopt` catch-up merge
-ships, `loot adopt` (no arg) will fold the whole harbor lineage in; until then,
-name the landed version explicitly.
+resurrects files deleted upstream). Use it when the primary sits on a **divergent**
+head that must be discarded. When the primary is merely *behind* landed main, the
+no-arg **`loot adopt`** catches it up by folding the harbor lineage in — a clean
+fast-forward when there is no local work, a merge when there is (#250). Reach for
+`adopt <version>` to replace a divergent line, plain `adopt` to catch up.
 
-`loot ferry` is the complement: a clean lane-land already moved the harbor's
-`mirror.git`, and a ferry pass ingests git-origin commits and converges the
-primary's dock against them — so if the primary is only *behind* the landed line
-(no divergent local head to discard), a `loot ferry` settles it too. Reach for
-`adopt <version>` when the primary sits on a divergent head that must be replaced;
-reach for `ferry` when it is merely behind.
+`loot ferry` also catches the primary up as a side effect: a pass ingests any
+git-origin commits and converges the dock against them, so a primary only *behind*
+the landed line settles through a plain `loot ferry` too. The three, in short:
+**`adopt <version>`** to discard a divergent line, **`adopt`** (no arg) to fold
+the harbor lineage in, and **`ferry`** when there are also git-origin commits to
+ingest.
 
 ## Recovery playbook
 

@@ -1319,6 +1319,74 @@ impl Workspace {
         Ok(AdoptReport { target, abandoned: competing_all, discarded_wip, already_there: false })
     }
 
+    /// No-arg `loot adopt`: catch this dock/lane up to the harbor's landed main
+    /// **by merging it in** (ADR 0034) — the fold-in counterpart to the
+    /// `<version>` take-wholesale arm. The target is the harbor lineage *as a
+    /// whole* (the change the mirror's `main` projects), never an arbitrary signed
+    /// change; per-change adoption stays refused. No network — the objects are
+    /// already in the shared store. Unlike `<version>`, this **keeps** the local
+    /// line, folding it into a merge (or fast-forwarding when strictly behind).
+    /// A live working change is captured and finalized into the merge, not
+    /// discarded — so there is no `--discard-wip`. Allowed from a lane (its whole
+    /// point is catching a lane up), so it does not `ensure_primary`.
+    pub fn adopt_harbor(&mut self) -> Result<AdoptCatchupReport, String> {
+        let their = self.mirror_main_change().ok_or(
+            "no mirror main to catch up to — bind and `loot ferry` a mirror first, \
+             or name a landed change: `loot adopt <version-id>`",
+        )?;
+        // Capture-first (#219, ADR 0030): fold any uncaptured disk edits into a
+        // working change *before* we choose fast-forward vs merge. Otherwise a
+        // dirty tree with no in-progress working change (the state right after a
+        // finalize) would take neither the FF's "clean" path nor `fold_line_in`'s
+        // `working.is_some()` capture — and the materialize below would clobber
+        // it, silently, bypassing the #219 tree-write chokepoint.
+        self.capture_uncaptured_edits()?;
+        let anchor = self.anchor();
+        // Already current: the harbor head is our finalized tip or already behind
+        // it. Any captured working change is left in place — nothing landed to
+        // fold into it.
+        if let Some(o) = &anchor {
+            if o == &their || self.graph().is_ancestor(&their, o) {
+                return Ok(AdoptCatchupReport {
+                    harbor: their,
+                    already_current: true,
+                    merged: false,
+                    outcomes: BTreeMap::new(),
+                });
+            }
+        }
+        let msg = format!("adopt: catch up to landed main {}", short_version(&their));
+        // Clean fast-forward: no captured local work and our line is strictly
+        // behind the harbor's — settle *exactly* on it. A merge would leave the
+        // dock at a node that is not main, defeating "catch up"; the FF keeps the
+        // primary's tip == git-main after a lane land (the common case, unlike
+        // `dock merge` which reports the fold as merge outcomes). With captured
+        // WIP we fall through to the merge, folding the local line in.
+        if self.working.is_none() {
+            if let Some(o) = anchor.clone() {
+                if self.graph().is_ancestor(&o, &their) {
+                    self.fast_forward_to(&o, &their)?;
+                    self.record_op("adopt", &msg, false);
+                    return Ok(AdoptCatchupReport {
+                        harbor: their,
+                        already_current: false,
+                        merged: true,
+                        outcomes: BTreeMap::new(),
+                    });
+                }
+            }
+        }
+        // Otherwise fold the local line into a merge (`fold_line_in` finalizes the
+        // captured WIP as our signed merge parent).
+        let before = self.anchor();
+        let outcomes = self.fold_line_in(&their, &msg)?;
+        let merged = self.anchor() != before;
+        if merged {
+            self.record_op("adopt", &msg, false);
+        }
+        Ok(AdoptCatchupReport { harbor: their, already_current: !merged, merged, outcomes })
+    }
+
     /// The harbor/main lineage fence for [`adopt`](Self::adopt) (§4): `target`
     /// must be reachable (ancestor-or-equal) from the loot change the git
     /// mirror's `main` projects — the same "harbor lineage only" invariant
@@ -2106,66 +2174,82 @@ impl Workspace {
             format!("dock '{name}' has no finalized change to merge — run `loot new` in it first")
         })?;
 
-        // Short-circuit BEFORE touching our work: if their tip is already our
-        // finalized tip, there is nothing to merge. `anchor()` reads the finalized
-        // tip without disturbing any in-progress change, so an up-to-date no-op
-        // never seals our pending work into a spurious tip.
-        if self.anchor() == Some(their.clone()) {
-            return Ok((name.to_string(), BTreeMap::new()));
-        }
+        let msg = format!("merge dock '{name}' into '{}'", self.dock);
+        let outcomes = self.fold_line_in(&their, &msg)?;
+        Ok((name.to_string(), outcomes))
+    }
 
+    /// Fold a finalized line `their` into this dock's current line, returning the
+    /// per-path merge outcomes. Capture+finalize our WIP so our side is a signed
+    /// merge parent, then take the cheapest correct path: nothing to do (their tip
+    /// is already ours), a fast-forward (their line superseded ours per ADR 0032,
+    /// or our line is strictly behind theirs), or a reconciled signed merge change
+    /// (`merge_tips` reuses converge) that becomes our tip with the merged tree
+    /// materialized. Shared by `dock merge` (their = a named dock's tip) and the
+    /// no-arg `loot adopt` catch-up (their = the harbor's landed main head).
+    fn fold_line_in(
+        &mut self,
+        their: &Oid,
+        msg: &str,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        // Short-circuit BEFORE touching our work: their tip is already our
+        // finalized tip. `anchor()` reads it without disturbing any in-progress
+        // change, so an up-to-date no-op never seals pending work into a spurious tip.
+        if self.anchor().as_ref() == Some(their) {
+            return Ok(BTreeMap::new());
+        }
         // Capture and finalize any in-progress work so our side of the merge is a
         // signed tip (a merge parent must be finalized to travel in a bundle).
         if self.working.is_some() {
-            let msg = self
+            let m = self
                 .working
                 .as_ref()
                 .and_then(|w| self.repo.change_message(w))
                 .unwrap_or_else(|| "(working change)".to_string());
-            self.snapshot(&msg)?;
+            self.snapshot(&m)?;
             self.finalize_working()?;
         }
         let ours = self
             .anchor()
             .ok_or("nothing to merge into yet — record a change first (`loot new`)")?;
-        if ours == their {
-            return Ok((name.to_string(), BTreeMap::new()));
+        if &ours == their {
+            return Ok(BTreeMap::new());
         }
-
-        // Supersession-aware fork collapse (ADR 0032). If their line *amended*
-        // our tip, merging would content-merge a version with its own
-        // replacement — resurrecting what the amend removed. Adopt the amend
-        // instead: fast-forward this dock onto their tip. Symmetrically, a
-        // their-tip our own line already superseded has nothing left to offer.
-        // Both tests demand the replacement sit ON the other line — a
-        // supersession elsewhere in the shared store proves nothing here.
-        if self.repo.supersedes(&ours, &their) {
-            return Ok((name.to_string(), BTreeMap::new()));
+        // Supersession-aware fork collapse (ADR 0032). If their line *amended* our
+        // tip, merging would content-merge a version with its own replacement —
+        // resurrecting what the amend removed; adopt the amend by fast-forwarding.
+        // Symmetrically, a their-tip our own line already superseded offers
+        // nothing. Both demand the replacement sit ON the other line.
+        if self.repo.supersedes(&ours, their) {
+            return Ok(BTreeMap::new());
         }
-        if self.repo.supersedes(&their, &ours) {
-            self.repo
-                .materialize(Some(&ours), &their, &self.identity, self.now)
-                .map_err(|e| e.to_string())?;
-            self.tip = Some(their.clone());
-            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
-            self.persist()?;
-            return Ok((name.to_string(), BTreeMap::new()));
+        if self.repo.supersedes(their, &ours) {
+            return self.fast_forward_to(&ours, their).map(|_| BTreeMap::new());
         }
-
-        // Reconcile the two lines into a merge change (reuses converge), then sign
-        // it and make it this dock's tip.
-        let msg = format!("merge dock '{name}' into '{}'", self.dock);
+        // Divergent lines: reconcile into a signed merge change (reuses converge),
+        // make it our tip, and reflect the merged tree on disk.
         let (merge_id, outcomes) = self
             .repo
-            .merge_tips(&ours, &their, &msg, self.now)
+            .merge_tips(&ours, their, msg, self.now)
             .map_err(|e| e.to_string())?;
         self.working = Some(merge_id.clone());
         self.finalize_working()?;
-        // Reflect the merged tree in the working directory.
         self.repo
             .materialize(Some(&ours), &merge_id, &self.identity, self.now)
             .map_err(|e| e.to_string())?;
-        Ok((name.to_string(), outcomes))
+        Ok(outcomes)
+    }
+
+    /// Fast-forward this dock's tip from `from` onto `target` (which contains
+    /// `from`), materializing target's tree. Used when a merge would be redundant:
+    /// a supersession, or a line strictly behind the one it folds in.
+    fn fast_forward_to(&mut self, from: &Oid, target: &Oid) -> Result<(), String> {
+        self.repo
+            .materialize(Some(from), target, &self.identity, self.now)
+            .map_err(|e| e.to_string())?;
+        self.tip = Some(target.clone());
+        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        self.persist()
     }
 
     /// Capture-first for pull/apply (#219, ADR 0030 amendment): fold any
@@ -3118,6 +3202,19 @@ pub struct AdoptReport {
     pub discarded_wip: bool,
     /// The dock was already on `target` with a clean tree — a no-op with a note.
     pub already_there: bool,
+}
+
+/// The outcome of a no-arg `loot adopt` (harbor catch-up merge, ADR 0034).
+#[derive(Debug)]
+pub struct AdoptCatchupReport {
+    /// The harbor's landed main head this dock caught up to.
+    pub harbor: Oid,
+    /// The dock was already at or ahead of the harbor head — a no-op with a note.
+    pub already_current: bool,
+    /// The local line was folded in (a merge or a fast-forward advanced the tip).
+    pub merged: bool,
+    /// Per-path merge outcomes when a reconcile ran (empty on a fast-forward).
+    pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
 }
 
 /// The outcome of a pull (#219). Carries the folded per-path merge outcomes,
@@ -4085,6 +4182,146 @@ mod tests {
         assert_eq!(r2.ingested, 0, "no git-native commits to ingest");
         assert_eq!(r2.projected, 0, "the dock is on main — nothing projects (§6.5)");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- no-arg `loot adopt`: harbor catch-up MERGE (#250, ADR 0034) ---
+
+    #[test]
+    fn adopt_no_arg_refuses_without_a_mirror() {
+        let dir = std::env::temp_dir().join(format!("loot-250-nomirror-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        seed_fork(&mut ws);
+        let err = ws.adopt_harbor().unwrap_err();
+        assert!(err.contains("no mirror main"), "names the missing mirror: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_no_arg_is_a_noop_when_already_current() {
+        let dir = std::env::temp_dir().join(format!("loot-250-current-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (c1, _x) = seed_fork(&mut ws);
+        seed_mirror_main(&ws, &"1".repeat(40), &c1);
+        ws.adopt(&loot_core::hex::encode(&c1.0), false).unwrap(); // settle tip on c1
+
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.already_current && !report.merged, "harbor is our tip — a no-op");
+        assert_eq!(ws.anchor(), Some(c1), "the tip did not move");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_no_arg_fast_forwards_a_dock_strictly_behind_landed_main() {
+        // The common post-lane-land case: the primary sits on `c1` while another
+        // lane advanced main to `c2` (a descendant). Catch-up is a clean
+        // fast-forward — no redundant merge change.
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-250-ff-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (c1, _x) = seed_fork(&mut ws);
+        seed_mirror_main(&ws, &"1".repeat(40), &c1);
+        ws.adopt(&loot_core::hex::encode(&c1.0), false).unwrap(); // tip = c1
+
+        // Main advances to c2 (a child of c1); the dock's tip stays at c1.
+        let c2 = ws
+            .with_repo(|repo| {
+                repo.record_carrying(
+                    Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "landed c2".into(), tree: Default::default() },
+                    Some([5u8; 16]),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        ws.record_op("seed", "harbor advanced to c2", false);
+        seed_mirror_main(&ws, &"2".repeat(40), &c2);
+
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged && !report.already_current, "caught up");
+        assert!(report.outcomes.is_empty(), "a fast-forward has no merge outcomes");
+        assert_eq!(ws.repo().heads(), vec![c2.clone()], "tip fast-forwarded to c2, no merge head");
+        assert_eq!(ws.anchor(), Some(c2), "the dock now sits on main");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_no_arg_folds_a_divergent_local_line_into_a_merge() {
+        // The dock did local work `w` while main advanced to a sibling `f`.
+        // Catch-up folds both into a signed merge that keeps the local line.
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-250-merge-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (c1, _x) = seed_fork(&mut ws);
+        seed_mirror_main(&ws, &"1".repeat(40), &c1);
+        ws.adopt(&loot_core::hex::encode(&c1.0), false).unwrap(); // tip = c1
+
+        // Local work `w` (child of c1) — finalize advances the seeded tip to w.
+        std::fs::write(dir.join("local.txt"), b"w").unwrap();
+        ws.snapshot("local work").unwrap();
+        ws.finalize_working().unwrap();
+        let w = ws.repo().heads()[0].clone();
+
+        // Meanwhile main advanced to `f` (a sibling of w off c1).
+        let f = ws
+            .with_repo(|repo| {
+                repo.record_carrying(
+                    Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "landed f".into(), tree: Default::default() },
+                    Some([6u8; 16]),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        ws.record_op("seed", "harbor advanced to f", false);
+        seed_mirror_main(&ws, &"6".repeat(40), &f);
+
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged && !report.already_current, "folded the local line in");
+        let tip = ws.anchor().unwrap();
+        let parents = ws.graph().parents(&tip);
+        assert!(parents.contains(&w) && parents.contains(&f), "the merge carries both lines");
+        assert!(ws.graph().is_ancestor(&f, &tip), "main is now an ancestor — caught up");
+        assert!(ws.graph().is_ancestor(&w, &tip), "the local line survives the fold");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_no_arg_folds_uncaptured_disk_edits_into_the_merge_not_clobbered() {
+        // Regression (#250 review): a dirty tree with NO in-progress working change
+        // (the state right after a finalize) must be captured and folded into the
+        // catch-up merge — never clobbered by the materialize. Before capture-first
+        // this path took neither the FF's clean branch nor `fold_line_in`'s
+        // `working.is_some()` capture, so the edit was silently lost.
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-250-dirty-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (c1, _x) = seed_fork(&mut ws);
+        seed_mirror_main(&ws, &"1".repeat(40), &c1);
+        ws.adopt(&loot_core::hex::encode(&c1.0), false).unwrap(); // tip = c1, clean tree
+
+        // Uncaptured local edit on disk — no snapshot, no working change.
+        std::fs::write(dir.join("local.txt"), b"my work").unwrap();
+
+        // Main advanced to `f` (a child of c1).
+        let f = ws
+            .with_repo(|repo| {
+                repo.record_carrying(
+                    Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "landed f".into(), tree: Default::default() },
+                    Some([7u8; 16]),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        ws.record_op("seed", "harbor advanced to f", false);
+        seed_mirror_main(&ws, &"7".repeat(40), &f);
+
+        let report = ws.adopt_harbor().unwrap();
+        assert!(report.merged, "the dirty local line was folded in");
+        assert_eq!(
+            std::fs::read(dir.join("local.txt")).unwrap(),
+            b"my work",
+            "the uncaptured edit survived the catch-up — not clobbered",
+        );
+        assert!(ws.graph().is_ancestor(&f, &ws.anchor().unwrap()), "main is an ancestor — caught up");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -105,6 +105,7 @@ usage:
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
   loot abandon <version-id>                 drop a version from a divergent change (marked `!` in log), leaving one; undoable
   loot abandon --head <version-id>          drop an independent live head (a whole fork tip); undoable
+  loot adopt                                catch this dock/lane up to landed main by merging it in (keeps the local line); undoable
   loot adopt <version-id> [--discard-wip]   settle this dock onto a landed change, discarding the divergent line (no merge); undoable
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
@@ -460,9 +461,39 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
 /// override of the #219 tree-write chokepoint).
 fn cmd_adopt(args: &[String]) -> Result<(), String> {
     let discard_wip = has_flag(args, "--discard-wip");
-    let prefix =
-        first_positional(args).ok_or("usage: loot adopt <version-id> [--discard-wip]")?;
     let mut ws = Workspace::open()?;
+
+    // No target → the harbor catch-up **merge** arm (ADR 0034): fold the landed
+    // main line into this dock/lane, keeping the local line. `<version>` below is
+    // the take-wholesale arm that discards it.
+    let Some(prefix) = first_positional(args) else {
+        if discard_wip {
+            return Err(
+                "`--discard-wip` applies only to `loot adopt <version-id>`; the no-arg catch-up \
+                 merge folds your working change in rather than dropping it"
+                    .into(),
+            );
+        }
+        let report = ws.adopt_harbor()?;
+        if report.already_current {
+            println!("already caught up to landed main ({}) — nothing to merge", short(&report.harbor));
+            return Ok(());
+        }
+        println!("caught up to landed main ({}) — folded the local line in", short(&report.harbor));
+        let conflicts = report
+            .outcomes
+            .values()
+            .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
+            .count();
+        if conflicts > 0 {
+            println!(
+                "  {conflicts} path(s) need resolution — `loot resolve <path> <file>`, then re-land"
+            );
+        }
+        println!("  `loot undo` steps back before the catch-up (see `loot op log`)");
+        return Ok(());
+    };
+
     let report = ws.adopt(prefix, discard_wip)?;
     if report.already_there {
         println!("already on {} — nothing to settle", short(&report.target));

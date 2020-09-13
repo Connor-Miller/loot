@@ -124,6 +124,11 @@ its seal; keyless stays a single-position legacy mode.
 
 ### `loot adopt`: catch-up converge onto the harbor lineage
 
+*(No-arg arm shipped #250, 2026-07-14: a `loot-cli` composition — `fold_line_in`,
+shared with `dock merge`, folds `mirror_main_change()` into the dock's line; a
+clean fast-forward when strictly behind, a signed merge when the local line
+diverged. No new engine machinery, allowed from a lane.)*
+
 **`loot adopt`** extends the lane's view frontier with the harbor's landed
 heads and runs the existing in-process `apply`/converge onto the lane's
 working change — today's `dock merge` pointed the other way, no new engine
