@@ -23,8 +23,8 @@ consults; it sits beside [workflow.md](workflow.md) (how work lands) and
 ## Claim ritual: a claim spawns its lane (#232, ADR 0034/0035)
 
 Work on a claimed ticket happens in a sealed lane, not in the primary
-directory — that is what makes N concurrent agents in this repo safe. After
-assigning:
+directory — that is what makes N concurrent agents in this repo safe (the full
+concurrency playbook is [concurrent.md](concurrent.md)). After assigning:
 
 ```
 loot lane new --ticket <n> --porcelain     # from the primary; row: L  id  name  path ...

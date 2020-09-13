@@ -183,6 +183,8 @@ surfaced by `loot conflicts`; that change can't land until you resolve it in loo
 
 ## See also
 
+- [concurrent.md](concurrent.md) — running several agents at once: one lane each,
+  what serializes at the harbor, and the drift discipline.
 - [identity.md](identity.md) — agents are clones (ADR 0026).
 - ADRs: 0018 (signed authored history), 0022 (docks/harbor), 0026 (agent
   identity), 0028 (git bridge / ferry), 0023 (machine output).
