@@ -205,9 +205,12 @@ becomes a **named [[Lane]]** — since #231 the promotion verb is `loot lane
 name <n>`. The naming call is locked and #234 swept the primary's stale named
 docks (`adr-0033-ferry`, `list`, `loot-first`) into the lane model, leaving only
 `main` — the git-`main`-tracked [[Harbor]] position, a dock in the new sense.
-Legacy in-place *switching* still lives in the primary because today's landing
-ritual runs on the `main` dock; retiring that switching code — and `loot dock
-<name>` becoming purely the naming verb — is the remaining build gap.)* _Avoid_:
+Legacy in-place *switching* is **retired from the CLI** (#3b layer 1): a bare
+`loot dock <name>` now refuses ("use `loot lane new`, or `--at <dir>` to bind a
+separate worktree") — a second position is always a separate directory, never a
+re-materialization of the primary tree. `dock_goto` survives only as test
+scaffolding. The deeper end-state — dropping `.loot/docks/` entirely so
+`dock merge` resolves a named [[Lane]] from the registry — rides #253.)* _Avoid_:
 worktree, checkout, berth, slip.
 
 **Buoy** *(CA4 shipped, 2026-07-09)* — a change that

@@ -1603,6 +1603,11 @@ impl Workspace {
     /// the ambient dock's finalized tip) and switch to it. A no-op if already on
     /// `name`. The outgoing dock is auto-snapshotted first so no uncommitted work
     /// is lost — every pruned file is recoverable by switching back (ADR 0022).
+    // In-place dock switching is retired from the CLI (ADR 0034, #3b layer 1):
+    // `create_dock` no longer calls this. It survives as test scaffolding that
+    // exercises the dock/merge/converge/parking machinery until #253 moves those
+    // tests onto lanes and drops `.loot/docks/` for good.
+    #[cfg(test)]
     pub fn dock_goto(&mut self, name: &str) -> Result<DockAction, String> {
         self.ensure_primary("`loot dock`")?;
         if name == self.dock {
@@ -1682,21 +1687,25 @@ impl Workspace {
         Ok(if creating { DockAction::Created } else { DockAction::Switched })
     }
 
-    /// `loot dock <name> [--at <dir>]` — the physical-model dock verb (ADR 0022).
-    /// Without `at`, create-or-switch the ambient dock in place and re-materialize
-    /// (the single-dir checkout flow, [`dock_goto`]). With `at`, bind a *separate*
-    /// working directory to this repo's shared store via a `.loot` pointer file
-    /// and materialize the dock's tree there, so concurrent agents edit physically
-    /// separate trees over one object store.
+    /// `loot dock <name> --at <dir>` — bind a *separate* working directory to this
+    /// repo's shared store via a `.loot` pointer file and materialize the dock's
+    /// tree there, so concurrent agents edit physically separate trees over one
+    /// object store (ADR 0022, a git-worktree analogue).
     ///
-    /// [`dock_goto`]: Workspace::dock_goto
+    /// In-place switching (the old no-`--at` flow that re-materialized the single
+    /// primary tree and parked its WIP) is **retired** (ADR 0034, #3b layer 1): a
+    /// second position is always a separate directory — a `--at` dock, or
+    /// preferably a `loot lane new` lane. The bare form now refuses with that
+    /// guidance. (Dropping `.loot/docks/` entirely in favour of lanes rides #253.)
     pub fn create_dock(&mut self, name: &str, at: Option<&Path>) -> Result<(), String> {
         self.ensure_primary("`loot dock`")?;
         match at {
-            None => {
-                self.dock_goto(name)?;
-                Ok(())
-            }
+            None => Err(
+                "in-place dock switching is retired (ADR 0034): a second position is a \
+                 separate directory. Use `loot lane new` for a sealed lane over this store, \
+                 or `loot dock <name> --at <dir>` to bind a separate worktree."
+                    .into(),
+            ),
             Some(dir) => self.bind_dock_dir(name, dir),
         }
     }
@@ -2815,7 +2824,8 @@ fn opt(name: &str) -> Option<&str> {
     }
 }
 
-/// What `dock_goto` did, for CLI reporting.
+/// What `dock_goto` did — test-only now that in-place switching is retired (#3b).
+#[cfg(test)]
 #[derive(Debug)]
 pub enum DockAction {
     Already,

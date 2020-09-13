@@ -111,7 +111,7 @@ usage:
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
   loot surface                              materialize what the current identity may see
-  loot dock <name>                          create a dock (isolated working tree + tip), or switch to one
+  loot dock <name> --at <dir>               bind a separate worktree over the shared store (in-place switch retired — use `loot lane new`)
   loot docks                                list docks with their tip and visibility
   loot log                                  show change history
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
@@ -123,7 +123,7 @@ usage:
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
-  loot dock <name> [--at <dir>]             create/switch a dock (isolated tree over the shared store, ADR 0022)
+  loot dock <name> --at <dir>               bind a separate worktree over the shared store (ADR 0022; in-place switch retired #3b)
   loot dock merge <name> [--porcelain|--json]  merge another dock's finalized tip into the current dock (local, CA2)
   loot dock rm <name>                       remove a dock: drop its parked unsigned WIP + pointers; undoable (#212)
   loot docks                                list docks with their working tip
@@ -1129,16 +1129,17 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
     }
     let name = positional
         .first()
-        .ok_or("usage: loot dock <name> [--at <dir>]  |  loot dock merge <name>  |  loot dock rm <name>")?;
+        .ok_or("usage: loot dock <name> --at <dir>  |  loot dock merge <name>  |  loot dock rm <name>")?;
+    // In-place switching is retired (#3b): a bare `loot dock <name>` now returns
+    // the "use a lane or --at" refusal from `create_dock`; only `--at` proceeds.
     let at = flag(args, "--at").map(std::path::PathBuf::from);
     let mut ws = Workspace::open()?;
     ws.create_dock(name, at.as_deref())?;
-    match &at {
-        Some(dir) => println!(
+    if let Some(dir) = &at {
+        println!(
             "created dock '{name}' at {} — a separate working tree over this repo's shared store",
             dir.display()
-        ),
-        None => println!("on dock '{name}' — re-materialized its working tree here"),
+        );
     }
     ws.record_op("dock", &format!("dock {name}"), false);
     Ok(())
