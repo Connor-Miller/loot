@@ -13,8 +13,8 @@ use loot_core::{
 };
 use loot_identity as identity;
 use render::{
-    change_col, delta_line, outcome_rows, render_buoy_human, render_history, short,
-    short_change,
+    change_col, delta_line, outcome_rows, render_buoy_human, render_grant_status, render_history,
+    short, short_change,
 };
 use std::fmt::Write as _;
 use std::process::ExitCode;
@@ -124,6 +124,7 @@ const COMMANDS: &[Verb] = &[
     verb("bundle", &[], &[], cmd_bundle),
     verb("apply", &[], OUT, cmd_apply),
     verb("grant", &["--relay", "--allow-demote"], SKIP, cmd_grant),
+    verb("grant-status", &[], &[], cmd_grant_status),
     verb("maroon", DEMOTE, &["--hard", "--no-snapshot", "--ignore-working-copy"], cmd_maroon),
     verb("migrate", DEMOTE, SKIP, cmd_migrate),
     verb("manifest", &[], &[], |_| cmd_manifest()),
@@ -180,6 +181,7 @@ usage:
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
   loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
+  loot grant-status <path>                  list current grantees for <path> — grantor, delivery method, granted_at (sanity check before `loot maroon`, #5)
   loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
@@ -1075,6 +1077,25 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     println!("  recipient runs `loot pull-grants` to receive it");
     // Sealed grant delivered to the relay — a one-way disclosure (ADR 0031).
     snap.record_op("grant", &format!("grant {path} → {grantee} (sealed)"), true);
+    Ok(())
+}
+
+/// `loot grant-status <path>` (#5): who currently holds a grant for `path`,
+/// read straight from the Manifest — a sanity check before `loot maroon`.
+/// Read-only (no snapshot, ADR 0030 — this inspects existing history, it
+/// doesn't record any).
+fn cmd_grant_status(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("grant-status requires <path>")?;
+    let ws = Workspace::open()?;
+    let reg = identity::PeerRegistry::load(ws.dot());
+
+    let oid = ws
+        .current_tree_oid(std::path::Path::new(path))
+        .map_err(|_| format!("path '{path}' not found in current change"))?;
+
+    let entries = ws.manifest().grants_for(&oid);
+    let name_of = |pk: &[u8; 32]| resolve_pubkey_name(&reg, pk);
+    print!("{}", render_grant_status(std::path::Path::new(path), &entries, &name_of));
     Ok(())
 }
 
