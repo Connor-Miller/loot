@@ -11,12 +11,15 @@
 //! [`render`] rides along because `ferry` and the bin depend on it. [`emit`]
 //! (#321) holds the one rendering seam over the Verdict output contract (ADR
 //! 0023) — it lives here rather than in `main.rs` so its [`emit::OutFmt`]
-//! type is available to both the bin and (eventually) `loot-first`.
+//! type is available to both the bin and (eventually) `loot-first`. [`reconcile`]
+//! (#325) holds the pure decision half of `Workspace::reconcile_onto` — a
+//! `View -> Plan` table the executor in `workspace.rs` matches on.
 
 pub mod emit;
 pub mod ferry;
 pub mod flags;
 pub mod ledger;
 mod position;
+pub mod reconcile;
 pub mod render;
 pub mod workspace;

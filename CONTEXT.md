@@ -168,6 +168,23 @@ ref, and only the owning position can judge (or land) it.
 _Avoid_: worktree, sandbox, session.
 Concurrent-agent playbook: [docs/agents/concurrent.md](docs/agents/concurrent.md).
 
+**Position** *(#324, shipped this wave)* — ADR 0034's "position is place, not
+state" lifted into its own module (`crates/loot-cli/src/position.rs`): the
+three fields that name where a [[Workspace]] sits — the dock, the
+[[Lane]] id (if any), and the pinned tip — plus the `tracks_tip` predicate
+(does this position owe a tip advance at all?), the finalized-anchor rule
+(`anchor`: pinned tip, else the working change's parent, else the sole head),
+and the one tip-advancing seam every finalize/adopt/resolve path crosses —
+`advance` (guarded by `tracks_tip`) and `seed` (unconditional, for the
+handful of callers that (re)pin a position rather than advance an
+already-tracked one). Before this module the rule was re-derived at ten
+separate call sites, each hand-writing `self.tip = ...` followed by a store
+write; the #195/#229/#234/#265/#293 stuck-tip bug class is what happens when
+two of those sites disagree. `Workspace` keeps every old public accessor
+(`current_dock`, `lane_id`, `finalized_anchor`, ...) — they delegate here, so
+nothing outside `workspace.rs` needs to know `Position` exists. See
+[[Lane]]/[[Dock]]/[[Harbor]] for what a position sits *on*.
+
 **Shared store** *(the "share only the immutable store" half of ADR 0034;
 ownership classes locked #228, audited #230)* — the append-only surface every
 [[Lane]] forks over without a second clone: `objects/`, `graph`, `keyring`,
@@ -293,6 +310,19 @@ tracks a designated dock. The spine is the mark map (sha ↔ change-id ↔ origi
 in `.loot/git-mirror/`, local-only and rebuildable from trailers. CLI: `loot
 ferry [--git-dir <path>] [--dock <name>]`. _Avoid_: sync, mirror-push — a ferry
 carries in both directions in one crossing.
+
+**Reconcile plan** *(#325)* — the pure Verdict of the reconcile decision:
+`decide(View) -> Plan` (`NoOp`/`Adopt`/`Merge`/`Refuse`) in
+`crates/loot-cli/src/reconcile.rs`, split out of `Workspace::reconcile_onto`
+(the bridge/pull-shaped entry the [[Ferry]] pass and `loot-first review`'s
+catch-up both call). The executor captures disk work first (#219's
+chokepoint, mechanics untouched), builds a `View` from what capture and the
+graph found, then decides, then materializes/signs through [[Position]]. The
+#275 (an un-described working change silently sealed as a merge parent) and
+#292 (a review catch-up finalizing WIP a review is supposed to show unsigned)
+refusals are `Plan::Refuse` variants now — table-tested directly, without a
+`Workspace`, in place of being reachable only through the mutating helper
+that used to hold them.
 
 **Attestation** — a detachable, signed, advisory marker over a change id:
 `sign(change_id || attester || role)` (ADR 0018 / S4). Verified drop-not-fatal

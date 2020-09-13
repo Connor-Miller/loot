@@ -9,6 +9,7 @@
 //! the engine reconciles, and persists state after a mutation.
 
 use crate::position::Position;
+use crate::reconcile::{self, REFUSE_UNDESCRIBED_PARENT};
 use loot_core::bridge::{FerryState, MarkMap};
 use loot_core::{
     oplog, valid_dock_name, DagRepo, LaneEntry, MergeOutcome, Oid, Operation, Repo, RepoStore,
@@ -629,10 +630,13 @@ impl Workspace {
     /// #275) — one rule, two refusals, because the two callers must explain
     /// themselves very differently. [`REFUSE_UNDESCRIBED`] answers a deliberate
     /// `loot new`; [`REFUSE_UNDESCRIBED_PARENT`] answers a merge that seals the
-    /// operator's work as a parent in passing (`fold_line_in` for
-    /// `loot dock merge` / the `loot adopt` catch-up, `reconcile_capture` for a
-    /// `loot ferry` over a git `main` that moved), where a bare "name it" would
-    /// read as a non-sequitur.
+    /// operator's work as a parent in passing, where a bare "name it" would
+    /// read as a non-sequitur. This helper's sole remaining caller is
+    /// `fold_line_in` (`loot dock merge` / the `loot adopt` catch-up); the
+    /// `loot ferry` reconcile asks the same question through
+    /// [`crate::reconcile::decide`] instead (#325) — same wording
+    /// ([`crate::reconcile::Refusal::UndescribedParent`] returns this exact
+    /// constant), decided in the pure planner rather than here.
     ///
     /// The merge *nodes* those paths mint (`merge_tips`) never come through here:
     /// they are machine-authored and carry an honest mechanical subject.
@@ -2913,6 +2917,15 @@ impl Workspace {
     // [`Workspace::merge_dock`] is the dock-shaped entry; and
     // [`Workspace::converge_heads`] is the post-pull fork collapse. The
     // ferry_* mechanics below are private to this decision.
+    //
+    // #325 split the home into a pure brain and a small pair of hands: the
+    // decision itself — covered/adopt/merge/refuse, including the #275/#292
+    // refusal policy — is [`crate::reconcile::decide`], a `View -> Plan`
+    // table tested without a `Workspace`. `reconcile_onto` below is the
+    // hands: it still owns the graph queries the `View` is built from, still
+    // captures first (#219, mechanics untouched), and still signs/materializes/
+    // persists through [`reconcile_adopt`]/[`reconcile_merge`] and the
+    // Position module (#324).
 
     /// Advance the ambient dock to cover `target` — the whole reconcile
     /// decision, one place (previously smeared across ferry.rs's match and
@@ -2922,12 +2935,15 @@ impl Workspace {
     /// the tree — capture in-progress disk work first against `pinned` (the
     /// caller's pre-ingest anchor, so the two lines meet only through the
     /// converge classifier; a capture matching `pinned` or `target` is dropped,
-    /// not minted). Then:
+    /// not minted), build a [`crate::reconcile::View`] from what capture and
+    /// the graph found, and execute whatever [`crate::reconcile::decide`]
+    /// returns:
     ///   - `target` covered by us        → no-op (we are on/ahead/supersede it);
     ///   - real concurrent work captured → merge it with `target`;
     ///   - no local line (`pinned` None) → adopt (fast-forward);
     ///   - we are behind `target`        → adopt (fast-forward);
-    ///   - genuinely diverged            → merge via the classifier.
+    ///   - genuinely diverged            → merge via the classifier;
+    ///   - #275/#292's guards            → refuse, capture already safe on disk.
     ///
     /// Capture is gated on "will this reconcile overwrite the tree?", NOT on
     /// "did git bring new commits?". That latter gate (`had_new`) was the #280
@@ -2944,10 +2960,11 @@ impl Workspace {
     /// merge: review's job is to project the *unfinalized* WIP, so if `main`
     /// moved under the lane and real local work is on the tree, capturing +
     /// finalizing it here would sign the WIP into a merge and leave the empty
-    /// minted change as the thing to "review" — nothing (#292). Under
-    /// `preserve_wip` that path refuses instead, leaving the WIP captured and
-    /// unfinalized. The no-ops (main where we left it) never reach the capture,
-    /// so an ordinary review still projects un-described WIP untouched.
+    /// minted change as the thing to "review" — nothing (#292, now
+    /// [`crate::reconcile::Refusal::ReviewStaleAnchor`]). Under `preserve_wip`
+    /// that path refuses instead, leaving the WIP captured and unfinalized.
+    /// The no-ops (main where we left it) never reach the capture, so an
+    /// ordinary review still projects un-described WIP untouched.
     ///
     /// Returns the per-path outcomes (empty on adopt/no-op).
     pub fn reconcile_onto(
@@ -3004,20 +3021,42 @@ impl Workspace {
         // `reconcile_adopt` materialized the landed tree straight over a live,
         // captured working change. `reconcile_capture` drops a capture that is
         // empty or duplicates `pinned`/`target` (the co-located checkout after a
-        // `git pull`), so the fast-forward path still costs nothing.
-        let wip = self.reconcile_capture(pinned, Some(target), preserve_wip)?;
-        match (wip, pinned) {
-            (Some(w), _) => self.reconcile_merge(&w, target, label),
-            (None, None) => {
+        // `git pull`), so the fast-forward path still costs nothing. It no
+        // longer refuses (#325) — that policy lives in `reconcile::decide` now,
+        // reachable only via the `View` built below.
+        let wip = self.reconcile_capture(pinned, Some(target))?;
+
+        // `described` only matters when `wip` is real (see `View`'s doc); with
+        // no capture the working change is gone (dropped as redundant) or was
+        // never there, and either way `working_is_undescribed` reads `true`,
+        // which the planner never consults on that path.
+        let described = wip.is_some() && !self.working_is_undescribed();
+        let view = reconcile::View {
+            // Always `false` here — the `covered` early return above already
+            // handled `true`. Kept on `View` so the arm stays part of the one
+            // decision table and table-tested (see `reconcile.rs`).
+            covered: false,
+            wip: wip.clone(),
+            pinned: pinned.cloned(),
+            pinned_is_ancestor_of_target: pinned.is_some_and(|o| self.graph().is_ancestor(o, target)),
+            preserve_wip,
+            described,
+        };
+        match reconcile::decide(&view) {
+            reconcile::Plan::NoOp => Ok(BTreeMap::new()),
+            reconcile::Plan::Refuse(refusal) => Err(refusal.message().to_string()),
+            reconcile::Plan::Adopt => {
                 self.reconcile_adopt(target)?;
                 Ok(BTreeMap::new())
             }
-            (None, Some(o)) if self.graph().is_ancestor(o, target) => {
-                self.reconcile_adopt(target)?;
-                Ok(BTreeMap::new())
-            }
-            (None, Some(o)) => {
-                let ours = o.clone();
+            reconcile::Plan::Merge { ours } => {
+                // Merging the just-captured wip signs it as our merge parent
+                // first (#275's "this merge seals your local work into signed
+                // history") — a pinned tip merged instead is already finalized,
+                // nothing left to sign.
+                if wip.is_some() {
+                    self.finalize_working()?;
+                }
                 self.reconcile_merge(&ours, target, label)
             }
         }
@@ -3037,35 +3076,26 @@ impl Workspace {
     /// co-located checkout after a `git pull`) is dropped from the graph
     /// again, so no redundant change is minted and no stray head is left for
     /// reconcile or a later pass's anchor derivation to trip over. Returns
-    /// the captured change when real work was finalized.
+    /// the captured change when real work was found.
+    ///
+    /// Mechanics only (#325, #219's chokepoint semantics byte-untouched): this
+    /// used to also decide whether to refuse or finalize the capture — that
+    /// policy now lives in `reconcile::decide`, reached from `reconcile_onto`
+    /// after this returns. Callers that still want the old "capture, refuse
+    /// on an un-described real capture, else finalize" shape (`fold_line_in`)
+    /// compose it themselves from `drop_capture_if_redundant` +
+    /// `refuse_if_undescribed` + `finalize_working`.
     fn reconcile_capture(
         &mut self,
         base: Option<&Oid>,
         target: Option<&Oid>,
-        preserve_wip: bool,
     ) -> Result<Option<Oid>, String> {
         let msg = self.working_message_or_placeholder();
         let (id, _) = self.snapshot_from(base, &msg, &[])?;
         let against: Vec<&Oid> = [base, target].into_iter().flatten().collect();
         if self.drop_capture_if_redundant(&id, &against)? {
             Ok(None)
-        } else if preserve_wip {
-            // Review's catch-up ferry (#292): git `main` moved under this lane
-            // while a live working change carries real work. Finalizing it as a
-            // merge parent — the fold below — is what stranded #257's work:
-            // signed into a "ferry: reconcile git main" merge, with the empty
-            // minted change left as the thing to review (nothing), unlandable
-            // (land finalizes a *working* change), and no op-log entry to undo.
-            // Refuse instead. The snapshot above persisted the edits, so the WIP
-            // survives as a live, UNFINALIZED working change — only the signature
-            // is withheld — and the pass records nothing to walk back.
-            Err(REFUSE_REVIEW_STALE_ANCHOR.to_string())
         } else {
-            // Real local work, about to be signed as our merge parent — it needs
-            // a name (#275). Below the duplicate drop above, so the common
-            // nothing-new pass never asks for one.
-            self.refuse_if_undescribed(REFUSE_UNDESCRIBED_PARENT)?;
-            self.finalize_working()?;
             Ok(Some(id))
         }
     }
@@ -3165,42 +3195,6 @@ const REFUSE_UNDESCRIBED: &str = "refusing to sign an un-described working chang
      becomes the permanent subject on git `main`\n  name it:        loot describe -m \"<subject>\"\n  \
      or in one step: loot new -m \"<subject>\"\n  (your edits are captured and safe — only the \
      signature was withheld)";
-
-/// The [`REFUSE_UNDESCRIBED`] twin for the merges that seal the operator's work
-/// as a parent in passing (#275): same rule, but it must say *why a sync verb is
-/// suddenly asking for a name*, or it reads as a non-sequitur.
-///
-/// It promises the capture survives, and nothing more. That is the one thing
-/// verified to outlive the erroring process (`snapshot_from` persists; loot is
-/// process-per-command, so an in-memory guarantee would be a lie). A refused
-/// pass's *ingest* does not persist — it is simply redone on the re-run, which
-/// is why the whole pass is safe to abandon here.
-const REFUSE_UNDESCRIBED_PARENT: &str =
-    "refusing to sign your un-described working change as a merge parent — this merge seals \
-     your local work into signed history, and its message becomes the permanent subject on \
-     git `main`\n  name it:  loot describe -m \"<subject>\"\n  then re-run the same command\n  \
-     (your edits are captured and safe — only the merge waits for the name)";
-
-/// The review-only refusal (#292): `loot-first review` / `loot ferry --with-wip`
-/// caught up over a git `main` that moved *under this lane* while a live working
-/// change carried real work. Folding it into the catch-up merge would finalize
-/// the WIP and leave the empty minted change as the thing to review — the silent
-/// dead end #257 hit (unreviewable, unlandable, no op to undo). We refuse before
-/// the fold, so the described WIP stays a live, unfinalized working change.
-///
-/// Like [`REFUSE_UNDESCRIBED_PARENT`], it promises only that the capture
-/// survives the erroring process (`snapshot_from` persists; the refused pass's
-/// ingest does not, so it is simply redone on the re-run). The root cause is a
-/// lane spawned from an anchor already behind git `main`.
-const REFUSE_REVIEW_STALE_ANCHOR: &str =
-    "git `main` moved under this lane while your work is described but unfinalized, so \
-     `loot-first review` would have to fold your WIP into a reconcile merge to catch up — \
-     which finalizes it and leaves nothing to review (issue #292). Refusing so your work is \
-     never silently stranded.\n  Nothing was finalized; your working change is intact on \
-     disk.\n  This lane was spawned from an anchor already behind git `main`. To land this \
-     work, re-spawn a lane from current main and re-apply it there (`loot lane new` from the \
-     primary once it has caught up), or reconcile deliberately with `loot adopt` — aware that \
-     the adopt signs your WIP into a merge (it stops being a reviewable working change).";
 
 /// Resolve visibility for `path` under an explicit `.lootattributes` text.
 /// The bridge classifies ingested files under the *ingested commit's own*
