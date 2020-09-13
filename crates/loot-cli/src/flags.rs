@@ -15,9 +15,14 @@
 /// them (`-m <message>`); `bare` flags stand alone (`--json`). Anything else
 /// spelled like a flag is rejected before the verb runs.
 ///
-/// Declared per verb, not per subcommand: `loot lane`'s spec is the union over
-/// `new`/`gc`/…, which is what it takes to catch a flag that exists nowhere in
-/// the CLI — the #67 class — without a second dispatch table to keep in step.
+/// Declared per verb in the dispatch table: `loot lane`'s entry is the union
+/// over `new`/`gc`/…, which is what it takes to catch a flag that exists
+/// nowhere in the CLI — the #67 class — without a second dispatch table to
+/// keep in step. A verb that branches on a subcommand then narrows the gate
+/// itself: it re-checks the resolved subcommand's own spec via [`check_sub`],
+/// so a flag real only on a *sibling* subcommand refuses too (#278).
+///
+/// [`check_sub`]: FlagSpec::check_sub
 pub struct FlagSpec {
     /// The binary the verb belongs to, for the error text (`loot`, `loot-first`).
     pub bin: &'static str,
@@ -62,6 +67,23 @@ impl FlagSpec {
             }
         }
         Ok(FlagCheck::Proceed)
+    }
+
+    /// The re-check where a verb resolves its subcommand (#278). The verb's
+    /// table entry is the union of its subcommands' flags, so a flag real on a
+    /// *sibling* subcommand passes `main`'s gate and used to be silently
+    /// ignored — the #67 failure mode, narrowed from CLI-wide to within-verb.
+    /// The verb calls this with the resolved subcommand's own spec (its `name`
+    /// is the resolved form, e.g. `lane new`) before anything runs.
+    ///
+    /// `-h`/`--help` cannot normally reach here — the verb gate in `main`
+    /// intercepts it before dispatch — but if one does, refuse rather than
+    /// run: never execute a verb the user asked to have explained.
+    pub fn check_sub(&self, args: &[String]) -> Result<(), String> {
+        match self.check(args)? {
+            FlagCheck::Proceed => Ok(()),
+            FlagCheck::Help => Err(format!("run `{} --help` for usage", self.bin)),
+        }
     }
 
     /// The refusal — it names the offending flag and lists what this verb does
@@ -146,6 +168,20 @@ mod tests {
     #[test]
     fn positionals_are_not_flags() {
         assert_eq!(NOFLAGS.check(&args(&["a3f9", "-"])), Ok(FlagCheck::Proceed));
+    }
+
+    /// The #278 narrowing: a verb's table entry is the union over its
+    /// subcommands, so the *subcommand* re-checks its own spec at resolution.
+    /// Same refusal shape as the verb gate; help arriving here (it is
+    /// intercepted upstream) explains rather than runs.
+    #[test]
+    fn check_sub_refuses_what_this_subcommand_does_not_take() {
+        assert_eq!(BOTH.check_sub(&args(&["positional", "-m", "x", "--dry"])), Ok(()));
+        let err = BOTH.check_sub(&args(&["--nope"])).unwrap_err();
+        assert!(err.contains("--nope"), "the error names the offending flag: {err}");
+        assert!(err.contains("`toy both` accepts"), "{err}");
+        // Defense-in-depth: never run a verb the user asked to have explained.
+        assert!(BOTH.check_sub(&args(&["--help"])).is_err());
     }
 
     /// `-h`/`--help` is accepted everywhere and short-circuits to usage. It is

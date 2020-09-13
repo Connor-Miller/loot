@@ -223,7 +223,9 @@ info flags (no repo needed):
 
 a flag a verb does not accept is an error, never ignored (#67) — a typo like
   `loot log --path x` refuses instead of printing the unfiltered log as if the
-  filter had run.";
+  filter had run. That holds within a verb too (#278): `loot lane new
+  --stale-hours 12` refuses (`--stale-hours` belongs to `lane gc`) rather than
+  reading as accepted and doing nothing.";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -1185,18 +1187,40 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A subcommand's own flag spec (#278): `name` is the resolved form the
+/// refusal shows (`lane new`), checked with [`FlagSpec::check_sub`] where the
+/// verb resolves its subcommand. The verb's [`COMMANDS`] entry stays the union
+/// of these (a test pins that), so a flag that exists nowhere is still caught
+/// — and `--help` still honoured — before dispatch.
+const fn subspec(
+    name: &'static str,
+    valued: &'static [&'static str],
+    bare: &'static [&'static str],
+) -> FlagSpec {
+    FlagSpec { bin: "loot", name, valued, bare }
+}
+
+/// `loot dock`'s subcommand specs (#278): merge / rm / the create form.
+const DOCK_MERGE: FlagSpec = subspec("dock merge", &[], OUT);
+const DOCK_RM: FlagSpec = subspec("dock rm", &[], &[]);
+const DOCK_CREATE: FlagSpec = subspec("dock <name>", &["--at"], &[]);
+#[cfg(test)]
+const DOCK_SUBS: &[&FlagSpec] = &[&DOCK_MERGE, &DOCK_RM, &DOCK_CREATE];
+
 fn cmd_dock(args: &[String]) -> Result<(), String> {
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
     // Subcommand forms: `loot dock merge <name>` collapses another dock's tip
     // into this one locally (CA2); `loot dock rm <name>` removes a dock
     // (#212). Everything else is create/switch.
     if positional.first().map(|s| s.as_str()) == Some("merge") {
+        DOCK_MERGE.check_sub(args)?;
         let name = positional
             .get(1)
             .ok_or("usage: loot dock merge <name>")?;
         return cmd_dock_merge(name, args);
     }
     if positional.first().map(|s| s.as_str()) == Some("rm") {
+        DOCK_RM.check_sub(args)?;
         let name = positional.get(1).ok_or("usage: loot dock rm <name>")?;
         let mut ws = Workspace::open()?;
         let parked = ws.remove_dock(name)?;
@@ -1209,6 +1233,7 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
+    DOCK_CREATE.check_sub(args)?;
     let name = positional
         .first()
         .ok_or("usage: loot dock <name> --at <dir>  |  loot dock merge <name>  |  loot dock rm <name>")?;
@@ -1227,6 +1252,15 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `loot lane`'s subcommand specs (#278).
+const LANE_NEW: FlagSpec = subspec("lane new", &["--ticket", "--name", "--at"], OUT);
+const LANE_LIST: FlagSpec = subspec("lane list", &[], OUT);
+const LANE_NAME: FlagSpec = subspec("lane name", &[], &[]);
+const LANE_RM: FlagSpec = subspec("lane rm", &[], &[]);
+const LANE_GC: FlagSpec = subspec("lane gc", &["--stale-hours"], &[]);
+#[cfg(test)]
+const LANE_SUBS: &[&FlagSpec] = &[&LANE_NEW, &LANE_LIST, &LANE_NAME, &LANE_RM, &LANE_GC];
+
 /// `loot lane <new|list|name|rm|gc>` — the sealed-lane lifecycle (ADR 0034,
 /// #231). A lane is an ephemeral working directory over this repo's shared
 /// store, born at the finalized tip; naming it makes it a dock (persisted).
@@ -1234,8 +1268,13 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
 /// heartbeat goes stale.
 fn cmd_lane(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
+    // Each arm re-gates against its own spec (#278) before the workspace
+    // opens: the table's `lane` entry is the union over these, so `main`'s
+    // gate alone would let a sibling's flag (`lane new --stale-hours`) ride
+    // through ignored.
     match sub {
         "new" => {
+            LANE_NEW.check_sub(args)?;
             let fmt = out_fmt(args);
             let name = flag(args, "--name");
             let at = flag(args, "--at").map(std::path::PathBuf::from);
@@ -1274,8 +1313,14 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        "list" | "ls" => cmd_lane_list(&args[1..]),
+        // Full `args` (not `args[1..]`): `out_fmt` only reads flags, and bare
+        // `loot lane` used to panic slicing an empty argv here.
+        "list" | "ls" => {
+            LANE_LIST.check_sub(args)?;
+            cmd_lane_list(args)
+        }
         "name" => {
+            LANE_NAME.check_sub(args)?;
             let name = args.get(1).ok_or("usage: loot lane name <name>  (inside the lane)")?;
             let ws = Workspace::open()?;
             ws.name_lane(name)?;
@@ -1286,6 +1331,7 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "rm" => {
+            LANE_RM.check_sub(args)?;
             let key = args.get(1).ok_or("usage: loot lane rm <id-or-name>")?;
             let mut ws = Workspace::open()?;
             let e = ws.remove_lane(key)?;
@@ -1298,6 +1344,7 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "gc" => {
+            LANE_GC.check_sub(args)?;
             let stale_secs: u64 = match flag(args, "--stale-hours") {
                 Some(v) => {
                     let hours: u64 =
@@ -2281,6 +2328,12 @@ mod tests {
                 None if name == "buoy" => &BUOY_FLAGS,
                 None => continue, // not a verb line (prose that mentions `loot`)
             };
+            // #278: a line that documents a subcommand (`loot lane gc …`,
+            // `loot dock <name> …`) must also pass that subcommand's own
+            // gate — the verb's union alone would hide a flag documented on
+            // the wrong sibling.
+            let subhead = rest.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+            let subspec = LANE_SUBS.iter().chain(DOCK_SUBS).find(|s| s.name == subhead);
             // Usage decorates flags with brackets and alternation:
             // `[--porcelain|--json]`, `[-m <message>]`.
             for token in rest.split(|c: char| c.is_whitespace() || "[]|()".contains(c)) {
@@ -2291,6 +2344,12 @@ mod tests {
                     spec.check(&args(&[token])).is_ok(),
                     "usage documents `{token}` on `loot {name}`, but its spec rejects it"
                 );
+                if let Some(s) = subspec {
+                    assert!(
+                        s.check(&args(&[token])).is_ok(),
+                        "usage documents `{token}` on `loot {subhead}`, but its subcommand spec rejects it"
+                    );
+                }
             }
         }
     }
@@ -2355,6 +2414,87 @@ mod tests {
     fn buoy_gates_its_flags_too() {
         assert!(BUOY_FLAGS.check(&args(&["--rolel", "release"])).is_err());
         assert_eq!(BUOY_FLAGS.check(&args(&["--help"])), Ok(FlagCheck::Help));
+    }
+
+    // --- #278: the subcommand gate ---
+    // The table's `lane`/`dock` entry is the union over its subcommands, so a
+    // flag real on a *sibling* subcommand passes `main`'s gate; the verb
+    // re-checks the resolved subcommand's own spec before anything runs.
+
+    /// The finding itself: `loot lane new --stale-hours 12` read as accepted
+    /// (`--stale-hours` is `lane gc`'s flag) and did nothing. Each refusal
+    /// fires at the gate, before the workspace opens.
+    #[test]
+    fn a_sibling_subcommands_flag_is_rejected_at_the_subcommand() {
+        let err = cmd_lane(&args(&["new", "--stale-hours", "12"])).unwrap_err();
+        assert!(err.contains("--stale-hours"), "the error names the offending flag: {err}");
+        assert!(err.contains("`loot lane new` accepts"), "{err}");
+
+        let err = cmd_lane(&args(&["gc", "--ticket", "67"])).unwrap_err();
+        assert!(err.contains("--ticket"), "{err}");
+        assert!(err.contains("`loot lane gc` accepts"), "{err}");
+
+        // `lane name`/`lane rm` take no flags at all — even the union's
+        // machine-output selectors refuse.
+        let err = cmd_lane(&args(&["name", "n", "--json"])).unwrap_err();
+        assert!(err.contains("`loot lane name` takes no flags"), "{err}");
+        let err = cmd_lane(&args(&["rm", "t1", "--porcelain"])).unwrap_err();
+        assert!(err.contains("`loot lane rm` takes no flags"), "{err}");
+
+        // The issue's `dock` example: `--at` is the create form's flag.
+        let err = cmd_dock(&args(&["rm", "x", "--at", "y"])).unwrap_err();
+        assert!(err.contains("--at"), "{err}");
+        assert!(err.contains("`loot dock rm` takes no flags"), "{err}");
+        let err = cmd_dock(&args(&["merge", "x", "--at", "y"])).unwrap_err();
+        assert!(err.contains("`loot dock merge` accepts"), "{err}");
+    }
+
+    /// Each subcommand's own flags still pass its gate — the narrowed specs
+    /// must not turn a working flag into a refusal.
+    #[test]
+    fn each_subcommands_declared_flags_pass_its_own_gate() {
+        let ok =
+            |s: &FlagSpec, argv: &[&str]| assert_eq!(s.check(&args(argv)), Ok(FlagCheck::Proceed));
+        ok(&LANE_NEW, &["new", "--ticket", "67", "--name", "n", "--at", "d", "--json"]);
+        ok(&LANE_LIST, &["list", "--porcelain"]);
+        ok(&LANE_NAME, &["name", "n"]);
+        ok(&LANE_RM, &["rm", "t1"]);
+        ok(&LANE_GC, &["gc", "--stale-hours", "12"]);
+        ok(&DOCK_MERGE, &["merge", "x", "--json"]);
+        ok(&DOCK_RM, &["rm", "x"]);
+        ok(&DOCK_CREATE, &["x", "--at", "dir"]);
+    }
+
+    /// The two gates must agree on which flags exist under the verb: the
+    /// table's union is what catches a nowhere-flag (and honours `--help`)
+    /// before dispatch, and the subcommand specs are what the verb re-checks.
+    /// A flag added to one side only is either refused before its own gate
+    /// can accept it, or slips back to silently-ignored — this is the "second
+    /// dispatch table kept in step" #67 declined to hand-maintain, held by a
+    /// test instead.
+    #[test]
+    fn the_verb_spec_is_the_union_of_its_subcommand_specs() {
+        use std::collections::BTreeSet;
+        let union = |subs: &[&FlagSpec]| -> (BTreeSet<&str>, BTreeSet<&str>) {
+            (
+                subs.iter().flat_map(|s| s.valued).copied().collect(),
+                subs.iter().flat_map(|s| s.bare).copied().collect(),
+            )
+        };
+        for (verb, subs) in [("lane", LANE_SUBS), ("dock", DOCK_SUBS)] {
+            let table = &COMMANDS.iter().find(|v| v.spec.name == verb).unwrap().spec;
+            let (valued, bare) = union(subs);
+            assert_eq!(table.valued.iter().copied().collect::<BTreeSet<_>>(), valued, "{verb}");
+            assert_eq!(table.bare.iter().copied().collect::<BTreeSet<_>>(), bare, "{verb}");
+        }
+    }
+
+    /// Bare `loot lane` defaults to `list` — it must not panic slicing an
+    /// empty argv (found wiring #278; `&args[1..]` on zero args). The contract
+    /// here is only "returns": a listing or a real refusal, never a panic.
+    #[test]
+    fn bare_lane_defaults_to_list_without_panicking() {
+        let _ = cmd_lane(&args(&[]));
     }
 
     #[test]

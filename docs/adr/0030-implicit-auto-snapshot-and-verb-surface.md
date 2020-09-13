@@ -261,10 +261,14 @@ clap): one gate, two dispatch tables. Two consequences worth stating:
 - **`-h`/`--help` rides every verb** and prints usage *instead of* running it.
   Otherwise it would be the one flag still silently ignored — and it was the
   dangerous one: `loot new --help` **finalized (signed) the working change**.
-- **Flags are declared per verb, not per subcommand** — `loot lane`'s set is the
-  union over `new`/`gc`/…. That catches every flag that exists nowhere in the
-  CLI (the reported class) without a second dispatch table to keep in step; a
-  flag real on a *sibling* subcommand is still ignored (#278).
+- **Flags are declared per verb, and re-checked per subcommand** — the dispatch
+  table's `loot lane` entry is the union over `new`/`gc`/…, which catches every
+  flag that exists nowhere in the CLI (the reported class) before dispatch and
+  keeps `--help` riding the verb. A verb that branches on a subcommand then
+  narrows the gate itself: it re-checks the resolved subcommand's own spec, so
+  a flag real only on a *sibling* subcommand (`loot lane new --stale-hours`,
+  `loot dock rm --at x`) refuses too (#278). The union and the subcommand specs
+  are kept in step by a test, not by hand.
 
 ### Parallel-agent safety: snapshot never finalizes or signs
 
