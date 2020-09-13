@@ -40,6 +40,23 @@ fn main() -> ExitCode {
         };
     }
 
+    // `bisect run <cmd…>` passes flags through to the test command, so `bisect`
+    // is dispatched ahead of the flag gate (like `buoy`, #390). `-h`/`--help` as
+    // the first token prints usage; the handler validates each subcommand's args.
+    if cmd == "bisect" {
+        if matches!(rest.first().map(String::as_str), Some("-h" | "--help")) {
+            print_help();
+            return ExitCode::SUCCESS;
+        }
+        return match loot_cli::bisect::dispatch(rest) {
+            Ok(shape) => {
+                print!("{}", shape.render(OutFmt::Human));
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e, &[]),
+        };
+    }
+
     // Every verb *returns* its output as a boxed [`Emit`] shape rather than
     // writing stdout itself (1a): the dispatcher renders it once, here, with
     // the resolved format. `help`/`version` and the per-verb `--help` gate
@@ -248,6 +265,13 @@ usage:
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
   loot pull [<url>] [--remote <name>] [--no-surface] [--porcelain|--json]  fetch, merge, converge, and surface changes from a relay
   loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip instead projects ONLY the ambient dock's unfinalized WIP to review/<lane-id> (review/<dock> on the primary; map #148, #281) — a pure review projection: no ingest, no reconcile, no main advance (ADR 0039)
+  loot bisect start                         begin a binary search for the change that introduced a regression (#390); mark bounds, then iterate
+  loot bisect bad [<selector>]              mark a change as having the regression (default: the midpoint currently checked out)
+  loot bisect good [<selector>]             mark a change as NOT having the regression (default: the current midpoint)
+  loot bisect skip [<selector>]             mark a change as untestable; it is excluded as a midpoint but still bounds the range
+  loot bisect run <cmd> [args...]           automate: at each midpoint run <cmd> (exit 0=good, 125=skip, other=bad) until the first bad change is found
+  loot bisect status                        show the in-progress session (good/bad/skipped, the midpoint checked out)
+  loot bisect reset                         end the session and restore the working tree to where the bisect began
   loot completions <bash|zsh|fish>          print a shell completion script to stdout (no repo needed) — pipe it into your shell config, e.g. loot completions zsh > ~/.zsh/completions/_loot
 
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
@@ -2723,6 +2747,7 @@ fn cmd_remote(args: &[String]) -> Emitted {
 /// `loot lane`'s leaves are declared as their own [`FlagSpec`]s, see
 /// [`LANE_SUBS`]). Add a leaf here once and every generated shell offers it.
 const SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("bisect", &["start", "good", "bad", "skip", "run", "status", "reset"]),
     ("lane", &["new", "list", "merge", "name", "rm", "gc"]),
     ("peer", &["add", "remove", "list"]),
     ("remote", &["add", "remove", "list"]),
@@ -2738,6 +2763,7 @@ const SUBCOMMANDS: &[(&str, &[&str])] = &[
 fn completion_verb_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = COMMANDS.iter().map(|v| v.spec.name).collect();
     names.push("buoy");
+    names.push("bisect"); // dispatched ahead of the table (#390)
     names.push("help");
     names.sort_unstable();
     names
@@ -3215,6 +3241,7 @@ mod tests {
             .collect();
         let mut dispatched: BTreeSet<&str> = COMMANDS.iter().map(|v| v.spec.name).collect();
         dispatched.insert("buoy"); // dispatched before the table (own ExitCode)
+        dispatched.insert("bisect"); // dispatched before the table (run passes flags through, #390)
         assert_eq!(
             documented, dispatched,
             "usage text and the COMMANDS dispatch table disagree on the verb set"
