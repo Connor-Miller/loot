@@ -1,7 +1,7 @@
 # Build artifacts and generated repos never belong in history (loot#64).
 target/
 test-repos/
-.claude/
+.claude/worktrees/
 .scratch/
 # Site (loot.millerbyte.com, #257) deps + build output + Vercel CLI link.
 site/node_modules/
