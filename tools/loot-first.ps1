@@ -14,14 +14,18 @@
                           (or refresh) the PR. Records the PR in the pr-map
                           ledger keyed by the durable change id.
 
-    land -Pr <n>          Land an approved PR the loot way: finalize
-                          (`loot new`) on the PR's dock -> `loot ferry`
-                          (projects the signed commit onto main + reaps the
-                          provisional lane) -> fast-forward push main to
-                          GitHub -> point the PR head at the landed sha so
-                          GitHub marks it Merged by reachability (#150) ->
-                          `loot push` to the relay. Falls back to
-                          close-with-pointer when main cannot fast-forward.
+    land -Pr <n>          Land an approved PR the loot way: pre-land gate
+                          (`cargo test` - the review gate ran on projected
+                          WIP, nothing has yet proven the landed commit
+                          builds; -SkipTests is the break-glass for
+                          non-code lands) -> finalize (`loot new`) on the
+                          PR's dock -> `loot ferry` (projects the signed
+                          commit onto main + reaps the provisional lane) ->
+                          fast-forward push main to GitHub -> point the PR
+                          head at the landed sha so GitHub marks it Merged
+                          by reachability (#150) -> `loot push` to the
+                          relay. Falls back to close-with-pointer when main
+                          cannot fast-forward.
 
     status                Show the in-flight review lanes and their PRs.
 
@@ -45,7 +49,8 @@ param(
     [string]$Cmd,
     [int]$Pr = 0,
     [string]$Title = "",
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$SkipTests
 )
 
 # NOTE: keep this file ASCII-only (PowerShell 5.1 parses a no-BOM script as
@@ -191,6 +196,17 @@ exit 0
                 Fail "ambient dock is not '$($lane.Dock)' - run 'loot dock $($lane.Dock)' first (land refuses to finalize another lane)"
             }
             if ($DryRun) { Write-Host "(dry run) stopping before finalize"; break }
+
+            # Pre-land gate (#155 follow-up): review approved projected WIP,
+            # but nothing has yet proven the commit about to land builds.
+            # Finalize is the point of no return, so the gate sits here.
+            if ($SkipTests) {
+                Write-Host "pre-land cargo test SKIPPED (-SkipTests break-glass)" -ForegroundColor Yellow
+            } else {
+                Write-Host ">>> cargo test  (pre-land gate: the landed commit must build)"
+                & "$env:USERPROFILE\.cargo\bin\cargo.exe" test
+                if ($LASTEXITCODE -ne 0) { Fail "pre-land cargo test failed - not landing PR #$Pr" }
+            }
 
             Write-Host ">>> loot new  (finalize + sign; git-quiet)"
             & $Loot new
