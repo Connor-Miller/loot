@@ -120,6 +120,7 @@ const COMMANDS: &[Verb] = &[
     verb("lanes", &[], OUT, cmd_lane_list),
     verb("log", &[], &[], cmd_log),
     verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
+    verb("verify", &[], &[], |_| cmd_verify()),
     verb("bundle", &[], &[], cmd_bundle),
     verb("apply", &[], OUT, cmd_apply),
     verb("grant", &["--relay", "--allow-demote"], SKIP, cmd_grant),
@@ -174,6 +175,7 @@ usage:
   loot surface                              materialize what the current identity may see
   loot log [<selector>]                     show change history, or the ancestry of one point in it; selectors: @, HEAD, HEAD~<n>, id prefix
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
+  loot verify                               integrity-check the object store: rehash every object, find missing ones (exits 1 on problems)
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
@@ -768,6 +770,34 @@ fn cmd_gc(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// `loot verify` — integrity-check the loose object store (#19). Read-only:
+/// every object file is decoded and re-hashed against its filename (the
+/// content address), and every address a change references must have a file.
+/// A clean store exits 0; any corrupt or missing object is reported by full
+/// address and the command errors (exit 1), so CI can gate on it. Deliberately
+/// never opens the Workspace: a corrupt store fails to load, and the store
+/// that fails to load is the one this command exists to diagnose.
+fn cmd_verify() -> Result<(), String> {
+    let dot = workspace::resolve_store_dot(std::path::Path::new("."))?;
+    let report = loot_core::DagRepo::verify(&dot).map_err(|e| e.to_string())?;
+    if report.is_clean() {
+        println!("all objects OK — {} object(s) verified", report.ok);
+        return Ok(());
+    }
+    for addr in &report.corrupt {
+        println!("corrupt: {}", loot_core::hex::encode(&addr.0));
+    }
+    for addr in &report.missing {
+        println!("missing: {}", loot_core::hex::encode(&addr.0));
+    }
+    Err(format!(
+        "object store failed verification: {} corrupt, {} missing ({} OK)",
+        report.corrupt.len(),
+        report.missing.len(),
+        report.ok
+    ))
 }
 
 /// Render a byte count as a compact human-readable size (B / KiB / MiB / GiB).

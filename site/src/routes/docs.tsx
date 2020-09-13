@@ -31,6 +31,7 @@ const CLI: Array<{ id: string; group: string; verbs: Verb[] }> = [
 			{ cmd: 'loot log', desc: 'Show change history with visibility hints; a divergent change is marked !.' },
 			{ cmd: 'loot surface', desc: 'Materialize what the current identity may see; sealed paths are skipped.' },
 			{ cmd: 'loot gc [--dry-run]', desc: 'Prune loose objects no change references.' },
+			{ cmd: 'loot verify', desc: 'Integrity-check the object store: rehash every object, find missing ones. Exits 1 on problems.' },
 			{ cmd: 'loot undo  ·  loot op log  ·  loot op restore <n>', desc: 'Step the view back / list / jump the operation log (redo included).' },
 			{ cmd: 'loot abandon <version-id> [--head]', desc: 'Drop one version of a divergent change, or a whole fork tip; undoable.' },
 			{ cmd: 'loot adopt [<version-id>] [--discard-wip]', desc: 'Catch this working tree up to landed history.' },
