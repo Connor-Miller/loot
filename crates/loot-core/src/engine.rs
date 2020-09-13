@@ -34,6 +34,29 @@ use crate::store::RepoStore;
 use object_store::{ObjectStore, Stored};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic per-process counter feeding [`atomic_write`]'s staging name.
+static METADATA_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `bytes` to `path` atomically: stage to a unique sibling temp file in
+/// the same directory, then `fs::rename` it over `path`. A crash mid-write or a
+/// concurrent writer therefore never leaves a torn or truncated file — a reader
+/// always sees the whole prior-or-next version, never a partial one (#252). The
+/// temp name is unique per (process, call) so two writers of the same `path`
+/// cannot clobber each other's staging file, and staging in the *same*
+/// directory keeps the rename atomic (a cross-device rename is not).
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let n = METADATA_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), n));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
 
 /// Returned by `gc`: how many loose objects were (or, on a dry run, would be)
 /// pruned, and the total bytes they occupied on disk (ADR 0012, #66).
@@ -851,12 +874,14 @@ impl DagRepo {
         store.write_heads(&self.graph.heads()).map_err(io)?;
 
         // Custody + advisory metadata: shared, whole-file. RepoStore names them.
-        std::fs::write(store.keyring(), persist_codec::encode_keyring(&self.keyring)).map_err(io)?;
-        std::fs::write(store.escrow(), persist_codec::encode_escrow(&self.escrow)).map_err(io)?;
-        std::fs::write(store.manifest(), encode_manifest(&self.manifest)).map_err(io)?;
-        std::fs::write(store.purges(), encode_purges(&self.purges)).map_err(io)?;
-        std::fs::write(store.conflicts(), encode_conflicts(&self.conflicts)).map_err(io)?;
-        std::fs::write(store.attestations(), encode_attestations(&self.attestations)).map_err(io)?;
+        // Each goes through atomic_write (temp+rename) so a crash or a
+        // concurrent writer never tears a reader's view of the file (#252).
+        atomic_write(&store.keyring(), &persist_codec::encode_keyring(&self.keyring)).map_err(io)?;
+        atomic_write(&store.escrow(), &persist_codec::encode_escrow(&self.escrow)).map_err(io)?;
+        atomic_write(&store.manifest(), &encode_manifest(&self.manifest)).map_err(io)?;
+        atomic_write(&store.purges(), &encode_purges(&self.purges)).map_err(io)?;
+        atomic_write(&store.conflicts(), &encode_conflicts(&self.conflicts)).map_err(io)?;
+        atomic_write(&store.attestations(), &encode_attestations(&self.attestations)).map_err(io)?;
         Ok(())
     }
 }
@@ -2510,6 +2535,79 @@ mod tests {
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover_tmp, "atomic write should leave no .tmp files");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- atomic custody-metadata writes (#252) ---
+
+    #[test]
+    fn atomic_write_leaves_complete_new_contents_and_no_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "loot-atomic-write-{}-{}",
+            std::process::id(),
+            METADATA_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keyring");
+
+        atomic_write(&path, b"old-and-shorter").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old-and-shorter");
+
+        // Overwriting with different-length content leaves exactly the new
+        // bytes — never a truncated mix of old and new.
+        atomic_write(&path, b"new-longer-contents").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-longer-contents");
+
+        // No staging file survives the rename.
+        let leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover, "atomic_write must leave no .tmp staging file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_truncate() {
+        use std::sync::Arc;
+        // Many threads race to rewrite the same file with distinct, differently
+        // sized payloads. Every observed state must be one *complete* payload —
+        // never a torn/truncated blend (#252). Bare fs::write (truncate-in-
+        // place) cannot guarantee this; temp+rename can.
+        let dir = std::env::temp_dir().join(format!(
+            "loot-atomic-race-{}-{}",
+            std::process::id(),
+            METADATA_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Arc::new(dir.join("manifest"));
+
+        let payloads: Vec<Vec<u8>> =
+            (0..8u8).map(|i| vec![b'A' + i; 100 + i as usize * 37]).collect();
+        let payloads = Arc::new(payloads);
+
+        let handles: Vec<_> = (0..payloads.len())
+            .map(|i| {
+                let path = Arc::clone(&path);
+                let payloads = Arc::clone(&payloads);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        atomic_write(&path, &payloads[i]).unwrap();
+                        let seen = std::fs::read(&*path).unwrap();
+                        assert!(
+                            payloads.iter().any(|p| *p == seen),
+                            "reader saw a torn file of len {} — not any whole payload",
+                            seen.len()
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

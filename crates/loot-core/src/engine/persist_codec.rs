@@ -18,9 +18,32 @@ use crate::sealed::{Keyring, SealedObject};
 use crate::{Oid, RepoError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::change_graph::{ChangeGraph, ChangeNode};
 use super::object_store::ObjectStore;
+
+/// Monotonic per-process counter feeding [`stage_tmp_name`], so two staging
+/// writes in the same process never collide either.
+static STAGE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A staging filename for atomically writing the content-addressed object
+/// `addr`, unique per (process, call). Two writers of the *same* address must
+/// not share a single `{addr}.tmp` staging file — concurrent puts would tear
+/// each other's bytes before the rename (#252). The pid plus a per-process
+/// atomic counter make each stage private; the final atomic-rename target is
+/// still `{addr}`, and since objects are content-addressed the racers' final
+/// bytes are byte-identical. The name keeps a `.tmp` suffix so leftover-stage
+/// scans still recognize it and the loader's non-address skip still ignores it.
+fn stage_tmp_name(addr: &Oid) -> String {
+    let n = STAGE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}.{}.{}.tmp",
+        crate::hex::encode(&addr.0),
+        std::process::id(),
+        n
+    )
+}
 
 fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
     out.extend_from_slice(&c.id.0);
@@ -97,7 +120,7 @@ pub fn save_objects_loose(obj_dir: &Path, objects: &ObjectStore) -> Result<(), R
         if dest.exists() {
             continue;
         }
-        let tmp = obj_dir.join(format!("{}.tmp", crate::hex::encode(&addr.0)));
+        let tmp = obj_dir.join(stage_tmp_name(&addr));
         std::fs::write(&tmp, encode_object(obj)).map_err(io)?;
         std::fs::rename(&tmp, &dest).map_err(io)?;
     }
@@ -484,6 +507,76 @@ mod tests {
             grant_ids: vec!["*".into()],
             compressed: false,
         }
+    }
+
+    #[test]
+    fn object_stage_tmp_names_are_unique_per_write() {
+        // Two stagings of the *same* content-address must not share a temp
+        // file, or concurrent puts tear each other's bytes before the rename
+        // (#252). Uniqueness plus the non-address name (loader/pruner skip it)
+        // is the whole contract.
+        let addr = Oid([7; 32]);
+        let a = stage_tmp_name(&addr);
+        let b = stage_tmp_name(&addr);
+        assert_ne!(a, b, "two stages of one address must get distinct temp files");
+        assert!(a.ends_with(".tmp") && b.ends_with(".tmp"));
+        assert!(
+            crate::hex::decode_array::<32>(&a).is_none(),
+            "stage name must not parse as a 64-char address (loader/pruner skip it)"
+        );
+    }
+
+    #[test]
+    fn concurrent_stage_of_same_address_does_not_tear() {
+        use std::sync::Arc;
+        // A real race: many threads each `save_objects_loose` the SAME object
+        // into one shared dir. With per-write unique temp names no writer's
+        // staging file is clobbered mid-flight, so the final object is always
+        // its own complete, byte-identical content (#252).
+        let dir = std::env::temp_dir().join(format!(
+            "loot-stage-race-{}-{}",
+            std::process::id(),
+            STAGE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = ObjectStore::new();
+        let obj = sample_object();
+        // Address of a loose object is caller-assigned; use a fixed one so all
+        // threads write the identical destination file.
+        let addr = Oid([0x5a; 32]);
+        store.put(Oid(addr.0), obj.clone());
+        let store = Arc::new(store);
+        let dir = Arc::new(dir);
+        let expected = encode_object(&obj);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let dir = Arc::clone(&dir);
+                std::thread::spawn(move || {
+                    save_objects_loose(&dir, &store).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let dest = dir.join(crate::hex::encode(&addr.0));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            expected,
+            "concurrent stages of one address must land complete, untorn bytes"
+        );
+        // No staging file should survive.
+        let leftover = std::fs::read_dir(&*dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover, "no .tmp staging file should be left behind");
+        let _ = std::fs::remove_dir_all(&*dir);
     }
 
     #[test]
