@@ -48,6 +48,7 @@ struct Paths {
     checkout: PathBuf,
     mirror: PathBuf,
     pr_map: PathBuf,
+    pr_map_lock: PathBuf,
     wip: PathBuf,
 }
 
@@ -56,6 +57,7 @@ fn paths(ws: &Workspace) -> Paths {
     let checkout = ws.dot().parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     Paths {
         pr_map: ws.store().git_pr_map(),
+        pr_map_lock: ws.store().git_pr_map_lock(),
         wip: ws.store().git_wip(),
         mirror: mirror_dir.join("mirror.git"),
         position: ws.root().to_path_buf(),
@@ -63,12 +65,60 @@ fn paths(ws: &Workspace) -> Paths {
     }
 }
 
+/// Reads via [`loot_core::store::read_replaced`]: the ledger is replaced by
+/// [`atomic_write`](loot_core::store::atomic_write) in [`update_pr_map`], and
+/// on Windows a reader racing that rename-replace transiently hits
+/// `PermissionDenied` (#293 tail) — a bare read would swallow it into an
+/// empty map, the exact "not in the pr-map ledger" symptom #336 recovers from.
 fn read_pr_map(path: &Path) -> PrMap {
-    PrMap::parse(&std::fs::read_to_string(path).unwrap_or_default())
+    let text = loot_core::store::read_replaced(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    PrMap::parse(&text)
 }
 
-fn write_pr_map(path: &Path, map: &PrMap) -> Result<(), String> {
-    std::fs::write(path, map.encode()).map_err(|e| format!("write pr-map: {e}"))
+/// How long a ledger write waits on the pr-map lock, and when a leftover lock
+/// is presumed crashed and broken (#336). A locked read-apply-write is
+/// microseconds, so any honest contention clears within a poll or two; the
+/// budgets exist only so a crashed writer can never wedge review/land.
+const LEDGER_WAIT: Duration = Duration::from_secs(10);
+const LEDGER_STALE: Duration = Duration::from_secs(60);
+const LEDGER_POLL: Duration = Duration::from_millis(100);
+
+/// The pr-map ledger's one write door (#336): take the ledger lock, re-read
+/// the file fresh, apply only this operation's own row change, write
+/// atomically. `review`'s row add and `land`'s row remove both funnel here,
+/// so a copy read earlier in a flow is only ever a lookup — never what gets
+/// written back. (The lost-update this kills, live 2026-07-18: a land's read
+/// → whole-file rewrite spanned its tests/ferry/push, erasing all three rows
+/// sibling reviews had recorded in between.) The write is
+/// [`atomic_write`](loot_core::store::atomic_write), like every replaced file
+/// under `git-mirror/` (#307): unlocked readers (`status`, `loot lanes`,
+/// land's lookup) must never observe a truncated ledger, and a crash
+/// mid-write must not lose rows — the same failure class the lock exists for.
+fn update_pr_map(
+    pr_map: &Path,
+    lock: &Path,
+    apply: impl FnOnce(&mut PrMap),
+) -> Result<(), String> {
+    let _lock = HarborLock::acquire_contending(
+        lock.to_path_buf(),
+        LEDGER_WAIT,
+        LEDGER_STALE,
+        LEDGER_POLL,
+        &|p| {
+            format!(
+                "another review/land is writing the pr-map ledger ({}) — ledger writes \
+                 serialize under this lock (#336); retry, or remove the file if you are \
+                 sure no loot-first is running",
+                p.display()
+            )
+        },
+    )?;
+    let mut map = read_pr_map(pr_map);
+    apply(&mut map);
+    loot_core::store::atomic_write(pr_map, map.encode().as_bytes())
+        .map_err(|e| format!("write pr-map: {e}"))
 }
 
 fn hex8(s: Option<&str>) -> String {
@@ -158,7 +208,10 @@ pub fn review(
         )?;
     }
 
-    let mut map = read_pr_map(&p.pr_map);
+    // A lookup only — the row add below re-reads under the ledger lock (#336).
+    // The idempotency check is race-free unlocked: (change, dock, owner) rows
+    // are written only from their own position (ADR 0034 single-writer).
+    let map = read_pr_map(&p.pr_map);
     if let Some(lane) = map.lane_for(&projected.change, &projected.dock, &projected.owner) {
         println!("review round updated on PR #{} (op={})", lane.pr, projected.op);
         return Ok(());
@@ -179,13 +232,14 @@ pub fn review(
     );
     println!(">>> gh pr create --head {}", projected.branch);
     let pr = forge.create_pr(&projected.branch, "main", &title, &body)?;
-    map.push(PrLane {
-        change: projected.change.clone(),
-        dock: projected.dock.clone(),
-        pr,
-        owner: projected.owner.clone(),
-    });
-    write_pr_map(&p.pr_map, &map)?;
+    update_pr_map(&p.pr_map, &p.pr_map_lock, |m| {
+        m.push(PrLane {
+            change: projected.change.clone(),
+            dock: projected.dock.clone(),
+            pr,
+            owner: projected.owner.clone(),
+        })
+    })?;
     println!("opened PR #{pr} for {}", projected.branch);
     Ok(())
 }
@@ -439,8 +493,9 @@ pub fn land(
     // open per loot's philosophy; the operator decides). This verb pushes, so it
     // asks the remote: at the moment of the loudest warning, be sure.
     warn_if_drifted(ws, OriginRef::Remote);
-    let mut map = read_pr_map(&p.pr_map);
-    let lane = map
+    // A lookup only, never written back: this copy goes stale the moment a
+    // sibling review records a row, and a land spans minutes (#336).
+    let lane = read_pr_map(&p.pr_map)
         .lane_for_pr(pr)
         .cloned()
         .ok_or_else(|| format!("PR #{pr} is not in the pr-map ledger (was it opened by 'review'?)"))?;
@@ -565,8 +620,7 @@ pub fn land(
         eprintln!("warning: relay push failed ({e}); the land stands — retry `loot push`.");
     }
 
-    map.remove_pr(pr);
-    write_pr_map(&p.pr_map, &map)?;
+    update_pr_map(&p.pr_map, &p.pr_map_lock, |m| m.remove_pr(pr))?;
     println!(
         "landed: change_id={} main={main_sha} pr=#{pr} status={}",
         lane.change,
@@ -988,6 +1042,58 @@ mod tests {
         let cut = subject_of(&long);
         assert_eq!(cut.chars().count(), MAX_PR_TITLE, "cut to the cap, in chars");
         assert!(long.starts_with(cut), "and it is a prefix of the subject");
+    }
+
+    // -----------------------------------------------------------------------
+    // update_pr_map — the pr-map ledger's one write door (#336)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_land_finishing_after_sibling_reviews_keeps_their_rows() {
+        // The #336 lost-update, replayed: a land read the ledger, sibling
+        // reviews then recorded their rows, and the land's whole-file rewrite
+        // of its stale copy erased them all. The write door re-reads under the
+        // ledger lock and applies only its own row change, so the land's early
+        // read is just a lookup — never what gets written back.
+        let dir = scratch("336-lost-update");
+        let pr_map = dir.join("pr-map");
+        let lock = dir.join("pr-map.lock");
+        std::fs::write(&pr_map, "aaaa main 19 t19\n").unwrap();
+
+        // The land reads its lane up front (the copy that used to be written
+        // back verbatim at the end)...
+        let early = read_pr_map(&pr_map);
+        assert!(early.lane_for_pr(19).is_some());
+
+        // ...a sibling review records its row while the land runs...
+        update_pr_map(&pr_map, &lock, |m| {
+            m.push(PrLane { change: "bbbb".into(), dock: "grant".into(), pr: 333, owner: "t5".into() })
+        })
+        .unwrap();
+
+        // ...and the land's close-out clears only its own row.
+        update_pr_map(&pr_map, &lock, |m| m.remove_pr(19)).unwrap();
+
+        let after = read_pr_map(&pr_map);
+        assert!(after.lane_for_pr(19).is_none(), "the landed lane is cleared");
+        assert_eq!(
+            after.lane_for_pr(333).map(|l| l.owner.as_str()),
+            Some("t5"),
+            "a sibling review's row recorded mid-land survives the land's write (#336)"
+        );
+    }
+
+    #[test]
+    fn the_ledger_lock_is_held_only_across_the_write() {
+        let dir = scratch("336-lock-release");
+        let pr_map = dir.join("pr-map");
+        let lock = dir.join("pr-map.lock");
+        update_pr_map(&pr_map, &lock, |m| {
+            m.push(PrLane { change: "cccc".into(), dock: "main".into(), pr: 1, owner: String::new() })
+        })
+        .unwrap();
+        assert!(!lock.exists(), "the ledger lock releases with the write");
+        assert_eq!(read_pr_map(&pr_map).lanes.len(), 1);
     }
 
     // -----------------------------------------------------------------------

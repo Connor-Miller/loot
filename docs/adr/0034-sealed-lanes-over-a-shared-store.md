@@ -57,6 +57,17 @@ ownership classes partition `.loot/`:
 single-writer holds: **lanes read it; writes refuse from a lane** ("run from
 the primary"). Remote changes are rare operator actions.
 
+> **Amendment (#336, 2026-07-18).** "The harbor serializes" undersold one
+> file: the `pr-map` ledger is written by `loot-first review` and `land` from
+> *any* position, and review never enters the harbor's locked section — a land
+> holding a copy read before sibling reviews wrote their rows rewrote the file
+> and erased them (a classic lost-update, hit live). The class stands, but its
+> serialization for this file is now explicit: every ledger write holds
+> `git-mirror/pr-map.lock`, re-reads fresh, applies only its own row
+> add/remove, and replaces the file atomically. One writer *at a time*,
+> enforced by a lock rather than by layout — the exception that keeps the
+> rule honest.
+
 ### A lane is a directory; position is place, not state
 
 A **lane** is a working directory whose `.loot` is a *directory* (evolving

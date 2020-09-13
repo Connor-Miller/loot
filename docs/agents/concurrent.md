@@ -29,7 +29,11 @@ partition `.loot/`:
   lane — the one whose `.loot` holds them — writes these.
 - **harbor-owned** — the entire `git-mirror/` surface (`mirror.git`, `marks`,
   `state`, `pr-map`, `wip`, the `dock=` config). Only the harbor writes it, and it
-  serializes.
+  serializes. One refinement (#336): the `pr-map` ledger is written by *any*
+  position's `loot-first review`/`land`, which the harbor lock does not cover —
+  so every ledger write re-reads under its own `pr-map.lock` and applies only
+  its own row, and a land can no longer erase rows sibling reviews recorded
+  while it ran.
 
 If you ever find yourself wanting two sessions to edit one of these at once, that
 is the bug — spawn a second **lane** instead.

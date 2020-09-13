@@ -2255,9 +2255,15 @@ impl Workspace {
     /// multi-reader; only mutation is single-owner).
     pub fn lane_statuses(&self) -> Vec<LaneStatus> {
         // The harbor-owned pr-map ledger (ADR 0033/0034): reading it is fine,
-        // its writer stays the loot-first orchestrator.
+        // its writer stays the loot-first orchestrator. `read_replaced`, not a
+        // bare read: the orchestrator replaces the ledger atomically (#336),
+        // and on Windows a reader racing that rename transiently hits
+        // PermissionDenied (#293 tail) — swallowed here, that would read as an
+        // empty ledger and blank every lane's in-flight PR for one listing.
         let pr_map = crate::ledger::PrMap::parse(
-            &std::fs::read_to_string(self.store.git_pr_map()).unwrap_or_default(),
+            &loot_core::store::read_replaced(&self.store.git_pr_map())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
         );
         self.store
             .list_lane_entries()

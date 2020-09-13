@@ -333,6 +333,16 @@ impl RepoStore {
     /// `git-mirror/`; never bundled, never pushed.
     pub fn harbor_lock(&self) -> PathBuf { self.git_mirror_dir().join("harbor.lock") }
 
+    /// The **pr-map ledger lock** (#336): held across every read-modify-write
+    /// of [`git_pr_map`](Self::git_pr_map), so a `land`'s whole-file rewrite
+    /// can never erase rows sibling `review`s recorded after it read.
+    /// Deliberately a separate file from the harbor lock: the harbor
+    /// serializes the git-main-critical section (seconds, and released before
+    /// land's ledger close-out), while this guards a ledger write
+    /// (microseconds) — a review recording its row must not queue behind a
+    /// land. Shared-store-rooted and local-only, like its ledger.
+    pub fn git_pr_map_lock(&self) -> PathBuf { self.git_mirror_dir().join("pr-map.lock") }
+
     // --- operation log (S4, ADR 0031) ---
     //
     // Local-only, append-only history of view-changing operations backing

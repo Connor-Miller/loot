@@ -44,6 +44,28 @@ impl HarborLock {
         stale: Duration,
         poll: Duration,
     ) -> Result<Self, String> {
+        Self::acquire_contending(path, wait, stale, poll, &|p| {
+            format!(
+                "another land holds the harbor lock ({}) — one land projects to \
+                 git-main at a time (ADR 0036); retry when it releases, or remove \
+                 the file if you are sure no land is running",
+                p.display()
+            )
+        })
+    }
+
+    /// [`acquire_polling`](Self::acquire_polling) with a caller-supplied
+    /// contended-refusal message. The pr-map ledger lock (#336) rides the same
+    /// create-new/stale-break/RAII primitive as the harbor, and its refusal
+    /// must say what is actually wedged — the harbor's "is a land running?"
+    /// advice would mislead an operator staring at a stuck ledger write.
+    pub fn acquire_contending(
+        path: PathBuf,
+        wait: Duration,
+        stale: Duration,
+        poll: Duration,
+        contended: &dyn Fn(&Path) -> String,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -57,23 +79,18 @@ impl HarborLock {
                     return Ok(Self { path, held: true });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // A lock past its staleness horizon is a crashed land — break
-                    // it and retry at once (do not consume the wait budget).
+                    // A lock past its staleness horizon is a crashed holder —
+                    // break it and retry at once (do not consume the wait budget).
                     if lock_age(&path).is_none_or(|age| age >= stale) {
                         let _ = std::fs::remove_file(&path);
                         continue;
                     }
                     if start.elapsed().map(|e| e >= wait).unwrap_or(true) {
-                        return Err(format!(
-                            "another land holds the harbor lock ({}) — one land projects to \
-                             git-main at a time (ADR 0036); retry when it releases, or remove \
-                             the file if you are sure no land is running",
-                            path.display()
-                        ));
+                        return Err(contended(&path));
                     }
                     std::thread::sleep(poll);
                 }
-                Err(e) => return Err(format!("harbor lock {}: {e}", path.display())),
+                Err(e) => return Err(format!("lock {}: {e}", path.display())),
             }
         }
     }
@@ -187,6 +204,24 @@ mod tests {
         // neither breakable nor waitable, so it must refuse — not false-succeed.
         let err = HarborLock::acquire(t.lock(), Duration::ZERO, HOUR).unwrap_err();
         assert!(err.contains("another land holds the harbor lock"), "{err}");
+    }
+
+    #[test]
+    fn a_contended_acquire_reports_the_callers_message() {
+        // The pr-map ledger lock (#336) rides this primitive with its own
+        // operator message — a wedged ledger must not claim to be a wedged
+        // harbor, whose advice ("is a land running?") would mislead.
+        let t = Tmp::new("contend-msg");
+        let _held = HarborLock::acquire(t.lock(), Duration::ZERO, HOUR).unwrap();
+        let err = HarborLock::acquire_contending(
+            t.lock(),
+            Duration::ZERO,
+            HOUR,
+            Duration::from_millis(1),
+            &|p| format!("ledger busy at {}", p.display()),
+        )
+        .unwrap_err();
+        assert!(err.contains("ledger busy"), "{err}");
     }
 
     #[test]
