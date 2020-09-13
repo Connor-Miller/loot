@@ -2736,22 +2736,33 @@ impl Workspace {
     /// Advance the ambient dock to cover `target` — the whole reconcile
     /// decision, one place (previously smeared across ferry.rs's match and
     /// these mechanics; the four live ferry bugs of 2026-07-10 all lived in
-    /// that smear). With `capture`, in-progress disk work is captured first
-    /// against `pinned` (the caller's pre-ingest anchor, so the two lines meet
-    /// only through the converge classifier); a capture matching `pinned` or
-    /// `target` is dropped, not minted. Then:
+    /// that smear). The order is: settle the no-ops (our line already covers
+    /// `target`, so nothing materializes), then — only on the paths that write
+    /// the tree — capture in-progress disk work first against `pinned` (the
+    /// caller's pre-ingest anchor, so the two lines meet only through the
+    /// converge classifier; a capture matching `pinned` or `target` is dropped,
+    /// not minted). Then:
+    ///   - `target` covered by us        → no-op (we are on/ahead/supersede it);
     ///   - real concurrent work captured → merge it with `target`;
     ///   - no local line (`pinned` None) → adopt (fast-forward);
-    ///   - `target` covered by us        → no-op (the other side is behind);
     ///   - we are behind `target`        → adopt (fast-forward);
     ///   - genuinely diverged            → merge via the classifier.
+    ///
+    /// Capture is gated on "will this reconcile overwrite the tree?", NOT on
+    /// "did git bring new commits?". That latter gate (`had_new`) was the #280
+    /// data-loss bug: when git `main` moved because **another lane landed
+    /// through loot**, its commit is already marked, so the ferry saw no new
+    /// shas, skipped capture, and `reconcile_adopt` materialized the landed tree
+    /// straight over a live, captured working change. Every materializing arm
+    /// now captures first; the no-ops still touch nothing (so a `--with-wip`
+    /// review of un-described WIP is never asked for a name when `main` sits
+    /// where we left it).
     ///
     /// Returns the per-path outcomes (empty on adopt/no-op).
     pub fn reconcile_onto(
         &mut self,
         target: Option<&Oid>,
         pinned: Option<&Oid>,
-        capture: bool,
         label: &str,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
         // The incoming change may have landed from a lane this dock never
@@ -2763,30 +2774,52 @@ impl Workspace {
         // behind dock used to make). A tip the shared graph lost (pruned
         // pre-guard) keeps the pre-#265 arms — ferry's baseline adoption
         // (#263) recovers its content.
-        if let Some(t) = target {
-            self.repo.ingest_shared_lineage(&self.store, t).map_err(|e| e.to_string())?;
-        }
-        let wip = if capture { self.reconcile_capture(pinned, target)? } else { None };
         let Some(target) = target else {
             return Ok(BTreeMap::new());
         };
+        self.repo.ingest_shared_lineage(&self.store, target).map_err(|e| e.to_string())?;
+
+        // No-op fast paths — our line already covers `target`, so nothing will
+        // materialize: we are exactly on it, ahead of it, or hold a version that
+        // *supersedes* it (ADR 0032/0033 — a landed change reopened and amended
+        // while its old commit is still the git tip; a superseded version is
+        // dead, never merged into, and projection threads the amend onto the
+        // stale tip as a downstream fast-forward). The reopened-for-amend case
+        // is checked on the **working change** too: after `loot edit`, the dock
+        // re-anchors on the edited change's parent, so `pinned` no longer
+        // supersedes `target` — the live superseding version is the working
+        // change itself, and it must be left in place (adopting `target` would
+        // clobber the amend on disk; capturing would finalize it prematurely and
+        // reap its review lane). These MUST return before the capture below:
+        // with git `main` where we left it, a `loot ferry --with-wip` reviews
+        // *unsigned* WIP and asks for no name — capturing here would sign (or
+        // #275-refuse) an un-described working change the review lane is
+        // entitled to carry. Capture belongs only on the paths that overwrite
+        // the tree.
+        let covered = pinned.is_some_and(|o| {
+            o == target || self.graph().is_ancestor(target, o) || self.repo.supersedes(o, target)
+        }) || self.working.as_ref().is_some_and(|w| self.repo.supersedes(w, target));
+        if covered {
+            return Ok(BTreeMap::new());
+        }
+
+        // Past the no-ops, every arm below materializes `target`'s tree over the
+        // working directory (adopt) or merges into it (merge), so capture the
+        // disk FIRST — unconditionally. Gating capture on "did git bring new
+        // commits?" (`had_new`) was the #280 data-loss bug: when git `main`
+        // moved because another lane landed through loot, its commit is already
+        // marked, so `had_new` was false and capture was skipped — then
+        // `reconcile_adopt` materialized the landed tree straight over a live,
+        // captured working change. `reconcile_capture` drops a capture that is
+        // empty or duplicates `pinned`/`target` (the co-located checkout after a
+        // `git pull`), so the fast-forward path still costs nothing.
+        let wip = self.reconcile_capture(pinned, Some(target))?;
         match (wip, pinned) {
             (Some(w), _) => self.reconcile_merge(&w, target, label),
             (None, None) => {
                 self.reconcile_adopt(target)?;
                 Ok(BTreeMap::new())
             }
-            (None, Some(o)) if o == target || self.graph().is_ancestor(target, o) => {
-                Ok(BTreeMap::new())
-            }
-            // The git target is a version our line has *superseded* (ADR 0032/
-            // 0033): a landed change reopened and amended while its old commit is
-            // still the git tip. A superseded version is dead — never merge into
-            // it (that resurrects what the amend removed); keep our line and let
-            // projection thread the amend onto the stale tip (a fast-forward
-            // downstream). This is the reconcile twin of dock-merge's
-            // `supersedes` short-circuit and converge's superseded-head drop.
-            (None, Some(o)) if self.repo.supersedes(o, target) => Ok(BTreeMap::new()),
             (None, Some(o)) if self.graph().is_ancestor(o, target) => {
                 self.reconcile_adopt(target)?;
                 Ok(BTreeMap::new())
@@ -4641,7 +4674,7 @@ mod tests {
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
 
         let err = ws
-            .reconcile_onto(Some(&c2), ours.as_ref(), true, "ferry: reconcile git main")
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
             .unwrap_err();
         assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
         assert!(ws.working_id().is_some(), "the local work is captured, not dropped");
@@ -4657,10 +4690,58 @@ mod tests {
         std::fs::write(dir.join("local.txt"), b"my work").unwrap();
         ws.snapshot("feat: my local line").unwrap();
 
-        ws.reconcile_onto(Some(&c2), ours.as_ref(), true, "ferry: reconcile git main")
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
             .expect("described work reconciles");
         let tip = ws.anchor().expect("the dock advanced onto a merge");
         assert!(ws.graph().is_ancestor(&c2, &tip), "the landed side is folded in");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn ferry_reconcile_does_not_clobber_a_live_working_change_when_a_lane_landed_main() {
+        // #280 — data loss. git `main` moved because ANOTHER LANE LANDED
+        // THROUGH LOOT, so its commit is already marked: the ferry ingests no
+        // new git commits, and the old gate `had_new = !new_shas.is_empty()`
+        // was therefore `false`, so `capture` was `false` and the disk work
+        // was never captured. `reconcile_adopt` then materialized the landed
+        // tree straight over a live, *described* working change — the reported
+        // ~2h loss, recovered only from an orphaned GitHub commit.
+        //
+        // `landed_from_lane` moves main the way a land does — a marked,
+        // loot-projected commit — the fixture every prior reconcile test
+        // missed (they all used `git_native_commit`, where `had_new` is true).
+        // Capture is unconditional now (#280): the working change is FOLDED IN,
+        // and — the symptom that mattered — its files stay on disk.
+        let (area, dir, c2) = landed_from_lane("280-clobber");
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let ours = ws.finalized_anchor();
+        // Real local work, described and captured: an EDIT to a tracked file
+        // the anchor already carries (`base.txt`). Editing an existing path is
+        // what makes a clobber unmistakable — `reconcile_adopt` re-surfaces the
+        // target's whole tree, so it writes the landed `base.txt` straight over
+        // the edit (a brand-new path, absent from both trees, materialize would
+        // leave alone — which is exactly why the loss needs a tracked file).
+        std::fs::write(dir.join("base.txt"), b"two hours of work").unwrap();
+        ws.snapshot("feat: real local work").unwrap();
+
+        // The reconcile a `had_new == false` ferry makes: main is the marked
+        // lane-landed c2, and our line is its ancestor. Pre-#280 this hit the
+        // `(None, Some(o)) if is_ancestor(o, target)` adopt arm and clobbered.
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+            .expect("the working change reconciles — it is not clobbered");
+
+        assert_eq!(
+            std::fs::read(dir.join("base.txt")).unwrap(),
+            b"two hours of work",
+            "#280: the live working-change edit survived — not overwritten by the landed tree",
+        );
+        let tip = ws.anchor().expect("the dock advanced onto a merge");
+        assert!(ws.graph().is_ancestor(&c2, &tip), "the landed line is folded in, not dropped");
+        assert!(
+            std::fs::read(dir.join("landed.txt")).map(|b| b == b"landed").unwrap_or(false),
+            "and the landed content came in with the fold",
+        );
         let _ = std::fs::remove_dir_all(&area);
     }
 

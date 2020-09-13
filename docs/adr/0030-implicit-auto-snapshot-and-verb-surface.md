@@ -63,6 +63,30 @@ ceremony is gone.
 > intent** (rewriting the tree is what the operator asked for); a dock switch
 > already captures. This graduates map #169's fog item *"pull materializes over
 > uncaptured disk edits"* into a guarantee.
+>
+> **Amended 2026-07-16 (#280): `reconcile_onto` captures unconditionally — the
+> chokepoint protected the wrong thing.** The tree-write chokepoint refuses a
+> materialize over *uncaptured* dirt, but the bridge gated the **capture itself**
+> on `had_new = !new_shas.is_empty()` — "did git bring new commits to ingest?".
+> When git `main` moved because **another lane landed through loot**, its commit
+> is already marked, so `had_new` was `false`, `reconcile_capture` never ran, and
+> a *captured, un-finalized* working change (disk == working change, so the
+> chokepoint's `tree_is_dirty_over` was `false` and it waved the write through)
+> was materialized straight over — data loss (a described, 2h working change
+> destroyed on an ordinary two-agent day, recovered only from an orphaned GitHub
+> commit). `had_new` answers "is there something to ingest?"; the question a
+> reconcile must ask is "is the tree about to be overwritten?", and every
+> `reconcile_onto` arm except the no-ops may materialize `target`. So the
+> `capture` parameter is **gone**: `reconcile_onto` always captures first. This
+> is close to free — `reconcile_capture` already drops a capture that is empty or
+> duplicates `pinned`/`target` (the co-located checkout after a `git pull`), so
+> the common nothing-new pass still mints nothing — and it is what makes the
+> fast-forward path recognize a disk that already holds the landed tree. The
+> regression fixture moves `main` **the way a land does** (a marked, loot-projected
+> commit), not via `git_native_commit` — the exact path every prior reconcile
+> test missed. `converge_heads` already had this working-change guard (it defers
+> rather than orphan); `reconcile_adopt` gets the same protection here by never
+> being reached with a live working change on the disk.
 
 ### `status` becomes a pure read-only report (the `-m` flag is dropped)
 

@@ -161,22 +161,22 @@ pub fn run(
         // ingested change becomes a graph head itself, so the post-ingest
         // anchor can't tell fast-forward from true divergence.
         let ours = ws.finalized_anchor();
-        let had_new = !new_shas.is_empty();
         for sha in new_shas {
             ingest_commit(ws, &git, &sha, &mut marks, &id_map, &mut report)?;
         }
         let target = marks.change_for(tip).cloned().map(|(t, _)| t);
 
         // --- reconcile: advance the ambient dock to cover the git side ---
-        // The whole decision — capture-vs-not (ingesting first lets the
-        // capture recognize and drop a snapshot matching the incoming target,
-        // the co-located checkout after a `git pull`), adopt-vs-merge, which
-        // tip advances — lives in Workspace::reconcile_onto (R2, #178); the
-        // bridge only supplies the incoming line and its pinned anchor.
+        // The whole decision — capture-first (unconditional: the reconcile may
+        // materialize the target tree over the disk, so a live working change
+        // is captured before it can be clobbered, #280; a capture that just
+        // duplicates the incoming target — the co-located checkout after a
+        // `git pull` — is recognized and dropped), adopt-vs-merge, which tip
+        // advances — lives in Workspace::reconcile_onto (R2, #178); the bridge
+        // only supplies the incoming line and its pinned anchor.
         report.outcomes = ws.reconcile_onto(
             target.as_ref(),
             ours.as_ref(),
-            had_new,
             "ferry: reconcile git main",
         )?;
     }
