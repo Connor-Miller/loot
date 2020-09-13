@@ -104,6 +104,39 @@ workflow worked: no git commit ever created this file.
   `land` (or pass a message through the tool) so the landed subject reads
   like history. Cosmetic, but worth folding into the ritual.
 
+## Findings from the second loot-first day (2026-07-11, the pre-land-gate lane)
+
+The lane that landed this section added the missing **pre-land gate** to
+`loot-first.ps1 land` (`cargo test` before finalize — review approves
+*projected WIP*, so nothing had yet proven the commit about to land builds;
+`-SkipTests` is the break-glass for non-code lands). Driving it surfaced:
+
+- **`status`'s hint is a finalize foot-gun on dirty work.** With edits on
+  disk and no working change, `loot status` says "no working change (run
+  `loot new` to start one)" — but `new` is capture-*then-finalize*: following
+  the hint signed the dirty tree in one stroke (`0729287d`), skipping the
+  review lane entirely. The first verb on dirty work should be
+  `describe -m` (capture without finalize); the hint should say so. The
+  accidental finalize rode to `main` break-glass beneath this lane's
+  reviewed commit — content correct, subject the default, unreviewed.
+- **An oplog younger than the mistake protects nothing.** S4's `undo` exists
+  for exactly this, but `.loot/ops` was minted the same day — the accidental
+  finalize was **op 1, the floor**, and `undo` refuses to step behind it.
+  Expected for a just-shipped feature; recorded so the next reader doesn't
+  assume undo covers pre-oplog history.
+- **`log`'s live row mislabels the fresh-empty-working state.** After `new`
+  plus an empty `describe`, `loot log` rendered the *signed tip* as
+  "(working change)" (`wlwzrvry 0729287d`) and hid both the real working
+  node (`xsynprqr 53902449`) and the tip's actual message — while
+  `status --json` reported the working identity correctly. Display-only,
+  but it actively masked the accidental-finalize state while diagnosing it.
+- **Lane reap can't survive the amend era (code-read, not live).** The ferry
+  reap marks a lane landed when *any signed change* carries the lane's
+  `change_id`, scanning the raw graph with no abandonment filter — correct
+  today (one signed version per change id), but the moment `loot edit`
+  (map #169) makes signed same-`change_id` versions routine, an amended
+  change's review lane reaps itself on every pass. Filed ahead of #171.
+
 ## Verdict
 
 Every box of the map's destination is exercised by this file's own history:

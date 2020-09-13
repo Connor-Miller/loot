@@ -6,11 +6,11 @@ PR is a *review view*, not the merge target — loot is the merger. Read this be
 driving a working day here; it sits beside [identity.md](identity.md) (who agents
 are) and describes what everyone does day to day.
 
-> **Status (2026-07): target workflow, tooling landing in wayfinder #155.** The
-> design is settled (map [#148](https://github.com/Connor-Miller/loot/issues/148),
-> tickets #149-#153). The new surface below — `loot ferry --with-wip` and the
-> `loot-day` orchestrator — ships in #155; until then the repo still runs
-> git-first via `tools/loot-day.ps1`. The prototype transcript is
+> **Status (2026-07-11): LIVE.** Map [#148](https://github.com/Connor-Miller/loot/issues/148)
+> closed with #155's live run; `loot ferry --with-wip` and the
+> `tools/loot-first.ps1` orchestrator are the shipped surface, and this repo runs
+> loot-first (the git-first `tools/loot-day.ps1` is deprecated). The prototype
+> transcript is
 > [../research/loot-first-workflow-prototype.md](../research/loot-first-workflow-prototype.md).
 
 ## Why
@@ -43,7 +43,7 @@ code path; **every change lands through a PR** (you self-approve your own).
    never run a manual `status -m` before finalize.
 3. **Project for review.** `loot ferry --with-wip` snapshots the dock's WIP and
    projects it to a sealed-free `review/<dock>` branch, then a single-ref push
-   publishes it to GitHub; `loot-day review` opens the PR. The PR reviews
+   publishes it to GitHub; `loot-first.ps1 review` opens the PR. The PR reviews
    **unsigned** WIP.
 4. **Revise.** On a review comment, edit and re-run `loot ferry --with-wip`. It
    **appends** a commit to the branch (same `change id`, new `version id`), so
@@ -53,7 +53,11 @@ code path; **every change lands through a PR** (you self-approve your own).
    This is **git-quiet** — no mirror I/O, so parallel lanes never contend here.
 7. **Land.** `loot-first.ps1 land -Pr <n>` detects the approval
    (`reviewDecision == APPROVED`, or the self-authored fast path — GitHub forbids
-   approving your own PR), projects the one **signed** commit onto `main`, and
+   approving your own PR), runs the **pre-land gate** (`cargo test` — review
+   approved *projected WIP*, so nothing has yet proven the commit about to land
+   builds; `-SkipTests` is the break-glass for non-code lands), finalizes the
+   lane (a no-op if step 6 already ran — a bare `loot new` mints no empty
+   change), projects the one **signed** commit onto `main`, and
    collapses the PR head onto it. GitHub **auto-closes the PR on the zero-diff
    collapse** — that close *is* the landing signal (live finding of the #155 run;
    see below), and the tool attaches a pointer comment (change id → landed sha)
