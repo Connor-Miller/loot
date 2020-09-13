@@ -44,7 +44,8 @@ pub struct FerryReport {
 }
 
 /// Run one bidirectional reconcile pass. `git_dir_flag`/`dock_flag` override
-/// (and persist to) the mirror config under `.loot/git-mirror/config`.
+/// the mirror config under `.loot/git-mirror/config`; the override persists
+/// only when the pass succeeds (#201 — a failed probe must not rebind).
 /// `with_wip` additionally projects the ambient dock's *unfinalized* working
 /// change to `refs/heads/review/<dock>` as a provisional commit (map #148);
 /// provisional lifecycle reaping runs on every pass regardless of the flag.
@@ -65,14 +66,20 @@ pub fn run(
         cfg.insert("gitdir".into(), dir.into());
     }
     if let Some(dock) = dock_flag {
-        cfg.insert("dock".into(), dock.into());
+        let prev = cfg.insert("dock".into(), dock.into());
+        if let Some(prev) = prev.filter(|p| p != dock) {
+            report.notes.push(format!("mirror main now tracks dock '{dock}' (was '{prev}')"));
+        }
     }
     let git_dir = cfg
         .get("gitdir")
         .cloned()
         .ok_or("no mirror bound — run `loot ferry --git-dir <path>` once to bind one")?;
     let main_dock = cfg.get("dock").cloned().unwrap_or_else(|| "main".to_string());
-    write_kv(&cfg_path, &cfg)?;
+    // The config persists with the spine at the END of the pass, not here: a
+    // flag on a run that then fails must not rebind future bare passes (#201
+    // — a failed `--dock` probe silently retargeted main at a stale dock tip,
+    // and every later ferry rewrote the mirror's main backward from it).
 
     // --- open (or create, bare) the git side ---
     let git = match git2::Repository::open(&git_dir) {
@@ -223,6 +230,23 @@ pub fn run(
                 report.notes.push(
                     "main is checked out in the mirror — left to git (refs/loot/* updated)".into(),
                 );
+            } else if let Some(cur) = git
+                .find_reference(MAIN_REF)
+                .ok()
+                .and_then(|r| r.target())
+                .filter(|cur| *cur != oid && !git.graph_descendant_of(oid, *cur).unwrap_or(false))
+            {
+                // Fast-forward only (#201): the published branch is append-only
+                // to everything downstream (the GitHub push rejects a regression
+                // anyway) — a target that does not descend from the current tip
+                // means the designated dock is stale or freshly rebound, so say
+                // so instead of silently moving main backward.
+                report.notes.push(format!(
+                    "main NOT moved to {} — it does not descend from the current tip {}; \
+                     is the designated dock ('{main_dock}') stale? see .loot/git-mirror/config",
+                    &sha[..12.min(sha.len())],
+                    &cur.to_string()[..12]
+                ));
             } else {
                 git.reference(MAIN_REF, oid, true, "loot ferry")
                     .map_err(|e| format!("update main: {e}"))?;
@@ -387,6 +411,7 @@ pub fn run(
     state.loot_heads = ws.heads();
     std::fs::write(&marks_path, marks.encode()).map_err(|e| format!("write marks: {e}"))?;
     std::fs::write(&state_path, state.encode()).map_err(|e| format!("write state: {e}"))?;
+    write_kv(&cfg_path, &cfg)?;
     Ok(report)
 }
 
@@ -1236,6 +1261,57 @@ mod tests {
 
         // Deterministic dates: BASE_EPOCH + generation.
         assert_eq!(commit.time().seconds(), bridge::commit_timestamp(0));
+    }
+
+    #[test]
+    fn a_stale_designated_dock_cannot_drag_main_backward() {
+        let (mut ws, dir, mirror) = setup("ffguard");
+        put_file(&dir, "a.txt", "one\n");
+        seal_change(&mut ws, "first");
+        ferry(&mut ws, &mirror);
+
+        // Fork a side dock at the current tip, then advance main past it.
+        ws.dock_goto("side").unwrap();
+        ws.dock_goto("main").unwrap();
+        put_file(&dir, "a.txt", "two\n");
+        seal_change(&mut ws, "second");
+        ferry(&mut ws, &mirror);
+        let git = git2::Repository::open(&mirror).unwrap();
+        let tip = main_commit(&git).id();
+
+        // Rebinding main onto the stale fork must not rewind the published
+        // branch (#201) — the pass says so and leaves the ref alone.
+        let report = run(&mut ws, Some(mirror.to_str().unwrap()), Some("side"), false).unwrap();
+        assert_eq!(main_commit(&git).id(), tip, "main did not move backward");
+        assert!(
+            report.notes.iter().any(|n| n.contains("NOT moved")),
+            "the skipped update is loud: {:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn a_failed_pass_persists_no_config_rebind() {
+        let (mut ws, dir, mirror) = setup("cfgfail");
+        put_file(&dir, "a.txt", "one\n");
+        seal_change(&mut ws, "first");
+        ferry(&mut ws, &mirror);
+        let before = read_or_empty(&ws.store().git_config());
+
+        // A pass that dies after flag parsing (an existing path that is not a
+        // git repository) must not rebind the designated dock (#201).
+        let bogus = dir.join("not-a-repo");
+        std::fs::write(&bogus, "x").unwrap();
+        let err = match run(&mut ws, Some(bogus.to_str().unwrap()), Some("side"), false) {
+            Err(e) => e,
+            Ok(_) => panic!("pass against a non-repo path unexpectedly succeeded"),
+        };
+        assert!(err.contains("open git mirror"), "{err}");
+        assert_eq!(
+            read_or_empty(&ws.store().git_config()),
+            before,
+            "the failed pass left the binding untouched"
+        );
     }
 
     #[test]
