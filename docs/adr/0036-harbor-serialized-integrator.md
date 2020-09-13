@@ -106,6 +106,18 @@ via the converge that threads it under a merge tip). "Moved" therefore implies
 marks read and an ancestry check to close a hole the upstream gate already
 closes.
 
+> **Amendment (ADR 0039 / #362, 2026-07-19).** The queued land's converge no
+> longer "threads it under a merge tip": a behind-anchor land now **carries**
+> its self-authored suffix onto the landed `main` as superseding versions
+> (`DagRepo::carry_line`) — same change id, single parent, the stale original
+> kept as a predecessor — so landed history stays exactly one commit per
+> change, with no `ferry: reconcile git main` merge node and no
+> resolution-commit trail (a bounce's resolution folds into the carried
+> commit on re-land). The merge shape survives only as the fallback for
+> suffixes this repo did not author, where re-authoring would forge
+> provenance. Everything else in this section — the lock, the bounce, the
+> moved-main guard — is unchanged.
+
 > **Amendment (#349, 2026-07-19).** "Did not move within this invocation" turned
 > out not to imply "nothing to land": a bare `loot ferry` run between describe
 > and land projects the lane's signed line onto mirror `main` *then*, so the

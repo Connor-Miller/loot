@@ -1,7 +1,7 @@
 //! Reconcile plan — the pure decision half of `Workspace::reconcile_onto`
 //! (#325), split out of the executor that used to interleave deciding with
 //! mutating (mint, sign, materialize, persist — see `workspace.rs`'s
-//! `reconcile_onto`/`reconcile_capture`/`reconcile_merge`). R2/#178's
+//! `reconcile_onto`/`reconcile_capture`/`reconcile_carry`). R2/#178's
 //! consolidation ("THE home for advance-a-tip") is preserved, not undone: the
 //! home stays, it just splits into a pure brain (this module) and a small
 //! pair of hands (the executor, still in `workspace.rs`, still the only place
@@ -17,10 +17,12 @@
 //! capture unconditional on every materializing arm, mechanics untouched
 //! here), #275 (a merge silently sealing an un-described working change as
 //! its parent), and #292 (a review catch-up finalizing described WIP it was
-//! supposed to leave reviewable). #275 and #292 were refusal *policy* buried
-//! in the mutating `reconcile_capture` helper, reachable only through a full
-//! `Workspace` — they are [`Refusal`] variants here instead, table-tested
-//! directly.
+//! supposed to leave reviewable). #275 remains a [`Refusal`] variant here,
+//! table-tested directly. #292's refusal (`REFUSE_REVIEW_STALE_ANCHOR`) is
+//! **gone with its trigger**: review mode is a pure projection since ADR 0039
+//! — it performs no reconcile at all, so the fold that refusal guarded
+//! against is unrepresentable and reconciling is again exclusively the
+//! signing verbs' business (`ferry`, `adopt`, `loot-first land`).
 
 use loot_core::Oid;
 
@@ -51,10 +53,6 @@ pub struct View {
     /// so a fast-forward loses nothing. Only consulted when `wip` is `None`
     /// (no captured tip means `pinned` decides the shape).
     pub pinned_is_ancestor_of_target: bool,
-    /// Set only by the review projection (`loot ferry --with-wip`): forbids
-    /// folding a live working change into the reconcile merge, because that
-    /// would finalize WIP a review is entitled to show unsigned (#292).
-    pub preserve_wip: bool,
     /// Whether the captured `wip` carries a real name — not empty, not the
     /// `(working change)` placeholder. Only meaningful when `wip` is `Some`.
     pub described: bool,
@@ -63,7 +61,8 @@ pub struct View {
 /// What `reconcile_onto` should do, decided but not yet done. The executor
 /// matches on this and calls the corresponding hand: [`Plan::Adopt`] ->
 /// `reconcile_adopt`, [`Plan::Merge`] -> (finalize the captured wip if that is
-/// its source, then) `reconcile_merge`, [`Plan::Refuse`] -> return the
+/// its source, then) `reconcile_carry` — the ADR 0039 carry, with the merge
+/// shape as its foreign-work fallback — [`Plan::Refuse`] -> return the
 /// refusal's message, [`Plan::NoOp`] -> touch nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
@@ -71,35 +70,32 @@ pub enum Plan {
     NoOp,
     /// No local line to fold, or one strictly behind `target`: fast-forward.
     Adopt,
-    /// Fold `ours` (either the just-captured wip, or a pinned tip that
-    /// diverged from `target`) into `target` via the converge classifier.
+    /// Reconcile `ours` (either the just-captured wip, or a pinned tip that
+    /// diverged from `target`) with `target` via the converge classifier —
+    /// executed as a carry (ADR 0039), one commit per change.
     Merge { ours: Oid },
     /// Refuse rather than mutate — see [`Refusal`].
     Refuse(Refusal),
 }
 
 /// Why [`decide`] refused, carrying the exact wording the operator sees.
-/// Both variants preserve edits that are already captured on disk — a
-/// refusal only withholds the signature, never the work (see each
-/// constant's own doc for the full guarantee).
+/// The refusal preserves edits that are already captured on disk — it only
+/// withholds the signature, never the work (see the constant's doc for the
+/// full guarantee).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// #275: a merge is about to seal an un-described working change as its
-    /// parent — its message becomes the permanent subject on git `main`.
+    /// #275: a reconcile is about to seal an un-described working change into
+    /// signed history — its message becomes the permanent subject on git
+    /// `main`.
     UndescribedParent,
-    /// #292: a review catch-up caught up over a git `main` that moved while
-    /// live, described WIP sat on the tree — folding it in would finalize
-    /// the WIP a review is supposed to show unsigned.
-    ReviewStaleAnchor,
 }
 
 impl Refusal {
     /// The exact refusal text the operator sees — byte-identical to the
-    /// pre-#325 constants (agents and docs reference the wording).
+    /// pre-#325 constant (agents and docs reference the wording).
     pub fn message(&self) -> &'static str {
         match self {
             Refusal::UndescribedParent => REFUSE_UNDESCRIBED_PARENT,
-            Refusal::ReviewStaleAnchor => REFUSE_REVIEW_STALE_ANCHOR,
         }
     }
 }
@@ -108,17 +104,14 @@ impl Refusal {
 /// arms it used to be smeared across (#325). Order matters and mirrors the
 /// original exactly: `covered` short-circuits before anything else; past
 /// that, a real captured `wip` always outranks `pinned` (the disk holds real
-/// work, so it decides); and within the `wip` arm, `preserve_wip` outranks
-/// `described` (#292's refusal fires even over named work — it is about
-/// *when*, not *whether named*, review may fold).
+/// work, so it decides), and an un-described `wip` refuses (#275) before
+/// anything is signed.
 pub fn decide(view: &View) -> Plan {
     if view.covered {
         return Plan::NoOp;
     }
     if let Some(w) = &view.wip {
-        return if view.preserve_wip {
-            Plan::Refuse(Refusal::ReviewStaleAnchor)
-        } else if !view.described {
+        return if !view.described {
             Plan::Refuse(Refusal::UndescribedParent)
         } else {
             Plan::Merge { ours: w.clone() }
@@ -131,8 +124,8 @@ pub fn decide(view: &View) -> Plan {
     }
 }
 
-/// The [`Refusal::UndescribedParent`] twin for the merges that seal the
-/// operator's work as a parent in passing (#275): same rule as
+/// The [`Refusal::UndescribedParent`] twin for the reconciles that seal the
+/// operator's work in passing (#275): same rule as
 /// [`crate::workspace::REFUSE_UNDESCRIBED`], but it must say *why a sync verb
 /// is suddenly asking for a name*, or it reads as a non-sequitur.
 ///
@@ -146,27 +139,6 @@ pub(crate) const REFUSE_UNDESCRIBED_PARENT: &str =
      your local work into signed history, and its message becomes the permanent subject on \
      git `main`\n  name it:  loot describe -m \"<subject>\"\n  then re-run the same command\n  \
      (your edits are captured and safe — only the merge waits for the name)";
-
-/// The review-only refusal (#292): `loot-first review` / `loot ferry --with-wip`
-/// caught up over a git `main` that moved *under this lane* while a live working
-/// change carried real work. Folding it into the catch-up merge would finalize
-/// the WIP and leave the empty minted change as the thing to review — the silent
-/// dead end #257 hit (unreviewable, unlandable, no op to undo). We refuse before
-/// the fold, so the described WIP stays a live, unfinalized working change.
-///
-/// Like [`REFUSE_UNDESCRIBED_PARENT`], it promises only that the capture
-/// survives the erroring process (`snapshot_from` persists; the refused pass's
-/// ingest does not, so it is simply redone on the re-run). The root cause is a
-/// lane spawned from an anchor already behind git `main`.
-pub(crate) const REFUSE_REVIEW_STALE_ANCHOR: &str =
-    "git `main` moved under this lane while your work is described but unfinalized, so \
-     `loot-first review` would have to fold your WIP into a reconcile merge to catch up — \
-     which finalizes it and leaves nothing to review (issue #292). Refusing so your work is \
-     never silently stranded.\n  Nothing was finalized; your working change is intact on \
-     disk.\n  This lane was spawned from an anchor already behind git `main`. To land this \
-     work, re-spawn a lane from current main and re-apply it there (`loot lane new` from the \
-     primary once it has caught up), or reconcile deliberately with `loot adopt` — aware that \
-     the adopt signs your WIP into a merge (it stops being a reviewable working change).";
 
 #[cfg(test)]
 mod tests {
@@ -182,7 +154,6 @@ mod tests {
             wip: None,
             pinned: None,
             pinned_is_ancestor_of_target: false,
-            preserve_wip: false,
             described: false,
         }
     }
@@ -196,32 +167,15 @@ mod tests {
             wip: Some(oid(1)),
             pinned: Some(oid(2)),
             pinned_is_ancestor_of_target: true,
-            preserve_wip: true,
             described: true,
         };
         assert_eq!(decide(&view), Plan::NoOp, "covered outranks every other field");
     }
 
     #[test]
-    fn real_captured_wip_with_preserve_wip_refuses_review_stale_anchor() {
-        let view = View {
-            wip: Some(oid(1)),
-            preserve_wip: true,
-            described: true, // named, and still refused — #292 is about *when*
-            ..base_view()
-        };
-        assert_eq!(
-            decide(&view),
-            Plan::Refuse(Refusal::ReviewStaleAnchor),
-            "preserve_wip refuses even a described wip"
-        );
-    }
-
-    #[test]
     fn real_captured_wip_undescribed_refuses_undescribed_parent() {
         let view = View {
             wip: Some(oid(1)),
-            preserve_wip: false,
             described: false,
             ..base_view()
         };
@@ -233,7 +187,6 @@ mod tests {
         let w = oid(7);
         let view = View {
             wip: Some(w.clone()),
-            preserve_wip: false,
             described: true,
             ..base_view()
         };
@@ -266,7 +219,7 @@ mod tests {
             pinned_is_ancestor_of_target: false,
             ..base_view()
         };
-        assert_eq!(decide(&view), Plan::Merge { ours: p }, "diverged — merge via the classifier");
+        assert_eq!(decide(&view), Plan::Merge { ours: p }, "diverged — carry via the classifier");
     }
 
     // --- precedence: wip always outranks pinned when both are present ---
@@ -278,7 +231,6 @@ mod tests {
             wip: Some(w.clone()),
             pinned: Some(oid(10)),
             pinned_is_ancestor_of_target: true,
-            preserve_wip: false,
             described: true,
             ..base_view()
         };
@@ -294,7 +246,5 @@ mod tests {
     #[test]
     fn refusal_messages_are_the_pinned_constants() {
         assert_eq!(Refusal::UndescribedParent.message(), REFUSE_UNDESCRIBED_PARENT);
-        assert_eq!(Refusal::ReviewStaleAnchor.message(), REFUSE_REVIEW_STALE_ANCHOR);
-        assert!(REFUSE_REVIEW_STALE_ANCHOR.contains("#292"), "docs point at the ticket by number");
     }
 }

@@ -164,21 +164,35 @@ can never be pruned (#263's root cause, prevented).
 
 ## Recovery playbook
 
-### Open the review round BEFORE a sibling lands (the seal strands your PR)
+### Reviews never go stale — land from wherever you are (ADR 0039)
 
-Run `loot-first review` **immediately after `describe`** — before any other
-sync verb, and before a sibling's land can slip in. If git `main` moved since
-your lane spawned, the *review's own ferry pass* reconciles first, and
-reconciling over described WIP **seals it** as a signed merge parent (#275) —
-after which the WIP projection finds nothing unsigned and reports "nothing to
-review": your change is signed, merged with the landed line, and **PR-less**,
-and `loot-first land` refuses without a pr-map entry (hit live landing #289,
-2026-07-17). Recovery: a plain `loot ferry` projects the signed line onto the
-local mirror `main` (harbor-locked; GitHub does not move until a land pushes),
-after which a follow-up working change in the lane can open a review round
-whose branch carries the sealed work into the PR diff. Whether `review`
-should be able to project a signed-but-unlanded line directly is an open
-question for a future ticket.
+`loot-first review` is a **pure projection** (ADR 0039, #362): it mints the
+provisional commit from the lane's own anchor and pushes only its
+`review/<position>` ref — no ingest, no reconcile, no mirror-`main` advance.
+Siblings (or an out-of-wave land) moving git `main` under your lane changes
+nothing: open or refresh the PR whenever you like, in any order relative to
+other lands. (GitHub may show a cosmetic "conflicts with base" badge on a
+stale-anchor PR; display-only — loot is the merger.) The old failure family —
+the review pass's catch-up ferry sealing described WIP as a merge parent
+(#275/#289), then `REFUSE_REVIEW_STALE_ANCHOR` (#292/#302) stranding the lane,
+recoverable only by respawn-and-copy — is structurally gone: review cannot
+reconcile, so it can neither seal nor strand.
+
+`loot-first land` reconciles exactly once, under the harbor lock: a lane
+behind `main` **carries** its change onto the landed tip as a superseding
+version — landed history stays one commit per change, no
+`ferry: reconcile git main` merge noise. A genuine same-path collision still
+bounces (nothing minted, nothing pushed); `loot resolve <path> <file>` then
+re-run `land`, and the resolution folds into the carried commit rather than
+trailing it.
+
+One seal path remains, and it is deliberate: a **plain `loot ferry`** (or
+no-arg `loot adopt`) over described WIP still finalizes it — after which the
+WIP projection reports "nothing to review" and the signed line is PR-less.
+Don't run bare sync verbs in a lane with live WIP; if it happens, the
+follow-up-round recovery (a working change in the same lane opens a round
+whose branch carries the sealed work) still applies — making the tool own
+that round is #356.
 
 ### A break-glass git commit landed on `main` → `loot ferry`
 
@@ -246,9 +260,10 @@ capturing.
 See "Catch the primary up" above. The two habits are the same discipline stated
 twice because they fail the same way: **the loot mirror silently falls behind git
 `origin/main`**, and the next lane spawned from the stale position projects a
-*revert* of landed work. The catch-up folds any local line in with a merge, so the
-same rule applies: name the working change first, or the catch-up refuses rather
-than sign it (#275). With nothing pending — the usual state in the primary right
+*revert* of landed work. The catch-up carries any local line onto landed main
+(one version per change, ADR 0039), which signs it — so the same rule applies:
+name the working change first, or the catch-up refuses rather than sign it
+(#275). With nothing pending — the usual state in the primary right
 after a lane land — it fast-forwards and never asks. A drift guard now warns loudly on
 `loot-first status`/`review`/`land`/`tag` when the shared mirror's `main` has
 fallen *behind* real `origin/main`, or *diverged* from it (#243) — treat that

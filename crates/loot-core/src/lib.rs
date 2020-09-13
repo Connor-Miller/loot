@@ -27,8 +27,8 @@ pub use attestation::{Attestation, AttestationLog};
 pub use burn::{BurnLog, BurnTier, Tombstone};
 pub use liveness::{HeadPartition, Liveness};
 pub use engine::{
-    change_signing_message, DagRepo, GcReport, LogGraph, LogNode, MaroonResult, MigrateResult,
-    MissingObject, MissingRef, RotateRegrant, RotateReport, VerifyReport,
+    change_signing_message, CarryOutcome, DagRepo, GcReport, LogGraph, LogNode, MaroonResult,
+    MigrateResult, MissingObject, MissingRef, RotateRegrant, RotateReport, VerifyReport,
 };
 pub use oplog::{BarrierRefusal, Operation, StepError, Stepped, View};
 pub use store::{valid_dock_name, LaneEntry, QuarantinedGrant, RepoStore, HOME_DOCK};

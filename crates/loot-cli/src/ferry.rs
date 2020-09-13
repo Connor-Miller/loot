@@ -43,14 +43,28 @@ pub struct FerryReport {
     pub review: Option<String>,
 }
 
-/// Run one bidirectional reconcile pass. `git_dir_flag`/`dock_flag` override
-/// the mirror config under `.loot/git-mirror/config`; the override persists
-/// only when the pass succeeds (#201 — a failed probe must not rebind).
-/// `with_wip` additionally projects the ambient dock's *unfinalized* working
-/// change as a provisional commit (map #148) on `refs/heads/review/<lane-id>`
-/// — `review/<dock>` on the primary — so concurrent lanes never share a
-/// review ref (#281); provisional lifecycle reaping runs on every pass
-/// regardless of the flag.
+/// Run one ferry pass. `git_dir_flag`/`dock_flag` override the mirror config
+/// under `.loot/git-mirror/config`; the override persists only when a full
+/// pass succeeds (#201 — a failed probe must not rebind).
+///
+/// Two modes (ADR 0039):
+///
+/// - **`with_wip == false`** — the full bidirectional reconcile: ingest new
+///   git-native commits, reconcile them into the ambient dock (the carry —
+///   one commit per change), project every travel-worthy change, and advance
+///   the mirror's `main`.
+/// - **`with_wip == true`** — the **review projection, and nothing else**:
+///   project the ambient dock's *unfinalized* working change as a provisional
+///   commit (map #148) on `refs/heads/review/<lane-id>` — `review/<dock>` on
+///   the primary, so concurrent lanes never share a review ref (#281). No
+///   ingest, no reconcile, no mirror-`main` advance, no projection of other
+///   changes, and the bridge spine (marks/state/config) is not rewritten: a
+///   review pass is read-only with respect to the dock tip and the mirror's
+///   `main`, which is what lets a lane behind git `main` review normally
+///   instead of stranding (#292's `REFUSE_REVIEW_STALE_ANCHOR`, now gone).
+///
+/// Provisional lifecycle reaping runs on every pass regardless of the flag —
+/// it touches only `review/*` refs and the local wip ledger, never the spine.
 pub fn run(
     ws: &mut Workspace,
     git_dir_flag: Option<&str>,
@@ -147,7 +161,10 @@ pub fn run(
         .ok()
         .and_then(|r| r.target())
         .map(|o| o.to_string());
-    if !had_state && marks.is_empty() {
+    // (Review mode never bootstraps: adopting a baseline writes the spine,
+    // and a review pass leaves the spine alone — a fresh mirror simply has
+    // no marks yet and the review below refuses with "run a plain ferry".)
+    if !with_wip && !had_state && marks.is_empty() {
         if let (Some(sha), Some(anchor)) = (&main_tip, ws.finalized_anchor()) {
             state.git_main = Some(sha.clone());
             marks.insert(sha.clone(), anchor, MarkOrigin::Git);
@@ -162,7 +179,11 @@ pub fn run(
     let last_clean_sha = state.git_main.clone();
 
     // --- ingest: new commits on the mirrored branch ---
-    if let Some(tip) = &main_tip {
+    // Review mode skips the whole ingest → reconcile → project half: review
+    // is a pure projection of the WIP (ADR 0039). The dock tip and mirror
+    // `main` are read, never written, so a lane whose anchor fell behind git
+    // `main` reviews from its own anchor marks instead of catching up.
+    if let Some(tip) = main_tip.as_ref().filter(|_| !with_wip) {
         let new_shas = walk_new_commits(&git, tip, &marks, state.git_main.as_deref())?;
         // The loot side of the divergence check, pinned before ingest — an
         // ingested change becomes a graph head itself, so the post-ingest
@@ -200,18 +221,17 @@ pub fn run(
         // `git pull` — is recognized and dropped), adopt-vs-merge, which tip
         // advances — lives in Workspace::reconcile_onto (R2, #178); the bridge
         // only supplies the incoming line and its pinned anchor.
-        // `with_wip` is the review projection: it must not fold a live working
-        // change into this catch-up merge (that finalizes the WIP and leaves the
-        // empty minted change to "review" — #292). `preserve_wip` refuses that
-        // fold; a plain ferry/land (with_wip=false) keeps the fold.
+        // (Only the full pass reaches this — review mode never reconciles,
+        // ADR 0039. The label survives solely as the merge subject of the
+        // foreign-work fallback; a self-authored diverged line carries, so
+        // nothing on landed history wears it.)
         report.outcomes = match ws.reconcile_onto(
             target.as_ref(),
             ours.as_ref(),
             "ferry: reconcile git main",
-            /* preserve_wip */ with_wip,
         ) {
             Ok(outcomes) => outcomes,
-            // A reconcile refusal (#275/#292) aborts the pass — roll the
+            // A reconcile refusal (#275) aborts the pass — roll the
             // freshly ingested changes back with it (#307, above).
             Err(e) => return Err(rollback_note(ws.rollback_ingested(&minted), e)),
         };
@@ -235,8 +255,11 @@ pub fn run(
     // Everything a mark (or an ancestor of one) already stands for is
     // represented in git — marked changes map 1:1, and their ancestry is the
     // pre-bridge history the bootstrap baseline covers wholesale.
+    // Review mode projects nothing here: advancing the mirror with signed
+    // history is the full pass's job, and doing it from review was the
+    // trigger half of the #349 pre-projection trap (ADR 0039).
     let represented = ws.graph().ancestor_closure(marks.change_ids());
-    for id in ws.graph().ids_topo() {
+    for id in ws.graph().ids_topo().into_iter().filter(|_| !with_wip) {
         if represented.contains(&id) {
             continue;
         }
@@ -257,11 +280,13 @@ pub fn run(
         report.projected += 1;
     }
 
-    // --- refs: heads, and git-main tracking the primary ---
-    update_loot_refs(ws, &git, &marks)?;
+    // --- refs: heads, and git-main tracking the primary (full pass only) ---
+    if !with_wip {
+        update_loot_refs(ws, &git, &marks)?;
+    }
     // git-main tracks the primary's finalized anchor (#253/ADR 0034): named docks
     // are retired, so there is no other position's tip to designate.
-    let main_target = ws.finalized_anchor();
+    let main_target = ws.finalized_anchor().filter(|_| !with_wip);
     if let Some(tip_change) = main_target {
         if let Some(sha) = marks.sha_for(&tip_change) {
             let oid = git2::Oid::from_str(sha).map_err(|e| e.to_string())?;
@@ -486,16 +511,22 @@ pub fn run(
     }
     write_spine(&wip_path, &wip.encode())?;
 
-    // --- persist the spine ---
-    state.git_main = git
-        .find_reference(MAIN_REF)
-        .ok()
-        .and_then(|r| r.target())
-        .map(|o| o.to_string());
-    state.loot_heads = ws.heads();
-    write_spine(&marks_path, &marks.encode())?;
-    write_spine(&state_path, &state.encode())?;
-    write_kv(&cfg_path, &cfg)?;
+    // --- persist the spine (full pass only) ---
+    // A review pass writes the wip ledger above and nothing else: persisting
+    // `state.git_main` without having ingested would teach the next full pass
+    // to skip commits it never saw, and a rebuilt-in-memory mark map is
+    // simply rebuilt again (ADR 0039's read-only pin).
+    if !with_wip {
+        state.git_main = git
+            .find_reference(MAIN_REF)
+            .ok()
+            .and_then(|r| r.target())
+            .map(|o| o.to_string());
+        state.loot_heads = ws.heads();
+        write_spine(&marks_path, &marks.encode())?;
+        write_spine(&state_path, &state.encode())?;
+        write_kv(&cfg_path, &cfg)?;
+    }
     Ok(report)
 }
 
@@ -2277,16 +2308,21 @@ mod tests {
             "conflict visible to `loot conflicts`"
         );
 
-        // The merge commit exists in git, but the conflicted path is held at
-        // its last clean state; the non-conflicting edit synced normally.
-        let merge = main_commit(&git);
-        assert_ne!(merge.id(), clean_tip, "merge projected");
-        let tree = merge.tree().unwrap();
-        let shared = tree.get_name("shared.txt").unwrap();
-        let held = git.find_blob(shared.id()).unwrap();
-        assert_eq!(held.content(), b"clean\n", "conflicted path held at last clean state");
+        // ADR 0039: a conflicted reconcile BOUNCES — no merge change is
+        // minted, so nothing new reaches git `main`: it simply stays at the
+        // git-native tip until the operator resolves. (The pre-0039 pass
+        // minted a signed "ferry: reconcile git main" merge here and published
+        // it with the conflicted path held at its last clean state.)
+        let after_bounce = main_commit(&git);
+        assert_eq!(
+            after_bounce.summary(),
+            Some("git edit"),
+            "a bounce publishes nothing — main stays at git's own tip"
+        );
+        let tree = after_bounce.tree().unwrap();
         let other = tree.get_name("other.txt").unwrap();
         assert_eq!(git.find_blob(other.id()).unwrap().content(), b"git touch\n");
+        let _ = clean_tip;
 
         // Pre-dock resolve must sign the resolution on the spot — unsigned it
         // (and every descendant) is stranded as untravelable working history,
@@ -2309,48 +2345,194 @@ mod tests {
     }
 
     #[test]
-    fn a_review_projection_needs_no_name_until_git_main_moves_under_it() {
-        // `loot-first review` is deliberately the pre-`describe` verb — it reviews
-        // *unsigned* WIP, and `resolve_title` has a fallback title for exactly the
-        // un-described case. So the #275 refusal must not reach the ordinary
-        // review: with git `main` where we left it, nothing is signed and no name
-        // is asked for.
-        let (mut ws, dir, mirror) = setup("wip-review-275");
+    fn review_from_a_stale_anchor_is_a_pure_projection() {
+        // ADR 0039 (#362): git `main` moving under a lane no longer strands its
+        // review. The old pass ran a full catch-up ferry, whose reconcile had
+        // to fold (finalize) the WIP — #292's `REFUSE_REVIEW_STALE_ANCHOR`
+        // refused that and stranded the lane instead. Review is now a pure
+        // projection: it mints the provisional commit from the lane's own
+        // anchor marks and touches nothing else, so a review off a stale
+        // anchor opens normally — un-described, even (review stays the
+        // pre-`describe` verb).
+        let (mut ws, dir, mirror) = setup("wip-review-0039");
         put_file(&dir, "a.txt", "base\n");
         seal_change(&mut ws, "base");
         ferry(&mut ws, &mirror);
-
-        put_file(&dir, "wip.txt", "unnamed\n");
-        let report = ferry_wip(&mut ws, &mirror);
-        assert!(report.review.is_some(), "un-described WIP still projects a review lane");
-
-        // But when git `main` has moved under it, review must NOT fold the WIP
-        // into a reconcile merge to catch up — that finalizes the working change
-        // and leaves the empty minted change as the thing to review (nothing),
-        // unlandable, with no op to undo (#292). It refuses instead, leaving the
-        // WIP intact — and naming it does not change that, because the fold is
-        // the problem, not the name.
         let git = git2::Repository::open(&mirror).unwrap();
+        let anchor_sha = main_commit(&git).id();
+
+        // Main moves under the dock (a git-native commit — the out-of-wave
+        // land shape), and un-described WIP sits on the tree.
         git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
-        let refused = match run(&mut ws, Some(mirror.to_str().unwrap()), None, true) {
-            Err(e) => e,
-            Ok(_) => panic!("a review whose lane fell behind git main must refuse, not fold (#292)"),
-        };
+        let moved_sha = main_commit(&git).id();
+        put_file(&dir, "wip.txt", "unnamed\n");
+
+        let anchor_before = ws.finalized_anchor();
+        let marks_before = read_or_empty(&ws.store().git_marks());
+        let state_before = read_or_empty(&ws.store().git_state());
+
+        let r = ferry_wip(&mut ws, &mirror);
+        let line = r.review.expect("the stale-anchor review projects");
+        assert!(line.contains("op=opened") && line.contains("round=1"), "{line}");
+        assert_eq!((r.ingested, r.projected), (0, 0), "a review pass ingests and projects nothing");
+        assert!(r.outcomes.is_empty(), "and reconciles nothing");
+
+        // The PR diff is the lane's anchor..WIP: the provisional commit
+        // parents at the anchor's mark, not at the moved main.
+        let dock = ws.dock_name().to_string();
+        let rev = git.find_reference(&format!("refs/heads/review/{dock}")).unwrap();
+        let c1 = git.find_commit(rev.target().unwrap()).unwrap();
+        assert_eq!(c1.parent_id(0).unwrap(), anchor_sha, "review bases on the lane's own anchor");
+
+        // Read-only pin (ADR 0039): dock tip, mirror main, and the bridge
+        // spine are all byte-identical after the pass.
+        assert_eq!(ws.finalized_anchor(), anchor_before, "dock tip untouched");
+        assert_eq!(main_commit(&git).id(), moved_sha, "mirror main untouched");
+        assert_eq!(read_or_empty(&ws.store().git_marks()), marks_before, "mark spine untouched");
+        assert_eq!(read_or_empty(&ws.store().git_state()), state_before, "ferry state untouched");
+
+        // Round 2+ still appends from the stale anchor.
+        put_file(&dir, "wip.txt", "revised\n");
+        let r2 = ferry_wip(&mut ws, &mirror);
+        let line2 = r2.review.unwrap();
+        assert!(line2.contains("op=appended") && line2.contains("round=2"), "{line2}");
+        let rev2 = git.find_reference(&format!("refs/heads/review/{dock}")).unwrap();
+        let c2 = git.find_commit(rev2.target().unwrap()).unwrap();
+        assert_eq!(c2.parent_id(0).unwrap(), c1.id(), "round 2 appends onto round 1");
+        assert_eq!(main_commit(&git).id(), moved_sha, "main still untouched after round 2");
+    }
+
+    /// Walk `main` first-parent from the tip, newest first, returning each
+    /// commit's subject line — the shape assertions for the ADR 0039 land
+    /// criterion read from this.
+    fn main_subjects(git: &git2::Repository) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = Some(main_commit(git));
+        while let Some(c) = cur {
+            out.push(c.summary().unwrap_or("").to_string());
+            cur = c.parent(0).ok();
+        }
+        out
+    }
+
+    #[test]
+    fn a_stale_lane_lands_exactly_one_commit_per_change() {
+        // ADR 0039's hard criterion: a lane whose anchor fell behind git
+        // `main` (a sibling landed mid-flight) still lands as exactly one
+        // commit per change — linear history, no "ferry: reconcile git main"
+        // merge node.
+        let (mut ws, repo_dir, mirror) = setup("stale-land-linear");
+        put_file(&repo_dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // Two lanes fork at the same anchor.
+        let l1 = ws.spawn_lane(None, Some(&repo_dir.parent().unwrap().join("l1"))).unwrap();
+        let l2 = ws.spawn_lane(None, Some(&repo_dir.parent().unwrap().join("l2"))).unwrap();
+
+        // Sibling lane l1 lands first — main moves past l2's anchor.
+        let mut w1 = Workspace::open_at(&l1.dir).unwrap();
+        put_file(&l1.dir, "b.txt", "sibling\n");
+        seal_change(&mut w1, "landed: sibling change");
+        run(&mut w1, None, None, false).unwrap();
+        let git = git2::Repository::open(&mirror).unwrap();
+        let sibling_sha = main_commit(&git).id();
+
+        // l2 finalizes its own (disjoint) change from the stale anchor and
+        // lands — the ferry `loot-first land` runs.
+        let mut w2 = Workspace::open_at(&l2.dir).unwrap();
+        put_file(&l2.dir, "c.txt", "mine\n");
+        seal_change(&mut w2, "landed: stale-lane change");
+        let stale = w2.finalized_anchor().unwrap();
+        let r = run(&mut w2, None, None, false).unwrap();
+        assert!(w2.conflicts().is_empty(), "disjoint paths: no bounce");
+        assert!(r.projected >= 1, "the carried change projected");
+
+        // Linear, one commit per change, both contents present.
+        let tip = main_commit(&git);
+        assert_eq!(tip.summary(), Some("landed: stale-lane change"), "the change's own subject");
+        assert_eq!(tip.parent_ids().count(), 1, "not a merge commit");
+        assert_eq!(tip.parent_id(0).unwrap(), sibling_sha, "sits directly on the sibling's land");
+        let subjects = main_subjects(&git);
         assert!(
-            refused.contains("moved under this lane") && refused.contains("#292"),
-            "and it says why: {refused}"
+            !subjects.iter().any(|s| s.contains("ferry: reconcile")),
+            "no reconcile-merge noise on landed history: {subjects:?}"
+        );
+        let paths = tree_paths(&git, &tip.tree().unwrap());
+        assert!(paths.contains(&"b.txt".to_string()), "the sibling's content is under the tip");
+        assert!(paths.contains(&"c.txt".to_string()), "this lane's content landed");
+        // And in loot the landed tip supersedes the stale original.
+        let tip_change = w2.finalized_anchor().unwrap();
+        assert_ne!(tip_change, stale);
+        assert!(w2.repo().supersedes(&tip_change, &stale), "carried as a supersession");
+    }
+
+    #[test]
+    fn a_conflicted_stale_land_bounces_then_relands_as_one_commit() {
+        // The other half of the ADR 0039 criterion: a genuinely conflicted
+        // stale land bounces (nothing minted, main unmoved), resolves in-lane
+        // via `loot resolve`, and the re-land still projects ONE commit whose
+        // tree carries the resolution — no resolution-commit trail on main.
+        let (mut ws, repo_dir, mirror) = setup("stale-land-bounce");
+        put_file(&repo_dir, "base.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        let l1 = ws.spawn_lane(None, Some(&repo_dir.parent().unwrap().join("l1"))).unwrap();
+        let l2 = ws.spawn_lane(None, Some(&repo_dir.parent().unwrap().join("l2"))).unwrap();
+
+        // Sibling lands an edit of base.txt.
+        let mut w1 = Workspace::open_at(&l1.dir).unwrap();
+        put_file(&l1.dir, "base.txt", "theirs\n");
+        seal_change(&mut w1, "landed: sibling edit");
+        run(&mut w1, None, None, false).unwrap();
+        let git = git2::Repository::open(&mirror).unwrap();
+        let sibling_sha = main_commit(&git).id();
+
+        // This lane edits the same path from the stale anchor — the land's
+        // ferry bounces: conflicts recorded, nothing minted, main unmoved.
+        let mut w2 = Workspace::open_at(&l2.dir).unwrap();
+        put_file(&l2.dir, "base.txt", "ours\n");
+        seal_change(&mut w2, "fix: base edit");
+        let stale = w2.finalized_anchor().unwrap();
+        let r = run(&mut w2, None, None, false).unwrap();
+        assert!(
+            matches!(r.outcomes[&PathBuf::from("base.txt")], MergeOutcome::Conflict { .. }),
+            "the same-path divergence bounced"
+        );
+        assert!(!w2.conflicts().is_empty(), "conflict recorded for loot resolve");
+        assert_eq!(main_commit(&git).id(), sibling_sha, "a bounce moves nothing onto main");
+        assert_eq!(
+            w2.finalized_anchor(),
+            Some(stale.clone()),
+            "a bounce mints nothing — the signed change is untouched"
         );
 
-        // The WIP survived, unfinalized: the edit is still on disk, nothing was
-        // signed. Naming it still refuses — a review off a stale anchor stays
-        // refused until the lane is reconciled (re-spawned from current main).
-        assert_eq!(std::fs::read(dir.join("wip.txt")).unwrap(), b"unnamed\n");
-        ws.snapshot("wip: named work").unwrap();
-        let still = match run(&mut ws, Some(mirror.to_str().unwrap()), None, true) {
-            Err(e) => e,
-            Ok(_) => panic!("naming the WIP must not unlock the fold (#292)"),
-        };
-        assert!(still.contains("#292"), "naming does not unlock the fold: {still}");
+        // Resolve in-lane, then re-land: the resolution folds into the carried
+        // change instead of trailing it as its own commit.
+        w2.resolve_conflict(Path::new("base.txt"), b"resolved\n", loot_core::Visibility::Public)
+            .unwrap();
+        let r2 = run(&mut w2, None, None, false).unwrap();
+        assert!(w2.conflicts().is_empty(), "nothing left to resolve");
+        assert!(r2.projected >= 1);
+
+        let tip = main_commit(&git);
+        assert_eq!(tip.summary(), Some("fix: base edit"), "the change's own subject, not a resolution placeholder");
+        assert_eq!(tip.parent_ids().count(), 1, "not a merge commit");
+        assert_eq!(tip.parent_id(0).unwrap(), sibling_sha, "linear on top of the sibling's land");
+        let subjects = main_subjects(&git);
+        assert!(
+            !subjects.iter().any(|s| s.contains("(conflict resolution:") || s.contains("ferry: reconcile")),
+            "no resolution or merge noise on landed history: {subjects:?}"
+        );
+        // The landed tree carries the operator's resolution.
+        let blob = tip
+            .tree()
+            .unwrap()
+            .get_path(Path::new("base.txt"))
+            .and_then(|e| git.find_blob(e.id()))
+            .unwrap();
+        assert_eq!(blob.content(), b"resolved\n");
     }
 
     #[test]

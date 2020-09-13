@@ -280,6 +280,26 @@ const RESOLUTION_SUFFIX_OPEN: &str = " (conflict resolution: ";
 /// as [`RESOLVE_FALLBACK_PREFIX`]: change one, change both.
 const UNDESCRIBED_SUBJECT: &str = "(working change)";
 
+/// What [`DagRepo::carry_line`] decided — the git bridge's diverged-line
+/// reconcile (ADR 0039). Only `Carried` minted anything; a `Bounced` or
+/// `Foreign` outcome leaves the graph exactly as it was.
+#[derive(Debug)]
+pub enum CarryOutcome {
+    /// The suffix replayed clean: `minted` are the carried superseding
+    /// versions (unsigned — the caller finalizes each), oldest first, the
+    /// last being the new tip.
+    Carried { minted: Vec<Oid>, outcomes: BTreeMap<PathBuf, MergeOutcome> },
+    /// Genuine same-path divergence remains: the conflicts are recorded for
+    /// `loot resolve`, nothing was minted, the caller must not advance.
+    Bounced { outcomes: BTreeMap<PathBuf, MergeOutcome> },
+    /// The suffix carries work this repo did not author (or the repo is
+    /// keyless) — re-authoring it would forge provenance; the caller falls
+    /// back to the merge shape.
+    Foreign,
+    /// Nothing to carry: every suffix node replayed empty over `onto`.
+    Covered,
+}
+
 /// **Reconcile & relay face** (R3, #179): what happens when lines of history
 /// meet — the conflict set and its resolution, the relay's append-only `stow`,
 /// and the `apply_sync` machinery under the classifier (ADR 0001/0011).
@@ -1608,6 +1628,184 @@ impl DagRepo {
         };
         let id = self.record(change)?;
         Ok((id, merged.outcomes))
+    }
+
+    /// Carry the first-parent suffix of `ours` that `onto` does not cover onto
+    /// `onto`, as **superseding versions** (ADR 0032) — the reconcile shape the
+    /// git bridge lands with (ADR 0039's hard criterion): a lane that fell
+    /// behind `main` re-anchors its changes instead of minting a
+    /// `ferry: reconcile git main` merge, so landed git history stays **one
+    /// commit per change** with no merge or resolution-commit noise.
+    ///
+    /// Per suffix node, oldest first, the replay is the same three-way the
+    /// merge shape used (`converge::merge_trees`; base = the node's first
+    /// parent, so exactly the node's own delta replays). Each real node mints
+    /// a version carrying the original's change id, message, and a
+    /// `predecessors` entry naming it (so the old head reads superseded, never
+    /// deleted — ADR 0031). Two node kinds never mint their own version:
+    ///
+    /// - a **resolution** change (the `loot resolve` shapes, #337/#316 —
+    ///   recognized by [`RESOLUTION_SUFFIX_OPEN`]/[`RESOLVE_FALLBACK_PREFIX`])
+    ///   folds into the version before it: its tree-effect lands there and its
+    ///   own version joins that version's predecessors. This is what makes a
+    ///   bounced-then-resolved land still re-land as one commit;
+    /// - a node whose replay adds nothing over the carried line is dropped
+    ///   redundant, its version likewise folded into the neighbouring mint.
+    ///
+    /// Returns without minting when the suffix still genuinely conflicts
+    /// ([`CarryOutcome::Bounced`] — conflicts recorded for `loot resolve`),
+    /// when the suffix carries work this repo did not author
+    /// ([`CarryOutcome::Foreign`] — re-authoring a peer's or a git-native
+    /// change would forge provenance; the caller merges instead), or when
+    /// every node replayed empty ([`CarryOutcome::Covered`]).
+    ///
+    /// The minted versions are **unsigned** — the caller finalizes each, as
+    /// with [`merge_tips`](DagRepo::merge_tips) (ADR 0018, verify-only core).
+    pub fn carry_line(
+        &mut self,
+        ours: &Oid,
+        onto: &Oid,
+        now: u64,
+    ) -> Result<CarryOutcome, RepoError> {
+        // A keyless repo cannot author the carried versions it would mint.
+        let Some(self_author) = self.author else {
+            return Ok(CarryOutcome::Foreign);
+        };
+
+        // The ancestry of `onto` — everything already covered by the target.
+        let mut covered: std::collections::BTreeSet<Oid> = std::collections::BTreeSet::new();
+        let mut stack = vec![onto.clone()];
+        while let Some(id) = stack.pop() {
+            if !covered.insert(id.clone()) {
+                continue;
+            }
+            if let Some(node) = self.graph.get(&id) {
+                stack.extend(node.parents.iter().cloned());
+            }
+        }
+
+        // First-parent suffix of `ours` outside that ancestry, oldest first.
+        let mut chain: Vec<Oid> = Vec::new();
+        let mut cur = ours.clone();
+        while !covered.contains(&cur) {
+            let Some(node) = self.graph.get(&cur) else {
+                return Err(RepoError::Backend(format!(
+                    "carry: change {} is not loaded",
+                    crate::hex::short(&cur.0, 8)
+                )));
+            };
+            chain.push(cur.clone());
+            match node.parents.first() {
+                Some(p) => cur = p.clone(),
+                None => break, // disjoint root: replay against the empty tree
+            }
+        }
+        chain.reverse();
+        if chain.is_empty() {
+            return Ok(CarryOutcome::Covered);
+        }
+        // Re-authoring someone else's (or unauthored git-native) work as our
+        // own version would forge provenance — those lines keep the merge.
+        if chain
+            .iter()
+            .any(|id| self.graph.get(id).and_then(|n| n.author) != Some(self_author))
+        {
+            return Ok(CarryOutcome::Foreign);
+        }
+
+        /// One carried version waiting to mint (nothing minted until the whole
+        /// suffix replays clean, so a bounce leaves the graph untouched).
+        struct Pending {
+            message: String,
+            cid: Option<[u8; 16]>,
+            preds: Vec<Oid>,
+            tree: converge::Tree,
+        }
+        let mut pendings: Vec<Pending> = Vec::new();
+        let mut carried_tree = self.graph.tree_at(onto);
+        let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
+        let mut open_conflicts: BTreeMap<PathBuf, (Oid, Oid)> = BTreeMap::new();
+
+        for id in &chain {
+            let node = self.graph.get(id).expect("chain nodes are loaded").clone();
+            let base_tree = node.parents.first().map(|p| self.graph.tree_at(p));
+            let merged =
+                converge::merge_trees(&node.tree, &carried_tree, base_tree.as_ref(), self, now);
+            for (path, outcome) in merged.outcomes {
+                match &outcome {
+                    MergeOutcome::Conflict { .. } => {
+                        outcomes.insert(path, outcome);
+                    }
+                    _ => {
+                        // A later node that answers a path cleanly supersedes the
+                        // earlier conflict there — the ours line already resolved
+                        // it (the fold that keeps a re-land at one commit).
+                        if open_conflicts.remove(&path).is_some() {
+                            outcomes.insert(path, outcome);
+                        } else {
+                            let slot =
+                                outcomes.entry(path).or_insert(MergeOutcome::Converged);
+                            *slot = converge::worst(slot.clone(), outcome);
+                        }
+                    }
+                }
+            }
+            for (path, pair) in merged.conflicts {
+                open_conflicts.insert(path, pair);
+            }
+
+            let is_resolution = node.message.starts_with(RESOLVE_FALLBACK_PREFIX)
+                || (node.message.ends_with(')')
+                    && node.message.rfind(RESOLUTION_SUFFIX_OPEN).is_some());
+            let redundant = merged.tree == carried_tree;
+            carried_tree = merged.tree.clone();
+            match pendings.last_mut() {
+                // Resolutions and empty replays never mint their own version:
+                // their effect (if any) is already in `carried_tree`, and their
+                // version rides the neighbouring mint's predecessors so the old
+                // head reads superseded.
+                Some(last) if is_resolution || redundant => {
+                    last.tree = merged.tree;
+                    last.preds.push(id.clone());
+                }
+                _ if redundant => continue,
+                _ => pendings.push(Pending {
+                    message: node.message,
+                    cid: node.change_id,
+                    preds: vec![id.clone()],
+                    tree: merged.tree,
+                }),
+            }
+        }
+
+        if !open_conflicts.is_empty() {
+            for (path, pair) in open_conflicts {
+                self.conflicts.insert(path, pair);
+            }
+            return Ok(CarryOutcome::Bounced { outcomes });
+        }
+        if pendings.is_empty() {
+            return Ok(CarryOutcome::Covered);
+        }
+        let mut minted: Vec<Oid> = Vec::new();
+        let mut parent = onto.clone();
+        for pend in pendings {
+            let change = Change {
+                id: Oid([0; 32]),
+                parents: vec![parent.clone()],
+                message: pend.message,
+                tree: pend.tree,
+            };
+            let id = self.record_superseding(change, pend.cid, pend.preds)?;
+            parent = id.clone();
+            minted.push(id);
+        }
+        // The carried line continues on `onto`; the superseded original tip
+        // stops being a head (node untouched — ADR 0031). Without this, a
+        // heads-derived anchor (the untracked pristine home) can keep
+        // answering the stale tip.
+        self.graph.retire_head(ours);
+        Ok(CarryOutcome::Carried { minted, outcomes })
     }
 
     /// Verify and record an attestation over a change (S4, ADR 0018). Returns

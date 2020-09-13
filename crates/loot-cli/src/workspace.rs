@@ -3213,11 +3213,12 @@ impl Workspace {
     /// the graph found, and execute whatever [`crate::reconcile::decide`]
     /// returns:
     ///   - `target` covered by us        → no-op (we are on/ahead/supersede it);
-    ///   - real concurrent work captured → merge it with `target`;
+    ///   - real concurrent work captured → carry it onto `target` (ADR 0039);
     ///   - no local line (`pinned` None) → adopt (fast-forward);
     ///   - we are behind `target`        → adopt (fast-forward);
-    ///   - genuinely diverged            → merge via the classifier;
-    ///   - #275/#292's guards            → refuse, capture already safe on disk.
+    ///   - genuinely diverged            → carry via the classifier
+    ///     ([`reconcile_carry`](Self::reconcile_carry) — one commit per change);
+    ///   - #275's guard                  → refuse, capture already safe on disk.
     ///
     /// Capture is gated on "will this reconcile overwrite the tree?", NOT on
     /// "did git bring new commits?". That latter gate (`had_new`) was the #280
@@ -3229,16 +3230,11 @@ impl Workspace {
     /// review of un-described WIP is never asked for a name when `main` sits
     /// where we left it).
     ///
-    /// `preserve_wip` (set only by the review projection, `loot ferry
-    /// --with-wip`) forbids folding a **live working change** into the reconcile
-    /// merge: review's job is to project the *unfinalized* WIP, so if `main`
-    /// moved under the lane and real local work is on the tree, capturing +
-    /// finalizing it here would sign the WIP into a merge and leave the empty
-    /// minted change as the thing to "review" — nothing (#292, now
-    /// [`crate::reconcile::Refusal::ReviewStaleAnchor`]). Under `preserve_wip`
-    /// that path refuses instead, leaving the WIP captured and unfinalized.
-    /// The no-ops (main where we left it) never reach the capture, so an
-    /// ordinary review still projects un-described WIP untouched.
+    /// Only reconciling verbs reach this — `loot ferry`, `loot adopt`,
+    /// `loot-first land`. The review projection (`ferry --with-wip`) never
+    /// calls it: review is a pure projection (ADR 0039), so the old
+    /// `preserve_wip` refusal (#292, `REFUSE_REVIEW_STALE_ANCHOR`) is gone
+    /// with the fold it guarded against.
     ///
     /// Returns the per-path outcomes (empty on adopt/no-op).
     pub fn reconcile_onto(
@@ -3246,7 +3242,6 @@ impl Workspace {
         target: Option<&Oid>,
         pinned: Option<&Oid>,
         label: &str,
-        preserve_wip: bool,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
         // The incoming change may have landed from a lane this dock never
         // adopted — outside the lineage-filtered load (#265). Pull its line in
@@ -3313,7 +3308,6 @@ impl Workspace {
             wip: wip.clone(),
             pinned: pinned.cloned(),
             pinned_is_ancestor_of_target: pinned.is_some_and(|o| self.graph().is_ancestor(o, target)),
-            preserve_wip,
             described,
         };
         match reconcile::decide(&view) {
@@ -3324,21 +3318,87 @@ impl Workspace {
                 Ok(BTreeMap::new())
             }
             reconcile::Plan::Merge { ours } => {
-                // Merging the just-captured wip signs it as our merge parent
-                // first (#275's "this merge seals your local work into signed
-                // history") — a pinned tip merged instead is already finalized,
-                // nothing left to sign.
+                // Carrying the just-captured wip signs it first (#275's "this
+                // seals your local work into signed history") — a pinned tip
+                // carried instead is already finalized, nothing left to sign.
                 if wip.is_some() {
                     // Mis-seal gate (#353, ADR 0038 §1): the wip about to be
                     // signed was captured from the disk this pass — same seam
                     // as `fold_line_in`'s capture-and-sign, same gate. The
                     // disk still shows the captured tree here (materialize
-                    // runs after the merge), so the disk-reading gate vets
+                    // runs after the carry), so the disk-reading gate vets
                     // exactly what is being sealed.
                     self.seal_gate(&[])?;
                     self.finalize_working()?;
                 }
-                self.reconcile_merge(&ours, target, label)
+                self.reconcile_carry(&ours, target, label)
+            }
+        }
+    }
+
+    /// Reconcile a genuinely diverged line the ADR 0039 way: **carry** the
+    /// ours-side suffix onto `target` as superseding versions
+    /// ([`DagRepo::carry_line`]), so landed git history stays one commit per
+    /// change — no `ferry: reconcile git main` merge, no resolution-commit
+    /// trail. The minted versions are signed here (the land/ferry seam is
+    /// where signing is legitimate, ADR 0039); their trees are compositions of
+    /// content that already passed a finalize seam's mis-seal gate (the wip's
+    /// own finalize above, or landed history), so no new gate run is owed.
+    ///
+    /// A conflicted carry mints nothing — the conflicts are recorded and the
+    /// outcomes returned, so `loot-first land` bounces with the tree untouched
+    /// (the resolve-then-re-land round then folds the resolution into the
+    /// carried change). A suffix this repo did not author falls back to the
+    /// pre-0039 merge shape ([`reconcile_merge`](Self::reconcile_merge)):
+    /// re-authoring a peer's or git-native change would forge provenance.
+    fn reconcile_carry(
+        &mut self,
+        ours: &Oid,
+        target: &Oid,
+        label: &str,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        if self.signer.is_none() {
+            // A carried version must finalize to travel; with no signer the
+            // merge shape (whose caller-visible contract predates signing)
+            // is the only honest reconcile.
+            return self.reconcile_merge(ours, target, label);
+        }
+        match self.repo.carry_line(ours, target, self.now).map_err(|e| e.to_string())? {
+            loot_core::CarryOutcome::Foreign => self.reconcile_merge(ours, target, label),
+            loot_core::CarryOutcome::Covered => {
+                self.reconcile_adopt(target)?;
+                Ok(BTreeMap::new())
+            }
+            loot_core::CarryOutcome::Bounced { outcomes } => {
+                // Nothing minted, tree untouched — persist only the recorded
+                // conflicts so `loot conflicts`/`loot resolve` see them in the
+                // next process (loot is process-per-command).
+                self.persist()?;
+                Ok(outcomes)
+            }
+            loot_core::CarryOutcome::Carried { minted, outcomes } => {
+                // Finalize each carried version over
+                // `version ‖ change_id ‖ predecessors` (ADR 0029/0032),
+                // exactly like `resolve`'s signing block.
+                if let Some(signer) = &self.signer {
+                    for id in &minted {
+                        let cid = self.repo.change_change_id(id);
+                        let preds = self.repo.change_predecessors(id);
+                        let sig =
+                            signer.sign(&loot_core::change_signing_message(id, &cid, &preds));
+                        self.repo.attach_signature(id, sig).map_err(|e| e.to_string())?;
+                    }
+                }
+                let tip = minted.last().expect("Carried always mints").clone();
+                // Capture-first ran in `reconcile_onto`, so the disk shows
+                // `ours`'s tree — materialize the carried tip's tree over it.
+                self.repo
+                    .materialize(Some(ours), &tip, &self.identity, self.now)
+                    .map_err(|e| e.to_string())?;
+                self.position.advance(&self.store, Some(tip));
+                self.store.clear_tree_hash(self.dock_opt());
+                self.persist()?;
+                Ok(outcomes)
             }
         }
     }
@@ -3404,6 +3464,12 @@ impl Workspace {
     /// the bridge instead of a dock. Caller runs [`reconcile_capture`] first.
     /// Conflicts flow through the shared `conflicts`/`resolve` path. Returns
     /// the per-path outcomes.
+    ///
+    /// Since ADR 0039 this is only the **fallback** shape, reached from
+    /// [`reconcile_carry`](Self::reconcile_carry) when the diverged suffix
+    /// carries work this repo did not author (or the repo is keyless) — the
+    /// merge preserves foreign provenance at the cost of a merge commit on
+    /// the projected history. Self-authored suffixes carry instead.
     ///
     /// [`reconcile_capture`]: Workspace::reconcile_capture
     fn reconcile_merge(
@@ -5540,7 +5606,7 @@ mod tests {
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
 
         let err = ws
-            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", /* preserve_wip */ false)
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
             .unwrap_err();
         assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
         assert!(ws.working_id().is_some(), "the local work is captured, not dropped");
@@ -5556,62 +5622,81 @@ mod tests {
         std::fs::write(dir.join("local.txt"), b"my work").unwrap();
         ws.snapshot("feat: my local line").unwrap();
 
-        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", /* preserve_wip */ false)
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
             .expect("described work reconciles");
-        let tip = ws.anchor().expect("the dock advanced onto a merge");
-        assert!(ws.graph().is_ancestor(&c2, &tip), "the landed side is folded in");
+        let tip = ws.anchor().expect("the dock advanced");
+        assert!(ws.graph().is_ancestor(&c2, &tip), "the landed side is under the carried tip");
+        // ADR 0039: the described work is CARRIED onto landed main as a
+        // superseding version — its own subject, single parent, no
+        // "ferry: reconcile git main" merge node on the line.
+        assert_eq!(
+            ws.repo().change_message(&tip).as_deref(),
+            Some("feat: my local line"),
+            "the carried tip keeps the work's own subject"
+        );
+        assert_eq!(
+            ws.graph().parents(&tip),
+            vec![c2.clone()],
+            "the carried tip sits directly on landed main — linear, no merge node"
+        );
         let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
-    fn review_catch_up_refuses_to_fold_a_described_wip_when_main_moved() {
-        // #292 — the review fold. A lane spawned from an anchor already behind
-        // git `main` (`landed_from_lane` moves main past the dock via a lane
-        // land), then real described work on the tree. `loot-first review` runs
-        // its catch-up ferry with `--with-wip` (`preserve_wip = true`). Before
-        // this fix the reconcile CAPTURED + FINALIZED the described WIP into a
-        // "ferry: reconcile git main" merge and minted an empty working change —
-        // so review then reported "nothing to review", the work unlandable, with
-        // no op-log entry to undo. The catch-up must refuse the fold instead.
-        let (area, dir, c2) = landed_from_lane("292-review-fold");
+    fn a_finalized_stale_line_carries_onto_landed_main_as_one_version_per_change() {
+        // The ADR 0039 land shape. A lane finalized its change while a sibling
+        // landed (`landed_from_lane` moves main past the dock via a lane land).
+        // The land's ferry reconcile must NOT mint a "ferry: reconcile git
+        // main" merge — it carries the change onto landed main as a
+        // superseding version: same change id, same subject, single parent,
+        // predecessors naming the stale original (ADR 0031: nothing deleted).
+        let (area, dir, c2) = landed_from_lane("0039-carry-land");
 
         let mut ws = Workspace::open_at(&dir).unwrap();
         let ours = ws.finalized_anchor();
-        std::fs::write(dir.join("local.txt"), b"my reviewable work").unwrap();
-        ws.snapshot("feat: my local line").unwrap();
-        let wip = ws.working_id().cloned().expect("a live, described working change");
+        std::fs::write(dir.join("local.txt"), b"my landed work").unwrap();
+        ws.snapshot("feat: my landing change").unwrap();
+        ws.finalize_working().unwrap();
+        let stale = ws.finalized_anchor().expect("the lane's finalized change");
+        let stale_cid = ws.repo().change_change_id(&stale);
 
-        let err = ws
-            .reconcile_onto(
-                Some(&c2),
-                ours.as_ref(),
-                "ferry: reconcile git main",
-                /* preserve_wip */ true,
-            )
-            .unwrap_err();
+        let outcomes = ws
+            .reconcile_onto(Some(&c2), Some(&stale), "ferry: reconcile git main")
+            .expect("a clean stale land carries");
         assert!(
-            err.contains("moved under this lane") && err.contains("#292"),
-            "a clear, actionable refusal — not a silent fold: {err}"
+            !outcomes
+                .values()
+                .any(|o| matches!(o, loot_core::MergeOutcome::Conflict { .. })),
+            "precondition: disjoint paths converge cleanly"
         );
 
-        // The described WIP is intact and still UNFINALIZED: nothing was signed,
-        // the dock did not advance, and the landed side was NOT folded in.
+        let tip = ws.anchor().expect("the dock advanced onto the carried version");
+        assert_ne!(tip, stale, "a new version was minted");
         assert_eq!(
-            ws.working_id(),
-            Some(&wip),
-            "the described WIP survives as the live working change"
+            ws.graph().parents(&tip),
+            vec![c2.clone()],
+            "the carried version sits directly on landed main — no merge node"
         );
-        assert_eq!(ws.finalized_anchor(), ours, "nothing was finalized onto the line");
+        assert_eq!(
+            ws.repo().change_message(&tip).as_deref(),
+            Some("feat: my landing change"),
+            "the carried version keeps the change's own subject"
+        );
+        assert_eq!(
+            ws.repo().change_change_id(&tip),
+            stale_cid,
+            "the carried version IS the same change (change id preserved)"
+        );
         assert!(
-            !ws.graph().is_ancestor(&c2, &wip),
-            "the landed main was not folded into the WIP"
+            ws.repo().change_predecessors(&tip).contains(&stale),
+            "the stale original is superseded, not deleted (ADR 0031)"
         );
-        // And the edits are still on disk — the refusal cost only the signature.
-        assert_eq!(
-            std::fs::read(dir.join("local.txt")).unwrap(),
-            b"my reviewable work",
-            "the refusal did not clobber the working tree",
+        assert!(
+            ws.repo().supersedes(&tip, &stale),
+            "the graph reads the carry as a supersession"
         );
+        // Both sides' content on disk: ours carried, the landed side adopted.
+        assert_eq!(std::fs::read(dir.join("local.txt")).unwrap(), b"my landed work");
         let _ = std::fs::remove_dir_all(&area);
     }
 
@@ -5646,7 +5731,7 @@ mod tests {
         // The reconcile a `had_new == false` ferry makes: main is the marked
         // lane-landed c2, and our line is its ancestor. Pre-#280 this hit the
         // `(None, Some(o)) if is_ancestor(o, target)` adopt arm and clobbered.
-        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", /* preserve_wip */ false)
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
             .expect("the working change reconciles — it is not clobbered");
 
         assert_eq!(
@@ -7254,7 +7339,7 @@ mod tests {
 
         // The ferry reconcile the land runs — same-path divergence bounces.
         let outcomes = ws
-            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", false)
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
             .unwrap();
         assert!(
             matches!(outcomes[&PathBuf::from("base.txt")], MergeOutcome::Conflict { .. }),

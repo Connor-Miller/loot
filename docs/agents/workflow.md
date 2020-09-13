@@ -145,15 +145,21 @@ loot — all absorb through the same converge+ingest path:
   commit, not the content, that must be ingested.
 - **A break-glass local commit** (see guard rails) — same ingest.
 
-When one of these lands while you have local work, the ferry folds your line in
-with a merge — which **signs your work** to make it a merge parent. So it needs a
-name first: an un-described working change makes `ferry` (and `lane merge`, and
-the `adopt` catch-up) refuse, pointing at `describe -m` (#275). Nothing is lost —
-the capture happens, the disk is untouched, and re-running after naming completes
-the pass. Edits you never captured take two passes, because naming *is* capturing.
+When one of these lands while you have local work, the ferry **carries** your
+line onto the landed `main` as superseding versions (ADR 0039, `carry_line`) —
+same change ids, same subjects, one commit per change, no reconcile-merge node —
+which **signs your work**. So it needs a name first: an un-described working
+change makes `ferry` (and `lane merge`, and the `adopt` catch-up) refuse,
+pointing at `describe -m` (#275). Nothing is lost — the capture happens, the
+disk is untouched, and re-running after naming completes the pass. Edits you
+never captured take two passes, because naming *is* capturing. (A line this
+repo did not author — e.g. re-ingested foreign commits — still reconciles with
+a merge change: re-authoring it would forge provenance.)
 
-A genuine same-path conflict is held at its last clean state in git (ADR 0028) and
-surfaced by `loot conflicts`; that change can't land until you resolve it in loot.
+A genuine same-path conflict **bounces** the pass (ADR 0039): nothing is
+minted, git `main` stays where git put it, and the conflict surfaces in
+`loot conflicts`; resolve it in loot (`loot resolve`) and the re-run folds the
+resolution into the carried commit.
 
 ## Parallel work and landing
 

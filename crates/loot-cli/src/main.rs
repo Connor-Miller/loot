@@ -218,7 +218,7 @@ usage:
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
   loot pull [<url>] [--remote <name>] [--no-surface] [--porcelain|--json]  fetch, merge, converge, and surface changes from a relay
-  loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip also projects the ambient dock's unfinalized WIP to review/<lane-id> (review/<dock> on the primary; map #148, #281)
+  loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip instead projects ONLY the ambient dock's unfinalized WIP to review/<lane-id> (review/<dock> on the primary; map #148, #281) — a pure review projection: no ingest, no reconcile, no main advance (ADR 0039)
   loot completions <bash|zsh|fish>          print a shell completion script to stdout (no repo needed) — pipe it into your shell config, e.g. loot completions zsh > ~/.zsh/completions/_loot
 
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
@@ -1095,7 +1095,10 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
     for note in &report.notes {
         let _ = writeln!(human, "note: {note}");
     }
-    if report.ingested == 0 && report.projected == 0 && report.outcomes.is_empty() {
+    if with_wip {
+        // A review pass is a pure projection (ADR 0039): no ingest, no
+        // reconcile, no main advance — its whole report is the review line.
+    } else if report.ingested == 0 && report.projected == 0 && report.outcomes.is_empty() {
         let _ = writeln!(human, "ferry: up to date (nothing to ingest or project)");
     } else {
         let _ = writeln!(

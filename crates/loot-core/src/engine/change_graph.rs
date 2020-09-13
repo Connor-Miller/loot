@@ -189,6 +189,17 @@ impl ChangeGraph {
         self.changes.get(id)
     }
 
+    /// Retire `id` from the head set **without touching the node** — the
+    /// carry's supersession bookkeeping (ADR 0039): a carried version
+    /// continues the line on a new parent, so the superseded original stops
+    /// being a tip while staying fully in history (ADR 0031 — a head entry is
+    /// not the change). Unlike [`remove_head`](Self::remove_head), parents are
+    /// not restored: the line's continuation is the carried version, not the
+    /// original's parent. No-op when `id` is not a head.
+    pub fn retire_head(&mut self, id: &Oid) {
+        self.heads.retain(|h| h != id);
+    }
+
     /// Build a graph containing only the subgraph reachable from `heads` over a
     /// `pool` of candidate nodes (CA1.5, ADR 0022). This is the per-dock load:
     /// the shared store holds every dock's finalized nodes, but a dock only wants

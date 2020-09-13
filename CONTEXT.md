@@ -182,6 +182,22 @@ Supersedes the #292/#302 stale-anchor refusal, which guarded the fold this
 definition makes unrepresentable.
 _Avoid_: "review ferry" (it is not a ferry pass), catch-up-on-review.
 
+**Carry** *(ADR 0039 build, #362; `DagRepo::carry_line`)* — the bridge's
+diverged-line reconcile: replay the self-authored suffix of a line that fell
+behind git `main` onto the landed tip as **superseding versions** — same
+change id, same subject, single parent, the stale original kept as a
+predecessor (ADR 0031/0032) — instead of minting a
+`ferry: reconcile git main` merge change. This is what keeps landed history
+at exactly one commit per change when a behind-anchor [[Lane]] lands (ADR
+0036's queued land, as amended). A genuinely conflicted carry **bounces**:
+nothing minted, conflicts recorded for `loot resolve`, and on re-land the
+resolution change *folds into* the carried commit (recognized by the #337
+resolution-subject shape) rather than trailing it. A suffix this repo did not
+author falls back to the merge shape — re-authoring foreign or git-native
+work would forge provenance.
+_Avoid_: rebase (git's word for a history *rewrite* — the carry deletes
+nothing), reconcile-merge (the shape it replaces).
+
 **Position** *(#324, shipped this wave)* — ADR 0034's "position is place, not
 state" lifted into its own module (`crates/loot-cli/src/position.rs`): the
 three fields that name where a [[Workspace]] sits — the dock, the
