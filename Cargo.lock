@@ -1179,6 +1179,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "loot-revset"
+version = "0.0.0"
+dependencies = [
+ "loot-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "loot-wasm"
 version = "0.0.0"
 dependencies = [

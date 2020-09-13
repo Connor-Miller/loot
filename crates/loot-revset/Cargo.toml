@@ -1,0 +1,14 @@
+[package]
+name = "loot-revset"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Revset query language (#394): a small query algebra for selecting SETS of
+# changes from a `DagRepo` view — loot's answer to jj's revset DSL. A pure
+# parser + evaluator library; the downstream verbs (split, filtered log) are the
+# consumers. loot-core only — no I/O, no async, no crypto of its own.
+
+[dependencies]
+loot-core.workspace = true
+thiserror.workspace = true

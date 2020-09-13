@@ -4,6 +4,7 @@ members = [
     "crates/loot-codec",
     "crates/loot-wasm",
     "crates/loot-core",
+    "crates/loot-revset",
     "crates/loot-net",
     "crates/loot-identity",
     "crates/loot-cli",
