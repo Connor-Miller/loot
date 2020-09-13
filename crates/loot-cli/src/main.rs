@@ -6,12 +6,16 @@
 //! id) is owned by the [`Workspace`]; commands are thin verbs over it.
 
 mod ferry;
+mod render;
 mod workspace;
 
 use loot_core::{
     verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Visibility,
 };
 use loot_identity as identity;
+use render::{
+    change_col, outcome_rows, render_buoy_human, render_history, short, short_change, short_oid,
+};
 use std::process::ExitCode;
 use workspace::{GlobalConfig, StepReport, Workspace};
 
@@ -590,80 +594,17 @@ fn cmd_log() -> Result<(), String> {
         return Ok(());
     }
 
-    // Resolve author pubkeys to display names (peer registry + self); render
-    // the change id as reverse-hex letters beside the hex version id.
+    // Resolve author pubkeys to display names (peer registry + self); the
+    // rendering itself lives in render.rs and is tested there (R5, #181).
     let reg = identity::PeerRegistry::load(ws.dot());
     let own = ws.identity_pubkey();
-    let author_name = |author: &Option<[u8; 32]>| match author {
+    let name_of = |author: Option<&[u8; 32]>| match author {
         Some(pk) if own.as_ref() == Some(pk) => identity.clone(),
         Some(pk) => resolve_pubkey_name(&reg, pk),
         None => String::new(),
     };
-    let print_row = |row: &workspace::HistoryRow| {
-        println!(
-            "{}",
-            log_row(
-                &change_col(row.change_id, &view.divergent),
-                &short(&row.version),
-                &row.message,
-                &vis_col(row.total, row.restricted, row.embargoed),
-                &author_name(&row.author),
-            )
-        );
-        for (attester, role) in &row.attestations {
-            println!("    + attested by {} ({})", resolve_pubkey_name(&reg, attester), role);
-        }
-    };
-
-    match &view.graph {
-        None => {
-            println!("{}", log_header());
-            for row in &view.rows {
-                print_row(row);
-            }
-            if let Some(row) = &view.working {
-                print_working_row(&identity, row, &view.divergent);
-            }
-        }
-        Some(g) => {
-            println!("{} heads — diverged; run `loot apply` to converge", g.heads.len());
-            for (hi, head) in g.heads.iter().enumerate() {
-                println!();
-                println!("head {} — {}", hi + 1, short(head));
-                println!("{}", log_header());
-                for row in &g.per_head[hi] {
-                    print_row(row);
-                }
-            }
-            if !g.shared.is_empty() {
-                println!();
-                println!("shared history");
-                println!("{}", log_header());
-                for row in &g.shared {
-                    print_row(row);
-                }
-            }
-        }
-    }
+    print!("{}", render_history(&view, &identity, &name_of));
     Ok(())
-}
-
-/// Render the working-change row for `log` (ADR 0030): the durable change id
-/// (letters) + the live version id (hex, `—` when the change is empty), the
-/// message, and the current identity as author. Shares the columnar shape with
-/// the finalized rows so the two ids line up.
-fn print_working_row(
-    identity: &str,
-    row: &workspace::WorkingRow,
-    divergent: &std::collections::BTreeSet<[u8; 16]>,
-) {
-    let change = change_col(row.change_id, divergent);
-    let (version, message) = if row.empty {
-        (NO_ID.to_string(), "(working change, empty)".to_string())
-    } else {
-        (short(&row.version), row.message.clone())
-    };
-    println!("{}", log_row(&change, &version, &message, "", identity));
 }
 
 /// Annotate a change with its sealed/embargoed file counts, or "" if all public.
@@ -701,9 +642,7 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
                 println!("applied {infile}: nothing new (already up to date)");
             } else {
                 println!("applied {infile} as {identity}:");
-                for (path, outcome) in &outcomes {
-                    println!("  {:<24} {}", path.display(), describe(outcome));
-                }
+                print!("{}", outcome_rows(&outcomes));
                 println!("run `loot surface` to materialize what you may see");
             }
         }
@@ -740,9 +679,7 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
                     "ferry: ingested {} git commit(s), projected {} loot change(s)",
                     report.ingested, report.projected
                 );
-                for (path, outcome) in &report.outcomes {
-                    println!("  {:<24} {}", path.display(), describe(outcome));
-                }
+                print!("{}", outcome_rows(&report.outcomes));
             }
             if let Some(line) = &report.review {
                 println!("{line}");
@@ -1134,9 +1071,7 @@ fn cmd_dock_merge(name: &str, args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
             println!("merged dock '{name}' into '{current}':");
-            for (path, outcome) in &outcomes {
-                println!("  {:<24} {}", path.display(), describe(outcome));
-            }
+            print!("{}", outcome_rows(&outcomes));
             let conflicts = outcomes
                 .values()
                 .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
@@ -1273,60 +1208,34 @@ fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
     // registry for attester names). `None`'s porcelain is deliberately empty:
     // the exit code carries that outcome.
     use loot_core::verdict::BuoyVerdict;
-    let emit = |v: BuoyVerdict| match fmt {
-        OutFmt::Porcelain => print!("{}", v.porcelain()),
-        OutFmt::Json => println!("{}", v.json()),
-        OutFmt::Human => unreachable!("human arms render inline"),
+    let exit = match &result {
+        loot_core::buoy::BuoyResult::Resolved { .. } => ExitCode::SUCCESS,
+        loot_core::buoy::BuoyResult::Ambiguous { .. } => ExitCode::from(3),
+        loot_core::buoy::BuoyResult::None => ExitCode::from(2),
     };
-    match result {
-        loot_core::buoy::BuoyResult::Resolved { change, attesters } => {
-            match fmt {
-                OutFmt::Porcelain | OutFmt::Json => emit(BuoyVerdict::Resolved {
-                    role: role.to_string(),
-                    change,
-                    attesters,
-                }),
-                OutFmt::Human => {
-                    let attester_names: Vec<String> =
-                        attesters.iter().map(|pk| resolve_pubkey_name(&reg, pk)).collect();
-                    println!(
-                        "buoy ({}): {} — attested by {}",
-                        role,
-                        short(&change),
-                        attester_names.join(", "),
-                    );
-                }
-            }
-            Ok(ExitCode::SUCCESS)
+    match fmt {
+        OutFmt::Human => {
+            let name_of = |pk: &[u8; 32]| resolve_pubkey_name(&reg, pk);
+            print!("{}", render_buoy_human(&result, role, &name_of));
         }
-        loot_core::buoy::BuoyResult::Ambiguous { candidates } => {
-            match fmt {
-                OutFmt::Porcelain | OutFmt::Json => emit(BuoyVerdict::Ambiguous {
+        OutFmt::Porcelain | OutFmt::Json => {
+            let v = match result {
+                loot_core::buoy::BuoyResult::Resolved { change, attesters } => {
+                    BuoyVerdict::Resolved { role: role.to_string(), change, attesters }
+                }
+                loot_core::buoy::BuoyResult::Ambiguous { candidates } => BuoyVerdict::Ambiguous {
                     role: role.to_string(),
                     candidates: candidates.into_iter().map(|c| (c.change, c.attesters)).collect(),
-                }),
-                OutFmt::Human => {
-                    println!("ambiguous: {role} is attested on {} concurrent changes — attest one to resolve:", candidates.len());
-                    for c in &candidates {
-                        let names: Vec<String> =
-                            c.attesters.iter().map(|pk| resolve_pubkey_name(&reg, pk)).collect();
-                        println!("  {} (attested by {})", short(&c.change), names.join(", "));
-                    }
-                    println!("  run `loot attest <id> {role}` to pin one as the buoy");
-                }
-            }
-            Ok(ExitCode::from(3))
-        }
-        loot_core::buoy::BuoyResult::None => {
+                },
+                loot_core::buoy::BuoyResult::None => BuoyVerdict::None { role: role.to_string() },
+            };
             match fmt {
-                OutFmt::Porcelain | OutFmt::Json => emit(BuoyVerdict::None { role: role.to_string() }),
-                OutFmt::Human => {
-                    println!("no buoy for role '{role}'");
-                }
+                OutFmt::Porcelain => print!("{}", v.porcelain()),
+                _ => println!("{}", v.json()),
             }
-            Ok(ExitCode::from(2))
         }
     }
+    Ok(exit)
 }
 
 fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> String {
@@ -1912,9 +1821,7 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
                 println!("pulled from {url}: nothing new (already up to date)");
             } else {
                 println!("pulled from {url} as {identity}:");
-                for (path, outcome) in &outcomes {
-                    println!("  {:<24} {}", path.display(), describe(outcome));
-                }
+                print!("{}", outcome_rows(&outcomes));
                 println!("converged onto one line; run `loot surface` to materialize what you may see");
             }
         }
@@ -1928,79 +1835,13 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// --- formatting ---
+// --- formatting (the log/outcome family lives in render.rs, R5 #181) ---
 
 fn mark(vis: &loot_core::Visibility) -> String {
     // One home for the visibility token, shared with the machine `status`
     // output (CA3). Human phrasing is unchanged: public / restricted=a,b /
     // embargoed@<ts>.
     verdict::visibility_token(vis)
-}
-
-/// Human phrasing for a merge outcome, naming the relay role explicitly.
-fn describe(o: &MergeOutcome) -> &'static str {
-    match o {
-        MergeOutcome::Converged => "converged",
-        MergeOutcome::Merged => "merged",
-        MergeOutcome::Conflict { .. } => "conflict (needs resolution)",
-        MergeOutcome::RelayedUnmerged => "relayed (sealed — you lack the key)",
-    }
-}
-
-fn short(oid: &Oid) -> String {
-    oid.0[..4].iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn short_oid(oid: &Oid) -> String {
-    short(oid)
-}
-
-/// A change id's short display: the first 4 bytes as reverse-hex **letters**
-/// (ADR 0029), e.g. `qsouzmpr` — the durable-handle twin of [`short`]'s hex
-/// **digits**. The two alphabets disambiguate the ids at a glance.
-fn short_change(cid: &[u8; 16]) -> String {
-    loot_core::hex::short_letters(cid, 4)
-}
-
-/// The change-id column for `log`/`status` (ADR 0029/0030): the reverse-hex
-/// letters, with a trailing **`!`** when the change is **divergent** — one change
-/// id carrying more than one live version (S3). `None` (a legacy/unsigned change)
-/// renders as the absent-id dash and can never be divergent.
-fn change_col(cid: Option<[u8; 16]>, divergent: &std::collections::BTreeSet<[u8; 16]>) -> String {
-    match cid {
-        Some(c) if divergent.contains(&c) => format!("{}!", short_change(&c)),
-        Some(c) => short_change(&c),
-        None => NO_ID.to_string(),
-    }
-}
-
-/// The em dash shown where an id is absent — a legacy change with no change id,
-/// or the empty working change's not-yet-computed version (ADR 0029/0030).
-const NO_ID: &str = "—";
-
-/// Header + one row of the columnar `log`/`status` display (ADR 0030): the two
-/// ids ride their own columns so a change can carry both legibly. Column order
-/// is **change · version · message · vis · author**.
-fn log_header() -> String {
-    log_row("change", "version", "message", "vis", "author")
-}
-
-fn log_row(change: &str, version: &str, message: &str, vis: &str, author: &str) -> String {
-    // Trailing whitespace trimmed so empty tail columns don't dangle.
-    format!("{change:<10} {version:<9} {message:<30} {vis:<12} {author}")
-        .trim_end()
-        .to_string()
-}
-
-/// The compact `vis` column for a finalized change: the count of sealed and/or
-/// embargoed paths, or empty when the change is fully public.
-fn vis_col(_total: usize, restricted: usize, embargoed: usize) -> String {
-    match (restricted, embargoed) {
-        (0, 0) => String::new(),
-        (r, 0) => format!("{r} sealed"),
-        (0, e) => format!("{e} embargoed"),
-        (r, e) => format!("{r} sealed, {e} emb"),
-    }
 }
 
 /// A pubkey prefix for display: first 4 bytes as hex, plus an ellipsis.
@@ -2011,6 +1852,7 @@ fn hex_short(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use render::{describe, NO_ID};
     use loot_core::{Repo, SyncBundle, Visibility};
 
     /// #66 regression class: `loot gc` vanished from the CLI in a merge while
