@@ -187,8 +187,265 @@ impl Workspace {
         self.now
     }
 
+    /// Raw engine access — **compiled only for tests** (R1, #177): production
+    /// verbs go through the named faces below (`history`/`graph`/
+    /// `buoy_resolution`/the sync queries), so the engine's concrete surface
+    /// physically cannot leak past this seam outside a test build.
+    #[cfg(test)]
     pub fn repo(&self) -> &DagRepo {
         &self.repo
+    }
+
+    // --- the CLI's read face over the engine (R1, #177) ---
+
+    /// Read-only graph/content queries, grouped: the face the git bridge and
+    /// the wip lane consume. Content reads carry the ambient identity + clock,
+    /// so callers stop threading them.
+    pub fn graph(&self) -> Graph<'_> {
+        Graph { repo: &self.repo, identity: &self.identity, now: self.now }
+    }
+
+    /// The full view `log` renders (R1): finalized rows newest-first with
+    /// abandoned versions dropped and the working node excluded (it renders
+    /// once, as the live row), authors as pubkeys (name resolution is display),
+    /// divergence marks, and — when heads sit on ≥2 *distinct change lines*
+    /// (ADR 0029) — the per-head branch view instead of the flat list.
+    pub fn history(&mut self) -> Result<HistoryView, String> {
+        let working = self.live_working_row()?;
+        let working_node = self.working.clone();
+        let divergent = self.divergent_change_ids();
+        let abandoned = self.abandoned_versions();
+
+        let row_of = |id: &Oid, message: &str, total: usize, restricted: usize, embargoed: usize| HistoryRow {
+            version: id.clone(),
+            message: message.to_string(),
+            total,
+            restricted,
+            embargoed,
+            change_id: self.repo.change_change_id(id),
+            author: self.repo.change_author(id),
+            attestations: self
+                .repo
+                .attestations_for(id)
+                .iter()
+                .map(|a| (a.attester, a.role.clone()))
+                .collect(),
+        };
+
+        // Route by distinct change lines, not head count: a divergent change's
+        // several heads share one change id and stay the flat listing (S3).
+        let head_lines: std::collections::BTreeSet<Vec<u8>> = self
+            .repo
+            .heads()
+            .iter()
+            .map(|h| match self.repo.change_change_id(h) {
+                Some(cid) => cid.to_vec(),
+                None => h.0.to_vec(),
+            })
+            .collect();
+
+        let detailed = self.repo.log_detailed();
+        if head_lines.len() <= 1 {
+            let rows = detailed
+                .into_iter()
+                .rev()
+                .filter(|(id, ..)| Some(id) != working_node.as_ref() && !abandoned.contains(id))
+                .map(|(id, m, t, r, e)| row_of(&id, &m, t, r, e))
+                .collect();
+            return Ok(HistoryView { rows, divergent, working, graph: None });
+        }
+
+        // Diverged graph: each head's own lineage, then the shared ancestry.
+        let meta: BTreeMap<Oid, (String, usize, usize, usize)> = detailed
+            .into_iter()
+            .map(|(id, m, t, r, e)| (id, (m, t, r, e)))
+            .collect();
+        let node_row = |id: &Oid| match meta.get(id) {
+            Some((m, t, r, e)) => row_of(id, m, *t, *r, *e),
+            None => row_of(id, "", 0, 0, 0),
+        };
+        let g = self.repo.log_graph();
+        let per_head = (0..g.heads.len())
+            .map(|hi| {
+                g.changes
+                    .iter()
+                    .filter(|n| n.reachable_from == [hi] && !abandoned.contains(&n.id))
+                    .map(|n| node_row(&n.id))
+                    .collect()
+            })
+            .collect();
+        let shared = g
+            .changes
+            .iter()
+            .filter(|n| n.reachable_from.len() > 1 && !abandoned.contains(&n.id))
+            .map(|n| node_row(&n.id))
+            .collect();
+        Ok(HistoryView {
+            rows: Vec::new(),
+            divergent,
+            working,
+            graph: Some(GraphHistory { heads: g.heads, per_head, shared }),
+        })
+    }
+
+    /// Resolve the buoy for `role` (CA4, ADR 0025), owning the whole read:
+    /// present set, parent lookup, attestation stream, and the trust predicate
+    /// (peer registry ∪ self). Also reports trusted attestations naming changes
+    /// absent locally, for `--verbose`.
+    pub fn buoy_resolution(&self, role: &str) -> BuoyResolution {
+        let reg = loot_identity::PeerRegistry::load(&self.dot);
+        let my_pubkey = self.identity_pubkey();
+        let trusted = |pk: &[u8; 32]| -> bool {
+            if my_pubkey.as_ref() == Some(pk) {
+                return true;
+            }
+            reg.list().iter().any(|(_name, line)| {
+                loot_identity::PeerRegistry::parse_pubkey_bytes_from_line(line)
+                    .map(|p| &p == pk)
+                    .unwrap_or(false)
+            })
+        };
+        let present: std::collections::BTreeSet<Oid> =
+            self.repo.log().into_iter().map(|(id, _)| id).collect();
+        let parents_fn = |id: &Oid| self.repo.parents_of(id);
+        let all = self.repo.all_attestations();
+        let excluded = all
+            .iter()
+            .filter(|a| {
+                a.role == role && a.verify() && trusted(&a.attester) && !present.contains(&a.change_id)
+            })
+            .map(|a| a.change_id.clone())
+            .collect();
+        let result = loot_core::buoy::resolve(&present, &parents_fn, all.iter().copied(), &trusted, role);
+        BuoyResolution { result, excluded }
+    }
+
+    /// Every recorded change's version id, topo order (prefix resolution for
+    /// `attest`/`abandon` targets).
+    pub fn version_ids(&self) -> Vec<Oid> {
+        self.repo.log().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The manifest — the append-only grant audit trail (display reads).
+    pub fn manifest(&self) -> &loot_core::manifest::Manifest {
+        self.repo.manifest()
+    }
+
+    /// Every attestation in the log, cloned for display.
+    pub fn all_attestations(&self) -> Vec<loot_core::attestation::Attestation> {
+        self.repo.all_attestations().into_iter().cloned().collect()
+    }
+
+    /// The recorded conflict set (`loot conflicts` / `resolve` preflight).
+    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
+        self.repo.conflicts()
+    }
+
+    /// The ambient dock's live head set (sync negotiation, pull bookkeeping).
+    pub fn heads(&self) -> Vec<Oid> {
+        self.repo.heads()
+    }
+
+    /// A path's content address in the current tree (grant/maroon targets).
+    pub fn current_tree_oid(&self, path: &Path) -> Result<Oid, loot_core::RepoError> {
+        self.repo.current_tree_oid(path)
+    }
+
+    /// A stored object's visibility (grant --relay reads the embargo clock).
+    pub fn visibility_of(&self, oid: &Oid) -> Option<Visibility> {
+        self.repo.visibility_of(oid)
+    }
+
+    /// Every embargoed path this repo holds a key for (push's deposit pass).
+    pub fn embargoed_paths(&self) -> Vec<(PathBuf, Oid, u64)> {
+        self.repo.embargoed_paths()
+    }
+
+    /// Sync negotiation reads (S5/S6): what we'd offer, what we lack, whether
+    /// the tip is unsigned, and the batched bundles for a want set.
+    pub fn offered_objects(&self, have: &[Oid]) -> Vec<Oid> {
+        self.repo.offered_objects(have)
+    }
+
+    pub fn missing_objects(&self, offered: &[Oid]) -> Vec<Oid> {
+        self.repo.missing_objects(offered)
+    }
+
+    pub fn has_unsigned_tip(&self) -> bool {
+        self.repo.has_unsigned_tip()
+    }
+
+    pub fn bundle_wanted_batched(
+        &self,
+        have: &[Oid],
+        wants: &[Oid],
+        per_batch: usize,
+    ) -> Result<Vec<loot_core::SyncBundle>, String> {
+        self.repo.bundle_wanted_batched(have, wants, per_batch).map_err(|e| e.to_string())
+    }
+
+    /// The full sneakernet bundle (`loot bundle`): have = [], apply idempotent.
+    pub fn bundle_full(&self) -> Result<loot_core::SyncBundle, String> {
+        self.repo.bundle(&[]).map_err(|e| e.to_string())
+    }
+
+    // --- named mutations (R1): the with_repo escapes, given names ---
+
+    /// Apply a sync bundle into the working change and persist (`apply`,
+    /// `clone`, each `pull` batch). The clock is the ambient one.
+    pub fn apply_bundle(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        let now = self.now;
+        self.with_repo(|repo| {
+            repo.apply(&loot_core::SyncBundle(bytes), now).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Apply one relay-delivered sealed grant (ADR 0015): unseal with the
+    /// ambient keypair, verify + file the key, persist. Errors on a keyless
+    /// repo — receiving a grant requires the recipient key by construction.
+    pub fn apply_sealed_grant(
+        &mut self,
+        bundle_bytes: Vec<u8>,
+        grantor_pubkey: [u8; 32],
+    ) -> Result<(), String> {
+        let now = self.now;
+        let signer = self.signer.as_ref().ok_or("this repo has no keypair (run `loot keygen`)")?;
+        self.repo
+            .apply_sealed_grant(&loot_core::SyncBundle(bundle_bytes), grantor_pubkey, now, |wrapped| {
+                signer
+                    .unseal_key(wrapped)
+                    .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+            })
+            .map_err(|e| e.to_string())?;
+        self.persist()
+    }
+
+    /// Seal + deliver one timed grant atomically (ADR 0027): `deliver` runs
+    /// inside the mutation, so a failed delivery aborts before persist and the
+    /// manifest never records an undelivered grant — the next push retries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deposit_sealed_grant(
+        &mut self,
+        oid: &Oid,
+        peer: &str,
+        peer_pubkey: [u8; 32],
+        grantor_pubkey: [u8; 32],
+        reveal_at: u64,
+        seal: impl FnOnce(&[u8; 32]) -> Result<[u8; 80], loot_core::RepoError>,
+        deliver: impl FnOnce(Vec<u8>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let now = self.now;
+        let oid = oid.clone();
+        let peer = peer.to_string();
+        self.with_repo(|repo| {
+            let bundle = repo
+                .grant_sealed(&oid, &peer, peer_pubkey, grantor_pubkey, reveal_at, now, seal)
+                .map_err(|e| e.to_string())?;
+            deliver(bundle.0)
+        })
     }
 
     /// Snapshot the working tree into the working change (visibility-aware,
@@ -1289,6 +1546,152 @@ pub enum DockAction {
     Already,
     Switched,
     Created,
+}
+
+/// Read-only graph/content queries over the ambient repo (R1, #177): the face
+/// the git bridge and the wip lane consume, so the engine's concrete surface
+/// stays out of the bridge. Content reads carry the ambient identity + clock.
+/// The pure DAG walks (`is_ancestor`/`ancestor_closure`/`generations`) live
+/// here too — they are graph queries, not bridge logic.
+pub struct Graph<'a> {
+    repo: &'a DagRepo,
+    identity: &'a str,
+    now: u64,
+}
+
+impl Graph<'_> {
+    pub fn ids_topo(&self) -> Vec<Oid> {
+        self.repo.change_ids_topo()
+    }
+
+    pub fn parents(&self, id: &Oid) -> Vec<Oid> {
+        self.repo.parents_of(id)
+    }
+
+    pub fn tree(&self, id: &Oid) -> Option<BTreeMap<PathBuf, (Oid, Visibility)>> {
+        self.repo.change_tree(id)
+    }
+
+    pub fn author(&self, id: &Oid) -> Option<[u8; 32]> {
+        self.repo.change_author(id)
+    }
+
+    pub fn signature(&self, id: &Oid) -> Option<[u8; 64]> {
+        self.repo.change_signature(id)
+    }
+
+    pub fn change_id(&self, id: &Oid) -> Option<[u8; 16]> {
+        self.repo.change_change_id(id)
+    }
+
+    pub fn message(&self, id: &Oid) -> Option<String> {
+        self.repo.change_message(id)
+    }
+
+    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
+        self.repo.conflicts()
+    }
+
+    /// Open a stored object as the ambient identity at the ambient clock.
+    pub fn content(&self, oid: &Oid) -> Result<Vec<u8>, loot_core::RepoError> {
+        self.repo.get(oid, self.identity, self.now)
+    }
+
+    /// Is `ancestor` reachable from `descendant` through parent edges?
+    pub fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> bool {
+        let mut stack = vec![descendant.clone()];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if id == *ancestor {
+                return true;
+            }
+            if seen.insert(id.clone()) {
+                stack.extend(self.repo.parents_of(&id));
+            }
+        }
+        false
+    }
+
+    /// Every change reachable from `seeds` (inclusive) through parent edges.
+    pub fn ancestor_closure<'a>(
+        &self,
+        seeds: impl Iterator<Item = &'a Oid>,
+    ) -> std::collections::BTreeSet<Oid> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut stack: Vec<Oid> = seeds.cloned().collect();
+        while let Some(id) = stack.pop() {
+            if out.insert(id.clone()) {
+                stack.extend(self.repo.parents_of(&id));
+            }
+        }
+        out
+    }
+
+    /// Longest-path generation number per change (deterministic commit dates
+    /// for the bridge: `BASE_EPOCH + generation`, ADR 0028).
+    pub fn generations(&self) -> BTreeMap<Oid, u64> {
+        let mut gen: BTreeMap<Oid, u64> = BTreeMap::new();
+        for id in self.repo.change_ids_topo() {
+            let g = self
+                .repo
+                .parents_of(&id)
+                .iter()
+                .filter_map(|p| gen.get(p))
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            gen.insert(id, g);
+        }
+        gen
+    }
+}
+
+/// One render-ready `log` row (R1): the per-change data with the author as a
+/// pubkey — resolving it to a display name is the renderer's job.
+pub struct HistoryRow {
+    pub version: Oid,
+    pub message: String,
+    pub total: usize,
+    pub restricted: usize,
+    pub embargoed: usize,
+    pub change_id: Option<[u8; 16]>,
+    pub author: Option<[u8; 32]>,
+    /// (attester pubkey, role) per attestation on this change.
+    pub attestations: Vec<([u8; 32], String)>,
+}
+
+/// What `log` renders (R1). `graph: None` is the flat, newest-first listing in
+/// `rows`; `Some` means heads sit on ≥2 distinct change lines (a real fork,
+/// ADR 0029) and the branch view renders instead.
+pub struct HistoryView {
+    pub rows: Vec<HistoryRow>,
+    pub divergent: std::collections::BTreeSet<[u8; 16]>,
+    pub working: Option<WorkingRow>,
+    pub graph: Option<GraphHistory>,
+}
+
+impl HistoryView {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.graph.is_none() && self.working.is_none()
+    }
+}
+
+/// The diverged-graph half of a [`HistoryView`]: each head's own lineage, then
+/// the ancestry shared by more than one head.
+pub struct GraphHistory {
+    pub heads: Vec<Oid>,
+    pub per_head: Vec<Vec<HistoryRow>>,
+    pub shared: Vec<HistoryRow>,
+}
+
+/// A buoy resolution plus the trusted-but-absent attestations `--verbose`
+/// reveals (CA4, ADR 0025).
+pub struct BuoyResolution {
+    pub result: loot_core::buoy::BuoyResult,
+    /// Change ids named by trusted attestations for the role but absent from
+    /// the local store (not candidates — you cannot build from what you do not
+    /// hold).
+    pub excluded: Vec<Oid>,
 }
 
 /// Proof-of-capture handle for the snapshotting verbs (ADR 0030), constructed

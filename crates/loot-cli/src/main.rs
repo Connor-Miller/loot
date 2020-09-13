@@ -9,8 +9,7 @@ mod ferry;
 mod workspace;
 
 use loot_core::{
-    verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Repo, SyncBundle,
-    Visibility,
+    verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Visibility,
 };
 use loot_identity as identity;
 use std::process::ExitCode;
@@ -424,10 +423,8 @@ fn resolve_version(ws: &Workspace, prefix: &str) -> Result<Oid, String> {
     let abandoned = ws.abandoned_versions();
     let working = ws.working_id().cloned();
     let matches: Vec<Oid> = ws
-        .repo()
-        .log_detailed()
+        .version_ids()
         .into_iter()
-        .map(|(id, ..)| id)
         .filter(|id| !abandoned.contains(id))
         .filter(|id| Some(id) != working.as_ref())
         .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
@@ -582,129 +579,70 @@ fn human_bytes(bytes: u64) -> String {
 
 fn cmd_log() -> Result<(), String> {
     let mut ws = Workspace::open()?;
-    // The live working row (ADR 0030): read-only, never persists — same figure
-    // `status` shows, so the two agree on the working change. Computed first,
-    // while the `&mut` borrow is free, then rendered last.
-    let working = ws.live_working_row()?;
-    // The in-progress working change is a graph head, so it appears in
-    // `log_detailed`; render it *once*, as the live working row below, not also
-    // as a finalized row (its persisted and live version ids differ, ADR 0030,
-    // and two rows under one change id would misread as divergence).
-    let working_node = ws.working_id().cloned();
     let identity = ws.identity().to_string();
-
-    // Divergent change ids get a trailing `!`; abandoned versions are dropped
-    // from the listing entirely (S3, ADR 0029/0030) — a version `loot abandon`
-    // removed is no longer live, though it survives in the object store.
-    let divergent = ws.divergent_change_ids();
-    let abandoned = ws.abandoned_versions();
-
-    let detailed = ws.repo().log_detailed();
-    if detailed.is_empty() && working.is_none() {
+    // The whole read lives behind the Workspace (R1, #177): rows newest-first
+    // with abandoned versions dropped and the working node excluded (rendered
+    // once, as the live row), routed flat-vs-branch by distinct change lines
+    // (ADR 0029). This function only renders.
+    let view = ws.history()?;
+    if view.is_empty() {
         println!("no changes yet");
         return Ok(());
     }
 
-    // Resolve each change's author pubkey to a peer name (short-hex fallback),
-    // reusing the peer registry (S3, ADR 0018). Author trust stays advisory —
-    // this is display only. The change id (durable handle) rides its own column
-    // as reverse-hex letters; the version id is the hex short (ADR 0029).
+    // Resolve author pubkeys to display names (peer registry + self); render
+    // the change id as reverse-hex letters beside the hex version id.
     let reg = identity::PeerRegistry::load(ws.dot());
     let own = ws.identity_pubkey();
-    let change_of = |id: &Oid| change_col(ws.repo().change_change_id(id), &divergent);
-    let author_of = |id: &Oid| match ws.repo().change_author(id) {
-        // A change this identity authored resolves to its own name — the peer
-        // registry holds peers, not self, so it would otherwise show hex.
-        Some(pk) if own == Some(pk) => identity.clone(),
-        Some(pk) => resolve_pubkey_name(&reg, &pk),
+    let author_name = |author: &Option<[u8; 32]>| match author {
+        Some(pk) if own.as_ref() == Some(pk) => identity.clone(),
+        Some(pk) => resolve_pubkey_name(&reg, pk),
         None => String::new(),
     };
-    let print_attestations = |id: &Oid| {
-        for a in ws.repo().attestations_for(id) {
-            println!("    + attested by {} ({})", resolve_pubkey_name(&reg, &a.attester), a.role);
+    let print_row = |row: &workspace::HistoryRow| {
+        println!(
+            "{}",
+            log_row(
+                &change_col(row.change_id, &view.divergent),
+                &short(&row.version),
+                &row.message,
+                &vis_col(row.total, row.restricted, row.embargoed),
+                &author_name(&row.author),
+            )
+        );
+        for (attester, role) in &row.attestations {
+            println!("    + attested by {} ({})", resolve_pubkey_name(&reg, attester), role);
         }
     };
-    let row_of = |id: &Oid, message: &str, total: usize, restricted: usize, embargoed: usize| {
-        log_row(
-            &change_of(id),
-            &short(id),
-            message,
-            &vis_col(total, restricted, embargoed),
-            &author_of(id),
-        )
-    };
 
-    // A diverged *graph* (heads on ≥2 distinct change lines, e.g. after a pull)
-    // switches to the branch view; a single line — including a **divergent
-    // change** whose several heads share one change id (S3) — stays the flat,
-    // newest-first listing, where the `!` marker tells the divergence apart from
-    // a genuine fork. Head-counting alone would mis-route a divergent change into
-    // the "run `loot apply` to converge" view, but apply can't collapse it (its
-    // versions share a change id, sometimes an identical tree) — `loot abandon`
-    // does. So route by *distinct change lines*, not head count (ADR 0029).
-    let head_lines: std::collections::BTreeSet<Vec<u8>> = ws
-        .repo()
-        .heads()
-        .iter()
-        .map(|h| match ws.repo().change_change_id(h) {
-            Some(cid) => cid.to_vec(),
-            None => h.0.to_vec(),
-        })
-        .collect();
-    if head_lines.len() <= 1 {
-        println!("{}", log_header());
-        for (id, message, total, restricted, embargoed) in detailed.into_iter().rev() {
-            if Some(&id) == working_node.as_ref() {
-                continue; // shown once, as the live working row below
+    match &view.graph {
+        None => {
+            println!("{}", log_header());
+            for row in &view.rows {
+                print_row(row);
             }
-            if abandoned.contains(&id) {
-                continue; // dropped from a divergent change (S3)
+            if let Some(row) = &view.working {
+                print_working_row(&identity, row, &view.divergent);
             }
-            println!("{}", row_of(&id, &message, total, restricted, embargoed));
-            print_attestations(&id);
         }
-        if let Some(row) = &working {
-            print_working_row(&identity, row, &divergent);
-        }
-        return Ok(());
-    }
-
-    // Multi-head: show each head's own lineage indented under a label, then the
-    // shared ancestry once. Makes the divergence visible before `loot apply`.
-    // Per-change counts + message, keyed by version id, for the columnar rows.
-    let meta: std::collections::BTreeMap<Oid, (String, usize, usize, usize)> = detailed
-        .into_iter()
-        .map(|(id, m, total, restricted, embargoed)| (id, (m, total, restricted, embargoed)))
-        .collect();
-    let node_row = |id: &Oid| match meta.get(id) {
-        Some((m, total, restricted, embargoed)) => row_of(id, m, *total, *restricted, *embargoed),
-        None => row_of(id, "", 0, 0, 0),
-    };
-
-    let g = ws.repo().log_graph();
-    println!("{} heads — diverged; run `loot apply` to converge", g.heads.len());
-    for (hi, head) in g.heads.iter().enumerate() {
-        println!();
-        println!("head {} — {}", hi + 1, short(head));
-        println!("{}", log_header());
-        for node in g.changes.iter().filter(|n| n.reachable_from == [hi] && !abandoned.contains(&n.id)) {
-            println!("{}", node_row(&node.id));
-            print_attestations(&node.id);
-        }
-    }
-
-    let shared: Vec<&loot_core::LogNode> = g
-        .changes
-        .iter()
-        .filter(|n| n.reachable_from.len() > 1 && !abandoned.contains(&n.id))
-        .collect();
-    if !shared.is_empty() {
-        println!();
-        println!("shared history");
-        println!("{}", log_header());
-        for node in shared {
-            println!("{}", node_row(&node.id));
-            print_attestations(&node.id);
+        Some(g) => {
+            println!("{} heads — diverged; run `loot apply` to converge", g.heads.len());
+            for (hi, head) in g.heads.iter().enumerate() {
+                println!();
+                println!("head {} — {}", hi + 1, short(head));
+                println!("{}", log_header());
+                for row in &g.per_head[hi] {
+                    print_row(row);
+                }
+            }
+            if !g.shared.is_empty() {
+                println!();
+                println!("shared history");
+                println!("{}", log_header());
+                for row in &g.shared {
+                    print_row(row);
+                }
+            }
         }
     }
     Ok(())
@@ -743,7 +681,7 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
     let ws = Workspace::open()?;
     // Full bundle (have = []); apply is idempotent. Ships ciphertext + ANYONE-
     // granted keys only — restricted keys never travel (ADR 0003).
-    let bundle = ws.repo().bundle(&[]).map_err(|e| e.to_string())?;
+    let bundle = ws.bundle_full()?;
     std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
     println!("wrote {} ({} bytes) — copy it to a peer and `loot apply`", out, bundle.0.len());
     Ok(())
@@ -754,11 +692,8 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
     let infile = first_positional(args).ok_or("apply requires <file>")?;
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
     let mut ws = Workspace::open()?;
-    let now = ws.now();
     let identity = ws.identity().to_string();
-    let outcomes = ws.with_repo(|repo| {
-        repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
-    })?;
+    let outcomes = ws.apply_bundle(bytes)?;
 
     match fmt {
         OutFmt::Human => {
@@ -848,7 +783,6 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
 
     let oid = snap
         .ws()
-        .repo()
         .current_tree_oid(std::path::Path::new(path))
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
@@ -909,7 +843,6 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     let now = snap.ws().now();
     let oid = snap
         .ws()
-        .repo()
         .current_tree_oid(std::path::Path::new(path))
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
@@ -917,7 +850,7 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     // recipient gets a timed grant the relay withholds like the push-time
     // deposits — never an immediately-delivered key. Everything else is an
     // ordinary untimed grant (reveal_at = 0).
-    let reveal_at = match snap.ws().repo().visibility_of(&oid) {
+    let reveal_at = match snap.ws().visibility_of(&oid) {
         Some(Visibility::Embargoed { reveal_at }) => reveal_at,
         _ => 0,
     };
@@ -965,13 +898,10 @@ fn cmd_clone(args: &[String]) -> Result<(), String> {
     ws.remote_add("origin", url)?;
 
     // Pull from the relay and surface what this identity can see.
-    let now = ws.now();
-    let have = ws.repo().heads();
+    let have = ws.heads();
     let bytes = loot_net::pull(url, &have).map_err(|e| e.to_string())?;
     if !bytes.is_empty() {
-        let outcomes = ws.with_repo(|repo| {
-            repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
-        })?;
+        let outcomes = ws.apply_bundle(bytes)?;
         if !outcomes.is_empty() {
             println!("pulled {} change(s) from {url}", outcomes.len());
         }
@@ -1228,7 +1158,7 @@ fn cmd_manifest() -> Result<(), String> {
     let ws = Workspace::open()?;
     let dot = ws.dot().to_owned();
     let reg = identity::PeerRegistry::load(&dot);
-    let entries: Vec<_> = ws.repo().manifest().iter().collect();
+    let entries: Vec<_> = ws.manifest().iter().collect();
     if entries.is_empty() {
         println!("no grants recorded");
         return Ok(());
@@ -1247,7 +1177,7 @@ fn cmd_manifest() -> Result<(), String> {
     }
 
     // Attestations (S4, ADR 0018): advisory sign-offs over changes, by pubkey.
-    let attestations = ws.repo().all_attestations();
+    let attestations = ws.all_attestations();
     if !attestations.is_empty() {
         println!();
         println!("attestations:");
@@ -1278,10 +1208,8 @@ fn resolve_change(ws: &Workspace, prefix: &str) -> Result<loot_core::Oid, String
         }
     }
     let matches: Vec<loot_core::Oid> = ws
-        .repo()
-        .log()
+        .version_ids()
         .into_iter()
-        .map(|(id, _)| id)
         .filter(|id| Some(id) != working.as_ref())
         .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
         .collect();
@@ -1325,61 +1253,17 @@ fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
     let role = first_positional(args).unwrap_or("reviewed");
 
     let ws = Workspace::open()?;
-    let dot = ws.dot().to_owned();
-    let reg = identity::PeerRegistry::load(&dot);
+    let reg = identity::PeerRegistry::load(ws.dot());
 
-    // The local identity's own pubkey enables self-trust.
-    let my_pubkey: Option<[u8; 32]> = if identity::keypair_exists(&dot) {
-        let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
-        Some(id.public_key_bytes())
-    } else {
-        None
-    };
+    // The whole read — present set, parent lookup, attestation stream, trust
+    // predicate (peer registry ∪ self) — lives behind the Workspace (R1, #177).
+    let resolution = ws.buoy_resolution(role);
+    let result = resolution.result;
 
-    // Build the trusted predicate: peer registry OR self.
-    let trusted = |pk: &[u8; 32]| -> bool {
-        if my_pubkey.as_ref() == Some(pk) {
-            return true;
-        }
-        for (_name, pubkey_line) in reg.list() {
-            if identity::PeerRegistry::parse_pubkey_bytes_from_line(pubkey_line)
-                .map_or(false, |p| &p == pk)
-            {
-                return true;
-            }
-        }
-        false
-    };
-
-    // Build the present-changes set and parent-lookup from the engine.
-    use std::collections::BTreeSet;
-    let present: BTreeSet<loot_core::Oid> = ws.repo().log().into_iter().map(|(id, _)| id).collect();
-    let parents_fn = |id: &loot_core::Oid| ws.repo().parents_of(id);
-
-    let all_attestations = ws.repo().all_attestations();
-
-    // Collect verbose exclusions: trusted attestations naming absent changes.
-    let excluded: Vec<&&loot_core::attestation::Attestation> = if verbose {
-        all_attestations
-            .iter()
-            .filter(|a| a.role == role && a.verify() && trusted(&a.attester) && !present.contains(&a.change_id))
-            .collect()
-    } else {
-        vec![]
-    };
-
-    let result = loot_core::buoy::resolve(
-        &present,
-        &parents_fn,
-        all_attestations.iter().copied(),
-        &trusted,
-        role,
-    );
-
-    if verbose && !excluded.is_empty() {
+    if verbose && !resolution.excluded.is_empty() {
         eprintln!("buoy: trusted attestations for changes absent locally:");
-        for a in &excluded {
-            eprintln!("  {} ({})", loot_core::hex::encode(&a.change_id.0), a.role);
+        for change in &resolution.excluded {
+            eprintln!("  {} ({role})", loot_core::hex::encode(&change.0));
         }
     }
 
@@ -1459,7 +1343,7 @@ fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> Strin
 fn cmd_conflicts(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     let ws = Workspace::open()?;
-    let conflicts = ws.repo().conflicts();
+    let conflicts = ws.conflicts();
     match fmt {
         OutFmt::Human => {
             if conflicts.is_empty() {
@@ -1500,7 +1384,7 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     ws.record_op("resolve", &format!("resolve {}", path.display()), false);
 
     // The resolution is signed on the spot; on a dock it also advanced the tip.
-    if ws.repo().conflicts().is_empty() {
+    if ws.conflicts().is_empty() {
         if ws.current_dock().is_none() {
             println!("all conflicts resolved");
         } else {
@@ -1531,7 +1415,6 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
 
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
     let my_pubkey = id.public_key_bytes();
-    let now = ws.now();
 
     // Fetch by pubkey — loot-net hexes it; relay addresses mailbox by pubkey, not name (ADR 0015).
     let envelopes = loot_net::fetch_grants(&url, &my_pubkey).map_err(|e| e.to_string())?;
@@ -1571,14 +1454,7 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
             continue;
         }
 
-        let bundle = loot_core::SyncBundle(bundle_bytes.to_vec());
-        let result = ws.with_repo(|repo| {
-            repo.apply_sealed_grant(&bundle, grantor_pubkey, now, |wrapped| {
-                id.unseal_key(wrapped)
-                    .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
-            }).map_err(|e| e.to_string())
-        });
-        match result {
+        match ws.apply_sealed_grant(bundle_bytes.to_vec(), grantor_pubkey) {
             Ok(()) => applied += 1,
             Err(e) => eprintln!("loot: skipping grant (could not apply): {e}"),
         }
@@ -1827,8 +1703,8 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
     // dedup what it already has; change metadata is small and `stow` is idempotent,
     // so re-pushes stay cheap even though they re-send the change delta.
     let have: Vec<Oid> = Vec::new();
-    let offered = ws.repo().offered_objects(&have);
-    if offered.is_empty() && ws.repo().has_unsigned_tip() {
+    let offered = ws.offered_objects(&have);
+    if offered.is_empty() && ws.has_unsigned_tip() {
         return Err(
             "nothing to push: your working change has not been signed yet.\n\
              Run `loot new` (or sign the current change) before pushing."
@@ -1843,10 +1719,7 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
     // only the objects not yet stowed. The empty-wants case always produces one
     // bundle so the change delta and attestations propagate even when no new
     // objects are needed.
-    let bundles = ws
-        .repo()
-        .bundle_wanted_batched(&have, &wants, OBJECTS_PER_BATCH)
-        .map_err(|e| e.to_string())?;
+    let bundles = ws.bundle_wanted_batched(&have, &wants, OBJECTS_PER_BATCH)?;
     let batch_count = bundles.len();
     for bundle in bundles {
         loot_net::push(&url, bundle.0, &id).map_err(|e| e.to_string())?;
@@ -1883,19 +1756,19 @@ struct EmbargoDeposit {
 /// ledger — a recorded (oid → peer) grant is never re-deposited, which is also
 /// what makes an interrupted deposit loop resumable by re-running `loot push`.
 fn plan_embargo_deposits(
-    repo: &loot_core::DagRepo,
+    embargoed: &[(std::path::PathBuf, Oid, u64)],
+    manifest: &loot_core::manifest::Manifest,
     peers: &[(String, [u8; 32])],
     own_pubkey: [u8; 32],
 ) -> Vec<EmbargoDeposit> {
     let mut plan = Vec::new();
-    for (path, oid, reveal_at) in repo.embargoed_paths() {
+    for (path, oid, reveal_at) in embargoed {
         for (peer, peer_pubkey) in peers {
             if *peer_pubkey == own_pubkey {
                 continue; // the originator already holds the key
             }
-            let already_granted = repo
-                .manifest()
-                .grants_for(&oid)
+            let already_granted = manifest
+                .grants_for(oid)
                 .iter()
                 .any(|e| e.grantee_pubkey == *peer_pubkey);
             if !already_granted {
@@ -1904,7 +1777,7 @@ fn plan_embargo_deposits(
                     oid: oid.clone(),
                     peer: peer.clone(),
                     peer_pubkey: *peer_pubkey,
-                    reveal_at,
+                    reveal_at: *reveal_at,
                 });
             }
         }
@@ -1921,7 +1794,7 @@ fn deposit_embargo_grants(
     url: &str,
     id: &identity::Identity,
 ) -> Result<(), String> {
-    let embargoed = ws.repo().embargoed_paths();
+    let embargoed = ws.embargoed_paths();
     if embargoed.is_empty() {
         return Ok(());
     }
@@ -1945,24 +1818,28 @@ fn deposit_embargo_grants(
     }
 
     let my_pubkey = id.public_key_bytes();
-    let plan = plan_embargo_deposits(ws.repo(), &peers, my_pubkey);
+    let plan = plan_embargo_deposits(&ws.embargoed_paths(), ws.manifest(), &peers, my_pubkey);
     if plan.is_empty() {
         return Ok(());
     }
-    let now = ws.now();
     for d in &plan {
         let recipient_x25519 = identity::x25519_pubkey_from_ed25519_bytes(&d.peer_pubkey)
             .map_err(|e| format!("could not derive x25519 key for '{}': {e}", d.peer))?;
-        ws.with_repo(|repo| {
-            let bundle = repo
-                .grant_sealed(&d.oid, &d.peer, d.peer_pubkey, my_pubkey, d.reveal_at, now, |key| {
-                    identity::seal_key(key, &recipient_x25519)
-                        .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
-                })
-                .map_err(|e| e.to_string())?;
-            let envelope = id.wrap_envelope(&bundle.0);
-            loot_net::deliver_grant(url, &d.peer_pubkey, &envelope).map_err(|e| e.to_string())
-        })?;
+        ws.deposit_sealed_grant(
+            &d.oid,
+            &d.peer,
+            d.peer_pubkey,
+            my_pubkey,
+            d.reveal_at,
+            |key| {
+                identity::seal_key(key, &recipient_x25519)
+                    .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+            },
+            |bundle| {
+                let envelope = id.wrap_envelope(&bundle);
+                loot_net::deliver_grant(url, &d.peer_pubkey, &envelope).map_err(|e| e.to_string())
+            },
+        )?;
         println!("  {} → {} (embargoed until {})", d.path.display(), d.peer, d.reveal_at);
     }
     println!(
@@ -1976,9 +1853,8 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
-    let now = ws.now();
     let identity = ws.identity().to_string();
-    let have = ws.repo().heads();
+    let have = ws.heads();
     // Our side before the pull — the tip the working directory reflects. After
     // ingesting a peer's divergent tip we collapse onto this (#128).
     let ours_before = have.first().cloned();
@@ -1987,7 +1863,7 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     // lack; fetch returns a bundle limited to those. A re-pull with nothing new
     // transfers ~0 object bytes.
     let offered = loot_net::offer(&url, &have).map_err(|e| e.to_string())?;
-    let wants = ws.repo().missing_objects(&offered);
+    let wants = ws.missing_objects(&offered);
     // S6: fetch objects in batches. Each applied batch is persisted (with_repo
     // saves), so an interrupted pull resumes by re-negotiating and fetching
     // only what's left.
@@ -2008,11 +1884,9 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     let mut outcomes: std::collections::BTreeMap<std::path::PathBuf, MergeOutcome> =
         std::collections::BTreeMap::new();
     for batch in wants.chunks(OBJECTS_PER_BATCH) {
-        let current_have = ws.repo().heads();
+        let current_have = ws.heads();
         let bytes = loot_net::fetch(&url, &current_have, batch).map_err(|e| e.to_string())?;
-        let batch_outcomes = ws.with_repo(|repo| {
-            repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
-        })?;
+        let batch_outcomes = ws.apply_bundle(bytes)?;
         for (path, outcome) in batch_outcomes {
             let slot = outcomes
                 .entry(path)
@@ -2137,7 +2011,7 @@ fn hex_short(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loot_core::Visibility;
+    use loot_core::{Repo, SyncBundle, Visibility};
 
     /// #66 regression class: `loot gc` vanished from the CLI in a merge while
     /// its documentation survived. The usage text and the dispatch table must
@@ -2266,7 +2140,7 @@ mod tests {
     fn plan_deposits_one_timed_grant_per_registered_peer() {
         let (repo, oid) = embargoed_repo("plan-fanout", 9_999);
         let peers = vec![peer("bob", 0xbb), peer("carol", 0xcc)];
-        let plan = plan_embargo_deposits(&repo, &peers, [0xaa; 32]);
+        let plan = plan_embargo_deposits(&repo.embargoed_paths(), repo.manifest(), &peers, [0xaa; 32]);
         assert_eq!(plan.len(), 2, "one deposit per registered peer");
         assert!(plan.iter().all(|d| d.oid == oid && d.reveal_at == 9_999));
         assert!(plan.iter().all(|d| d.path == std::path::PathBuf::from("plans.md")));
@@ -2280,7 +2154,7 @@ mod tests {
             .unwrap();
         // alice's own key is registered as a peer too (e.g. a second machine).
         let peers = vec![peer("alice", 0xaa), peer("bob", 0xbb), peer("carol", 0xcc)];
-        let plan = plan_embargo_deposits(&repo, &peers, [0xaa; 32]);
+        let plan = plan_embargo_deposits(&repo.embargoed_paths(), repo.manifest(), &peers, [0xaa; 32]);
         assert_eq!(plan.len(), 1, "only the late-added peer still needs a deposit");
         assert_eq!(plan[0].peer, "carol");
     }
@@ -2294,7 +2168,8 @@ mod tests {
         tree.insert(std::path::PathBuf::from("open.md"), (oid, Visibility::Public));
         repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
             .unwrap();
-        assert!(plan_embargo_deposits(&repo, &[peer("bob", 0xbb)], [0xaa; 32]).is_empty());
+        assert!(plan_embargo_deposits(&repo.embargoed_paths(), repo.manifest(), &[peer("bob", 0xbb)], [0xaa; 32])
+            .is_empty());
     }
 
     #[test]
@@ -2306,7 +2181,8 @@ mod tests {
         let bundle = alice.bundle(&[]).unwrap();
         let mut bob = DagRepo::init(tmp("plan-nonkey-bob").join("work"), "bob").unwrap();
         bob.apply(&bundle, 0).unwrap();
-        assert!(plan_embargo_deposits(&bob, &[peer("carol", 0xcc)], [0xbb; 32]).is_empty());
+        assert!(plan_embargo_deposits(&bob.embargoed_paths(), bob.manifest(), &[peer("carol", 0xcc)], [0xbb; 32])
+            .is_empty());
     }
 
     fn contains_key(hay: &[u8], key: &[u8; 32]) -> bool {

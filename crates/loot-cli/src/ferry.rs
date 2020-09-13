@@ -186,8 +186,8 @@ pub fn run(
                 }
                 (None, None) => ws.ferry_adopt(&target)?,
                 // git behind loot: projection moves main below, nothing here.
-                (None, Some(ref o)) if *o == target || is_ancestor(ws, &target, o) => {}
-                (None, Some(ref o)) if is_ancestor(ws, o, &target) => ws.ferry_adopt(&target)?,
+                (None, Some(ref o)) if *o == target || ws.graph().is_ancestor(&target, o) => {}
+                (None, Some(ref o)) if ws.graph().is_ancestor(o, &target) => ws.ferry_adopt(&target)?,
                 (None, Some(ref o)) => {
                     report.outcomes = ws.ferry_merge(o, &target, "ferry: reconcile git main")?;
                 }
@@ -201,17 +201,17 @@ pub fn run(
         .and_then(|sha| git2::Oid::from_str(sha).ok())
         .and_then(|oid| git.find_commit(oid).ok())
         .and_then(|c| c.tree().ok());
-    let generations = generations(ws);
+    let generations = ws.graph().generations();
     // Everything a mark (or an ancestor of one) already stands for is
     // represented in git — marked changes map 1:1, and their ancestry is the
     // pre-bridge history the bootstrap baseline covers wholesale.
-    let represented = ancestor_closure(ws, marks.change_ids());
-    for id in ws.repo().change_ids_topo() {
+    let represented = ws.graph().ancestor_closure(marks.change_ids());
+    for id in ws.graph().ids_topo() {
         if represented.contains(&id) {
             continue;
         }
         // The ephemeral working change never travels (ADR 0018).
-        if ws.repo().change_author(&id).is_some() && ws.repo().change_signature(&id).is_none() {
+        if ws.graph().author(&id).is_some() && ws.graph().signature(&id).is_none() {
             continue;
         }
         let (sha, skipped) = project_change(ws, &git, &id, &marks, &generations, last_clean_tree.as_ref(), &id_map)?;
@@ -267,10 +267,10 @@ pub fn run(
     let mut wip = WipState::parse(&read_or_empty(&wip_path));
     let dock_sel_wip = |name: &str| if name == "main" { None } else { Some(name.to_string()) };
     wip.entries.retain(|e| {
-        let landed = ws.repo().change_ids_topo().iter().any(|c| {
-            ws.repo().change_signature(c).is_some()
+        let landed = ws.graph().ids_topo().iter().any(|c| {
+            ws.graph().signature(c).is_some()
                 && wip_key(ws, c) == e.change
-                && ws.repo().change_author(c).is_some()
+                && ws.graph().author(c).is_some()
         });
         let current = ws
             .store()
@@ -328,7 +328,7 @@ pub fn run(
                         Some(e) => (vec![e.sha.clone()], e.round + 1),
                         None => {
                             let mut shas = Vec::new();
-                            for p in ws.repo().parents_of(&wid) {
+                            for p in ws.graph().parents(&wid) {
                                 match marks.sha_for(&p) {
                                     Some(s) => shas.push(s.to_string()),
                                     None => {
@@ -345,11 +345,11 @@ pub fn run(
                     };
                     // An empty first round is nothing reviewable yet.
                     let parent_tree_same = ws
-                        .repo()
-                        .parents_of(&wid)
+                        .graph()
+                        .parents(&wid)
                         .first()
-                        .and_then(|p| ws.repo().change_tree(p))
-                        == ws.repo().change_tree(&wid);
+                        .and_then(|p| ws.graph().tree(p))
+                        == ws.graph().tree(&wid);
                     if existing.is_none() && parent_tree_same {
                         report.review = Some(
                             "review: op=none (working tree matches the anchor — nothing to review)"
@@ -406,7 +406,7 @@ pub fn run(
         .ok()
         .and_then(|r| r.target())
         .map(|o| o.to_string());
-    state.loot_heads = ws.repo().heads();
+    state.loot_heads = ws.heads();
     std::fs::write(&marks_path, marks.encode()).map_err(|e| format!("write marks: {e}"))?;
     std::fs::write(&state_path, state.encode()).map_err(|e| format!("write state: {e}"))?;
     Ok(report)
@@ -477,7 +477,7 @@ fn ingest_commit(
     if let Some(id_hex) = bridge::parse_trailer(&message, TRAILER_CHANGE_ID) {
         let id = bridge::parse_oid_hex(&id_hex)
             .ok_or_else(|| format!("commit {sha}: malformed {TRAILER_CHANGE_ID} trailer"))?;
-        if ws.repo().change_tree(&id).is_none() {
+        if ws.graph().tree(&id).is_none() {
             return Err(format!(
                 "commit {} names loot change {} which this repo does not have — \
                  is the mirror bound to a different loot repo?",
@@ -507,7 +507,7 @@ fn ingest_commit(
     }
     let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = parents_loot
         .first()
-        .and_then(|p| ws.repo().change_tree(p))
+        .and_then(|p| ws.graph().tree(p))
         .unwrap_or_default();
 
     // Diff against the first git parent — only touched paths re-seal (#98).
@@ -564,9 +564,7 @@ fn ingest_commit(
                 let bytes = blob.content().to_vec();
                 let vis = crate::workspace::visibility_under(&attrs_text, &rel);
                 if let Some(old_entry) = parent_tree.get(p) {
-                    let readable = ws
-                        .repo()
-                        .get(&old_entry.0, ws.identity(), ws.now());
+                    let readable = ws.graph().content(&old_entry.0);
                     match readable {
                         Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => {
                             return Err(format!(
@@ -672,10 +670,10 @@ fn project_change(
     last_clean: Option<&git2::Tree>,
     id_map: &BTreeMap<String, String>,
 ) -> Result<(String, Vec<String>), String> {
-    let repo = ws.repo();
+    let g = ws.graph();
 
     let mut parent_commits = Vec::new();
-    for p in repo.parents_of(id) {
+    for p in g.parents(id) {
         let sha = marks.sha_for(&p).ok_or_else(|| {
             format!(
                 "change {}: parent {} has no mirrored commit yet",
@@ -693,19 +691,19 @@ fn project_change(
     let parent_git_tree = parent_commits.first().and_then(|c| c.tree().ok());
     let (tree, skipped) = public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean)?;
 
-    let (name, email) = author_name_email(ws, repo.change_author(id), id_map);
+    let (name, email) = author_name_email(ws, g.author(id), id_map);
     let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
     let sig = git2::Signature::new(&name, &email, &when).map_err(|e| e.to_string())?;
 
     let mut trailers: Vec<(&str, String)> = vec![(TRAILER_CHANGE_ID, hex::encode(&id.0))];
-    if let Some(author) = repo.change_author(id) {
+    if let Some(author) = g.author(id) {
         trailers.push((TRAILER_AUTHOR, hex::encode(&author)));
     }
-    if let Some(sig64) = repo.change_signature(id) {
+    if let Some(sig64) = g.signature(id) {
         trailers.push((TRAILER_SIGNATURE, hex::encode(&sig64)));
     }
     let message = bridge::append_trailers(
-        &repo.change_message(id).unwrap_or_default(),
+        &g.message(id).unwrap_or_default(),
         &trailers,
     );
 
@@ -746,16 +744,16 @@ fn public_delta_tree<'g>(
     git_parent: Option<&git2::Tree>,
     last_clean: Option<&git2::Tree>,
 ) -> Result<(git2::Tree<'g>, Vec<String>), String> {
-    let repo = ws.repo();
-    let change_tree = repo
-        .change_tree(id)
+    let g = ws.graph();
+    let change_tree = g
+        .tree(id)
         .ok_or_else(|| format!("unknown change {}", hex::short(&id.0, 8)))?;
-    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = repo
-        .parents_of(id)
+    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = g
+        .parents(id)
         .first()
-        .and_then(|p| repo.change_tree(p))
+        .and_then(|p| g.tree(p))
         .unwrap_or_default();
-    let conflicts = repo.conflicts();
+    let conflicts = g.conflicts();
 
     // Start from the git parent's flat path -> (blob, filemode) map. Modes
     // ride along untouched — loot does not track the executable bit, so the
@@ -802,7 +800,7 @@ fn public_delta_tree<'g>(
             skipped.push(rel);
             continue;
         }
-        match repo.get(oid, ws.identity(), ws.now()) {
+        match g.content(oid) {
             Ok(bytes) => {
                 let blob = git.blob(&bytes).map_err(|e| e.to_string())?;
                 // Content changed; a known mode carries over.
@@ -837,7 +835,7 @@ fn project_wip(
     last_clean: Option<&git2::Tree>,
     id_map: &BTreeMap<String, String>,
 ) -> Result<(String, Vec<String>), String> {
-    let repo = ws.repo();
+    let g = ws.graph();
 
     let mut parent_commits = Vec::new();
     for sha in parent_shas {
@@ -851,7 +849,7 @@ fn project_wip(
     let parent_git_tree = parent_commits.first().and_then(|c| c.tree().ok());
     let (tree, skipped) = public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean)?;
 
-    let (name, email) = author_name_email(ws, repo.change_author(id), id_map);
+    let (name, email) = author_name_email(ws, g.author(id), id_map);
     let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
     let sig = git2::Signature::new(&name, &email, &when).map_err(|e| e.to_string())?;
 
@@ -859,11 +857,11 @@ fn project_wip(
         (TRAILER_CHANGE_ID, hex::encode(&id.0)),
         (TRAILER_PROVISIONAL, "true".to_string()),
     ];
-    if let Some(author) = repo.change_author(id) {
+    if let Some(author) = g.author(id) {
         trailers.push((TRAILER_AUTHOR, hex::encode(&author)));
     }
     let message =
-        bridge::append_trailers(&repo.change_message(id).unwrap_or_default(), &trailers);
+        bridge::append_trailers(&g.message(id).unwrap_or_default(), &trailers);
 
     let oid = if ws.author_pubkey().is_some() {
         let buf = git
@@ -884,8 +882,8 @@ fn project_wip(
 /// across re-snapshots), falling back to the version id for legacy changes —
 /// a legacy lane then re-keys every snapshot and simply reaps as superseded.
 fn wip_key(ws: &Workspace, id: &Oid) -> String {
-    ws.repo()
-        .change_change_id(id)
+    ws.graph()
+        .change_id(id)
         .map(|cid| hex::encode(&cid))
         .unwrap_or_else(|| hex::encode(&id.0))
 }
@@ -974,7 +972,7 @@ fn write_git_tree(
 /// reachability handles, not branches (ADR 0022 stands).
 fn update_loot_refs(ws: &Workspace, git: &git2::Repository, marks: &MarkMap) -> Result<(), String> {
     let mut live: Vec<String> = Vec::new();
-    for head in ws.repo().heads() {
+    for head in ws.heads() {
         if let Some(sha) = marks.sha_for(&head) {
             let name = format!("refs/loot/heads/{}", hex::encode(&head.0));
             let oid = git2::Oid::from_str(sha).map_err(|e| e.to_string())?;
@@ -1029,14 +1027,14 @@ fn rebuild_marks(ws: &Workspace, git: &git2::Repository) -> Result<MarkMap, Stri
             continue;
         }
         match bridge::parse_trailer(&message, TRAILER_CHANGE_ID).and_then(|h| bridge::parse_oid_hex(&h)) {
-            Some(id) if ws.repo().change_tree(&id).is_some() => {
+            Some(id) if ws.graph().tree(&id).is_some() => {
                 marks.insert(oid.to_string(), id, MarkOrigin::Loot);
             }
             _ => git_native.push(oid.to_string()),
         }
     }
     // Second pass: re-match ingested (git-origin) commits by parents + message.
-    let all_changes = ws.repo().change_ids_topo();
+    let all_changes = ws.graph().ids_topo();
     for sha in git_native {
         let Ok(commit) = git.find_commit(git2::Oid::from_str(&sha).map_err(|e| e.to_string())?) else {
             continue;
@@ -1049,10 +1047,10 @@ fn rebuild_marks(ws: &Workspace, git: &git2::Repository) -> Result<MarkMap, Stri
         let message = bridge::strip_trailers(&String::from_utf8_lossy(commit.message_bytes()));
         let candidates: Vec<&Oid> = all_changes
             .iter()
-            .filter(|c| ws.repo().parents_of(c) == parents)
+            .filter(|c| ws.graph().parents(c) == parents)
             .filter(|c| {
-                ws.repo()
-                    .change_message(c)
+                ws.graph()
+                    .message(c)
                     .is_some_and(|m| bridge::strip_trailers(&m) == message)
             })
             .collect();
@@ -1064,56 +1062,8 @@ fn rebuild_marks(ws: &Workspace, git: &git2::Repository) -> Result<MarkMap, Stri
 }
 
 // --- small shared helpers ---
-
-/// The ancestor closure (inclusive) of a set of changes — everything already
-/// represented in git by the marks that name them.
-fn ancestor_closure<'a>(
-    ws: &Workspace,
-    seeds: impl Iterator<Item = &'a Oid>,
-) -> std::collections::BTreeSet<Oid> {
-    let mut out = std::collections::BTreeSet::new();
-    let mut stack: Vec<Oid> = seeds.cloned().collect();
-    while let Some(id) = stack.pop() {
-        if out.insert(id.clone()) {
-            stack.extend(ws.repo().parents_of(&id));
-        }
-    }
-    out
-}
-
-/// True when `ancestor` is reachable from `descendant` over parent edges
-/// (inclusive of equality) — the bridge's fast-forward test.
-fn is_ancestor(ws: &Workspace, ancestor: &Oid, descendant: &Oid) -> bool {
-    let mut stack = vec![descendant.clone()];
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(id) = stack.pop() {
-        if id == *ancestor {
-            return true;
-        }
-        if seen.insert(id.clone()) {
-            stack.extend(ws.repo().parents_of(&id));
-        }
-    }
-    false
-}
-
-/// Ancestor depth per change (root = 0), memoized over the whole graph — the
-/// deterministic commit-date input (ADR 0028).
-fn generations(ws: &Workspace) -> BTreeMap<Oid, u64> {
-    let mut gen: BTreeMap<Oid, u64> = BTreeMap::new();
-    for id in ws.repo().change_ids_topo() {
-        let g = ws
-            .repo()
-            .parents_of(&id)
-            .iter()
-            .filter_map(|p| gen.get(p))
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
-        gen.insert(id, g);
-    }
-    gen
-}
+// (The pure DAG walks — ancestor closure, is-ancestor, generations — moved to
+// `Workspace::graph()` in R1 #177: they are graph queries, not bridge logic.)
 
 /// Same demotion rule as the engine's snapshot guard (#62): re-sealing more
 /// readably is refused unless done deliberately.
