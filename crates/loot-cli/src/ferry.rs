@@ -1718,10 +1718,6 @@ mod tests {
         let bdir = adir.parent().unwrap().join("repo-b");
         let _ = std::fs::remove_dir_all(&bdir);
         copy_dir(&adir.join(".loot"), &bdir.join(".loot"));
-        // A frozen primary has its tree on disk too — without it, the empty dir
-        // reads as a delete-everything edit against the base anchor (#289:
-        // deletions are real work, so an empty capture no longer evaporates).
-        put_file(&bdir, "a.txt", "base\n");
         let mut b = Workspace::open_at(&bdir).unwrap();
 
         // A lands a change (CRLF content and message — the byte-identical case that
@@ -1860,33 +1856,6 @@ mod tests {
             "base + ingested only — the identical capture snapshot evaporated"
         );
         assert_eq!(ws2.repo().heads().len(), 1, "single head: no stale fork left behind");
-    }
-
-    #[test]
-    fn deletion_only_change_finalizes_and_projects_the_removal_onto_main() {
-        // #289 end-to-end: describe a deletion-only change, finalize through the
-        // land path (`finalize_capturing`, where the tip-duplicate drop lives),
-        // then ferry — main's new commit tree must lack the deleted path.
-        let (mut ws, dir, mirror) = setup("del289");
-        put_file(&dir, "keep.txt", "k\n");
-        put_file(&dir, "gone.txt", "g\n");
-        seal_change(&mut ws, "base");
-        ferry(&mut ws, &mirror);
-        let git = git2::Repository::open(&mirror).unwrap();
-        let before = main_commit(&git).id();
-
-        std::fs::remove_file(dir.join("gone.txt")).unwrap();
-        ws.snapshot("chore: delete gone.txt").unwrap(); // describe -m
-        let finalized = ws.finalize_capturing(&[], false).unwrap();
-        assert!(finalized.is_some(), "the deletion-only change was signed, not dropped (#289)");
-
-        let report = ferry(&mut ws, &mirror);
-        assert_eq!((report.ingested, report.projected), (0, 1), "one commit projected");
-        let tip = main_commit(&git);
-        assert_ne!(tip.id(), before, "git main moved — no #195 false-stall");
-        let paths = tree_paths(&git, &tip.tree().unwrap());
-        assert!(paths.contains(&"keep.txt".to_string()), "kept content survives: {paths:?}");
-        assert!(!paths.contains(&"gone.txt".to_string()), "the deleted path left main: {paths:?}");
     }
 
     #[test]

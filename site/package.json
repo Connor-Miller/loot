@@ -27,10 +27,5 @@
 		"@types/react": "^19.2.17",
 		"@types/react-dom": "^19.2.3",
 		"typescript": "npm:@typescript/typescript6@^6.0.2"
-	},
-	"overrides": {
-		"esbuild": "^0.27.0",
-		"path-to-regexp": "^8.3.0",
-		"undici": "^6.0.0"
 	}
 }

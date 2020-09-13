@@ -2,7 +2,9 @@
 # docs/pitch/ is the genuinely-sealed-from-agents path (ADR 0026): the
 # zero-knowledge-host product notes, restricted to the dev identity.
 docs/pitch/** restricted=connor
-# The product site is deliberately, explicitly Public (already the default):
-# Vercel builds from the GitHub main projection, so sealed content can never
-# be a build input (spec docs/specs/loot-site.md §1).
+# The product site is deliberately, explicitly Public (already the default).
+# Sealed content stays out of site deploys twice over: GitHub `main` is the
+# sealed-free projection (the future auto-deploy input), and the interim
+# manual `vercel --prod` upload is gated by .vercelignore's site-only
+# allowlist (spec docs/specs/loot-site.md §1–2).
 site/** public

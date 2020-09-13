@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { CodeBlock } from '@millerbyte/ui';
+import { INSTALL_PS1_ONELINER, INSTALL_SH_ONELINER } from '../lib/install';
 
 export const Route = createFileRoute('/install')({
 	component: Install,
@@ -12,13 +13,9 @@ function Install() {
 		<>
 			<h1>Install</h1>
 			<p>macOS / Linux:</p>
-			<CodeBlock language="bash">
-				curl -sSf https://loot.millerbyte.com/install.sh | sh
-			</CodeBlock>
+			<CodeBlock language="bash">{INSTALL_SH_ONELINER}</CodeBlock>
 			<p>Windows:</p>
-			<CodeBlock language="powershell">
-				powershell -ExecutionPolicy Bypass -c "irm https://loot.millerbyte.com/install.ps1 | iex"
-			</CodeBlock>
+			<CodeBlock language="powershell">{INSTALL_PS1_ONELINER}</CodeBlock>
 			<p className="placeholder">
 				Placeholder shell — the all-platforms listing, manual downloads, and
 				verify-your-download instructions arrive with the content ticket.

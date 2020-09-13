@@ -1,5 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router';
 import { CodeBlock } from '@millerbyte/ui';
+import { INSTALL_SH_ONELINER } from '../lib/install';
 
 export const Route = createFileRoute('/')({
 	component: Landing,
@@ -15,9 +16,7 @@ function Landing() {
 				Visibility and permissions are properties of content and changes, not
 				of the repository.
 			</p>
-			<CodeBlock language="bash">
-				curl -sSf https://loot.millerbyte.com/install.sh | sh
-			</CodeBlock>
+			<CodeBlock language="bash">{INSTALL_SH_ONELINER}</CodeBlock>
 			<p className="placeholder">
 				Placeholder shell — landing content (thesis hook, demo vignettes, CTA
 				row) arrives with the content ticket. Meanwhile:{' '}

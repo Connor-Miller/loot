@@ -87,24 +87,6 @@ ceremony is gone.
 > test missed. `converge_heads` already had this working-change guard (it defers
 > rather than orphan); `reconcile_adopt` gets the same protection here by never
 > being reached with a live working change on the disk.
->
-> **Amended 2026-07-17 (#289): the empty/tip-duplicate drop judges recorded
-> manifests — deletions count.** The drop under `new` (and its `fold_line_in` /
-> `reconcile_capture` siblings) judged "adds nothing over the tip" with a tree
-> comparison built on the ancestry overlay, which unions ancestor entries and so
-> can never see a *missing* path: a change whose only content was **deleting
-> files** compared identical to the tip and was silently destroyed at finalize —
-> describe message and all — with only the #195 "main did not move" guard
-> between that and a false `landed:` (it ate the #284 cleanup live).
-> `same_tree_content` now compares the two changes' **recorded manifests**
-> (every change carries its complete tree, deletion = absence): same path set,
-> same visibilities, same openable content. An **empty** capture is redundant
-> only when nothing is held to compare against (a bare `new` in a fresh repo) —
-> over a non-empty tip it is a delete-everything change and signs like any other
-> work. Consequence: an *un-described* deletion-only capture now survives to the
-> #174 refusal instead of silently evaporating — it is real work, so being asked
-> to name it is this contract working, and a bare `new` on a genuinely clean
-> tree stays the no-op it was.
 
 ### `status` becomes a pure read-only report (the `-m` flag is dropped)
 
