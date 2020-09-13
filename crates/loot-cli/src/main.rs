@@ -182,8 +182,8 @@ usage:
   loot verify [--accept-loss]               integrity-check the object store: rehash every object, find missing ones with their referencing changes (exits 1 on problems); --accept-loss records current losses as acknowledged
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
-  loot grant <path> <identity> <file> [--expires <ts>]  write a targeted grant bundle for <identity> (file delivery); --expires makes future `surface`/`apply_sealed_grant` reject the grant once now >= ts (#20)
-  loot grant --relay <name> <path> <identity> [--expires <ts>]  seal and deliver a grant via relay mailbox
+  loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery); no --expires here — a tag-1 bundle carries no expiry, use the --relay form (#352)
+  loot grant --relay <name> <path> <identity> [--expires <ts>]  seal and deliver a grant via relay mailbox; --expires makes the recipient's `apply_sealed_grant` reject the grant once now >= ts (#20)
   loot grant-status <path>                  list current grantees for <path> — grantor, delivery method, granted_at (sanity check before `loot maroon`, #5)
   loot embargo-status <path>                show whether <path> is embargoed (sealed until a unix timestamp, shown with its human-readable date/time too), revealed (embargo passed), or not embargoed at all (#15); checks history too, not just the working tree — useful when troubleshooting why a file isn't visible after a pull
   loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
@@ -277,9 +277,10 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-/// `grant --expires <timestamp>` (#20): the unix timestamp after which the
-/// issued grant is no longer honored, or `None` if the flag is absent (the
-/// default — a grant that never expires, unchanged from before #20).
+/// `grant --relay --expires <timestamp>` (#20): the unix timestamp after which
+/// the issued grant is no longer honored, or `None` if the flag is absent (the
+/// default — a grant that never expires, unchanged from before #20). Sealed
+/// (relay) path only — the tag-1 file path refuses the flag outright (#352).
 fn parse_expires_flag(args: &[String]) -> Result<Option<u64>, String> {
     match flag(args, "--expires") {
         Some(v) => v
@@ -1122,15 +1123,16 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--relay") {
         return cmd_grant_relay(args);
     }
-    let expires_at = parse_expires_flag(args)?;
-    // `positionals()` only special-cases `--allow-demote <path>`; any other
-    // valued flag's value reads as a bare positional, so filter it out here
-    // too (the same pattern `cmd_grant_relay` uses for `--relay`'s value).
-    let expires_str = flag(args, "--expires");
-    let pos: Vec<&str> = positionals(args)
-        .into_iter()
-        .filter(|a| Some(*a) != expires_str)
-        .collect();
+    // A tag-1 grant is a file delivered out of band: the bundle carries no
+    // expiry and nothing enforces one on either side, so accepting the flag
+    // here would be a false promise (#352). Refuse and point at the sealed
+    // path, whose recipient-side `apply_sealed_grant` actually enforces (#20).
+    if has_flag(args, "--expires") {
+        return Err(
+            "--expires is not enforced on the file-grant path (a tag-1 bundle carries no expiry)\n  use: loot grant --relay <remote> <path> <identity> --expires <ts> — the sealed path enforces it (#352)".into(),
+        );
+    }
+    let pos = positionals(args);
     if pos.len() < 3 {
         return Err("grant requires <path> <identity> <file>\n  or: grant --relay <remote> <path> <identity>".into());
     }
@@ -1151,7 +1153,10 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
     let bundle = snap.mutate(|repo| {
-        repo.grant(&oid, grantee, now, expires_at).map_err(|e| e.to_string())
+        // `None`: the file path never sets an expiry (refused above, #352).
+        // The engine parameter stays — maroon's re-grant uses it to carry a
+        // grantee's recorded expiry forward in the manifest (#20).
+        repo.grant(&oid, grantee, now, None).map_err(|e| e.to_string())
     })?;
     std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
     println!(
@@ -1160,9 +1165,6 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
         bundle.0.len()
     );
     println!("  {path} → {grantee} (recorded in manifest)");
-    if let Some(t) = expires_at {
-        println!("  expires at {t} — surface skips this path for {grantee} after that (#20)");
-    }
     // A grant hands a content key to a peer — one-way (ADR 0031). Barrier.
     snap.record_op("grant", &format!("grant {path} → {grantee}"), true);
     Ok(())

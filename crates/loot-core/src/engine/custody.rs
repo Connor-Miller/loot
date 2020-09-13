@@ -105,9 +105,15 @@ impl DagRepo {
     ///
     /// `expires_at` (`None` = never expires, #20) rides only in the local
     /// manifest record here — a tag-1 grant is a file delivered out of band, so
-    /// there is no wire header to carry it; `surface` on this repo's own future
-    /// reads is what enforces it (parallel to `grant_sealed`'s wire-carried
-    /// `expires_at`, enforced by the recipient's `apply_sealed_grant` too).
+    /// there is no wire header to carry it and **nothing enforces it for this
+    /// grant's recipient**: expiry gates (`grant_expired_for`) only ever run
+    /// with `reader = self.identity`, which is the grantor on this side, and
+    /// the grantee's `apply` records no expiry (#352 — the CLI refuses
+    /// `--expires` on the file path for exactly this reason). The parameter
+    /// exists for maroon's re-grant, which must carry a grantee's recorded
+    /// expiry (e.g. from a sealed grant) forward in the manifest rather than
+    /// silently un-expiring it. Wire-enforced expiry is `grant_sealed`'s
+    /// `expires_at`, rejected by the recipient's `apply_sealed_grant`.
     ///
     /// The bundle carries only the objects and key for this single grant — it is
     /// a targeted hand-off, not a full sync. Apply it on the grantee side.

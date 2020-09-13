@@ -118,3 +118,53 @@ fn embargo_status_reports_embargoed_then_revealed_then_survives_deletion() {
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
+
+/// `--expires` on the tag-1 file-grant path is inert — the bundle carries no
+/// expiry and nothing enforces one on either side — so the CLI must refuse it
+/// with a pointer at `grant --relay --expires`, the sealed path that actually
+/// enforces (#352). The old behavior printed a success message claiming
+/// enforcement that never existed.
+#[test]
+fn grant_refuses_expires_on_the_file_path_and_points_at_relay() {
+    let cwd = empty_cwd("grant-expires");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_loot"))
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .expect("spawn loot")
+    };
+
+    assert!(run(&["init", "--identity", "alice"]).status.success());
+    std::fs::write(cwd.join("notes.txt"), b"hello\n").unwrap();
+    let described = run(&["describe", "-m", "add notes"]);
+    assert!(described.status.success(), "{}", String::from_utf8_lossy(&described.stderr));
+
+    // --expires without --relay: refused loudly, nothing written.
+    let refused = run(&["grant", "notes.txt", "bob", "out.bundle", "--expires", "100"]);
+    assert!(!refused.status.success(), "tag-1 --expires must refuse");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("--relay"), "the refusal points at the enforcing path: {err}");
+    assert!(err.contains("--expires"), "the refusal names the flag: {err}");
+    assert!(!cwd.join("out.bundle").exists(), "a refused grant must write no bundle");
+
+    // Without --expires the file path still works — and never claims expiry.
+    let ok = run(&["grant", "notes.txt", "bob", "out.bundle"]);
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    let out = String::from_utf8_lossy(&ok.stdout);
+    assert!(!out.contains("expires"), "no expiry claim on the file path: {out}");
+    assert!(cwd.join("out.bundle").exists(), "the plain file grant still writes its bundle");
+
+    // With --relay, `--expires` must reach the sealed path (which enforces),
+    // not the tag-1 refusal — here it fails for its own reason (no such
+    // remote), proving the dispatch order.
+    let relay = run(&["grant", "--relay", "origin", "notes.txt", "bob", "--expires", "100"]);
+    assert!(!relay.status.success(), "no remote configured — the sealed path fails on resolve");
+    let relay_err = String::from_utf8_lossy(&relay.stderr);
+    assert!(
+        !relay_err.contains("not enforced"),
+        "the sealed path must never hit the tag-1 refusal: {relay_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&cwd);
+}
