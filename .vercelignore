@@ -1,0 +1,14 @@
+# .vercelignore is the ONLY upload gate for CLI deploys — the Vercel CLI does
+# NOT read .gitignore (millerbyte's hard-won gotcha). This repo's working tree
+# holds .loot/ (the identity's PRIVATE KEY + keyring) and docs/pitch/ (sealed
+# content, loot-only host) — neither may ever reach the builder. Allowlist:
+# upload site/ only.
+/*
+!/site
+site/node_modules
+site/dist
+site/.output
+site/.tanstack
+site/.nitro
+site/.vercel
+.env*
