@@ -1901,6 +1901,34 @@ impl DagRepo {
         addrs.into_iter().collect()
     }
 
+    /// The heads a pull should NEGOTIATE with (#217): heads whose own full
+    /// tree's objects are all present locally. An interrupted batched pull
+    /// (S6, ADR 0024) ingests change nodes before all their object bytes
+    /// arrive; claiming such a head as `have` makes the relay skip the very
+    /// changes whose objects we still lack — the pull could then never
+    /// complete (offer returns nothing). Excluding incomplete heads makes the
+    /// relay re-offer their closure, so re-pulling fetches exactly the
+    /// remainder (change re-insertion is idempotent).
+    pub fn negotiation_have(&self) -> Vec<Oid> {
+        self.graph
+            .heads()
+            .into_iter()
+            .filter(|h| {
+                // Completeness covers the head's whole reachable CLOSURE, not
+                // just its own tree: batch order is address order, so a
+                // historical object of an ancestor can be the one still
+                // missing while the head's tree happens to be whole — claiming
+                // the head would strand that object exactly the same way.
+                self.ancestors_of(h).iter().all(|a| {
+                    self.graph
+                        .tree_at(a)
+                        .values()
+                        .all(|(oid, _vis)| self.object(oid).is_ok())
+                })
+            })
+            .collect()
+    }
+
     /// The subset of `offered` addresses this repo does NOT already hold — the
     /// "wants" a receiver replies with (S5).
     pub fn missing_objects(&self, offered: &[Oid]) -> Vec<Oid> {

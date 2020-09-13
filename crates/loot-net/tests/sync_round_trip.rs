@@ -114,6 +114,52 @@ fn relay_cannot_read_restricted_content_it_relays() {
 }
 
 #[test]
+fn offer_then_fetch_negotiated_pull_round_trips() {
+    // The production negotiated-pull path (#217): `/offer` then `/fetch` —
+    // the endpoints `Workspace::pull_via`'s HTTP adapter drives. First
+    // end-to-end coverage of these handlers (the older tests use `/negotiate`).
+    let relay_dir = tmp("relay-offer");
+    let addr = "127.0.0.1:47199";
+    let base = format!("http://{addr}");
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
+    });
+    wait_for_relay(&base);
+
+    let alice_id = alice_identity();
+    let alice_dir = tmp("alice-offer");
+    let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
+    let oid = alice.put(b"negotiated
+", Visibility::Public).unwrap();
+    let mut tree = BTreeMap::new();
+    tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+    let change_id = alice
+        .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+        .unwrap();
+    loot_net::push(&base, alice.bundle(&[]).unwrap().0, &alice_id).unwrap();
+
+    // Round 1: offer against empty have — the relay offers the object closure.
+    let bob_dir = tmp("bob-offer");
+    let mut bob = DagRepo::init(bob_dir.join("work"), "bob").unwrap();
+    let offered = loot_net::offer(&base, &bob.heads()).unwrap();
+    assert!(offered.contains(&oid), "the relay offers the closure's addresses");
+
+    // Round 2: fetch only what we lack; apply lands the change + bytes.
+    let wants = bob.missing_objects(&offered);
+    assert_eq!(wants, vec![oid.clone()]);
+    let bytes = loot_net::fetch(&base, &bob.heads(), &wants).unwrap();
+    bob.apply(&SyncBundle(bytes), 0).unwrap();
+    assert!(bob.heads().contains(&change_id));
+    assert_eq!(bob.get(&oid, "bob", 0).unwrap(), b"negotiated
+");
+
+    // Up to date: the offer subtracts what we now hold — nothing to want.
+    let offered = loot_net::offer(&base, &bob.heads()).unwrap();
+    assert!(bob.missing_objects(&offered).is_empty(), "re-negotiation finds nothing");
+}
+
+#[test]
 fn pull_with_up_to_date_have_returns_empty() {
     let relay_dir = tmp("relay2");
     let addr = "127.0.0.1:47194";

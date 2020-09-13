@@ -21,6 +21,25 @@ const DOT: &str = ".loot";
 const ATTRS: &str = ".lootattributes";
 const IGNORE: &str = ".lootignore";
 
+/// The transport a pull negotiates over (#217, map #215): exactly the two
+/// questions the pipeline asks a relay — nothing about URLs, HTTP, or batch
+/// size crosses this seam. Defined here because the Workspace is the
+/// consumer (the interface belongs to the caller, not to loot-net); the
+/// production adapter wraps `loot_net::offer`/`fetch` in main.rs, and the
+/// in-memory test adapter wraps a relay-role `DagRepo`.
+pub trait SyncTransport {
+    /// Round 1 (S5): send our heads, receive the object addresses in the
+    /// closure of the changes the relay would ship.
+    fn offer(&self, have: &[Oid]) -> Result<Vec<Oid>, String>;
+    /// Round 2 (S5/S6): send our heads + the wanted subset, receive a sync
+    /// bundle whose object bytes are limited to `wants`.
+    fn fetch(&self, have: &[Oid], wants: &[Oid]) -> Result<Vec<u8>, String>;
+}
+
+/// One fetch round-trip's object budget (S6) — pipeline-internal, never part
+/// of the [`SyncTransport`] interface.
+const OBJECTS_PER_BATCH: usize = 32;
+
 pub struct Workspace {
     dot: PathBuf,
     store: RepoStore,
@@ -1516,6 +1535,43 @@ impl Workspace {
         Ok((name.to_string(), outcomes))
     }
 
+    /// Run the whole pull pipeline over a [`SyncTransport`] (#217, map #215):
+    /// negotiate (offer → missing → wants), fetch in batches — each applied
+    /// batch persists, so an interrupted pull resumes by re-negotiating and
+    /// fetching only what's left (S6, ADR 0024) — then collapse any fork the
+    /// pull left us on (the keyholder fork-collapse of ADR 0011, #128).
+    ///
+    /// Two correctness points the pipeline owns (previously restated at the
+    /// CLI): `have` is re-read after each batch so the relay's change-delta
+    /// stays relative to our current heads; and outcomes fold with
+    /// `converge::worst` across batches AND across the post-pull converge, so
+    /// a Conflict can never be masked by a later Converged for the same path.
+    /// There is no caller-supplied "ours": the head partition derives the
+    /// converge base from the dock's anchor (#216 — the #203 wrong-base class
+    /// is unrepresentable). Returns the folded per-path outcomes; rendering
+    /// and op-recording stay with the caller (R5 #181; ADR 0031).
+    pub fn pull_via(
+        &mut self,
+        transport: &impl SyncTransport,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        // Negotiate with COMPLETE heads only (#217 find): an interrupted
+        // batched pull already ingested change nodes whose object bytes never
+        // arrived; claiming those heads would make the relay skip exactly the
+        // changes we still need, stranding the pull forever.
+        let offered = transport.offer(&self.repo.negotiation_have())?;
+        let wants = self.missing_objects(&offered);
+        let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
+        for batch in wants.chunks(OBJECTS_PER_BATCH) {
+            let current_have = self.repo.negotiation_have();
+            let bytes = transport.fetch(&current_have, batch)?;
+            let batch_outcomes = self.apply_bundle(bytes)?;
+            fold_worst(&mut outcomes, batch_outcomes);
+        }
+        let converged = self.converge_heads(None)?;
+        fold_worst(&mut outcomes, converged);
+        Ok(outcomes)
+    }
+
     /// Collapse a fork the ambient dock is sitting on into one materialized tip
     /// (#128). `pull`/`apply` ingest a peer's divergent tip as a *sibling head*
     /// — engine `apply_sync` records + classifies but never merges tips — so a
@@ -1585,8 +1641,9 @@ impl Workspace {
         }
         // Materialize diffs from what the DISK currently shows — the caller's
         // pre-pull base even if it was just dropped as superseded — not from
-        // whichever head the merge starts on.
-        let from = base.cloned().unwrap_or_else(|| ours.clone());
+        // whichever head the merge starts on. With no base (pull_via, #217)
+        // the dock's anchor is the disk truth.
+        let from = base.cloned().or_else(|| self.anchor()).unwrap_or_else(|| ours.clone());
         let mut acc = ours;
         let mut all: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
         for h in others {
@@ -1895,6 +1952,20 @@ pub fn visibility_under(attrs_text: &str, path: &str) -> Visibility {
 /// ingest-side twin of the snapshot walk's exclusion (#64).
 pub fn ignored_under(ignore_text: &str, rel: &str) -> bool {
     Ignore::parse(ignore_text).ignores_file(rel)
+}
+
+/// Fold one call's per-path outcomes into the running map with
+/// `converge::worst`, so a Conflict from one call can never be masked by a
+/// later Converged for the same path — the cross-call half of the invariant
+/// `apply_sync`/`converge_heads` each honour within a call (#217).
+fn fold_worst(
+    all: &mut BTreeMap<PathBuf, MergeOutcome>,
+    batch: BTreeMap<PathBuf, MergeOutcome>,
+) {
+    for (path, outcome) in batch {
+        let slot = all.entry(path).or_insert(MergeOutcome::Converged);
+        *slot = loot_core::converge::worst(slot.clone(), outcome);
+    }
 }
 
 /// Store selector for a dock name: `home` maps to the root files (`None`).
@@ -3595,6 +3666,199 @@ mod tests {
             })
             .unwrap();
         (dir, ws, x2, theirs, cid)
+    }
+
+    /// The in-memory adapter at the SyncTransport seam (#217): a relay-role
+    /// DagRepo answering offer/fetch with exactly the engine methods the HTTP
+    /// relay's handlers call (`offered_objects`, `bundle_wanted`) — the second
+    /// adapter that makes the seam real.
+    struct InMemoryRelay(loot_core::DagRepo);
+    impl SyncTransport for InMemoryRelay {
+        fn offer(&self, have: &[Oid]) -> Result<Vec<Oid>, String> {
+            Ok(self.0.offered_objects(have))
+        }
+        fn fetch(&self, have: &[Oid], wants: &[Oid]) -> Result<Vec<u8>, String> {
+            self.0.bundle_wanted(have, wants).map(|b| b.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A relay already stowing everything `ws` has finalized. `tag` keeps the
+    /// dir test-unique (tests run as parallel threads of ONE process, so pid
+    /// alone would share state); callers clean it up like their own dirs.
+    fn relay_holding(tag: &str, ws: &Workspace) -> (std::path::PathBuf, InMemoryRelay) {
+        use loot_core::Repo as _;
+        let dir = std::env::temp_dir().join(format!("loot-relay-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut relay = loot_core::DagRepo::init(dir.clone(), "relay").unwrap();
+        relay.stow(&ws.repo().bundle(&[]).unwrap()).unwrap();
+        (dir, InMemoryRelay(relay))
+    }
+
+    #[test]
+    fn pull_via_fetches_and_converges_through_the_transport_seam() {
+        // #217: the whole pull pipeline — negotiate, batched fetch, apply,
+        // post-pull converge — behind one Workspace method, driven in-process
+        // through the SyncTransport seam.
+        let dir_a = std::env::temp_dir().join(format!("loot-pull-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("doc.txt"), b"v1").unwrap();
+        alice.snapshot("doc").unwrap();
+        alice.finalize_working().unwrap();
+        let (relay_dir, relay) = relay_holding("basic", &alice);
+
+        let dir_b = std::env::temp_dir().join(format!("loot-pull-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+
+        let outcomes = bob.pull_via(&relay).unwrap();
+        assert!(!outcomes.is_empty(), "the pull reports per-path outcomes");
+        assert_eq!(
+            bob.heads(),
+            alice.heads(),
+            "bob converged onto alice's line through the seam"
+        );
+        assert!(bob.repo().conflicts().is_empty());
+
+        // A re-pull is a no-op: negotiation finds nothing missing.
+        let again = bob.pull_via(&relay).unwrap();
+        assert!(again.is_empty(), "nothing new (already up to date)");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn pull_via_divergent_pull_stays_flat_in_process() {
+        // #217's done-when: the amend-divergence demo's Act 2 as an ordinary
+        // Rust test — two identities each `loot edit` the same handle; the
+        // pull ingests the peer's amend and the divergence stays FLAT
+        // (#198/#203): both heads live, no per-path conflict, tree clean on
+        // ours, `!` renders, abandon settles.
+        use loot_core::Repo as _;
+        let dir_a = std::env::temp_dir().join(format!("loot-div-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("feat.txt"), b"feat: base").unwrap();
+        alice.snapshot("add feat").unwrap();
+        alice.finalize_working().unwrap();
+        let base_head = alice.heads()[0].clone();
+        let cid = alice.repo().change_change_id(&base_head).unwrap();
+        let (relay_dir, mut relay) = relay_holding("divergent", &alice);
+
+        // Bob shares the base through the seam.
+        let dir_b = std::env::temp_dir().join(format!("loot-div-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+        bob.pull_via(&relay).unwrap();
+        bob.surface().unwrap();
+        assert_eq!(std::fs::read(dir_b.join("feat.txt")).unwrap(), b"feat: base");
+
+        // Concurrent amends of the SAME handle: alice's travels to the relay;
+        // bob amends his own line before pulling it.
+        alice.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir_a.join("feat.txt"), b"feat: alice's take").unwrap();
+        alice.snapshot("add feat").unwrap();
+        alice.finalize_working().unwrap();
+        relay.0.stow(&alice.repo().bundle(&[]).unwrap()).unwrap();
+
+        bob.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(dir_b.join("feat.txt"), b"feat: bob's take").unwrap();
+        bob.snapshot("add feat").unwrap();
+        bob.finalize_working().unwrap();
+
+        // The divergent pull: alice's amend lands next to bob's.
+        let outcomes = bob.pull_via(&relay).unwrap();
+        assert!(
+            !outcomes
+                .values()
+                .any(|o| matches!(o, MergeOutcome::Conflict { .. })),
+            "no per-path conflict is minted for the co-version"
+        );
+        assert!(bob.divergent_change_ids().contains(&cid), "the ! marker state renders");
+        assert_eq!(bob.heads().len(), 2, "both co-versions stay flat as live heads");
+        assert!(bob.repo().conflicts().is_empty(), "loot conflicts reports nothing");
+        assert_eq!(
+            std::fs::read(dir_b.join("feat.txt")).unwrap(),
+            b"feat: bob's take",
+            "the tree stays clean on OURS"
+        );
+
+        // Abandon the peer's side: the whole settle.
+        let alices = bob
+            .liveness()
+            .live_of(&cid)
+            .into_iter()
+            .find(|v| Some(v) != bob.anchor().as_ref())
+            .unwrap();
+        bob.abandon(&alices).unwrap();
+        assert!(!bob.divergent_change_ids().contains(&cid));
+        assert!(bob.repo().conflicts().is_empty());
+        assert_eq!(std::fs::read(dir_b.join("feat.txt")).unwrap(), b"feat: bob's take");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
+    }
+
+    #[test]
+    fn pull_via_interrupted_fetch_resumes() {
+        // S6/ADR 0024 through the seam: each applied batch persists, so a
+        // transport that dies mid-pull loses nothing — the next pull
+        // re-negotiates and fetches only what's left.
+        struct FlakyTransport {
+            inner: InMemoryRelay,
+            fetches_before_failure: std::cell::Cell<u32>,
+        }
+        impl SyncTransport for FlakyTransport {
+            fn offer(&self, have: &[Oid]) -> Result<Vec<Oid>, String> {
+                self.inner.offer(have)
+            }
+            fn fetch(&self, have: &[Oid], wants: &[Oid]) -> Result<Vec<u8>, String> {
+                let left = self.fetches_before_failure.get();
+                if left == 0 {
+                    return Err("transport died mid-pull".into());
+                }
+                self.fetches_before_failure.set(left - 1);
+                self.inner.fetch(have, wants)
+            }
+        }
+
+        // One change with more objects than a single batch carries.
+        let dir_a = std::env::temp_dir().join(format!("loot-resume-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        for i in 0..40 {
+            std::fs::write(dir_a.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
+        }
+        alice.snapshot("forty files").unwrap();
+        alice.finalize_working().unwrap();
+        let (relay_dir, relay) = relay_holding("resume", &alice);
+
+        let dir_b = std::env::temp_dir().join(format!("loot-resume-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+
+        let flaky = FlakyTransport {
+            inner: relay,
+            fetches_before_failure: std::cell::Cell::new(1), // batch 1 lands, batch 2 dies
+        };
+        let err = bob.pull_via(&flaky).unwrap_err();
+        assert!(err.contains("transport died"), "the failure surfaces: {err}");
+
+        // Resume over a healthy transport: negotiation finds only the rest.
+        // (Negotiation must use COMPLETE heads — the #217 find: the partial
+        // pull already ingested the change node, and claiming it as `have`
+        // would make the relay offer nothing, stranding the pull forever.)
+        let relay = flaky.inner;
+        let offered = relay.offer(&bob.repo().negotiation_have()).unwrap();
+        let still_missing = bob.missing_objects(&offered).len();
+        assert!(
+            still_missing > 0 && still_missing < 40,
+            "the first batch persisted; only the remainder is re-fetched (missing {still_missing})"
+        );
+        bob.pull_via(&relay).unwrap();
+        assert_eq!(bob.heads(), alice.heads(), "resumed to convergence");
+        assert!(
+            bob.missing_objects(&relay.offer(&bob.repo().negotiation_have()).unwrap()).is_empty(),
+            "nothing left dangling after the resume"
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
     }
 
     #[test]
