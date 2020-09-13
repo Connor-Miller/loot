@@ -40,6 +40,23 @@ pub struct EditReport {
     pub superseded: Oid,
 }
 
+/// What `loot duplicate` did, for CLI reporting (#398). The copy is a fresh,
+/// independent change — a new `change_id`/`version` reproducing the source's
+/// tree with NO predecessor link back to it.
+#[derive(Debug)]
+pub struct DuplicateReport {
+    /// The change that was copied (the resolved `<selector>`).
+    pub source: Oid,
+    /// The freshly minted version id of the copy.
+    pub version: Oid,
+    /// The copy's durable change handle (`None` on a keyless/legacy repo).
+    pub change_id: Option<[u8; 16]>,
+    /// The insertion point the copy parents on — the working change (default)
+    /// or the resolved `--after` selector. `None` only on a repo with no
+    /// history to parent onto.
+    pub parent: Option<Oid>,
+}
+
 /// The delta class of one path across two trees: added, modified, or deleted
 /// (#306). `#7`'s first-change-in-repo case renders every path `Added`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

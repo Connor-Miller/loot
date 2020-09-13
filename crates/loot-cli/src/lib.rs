@@ -19,6 +19,7 @@ pub mod bisect;
 pub mod blame;
 pub mod emit;
 pub mod error;
+pub mod evolog;
 pub mod ferry;
 pub mod flags;
 pub mod grep;

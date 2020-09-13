@@ -36,7 +36,7 @@ pub use lanes::{LaneStatus, SpawnedLane, SweepOutcome};
 mod reports;
 pub use reports::{
     AdoptCatchupReport, AdoptReport, BurnReport, ConflictSide, ConflictView, DeltaClass,
-    DeltaReport, EditReport, PathDelta, PullReport, StepReport, WorkingRow,
+    DeltaReport, DuplicateReport, EditReport, PathDelta, PullReport, StepReport, WorkingRow,
 };
 
 const DOT: &str = ".loot";
@@ -597,6 +597,106 @@ impl Workspace {
             conflicted: false,
             change: Some(id),
         })
+    }
+
+    /// `loot duplicate <selector>` (#398): copy a change as a fresh, independent
+    /// node — a NEW change id and version id reproducing the target's tree, with
+    /// this identity as author and **no predecessor link** back to the source.
+    ///
+    /// Contrast the two adjacent verbs. `loot edit` supersedes: it carries the
+    /// source's durable change id AND records `predecessors = [source]`, so the
+    /// result travels as a replacement version. `cherry-pick` re-applies a
+    /// *delta* and re-seals it under the current `.lootattributes`. Duplicate
+    /// does neither — it copies the *whole tree* address-for-address, so ADR
+    /// 0004's content-address dedup makes the sealed objects (and their keys)
+    /// reused exactly as stored: no re-encryption, because the visibility of
+    /// each path travels unchanged with the copied entry. `record_carrying`
+    /// with `carried = None` mints a brand-new durable handle and leaves the
+    /// predecessor list empty.
+    ///
+    /// Placement: the copy parents on `after` when given (an explicit insertion
+    /// point), else on the current working change, else the dock's finalized
+    /// anchor. It is signed immediately (like `maroon`'s recorded re-seal), so
+    /// it is a finalized, travelling change rather than a working change — the
+    /// working change and the working tree are left untouched.
+    pub fn duplicate(
+        &mut self,
+        selector: &str,
+        after: Option<&str>,
+    ) -> Result<DuplicateReport, CliError> {
+        // Fold any uncaptured disk edits into the working change first, so a
+        // default placement parents on the operator's live tree (matching
+        // cherry-pick's capture-first discipline).
+        self.capture_uncaptured_edits()?;
+
+        let target = self.resolve_selector(selector)?;
+
+        // The insertion point (the copy's parent): an explicit `--after`
+        // selector, else the current working change, else the dock's finalized
+        // anchor. `None` only on a repo with no history at all.
+        let parent = match after {
+            Some(sel) => Some(self.resolve_selector(sel)?),
+            None => self.working.clone().or_else(|| self.anchor()),
+        };
+
+        // Copy the target's tree address-for-address (ADR 0004): every entry
+        // keeps its stored sealed oid + visibility, so no object is re-sealed.
+        let tree = self.repo.change_tree(&target).ok_or_else(|| {
+            CliError::from(format!(
+                "cannot duplicate unknown change {}",
+                short_version(&target)
+            ))
+        })?;
+        let message = self.repo.change_message(&target).unwrap_or_default();
+
+        let parents: Vec<Oid> = parent.iter().cloned().collect();
+        let change = loot_core::Change {
+            id: Oid([0; 32]),
+            parents,
+            message,
+            tree,
+        };
+        // Fresh change id (carried = None => mint) and NO predecessors: an
+        // independent change, never a superseding version of the source.
+        //
+        // loot version ids are content-addressed (author ‖ message ‖ parents ‖
+        // tree ‖ predecessors, ADR 0029) and the durable change id is metadata,
+        // not part of that fold — so a copy that reproduces the source's tree
+        // AND message AT THE SAME PARENT computes the source's own version id.
+        // `graph.insert` is idempotent on the version id, so that mints nothing
+        // (it would silently hand back the source, change id and all). Detect
+        // the collision and refuse with the remedy: a duplicate needs a distinct
+        // insertion point, which is the verb's whole purpose ("the same content
+        // at a different point in history").
+        let known: std::collections::BTreeSet<Oid> =
+            self.repo.change_ids_topo().into_iter().collect();
+        let version = self.repo.record_carrying(change, None).map_err(CliError::from)?;
+        if known.contains(&version) {
+            return Err(format!(
+                "duplicating {} at this parent would reproduce it exactly — a loot \
+                 version id is content-addressed, so an identical tree at the same \
+                 parent is the same change. Give a different `--after` insertion point.",
+                short_version(&target)
+            )
+            .into());
+        }
+        // Sign it so the copy is finalized and travels (push/bundle carry only
+        // signed history) — keyless repos record it unauthored, already
+        // travelling. Neither path touches `self.working`.
+        self.sign_change(&version)?;
+        self.persist()?;
+
+        let change_id = self.repo.change_change_id(&version);
+        self.record_op(
+            "duplicate",
+            &format!(
+                "duplicate {} as {}",
+                short_version(&target),
+                short_version(&version)
+            ),
+            false,
+        );
+        Ok(DuplicateReport { source: target, version, change_id, parent })
     }
 
     /// Apply one relay-delivered sealed grant (ADR 0015): unseal with the
@@ -7163,6 +7263,135 @@ mod tests {
             b"divergent\n",
             "the working tree is left untouched — ours stays on disk"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- duplicate at the workspace seam (#398) --------------------------------
+
+    #[test]
+    fn duplicate_copies_the_tree_with_a_new_change_id_and_no_predecessor() {
+        // #398: `loot duplicate` mints a fresh change id + version id that
+        // reproduces the source's tree address-for-address, carries NO
+        // predecessor link, and lands at the requested `--after` parent — the
+        // same content at a different point in history.
+        let dir = std::env::temp_dir().join(format!("loot-dup-happy-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        // The change to duplicate: it adds feature.txt on top of base.
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("add feature").unwrap();
+        ws.finalize_working().unwrap();
+        let source = ws.heads()[0].clone();
+        let source_cid = ws.repo().change_change_id(&source);
+        let source_tree = ws.repo().change_tree(&source).unwrap();
+        // A later change on the tip — the "different point in history" we will
+        // copy the source's content onto.
+        std::fs::write(dir.join("other.txt"), b"O").unwrap();
+        ws.snapshot("add other").unwrap();
+        ws.finalize_working().unwrap();
+        let tip = ws.heads()[0].clone();
+
+        // Duplicate the source, inserting it after the tip.
+        let tip_hex = loot_core::hex::encode(&tip.0);
+        let source_hex = loot_core::hex::encode(&source.0);
+        let report = ws.duplicate(&source_hex, Some(&tip_hex)).unwrap();
+
+        // A brand-new version id and a brand-new durable change id.
+        assert_ne!(report.version, source, "the copy is a distinct version");
+        assert!(report.change_id.is_some(), "an authored copy mints a durable handle");
+        assert_ne!(
+            report.change_id, source_cid,
+            "the copy carries a FRESH change id, not the source's"
+        );
+        // No predecessor edge back to the source — an independent change, not a
+        // superseding version (contrast `loot edit`).
+        assert!(
+            ws.repo().change_predecessors(&report.version).is_empty(),
+            "duplicate records no predecessor link to the source"
+        );
+        // The whole tree is reproduced address-for-address: the stored sealed
+        // objects are reused (ADR 0004), not re-sealed to new addresses.
+        assert_eq!(
+            ws.repo().change_tree(&report.version).unwrap(),
+            source_tree,
+            "the copy's tree is the source's tree, oid-for-oid (objects reused)"
+        );
+        // It lands at the requested parent, and is signed so it travels.
+        assert_eq!(
+            ws.repo().parents_of(&report.version),
+            vec![tip],
+            "the copy parents on the --after selector"
+        );
+        assert!(
+            ws.repo().change_signature(&report.version).is_some(),
+            "the copy is finalized (signed) and so propagates via push/bundle"
+        );
+        // The source is untouched.
+        assert_eq!(ws.repo().change_change_id(&source), source_cid);
+        assert_eq!(ws.repo().change_tree(&source).unwrap(), source_tree);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_refuses_to_reproduce_a_change_at_its_own_parent() {
+        // #398: a loot version id is content-addressed (ADR 0029), so copying a
+        // change's exact tree/message onto its OWN parent computes the source's
+        // own id — no distinct node exists. Duplicate refuses with the remedy
+        // rather than silently handing back the source.
+        let dir = std::env::temp_dir().join(format!("loot-dup-collide-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let base_id = ws.heads()[0].clone();
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("add feature").unwrap();
+        ws.finalize_working().unwrap();
+        let source = ws.heads()[0].clone();
+
+        // Duplicate the source AT its own parent (base) — an exact reproduction.
+        let base_hex = loot_core::hex::encode(&base_id.0);
+        let source_hex = loot_core::hex::encode(&source.0);
+        let err = ws.duplicate(&source_hex, Some(&base_hex)).unwrap_err();
+        assert!(err.message.contains("content-addressed"), "explains why: {}", err.message);
+        assert!(err.message.contains("--after"), "points at the remedy: {}", err.message);
+        // The graph is untouched — no phantom node, source keeps its identity.
+        assert_eq!(ws.heads(), vec![source], "no new head minted on the refusal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_defaults_to_placing_on_top_of_the_working_change() {
+        // #398: with no `--after`, the copy parents on the current working
+        // change, and the working change itself is left in place.
+        let dir = std::env::temp_dir().join(format!("loot-dup-default-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let source = ws.heads()[0].clone();
+        // An in-progress working change to stack the duplicate on top of.
+        std::fs::write(dir.join("wip.txt"), b"W").unwrap();
+        ws.snapshot("wip").unwrap();
+        let working = ws.working.clone().expect("a working change is in progress");
+
+        let source_hex = loot_core::hex::encode(&source.0);
+        let report = ws.duplicate(&source_hex, None).unwrap();
+
+        assert_eq!(report.parent, Some(working.clone()), "default parent is the working change");
+        assert_eq!(
+            ws.repo().parents_of(&report.version),
+            vec![working.clone()],
+            "the copy is stacked on top of the working change"
+        );
+        assert_eq!(
+            ws.working,
+            Some(working),
+            "the working change is left in place — duplicate does not become it"
+        );
+        assert!(ws.repo().change_predecessors(&report.version).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
