@@ -15,9 +15,11 @@ use crate::workspace::{
     ConflictSide, ConflictView, DeltaClass, EditReport, HistoryRow, HistoryView, PathDelta,
     WorkingRow,
 };
+use loot_core::manifest::GrantEntry;
 use loot_core::{verdict, MergeOutcome, Oid, Visibility};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 /// The em dash shown where an id is absent — a legacy change with no change id,
 /// or the empty working change's not-yet-computed version (ADR 0029/0030).
@@ -275,6 +277,17 @@ fn civil_date(unix_secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `YYYY-MM-DD HH:MM:SS UTC` for a unix timestamp — [`civil_date`]'s
+/// time-of-day twin, for callers (`grant-status`, #5) that want a grant's
+/// `granted_at` at full precision rather than a bare calendar date.
+fn civil_datetime(unix_secs: u64) -> String {
+    let secs_of_day = unix_secs % 86_400;
+    let h = secs_of_day / 3600;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    format!("{} {h:02}:{m:02}:{s:02} UTC", civil_date(unix_secs))
+}
+
 /// The human `loot diff --conflict <path>` view (#13): both sides of a
 /// conflict, each rendered through the shared #306 [`delta_line`] so the
 /// path/visibility/sealed-fallback shape matches `diff` and `status`, followed
@@ -349,6 +362,47 @@ pub fn render_buoy_human(
         BuoyResult::None => {
             let _ = writeln!(out, "no buoy for role '{role}'");
         }
+    }
+    out
+}
+
+/// The `loot grant-status <path>` report (#5): every grantee currently
+/// holding a grant for `path`'s content — a sanity check before running
+/// `loot maroon`. `entries` is the [`GrantEntry`] set for that path's current
+/// oid (`Manifest::grants_for`, caller-resolved so this stays a pure
+/// render — no `Workspace` in the test surface); `name_of` resolves a
+/// grantor pubkey to a peer name, falling back to its hex form when no
+/// registered peer matches (the same contract `render_buoy_human` uses).
+/// Delivery method is [`GrantEntry::has_grantor`]'s existing split (ADR
+/// 0008/0015): a file-based (tag-1) grant carries no envelope so no verified
+/// grantor; a relay-delivered (tag-3) grant does.
+pub fn render_grant_status(
+    path: &Path,
+    entries: &[&GrantEntry],
+    name_of: &dyn Fn(&[u8; 32]) -> String,
+) -> String {
+    let mut out = String::new();
+    if entries.is_empty() {
+        let _ = writeln!(out, "no grants found for {}", path.display());
+        return out;
+    }
+    let _ = writeln!(out, "grants for {}:", path.display());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{:<16} {:<24} {:<6} grantor", "grantee", "granted_at", "via");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let mut sorted: Vec<&&GrantEntry> = entries.iter().collect();
+    sorted.sort_by_key(|e| (e.granted_at, e.grantee.clone()));
+    for e in sorted {
+        let via = if e.has_grantor() { "relay" } else { "file" };
+        let grantor = if e.has_grantor() { name_of(&e.grantor_pubkey) } else { "(file)".to_string() };
+        let _ = writeln!(
+            out,
+            "{:<16} {:<24} {:<6} {}",
+            e.grantee,
+            civil_datetime(e.granted_at),
+            via,
+            grantor
+        );
     }
     out
 }
@@ -598,5 +652,80 @@ mod tests {
         let out = render_buoy_human(&ambiguous, "base", &single);
         assert!(out.contains("ambiguous: base is attested on 1 concurrent changes"));
         assert!(out.contains("run `loot attest <id> base`"));
+    }
+
+    #[test]
+    fn civil_datetime_adds_time_of_day_to_the_civil_date() {
+        // 1799971200 = 2027-01-15 00:00:00 UTC (the #306 sample); +3661s = 01:01:01.
+        assert_eq!(civil_datetime(1_799_971_200), "2027-01-15 00:00:00 UTC");
+        assert_eq!(civil_datetime(1_799_971_200 + 3_661), "2027-01-15 01:01:01 UTC");
+    }
+
+    fn grant(grantee: &str, grantor_pk: Option<u8>, granted_at: u64) -> GrantEntry {
+        let grantor_pubkey = match grantor_pk {
+            Some(b) => [b; 32],
+            None => loot_core::manifest::UNKNOWN_PUBKEY,
+        };
+        GrantEntry {
+            oid: oid(0x3f),
+            grantee: grantee.into(),
+            grantee_pubkey: [0xee; 32],
+            grantor_pubkey,
+            granted_at,
+        }
+    }
+
+    /// A peer-registry fixture: known pubkeys resolve to a name, anything else
+    /// falls back to its hex form — the same shape `resolve_pubkey_name` uses
+    /// in `main.rs`, reproduced here so `render_grant_status` stays testable
+    /// without a real `Workspace`/`PeerRegistry`.
+    fn peer_names(known: &'static [(u8, &'static str)]) -> impl Fn(&[u8; 32]) -> String {
+        move |pk: &[u8; 32]| {
+            known
+                .iter()
+                .find(|(b, _)| pk[0] == *b)
+                .map(|(_, name)| name.to_string())
+                .unwrap_or_else(|| format!("{:02x}…", pk[0]))
+        }
+    }
+
+    #[test]
+    fn grant_status_reports_no_grants_found_when_empty() {
+        let out = render_grant_status(&PathBuf::from("secret.env"), &[], &peer_names(&[]));
+        assert_eq!(out, "no grants found for secret.env\n");
+    }
+
+    #[test]
+    fn grant_status_lists_every_grantee_with_delivery_method_and_grantor_name() {
+        let alice = grant("alice", None, 1_799_971_200); // file-based (tag-1)
+        let bob = grant("bob", Some(0xbb), 1_799_971_200 + 60); // relay-delivered (tag-3)
+        let entries: Vec<&GrantEntry> = vec![&alice, &bob];
+        let out = render_grant_status(
+            &PathBuf::from("secret.env"),
+            &entries,
+            &peer_names(&[(0xbb, "carol")]),
+        );
+
+        assert!(out.contains("grants for secret.env:"), "{out}");
+        // Multi-grantee: both rows present.
+        let alice_line = out.lines().find(|l| l.starts_with("alice")).expect(&out);
+        let bob_line = out.lines().find(|l| l.starts_with("bob")).expect(&out);
+        // File-based grant: "file" delivery, no envelope grantor to resolve.
+        assert!(alice_line.contains("file") && alice_line.contains("(file)"), "{alice_line}");
+        assert!(alice_line.contains("2027-01-15"), "{alice_line}");
+        // Relay-delivered grant: "relay" delivery, grantor resolved to its peer name.
+        assert!(bob_line.contains("relay") && bob_line.contains("carol"), "{bob_line}");
+    }
+
+    #[test]
+    fn grant_status_falls_back_to_pubkey_when_grantor_is_an_unknown_peer() {
+        let stranger = grant("mallory", Some(0xcc), 1_799_971_200);
+        let entries: Vec<&GrantEntry> = vec![&stranger];
+        // No peer named for 0xcc — the resolver's fallback path.
+        let out = render_grant_status(&PathBuf::from("secret.env"), &entries, &peer_names(&[]));
+
+        assert!(out.contains("relay"), "{out}");
+        assert!(out.contains("cc…"), "unresolved grantor falls back to its pubkey: {out}");
+        assert!(!out.contains("(file)"), "a relay grant is never labelled file-based: {out}");
     }
 }

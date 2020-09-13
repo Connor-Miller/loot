@@ -149,6 +149,48 @@ pub fn load_objects_loose(obj_dir: &Path) -> Result<ObjectStore, RepoError> {
     Ok(objects)
 }
 
+/// What a loose-object integrity scan found on disk (#19): every address that
+/// has a file (`present`, corrupt or not — a corrupt file is present, so it is
+/// never also "missing"), and the subset whose file fails verification
+/// (`corrupt`: undecodable, or its content re-hashes to a different address).
+pub struct LooseObjectScan {
+    pub present: BTreeSet<Oid>,
+    pub corrupt: Vec<Oid>,
+}
+
+/// Re-verify every loose object file under `obj_dir` (#19): decode it and
+/// recompute its content address (`blake3(nonce || ciphertext)`,
+/// [`SealedObject::address`]) — the filename *is* the address, so any mismatch
+/// or decode failure is corruption, exactly. Read-only. Files whose name is not
+/// a 64-char hex address (leftover `*.tmp` stages) are skipped, as in the
+/// loader and the pruner. A missing directory scans as empty (a fresh repo
+/// persists nothing until its first object); an unreadable file propagates —
+/// "can't read" must never pass as "verified".
+pub fn scan_objects_loose(obj_dir: &Path) -> Result<LooseObjectScan, RepoError> {
+    let mut present = BTreeSet::new();
+    let mut corrupt = Vec::new();
+    let entries = match std::fs::read_dir(obj_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(LooseObjectScan { present, corrupt }),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| RepoError::Backend(e.to_string()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(addr) = crate::hex::decode_array::<32>(&name) else {
+            continue; // skip *.tmp and anything not a content address
+        };
+        let addr = Oid(addr);
+        let bytes = std::fs::read(entry.path()).map_err(|e| RepoError::Backend(e.to_string()))?;
+        match decode_object(&bytes) {
+            Ok(obj) if obj.address() == addr => {}
+            _ => corrupt.push(addr.clone()),
+        }
+        present.insert(addr);
+    }
+    Ok(LooseObjectScan { present, corrupt })
+}
+
 /// Delete loose object files under `obj_dir` whose address is not in
 /// `keep`, returning `(count, total_bytes)` of the files pruned. With `dry_run`,
 /// the files are only counted and sized — nothing is deleted. Files whose name
