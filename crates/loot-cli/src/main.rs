@@ -443,8 +443,12 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
                 short(&row.version),
                 row.message
             );
-            for (path, vis) in &row.entries {
-                println!("  {:<24} {}", path.display(), mark(vis));
+            // The per-path listing is the delta vs the previous finalized
+            // change (#7), rendered through the shared #306 line: `+` new,
+            // `M` modified, `-` deleted, visibility token trailing. The base
+            // is implicit (the working change's anchor) — no selector here.
+            for d in &ws.working_delta()? {
+                println!("{}", delta_line(d));
             }
         }
         // status is not a merge: its own working-change shape (ADR 0023/0029).
