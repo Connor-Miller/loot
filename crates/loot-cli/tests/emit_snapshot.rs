@@ -595,6 +595,49 @@ fn pull_reports_a_converged_change_in_every_format() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+// --- remote info (#10) ------------------------------------------------------
+
+/// `loot remote info` end-to-end through the real binary: register `origin`
+/// pointing at a live relay, then probe it. The default (no name) resolves
+/// `origin`, and an explicit name resolves the same remote — both print the
+/// relay's format version and its (open) allowlist.
+#[test]
+fn remote_info_probes_the_named_relay() {
+    let base = area("remote-info");
+    let relay_dir = base.join("relay");
+    let addr = "127.0.0.1:47512";
+    let relay_url = format!("http://{addr}");
+    std::thread::spawn({
+        let relay_dir = relay_dir.clone();
+        move || {
+            let _ = loot_net::serve(relay_dir, addr, vec![]);
+        }
+    });
+    for _ in 0..100 {
+        if loot_net::pull(&relay_url, &[]).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let repo = base.join("repo");
+    keyed_repo(&repo, "connor");
+    run(&repo, &["remote", "add", "origin", &relay_url]);
+
+    // Default: no name given → resolves `origin`.
+    let default = run(&repo, &["remote", "info"]);
+    assert!(default.contains(&format!("remote 'origin' → {relay_url}")), "names the resolved remote: {default}");
+    assert!(default.contains(&format!("format    v{FORMAT_MAJOR}.")), "reports the format version: {default}");
+    assert!(default.contains("zero-knowledge relay"), "a keyless relay reports no pubkey: {default}");
+    assert!(default.contains("allowlist open"), "an open relay reports an open allowlist: {default}");
+
+    // Explicit name resolves the same remote.
+    let named = run(&repo, &["remote", "info", "origin"]);
+    assert!(named.contains(&format!("remote 'origin' → {relay_url}")), "the named form resolves too: {named}");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 // --- machine error channel (#430) -------------------------------------------
 
 /// The whole contract, both directions: a `Workspace::open` failure in a

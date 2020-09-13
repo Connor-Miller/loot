@@ -38,6 +38,46 @@ pub use relay_store::{is_relay, RelayStore};
 /// from it and the two can never drift apart.
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Discovery payload the relay serves at `GET /info` (#10). It exposes only
+/// what an operator needs to debug an allowlist mismatch or a format skew from
+/// the outside — the loot format version this relay speaks, its push allowlist
+/// (hex ed25519 pubkeys, empty = open relay), and its own pubkey **if it has
+/// one**. A loot relay is zero-knowledge (empty keyring, ADR 0011), so
+/// `relay_pubkey` is normally `null`; the field exists for a future relay that
+/// signs its offers, not because this one does.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RelayInfo {
+    /// Human-readable version line, e.g. `"loot relay (format v9.0)"`.
+    pub version: String,
+    /// Wire-format major this relay reads/writes — the number that decides
+    /// whether a client's push is intelligible (a mismatch is the #361 outage).
+    pub format_major: u8,
+    /// Wire-format minor (forward-compatible within a major).
+    pub format_minor: u8,
+    /// Push allowlist as 64-char hex ed25519 pubkeys. Empty = open relay: any
+    /// validly signed push is accepted.
+    pub allowed_pubkeys: Vec<String>,
+    /// The relay's own pubkey, if it has one. `None` for a zero-knowledge relay.
+    pub relay_pubkey: Option<String>,
+}
+
+/// Build the info payload for `allowed_keys` (hex-encoded). Split out so the
+/// version/allowlist mapping is unit-testable without standing up a server.
+fn relay_info(allowed_keys: &[[u8; 32]]) -> RelayInfo {
+    RelayInfo {
+        version: format!(
+            "loot relay (format v{}.{})",
+            loot_core::format::FORMAT_MAJOR,
+            loot_core::format::FORMAT_MINOR
+        ),
+        format_major: loot_core::format::FORMAT_MAJOR,
+        format_minor: loot_core::format::FORMAT_MINOR,
+        allowed_pubkeys: allowed_keys.iter().map(|k| loot_core::hex::encode(k)).collect(),
+        // Zero-knowledge relay: it holds no keys of its own (ADR 0011).
+        relay_pubkey: None,
+    }
+}
+
 #[derive(Debug)]
 pub enum NetError {
     Io(String),
@@ -183,7 +223,7 @@ pub fn serve(dir: PathBuf, addr: &str, allowed_keys: Vec<[u8; 32]>) -> Result<()
 }
 
 async fn serve_async(store: RelayStore, dir: PathBuf, addr: &str, allowed_keys: Vec<[u8; 32]>) -> Result<(), NetError> {
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::Router;
 
     let state = ServerState {
@@ -192,6 +232,7 @@ async fn serve_async(store: RelayStore, dir: PathBuf, addr: &str, allowed_keys: 
         allowed_keys: Arc::new(allowed_keys),
     };
     let app = Router::new()
+        .route("/info", get(handle_info))
         .route("/stow", post(handle_stow))
         .route("/negotiate", post(handle_negotiate))
         .route("/offer", post(handle_offer))
@@ -212,6 +253,15 @@ async fn serve_async(store: RelayStore, dir: PathBuf, addr: &str, allowed_keys: 
     axum::serve(listener, app)
         .await
         .map_err(|e| NetError::Http(e.to_string()))
+}
+
+/// `GET /info` (#10): a keyless discovery probe. Returns this relay's format
+/// version, push allowlist, and (null) relay pubkey as JSON — enough to debug
+/// an allowlist mismatch or a format skew without shell access to the relay.
+async fn handle_info(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+) -> axum::Json<RelayInfo> {
+    axum::Json(relay_info(&state.allowed_keys))
 }
 
 async fn handle_stow(
@@ -476,6 +526,24 @@ pub fn wants(base_url: &str, offered: &[Oid]) -> Result<Vec<Oid>, NetError> {
     decode_addrs(&bytes)
 }
 
+/// `loot remote info` (#10): a plain `GET <base_url>/info`, decoding the relay's
+/// discovery JSON. No auth and no body — the payload is public metadata. Works
+/// over HTTP and HTTPS alike (reqwest carries the rustls stack).
+pub fn info(base_url: &str) -> Result<RelayInfo, NetError> {
+    let url = format!("{}/info", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| NetError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(relay_rejected("info", resp.status(), &resp.text().unwrap_or_default()));
+    }
+    let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| NetError::Http(format!("malformed /info response (is this a loot relay?): {e}")))
+}
+
 /// Helper: load a working repo's heads for the pull `have` list, given its
 /// `.loot/` dir and working root.
 pub fn heads_of(dot: &Path, root: PathBuf) -> Result<Vec<Oid>, NetError> {
@@ -618,6 +686,38 @@ mod tests {
         assert!(s.contains("relay rejected pull"), "keeps the base message: {s}");
         assert!(!s.contains("redeploy"), "no spurious redeploy hint: {s}");
         assert!(!s.contains("body limit"), "no spurious 413 hint: {s}");
+    }
+
+    #[test]
+    fn relay_info_reports_format_version_and_hexes_the_allowlist() {
+        // Open relay: no allowlisted keys, no relay pubkey, but the format
+        // version is always reported (it is what a client checks compatibility
+        // against).
+        let open = relay_info(&[]);
+        assert_eq!(open.format_major, loot_core::format::FORMAT_MAJOR);
+        assert_eq!(open.format_minor, loot_core::format::FORMAT_MINOR);
+        assert!(open.allowed_pubkeys.is_empty(), "open relay has an empty allowlist");
+        assert_eq!(open.relay_pubkey, None, "a zero-knowledge relay has no pubkey");
+        assert!(open.version.contains("format v"), "version line names the format: {}", open.version);
+
+        // With an allowlist: each key is a 64-char hex string.
+        let info = relay_info(&[[0x11u8; 32], [0xabu8; 32]]);
+        assert_eq!(info.allowed_pubkeys.len(), 2);
+        assert_eq!(info.allowed_pubkeys[0], "11".repeat(32));
+        assert_eq!(info.allowed_pubkeys[1], "ab".repeat(32));
+    }
+
+    #[test]
+    fn relay_info_round_trips_through_json() {
+        // The struct the client decodes is the struct the server encodes — a
+        // serde round-trip pins the wire contract the two ends share.
+        let info = relay_info(&[[0x42u8; 32]]);
+        let json = serde_json::to_vec(&info).unwrap();
+        let back: RelayInfo = serde_json::from_slice(&json).unwrap();
+        assert_eq!(info, back);
+        // relay_pubkey serializes as JSON null, not omitted.
+        let text = String::from_utf8(json).unwrap();
+        assert!(text.contains("\"relay_pubkey\":null"), "null pubkey stays explicit: {text}");
     }
 
     #[test]

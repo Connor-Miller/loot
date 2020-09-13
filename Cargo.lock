@@ -1175,6 +1175,8 @@ dependencies = [
  "loot-core",
  "loot-identity",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

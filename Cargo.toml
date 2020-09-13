@@ -42,6 +42,10 @@ ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 git2 = { version = "0.19", default-features = false }
 rand = "0.8"
 chacha20poly1305 = "0.10"
+# JSON only for the relay's `GET /info` discovery endpoint (#10) — the sync
+# wire formats stay hand-rolled binary; this is the one human-readable surface.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]
