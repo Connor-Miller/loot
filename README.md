@@ -173,6 +173,7 @@ loot lanes                               list lanes with their tip, in-flight PR
 loot lane merge <id-or-name>             fold a named lane's finalized line into the primary (CA2)
 loot log                                 show change history with visibility hints
 loot gc [--dry-run]                      prune loose objects no change references
+loot verify                              integrity-check the object store (exits 1 on corrupt/missing)
 loot bundle <file>                       write a sync bundle (ciphertext, no keys)
 loot apply <file>                        merge a peer's bundle (idempotent)
 loot grant <path> <identity> <file>      write a targeted grant bundle (file delivery)
