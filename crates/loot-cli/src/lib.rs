@@ -24,6 +24,7 @@ pub mod flags;
 pub mod grep;
 mod kv;
 pub mod ledger;
+pub mod pick;
 mod policy;
 mod position;
 pub mod reconcile;

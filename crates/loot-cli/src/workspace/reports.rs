@@ -147,6 +147,25 @@ pub struct PullReport {
     pub deferred: Option<Oid>,
 }
 
+/// What `loot cherry-pick` / `loot revert` did (#392/#393). Carries the per-path
+/// merge outcomes for the verdict rows, the sealed paths that were skipped
+/// (unopenable, so uncherry-pickable), whether the delta conflicted (recorded
+/// for `loot resolve`, nothing minted), and the new change's id on the clean
+/// path.
+#[derive(Debug)]
+pub struct DeltaReport {
+    /// Per touched-path merge outcome, for rendering the verdict rows.
+    pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
+    /// Delta paths skipped because this identity cannot open the content the
+    /// delta introduces — reported as a warning, never fatal.
+    pub skipped: Vec<PathBuf>,
+    /// The delta conflicted with the working line: conflicts recorded, nothing
+    /// applied or minted (`change` is `None`).
+    pub conflicted: bool,
+    /// The new change's id on a clean apply, else `None` (a conflict stop).
+    pub change: Option<Oid>,
+}
+
 /// What a completed `undo`/`op restore` did, for CLI reporting (ADR 0031).
 #[derive(Debug)]
 pub struct StepReport {

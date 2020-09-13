@@ -64,6 +64,31 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// One clean delta path's plaintext action, from
+/// [`DagRepo::change_delta_merge`]: `Some(bytes)` writes/overwrites the content,
+/// `None` deletes the path. The caller applies these to the working tree and
+/// snapshots, so the delta is **re-sealed under the current `.lootattributes`**
+/// — never the source change's policy (`loot cherry-pick`/`revert`, #392/#393).
+pub type DeltaAction = Option<Vec<u8>>;
+
+/// The result of computing a change's parent-delta and 3-way merging it onto a
+/// working line — the shared core of `loot cherry-pick` and `loot revert`
+/// ([`DagRepo::change_delta_merge`]).
+#[derive(Clone, Debug, Default)]
+pub struct DeltaMerge {
+    /// Per touched-path verdict, for reporting (same labels as `apply`).
+    pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
+    /// Clean delta paths to apply as plaintext — empty when the delta conflicted
+    /// (nothing is applied on a conflict, exactly like `apply`).
+    pub actions: BTreeMap<PathBuf, DeltaAction>,
+    /// Delta paths skipped because this identity cannot open the content the
+    /// delta introduces (the key oracle returned `None`) — reported, not fatal.
+    pub skipped: Vec<PathBuf>,
+    /// Whether the delta conflicted with the working line. On `true` the
+    /// conflicts are recorded in the repo's conflicts map and `actions` is empty.
+    pub conflicted: bool,
+}
+
 /// Returned by `gc`: how many loose objects were (or, on a dry run, would be)
 /// pruned, and the total bytes they occupied on disk (ADR 0012, #66).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1629,6 +1654,135 @@ impl DagRepo {
         };
         let id = self.record(change)?;
         Ok((id, merged.outcomes))
+    }
+
+    /// Compute `target`'s **parent-delta** (its tree vs. its parent's tree) and
+    /// 3-way merge it onto `working`'s tree — the shared core of `loot
+    /// cherry-pick` (`invert = false`) and `loot revert` (`invert = true`, which
+    /// swaps additions and deletions). The merge is the exact ADR 0001 rule
+    /// [`merge_tips`](DagRepo::merge_tips)/`apply` use ([`converge::merge_trees`]),
+    /// with `target`'s "before" side as the base — so a `working` line that never
+    /// touched a delta path takes the delta cleanly, while a genuine same-path
+    /// divergence is a `Conflict` recorded for `loot resolve`.
+    ///
+    /// Parent-delta corner cases (the report's question): a **root** change (no
+    /// parents) diffs against the *empty* tree, so its whole tree is the delta
+    /// (all additions); a **merge** change diffs against its **first** parent —
+    /// the same first-parent convention [`carry_line`](DagRepo::carry_line) and
+    /// blame walk with — so a cherry-pick of a merge replays the first-parent
+    /// delta.
+    ///
+    /// Sealed-path gate: a delta path whose introduced content this identity
+    /// cannot open (the key oracle returns `None`) is **skipped** and reported in
+    /// [`DeltaMerge::skipped`], never fatal — you cannot re-seal plaintext you
+    /// cannot read, and the source change's own visibility does not travel with a
+    /// cherry-pick (the caller re-seals under the *current* policy).
+    ///
+    /// On conflict this records the conflicts in the repo's conflicts map (so
+    /// `loot resolve` sees them, exactly as `apply` does) and returns
+    /// [`DeltaMerge::actions`] empty; otherwise it mutates nothing and the caller
+    /// applies the plaintext `actions`. The predecessor graph is **not** touched:
+    /// a cherry-pick is a new change, not a superseding version of `target`.
+    pub fn change_delta_merge(
+        &mut self,
+        working: &Oid,
+        target: &Oid,
+        invert: bool,
+        now: u64,
+    ) -> DeltaMerge {
+        let working_tree = self.graph.tree_at(working);
+        let target_tree = self.graph.tree_at(target);
+        // The parent-delta's base tree: the target's first parent (root -> empty).
+        let parent_tree = self
+            .graph
+            .get(target)
+            .and_then(|n| n.parents.first().cloned())
+            .map(|p| self.graph.tree_at(&p))
+            .unwrap_or_default();
+
+        // Forward applies `target`'s side over its parent; invert swaps them, so
+        // an addition (parent lacks, target has) becomes a deletion and a
+        // deletion becomes a re-addition.
+        let (theirs_full, base_full): (&converge::Tree, &converge::Tree) =
+            if invert { (&parent_tree, &target_tree) } else { (&target_tree, &parent_tree) };
+
+        // The delta = every path the change actually touched (target vs. parent
+        // differ). A change reuses a path's sealed object when content and
+        // visibility are unchanged (#98), so entry inequality here is a real edit.
+        let mut delta_paths: BTreeSet<PathBuf> = BTreeSet::new();
+        for (path, entry) in &target_tree {
+            if parent_tree.get(path) != Some(entry) {
+                delta_paths.insert(path.clone());
+            }
+        }
+        for (path, entry) in &parent_tree {
+            if target_tree.get(path) != Some(entry) {
+                delta_paths.insert(path.clone());
+            }
+        }
+
+        // Restrict the 3-way to the delta's paths, dropping any whose introduced
+        // content we cannot open (skipped, reported). `theirs`/`base` are the two
+        // trees `merge_trees` walks: an add/modify rides in `theirs`, a deletion
+        // rides in `base` only (the symmetric ours-vs-base pass sees it there).
+        let mut theirs: converge::Tree = BTreeMap::new();
+        let mut base: converge::Tree = BTreeMap::new();
+        let mut skipped: Vec<PathBuf> = Vec::new();
+        for path in &delta_paths {
+            if let Some(entry) = theirs_full.get(path) {
+                // The content the delta would introduce — we must read it to
+                // re-seal it, so an unopenable side cannot be cherry-picked.
+                if self.get(&entry.0, &self.identity, now).is_err() {
+                    skipped.push(path.clone());
+                    continue;
+                }
+                theirs.insert(path.clone(), entry.clone());
+            }
+            if let Some(entry) = base_full.get(path) {
+                base.insert(path.clone(), entry.clone());
+            }
+        }
+
+        let merged = converge::merge_trees(&working_tree, &theirs, Some(&base), self, now);
+
+        if !merged.conflicts.is_empty() {
+            // Record conflicts so `loot conflicts`/`loot resolve` see them —
+            // `target`'s side stays reachable through `target` itself — and mint
+            // nothing (the caller stops, leaving the working line untouched).
+            for (path, pair) in &merged.conflicts {
+                self.conflicts.insert(path.clone(), pair.clone());
+            }
+            return DeltaMerge {
+                outcomes: merged.outcomes,
+                actions: BTreeMap::new(),
+                skipped,
+                conflicted: true,
+            };
+        }
+
+        // Clean: turn each delta path's chosen content in the merged tree into a
+        // plaintext action the caller writes and re-seals. Present -> write the
+        // (opened) bytes; absent -> a deletion won, remove the path.
+        let mut actions: BTreeMap<PathBuf, DeltaAction> = BTreeMap::new();
+        for path in &delta_paths {
+            if skipped.contains(path) {
+                continue;
+            }
+            match merged.tree.get(path) {
+                Some((oid, _vis)) => match self.get(oid, &self.identity, now) {
+                    Ok(bytes) => {
+                        actions.insert(path.clone(), Some(bytes));
+                    }
+                    // A kept path should be openable; if not, skip rather than
+                    // write blind.
+                    Err(_) => skipped.push(path.clone()),
+                },
+                None => {
+                    actions.insert(path.clone(), None);
+                }
+            }
+        }
+        DeltaMerge { outcomes: merged.outcomes, actions, skipped, conflicted: false }
     }
 
     /// Carry the first-parent suffix of `ours` that `onto` does not cover onto
@@ -3704,6 +3858,117 @@ mod tests {
         assert!(repo
             .snapshot(None, Some(&w2), &[entry("fix.rs", b"cve", Visibility::Embargoed { reveal_at: 100 }), entry("a.md", b"x", restricted)], "wip", 0)
             .is_ok());
+    }
+
+    // --- change_delta_merge: the cherry-pick/revert shared core (#392/#393) ---
+
+    #[test]
+    fn cherry_pick_delta_re_applies_an_addition_onto_a_sibling_line() {
+        // A change that added feature.txt over its parent, cherry-picked onto a
+        // sibling line that never had it: the addition applies cleanly.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Public)], "base", 0).unwrap();
+        let t = repo
+            .snapshot(
+                Some(&b),
+                None,
+                &[entry("a.txt", b"base", Visibility::Public), entry("feature.txt", b"F", Visibility::Public)],
+                "add feature",
+                0,
+            )
+            .unwrap();
+        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"base", Visibility::Public)], "wip", 0).unwrap();
+
+        let dm = repo.change_delta_merge(&w, &t, false, 0);
+        assert!(!dm.conflicted, "a clean add never conflicts");
+        assert!(dm.skipped.is_empty(), "nothing sealed to skip");
+        assert_eq!(
+            dm.actions.get(&PathBuf::from("feature.txt")),
+            Some(&Some(b"F".to_vec())),
+            "the addition is applied as plaintext, ready to re-seal"
+        );
+        assert!(!dm.actions.contains_key(&PathBuf::from("a.txt")), "only the delta's path is touched");
+    }
+
+    #[test]
+    fn revert_delta_inverts_an_addition_into_a_deletion() {
+        // The inverse of a change that added feature.txt is a deletion of it,
+        // applied onto a line that has it (the change's own line).
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Public)], "base", 0).unwrap();
+        let t = repo
+            .snapshot(
+                Some(&b),
+                None,
+                &[entry("a.txt", b"base", Visibility::Public), entry("feature.txt", b"F", Visibility::Public)],
+                "add feature",
+                0,
+            )
+            .unwrap();
+
+        let dm = repo.change_delta_merge(&t, &t, true, 0);
+        assert!(!dm.conflicted);
+        assert_eq!(
+            dm.actions.get(&PathBuf::from("feature.txt")),
+            Some(&None),
+            "reverting an addition deletes the path"
+        );
+    }
+
+    #[test]
+    fn change_delta_merge_records_a_conflict_and_mints_nothing() {
+        // The delta and the working line edited the same path differently — a
+        // genuine conflict, recorded for `loot resolve`, with no action applied.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base\n", Visibility::Public)], "base", 0).unwrap();
+        let t = repo.snapshot(Some(&b), None, &[entry("a.txt", b"target\n", Visibility::Public)], "t", 0).unwrap();
+        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"divergent\n", Visibility::Public)], "w", 0).unwrap();
+
+        let dm = repo.change_delta_merge(&w, &t, false, 0);
+        assert!(dm.conflicted, "same-path divergence conflicts");
+        assert!(dm.actions.is_empty(), "nothing is applied on a conflict — exactly like apply");
+        assert!(
+            repo.conflicts().contains_key(&PathBuf::from("a.txt")),
+            "the conflict is recorded so `loot resolve` sees it"
+        );
+    }
+
+    #[test]
+    fn change_delta_merge_skips_a_sealed_path_it_cannot_open() {
+        // A delta path whose introduced content this identity cannot open (still
+        // embargoed) is skipped and reported — you cannot re-seal what you cannot
+        // read — never fatal, and never applied.
+        let embargoed = Visibility::Embargoed { reveal_at: 9_999_999_999 };
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let b = repo.snapshot(None, None, &[entry("a.txt", b"base", Visibility::Public)], "base", 0).unwrap();
+        let t = repo
+            .snapshot(
+                Some(&b),
+                None,
+                &[entry("a.txt", b"base", Visibility::Public), entry("secret.txt", b"cve", embargoed)],
+                "add secret",
+                0,
+            )
+            .unwrap();
+        let w = repo.snapshot(Some(&b), None, &[entry("a.txt", b"base", Visibility::Public)], "wip", 0).unwrap();
+
+        let dm = repo.change_delta_merge(&w, &t, false, 0);
+        assert!(!dm.conflicted);
+        assert_eq!(dm.skipped, vec![PathBuf::from("secret.txt")], "the unopenable path is skipped");
+        assert!(!dm.actions.contains_key(&PathBuf::from("secret.txt")), "and never applied");
+    }
+
+    #[test]
+    fn cherry_pick_of_a_root_change_diffs_against_the_empty_tree() {
+        // A root change (no parents) has its whole tree as the delta. Cherry-
+        // picking it onto a disjoint line adopts every path it introduced.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let root = repo.snapshot(None, None, &[entry("r.txt", b"R", Visibility::Public)], "root", 0).unwrap();
+        let w = repo.snapshot(None, None, &[entry("other.txt", b"O", Visibility::Public)], "w", 0).unwrap();
+
+        let dm = repo.change_delta_merge(&w, &root, false, 0);
+        assert!(!dm.conflicted);
+        assert_eq!(dm.actions.get(&PathBuf::from("r.txt")), Some(&Some(b"R".to_vec())));
     }
 
     #[test]

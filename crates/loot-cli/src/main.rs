@@ -8,7 +8,7 @@
 use loot_cli::emit::{self, Emit, OutFmt};
 use loot_cli::error::CliError;
 use loot_cli::flags::{FlagCheck, FlagSpec};
-use loot_cli::{ferry, grep, render, workspace};
+use loot_cli::{ferry, grep, pick, render, workspace};
 use loot_core::{
     verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Visibility,
 };
@@ -155,6 +155,8 @@ const COMMANDS: &[Verb] = &[
     verb("edit", &[], &[], cmd_edit),
     verb("abandon", &[], &["--head"], cmd_abandon),
     verb("adopt", &[], &["--discard-wip", "--seal-wip"], cmd_adopt),
+    verb("cherry-pick", &[], OUT, pick::cmd_cherry_pick),
+    verb("revert", &[], OUT, pick::cmd_revert),
     verb("undo", &[], &[], |_| cmd_undo()),
     verb("op", &[], &[], cmd_op),
     verb("surface", &[], OUT, cmd_surface),
@@ -217,6 +219,8 @@ usage:
   loot abandon --head <selector>            drop an independent live head (a whole fork tip); undoable
   loot adopt                                catch this position up to landed main by merging it in (keeps the local line); undoable
   loot adopt <version-id> [--discard-wip]   settle this position onto a landed change, discarding the divergent line (no merge); undoable
+  loot cherry-pick <selector> [--porcelain|--json]  apply a change's delta (its tree vs its parent) forward onto the current line as a NEW change, re-sealed under the current .lootattributes; selectors: @, HEAD, HEAD~<n>, id prefix; sealed paths you can't open are skipped; conflicts stop like `apply` (#392)
+  loot revert <selector> [--porcelain|--json]  apply the INVERSE of a change's delta onto the current line, minting `revert: <subject>`; same conflict + key-oracle gate as cherry-pick (#393)
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)

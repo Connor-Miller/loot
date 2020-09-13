@@ -35,8 +35,8 @@ pub use lanes::{LaneStatus, SpawnedLane, SweepOutcome};
 /// stay stable for main.rs and render.rs.
 mod reports;
 pub use reports::{
-    AdoptCatchupReport, AdoptReport, BurnReport, ConflictSide, ConflictView, DeltaClass, EditReport,
-    PathDelta, PullReport, StepReport, WorkingRow,
+    AdoptCatchupReport, AdoptReport, BurnReport, ConflictSide, ConflictView, DeltaClass,
+    DeltaReport, EditReport, PathDelta, PullReport, StepReport, WorkingRow,
 };
 
 const DOT: &str = ".loot";
@@ -522,6 +522,80 @@ impl Workspace {
         self.with_repo(|repo| {
             repo.apply_with(&loot_core::SyncBundle(bytes), now, &abandoned)
                 .map_err(CliError::from)
+        })
+    }
+
+    /// Shared core of `loot cherry-pick` and `loot revert` (#392/#393): apply the
+    /// change `target`'s parent-delta — forward (`invert = false`) or inverted
+    /// (`invert = true`) — onto the current line as a new change named `subject`.
+    ///
+    /// Capture-first (ADR 0030), like `apply`: fold uncaptured disk edits into
+    /// the working change before the 3-way, so nothing is lost. The merge itself
+    /// reuses the exact `apply`/`merge_tips` classifier
+    /// ([`DagRepo::change_delta_merge`]). On **conflict** the conflicts are
+    /// recorded for `loot resolve` and the working tree is left untouched —
+    /// nothing minted, exactly `apply`'s stop. On a **clean** delta the openable
+    /// paths are written to the working tree and snapshotted under `subject`, so
+    /// the delta **re-seals under the current `.lootattributes`** (never the
+    /// source change's policy); paths this identity cannot open are skipped and
+    /// named in [`DeltaReport::skipped`]. The predecessor graph is not touched: a
+    /// cherry-pick is a new change, not a superseding version of `target`.
+    pub fn apply_change_delta(
+        &mut self,
+        target: &Oid,
+        invert: bool,
+        subject: &str,
+    ) -> Result<DeltaReport, CliError> {
+        // Fold any uncaptured disk edits into the working change first (#219), so
+        // the 3-way sees the operator's live tree and a later snapshot can never
+        // silently overwrite it.
+        self.capture_uncaptured_edits()?;
+        // The line we apply onto: the in-progress working change if there is one,
+        // else the finalized tip.
+        let ours = self
+            .working
+            .clone()
+            .or_else(|| self.anchor())
+            .ok_or("nothing to apply onto yet — record a change first (`loot new`)")?;
+
+        let now = self.now;
+        let merged = self.repo.change_delta_merge(&ours, target, invert, now);
+
+        if merged.conflicted {
+            // Conflicts are recorded in the repo; persist them for `loot
+            // conflicts`/`loot resolve`, then stop — the working tree is untouched.
+            self.persist()?;
+            return Ok(DeltaReport {
+                outcomes: merged.outcomes,
+                skipped: merged.skipped,
+                conflicted: true,
+                change: None,
+            });
+        }
+
+        // Apply the clean plaintext actions to the working tree, then snapshot so
+        // the delta re-seals under the current `.lootattributes`.
+        for (path, action) in &merged.actions {
+            let full = self.root.join(path);
+            match action {
+                Some(bytes) => {
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+                    }
+                    std::fs::write(&full, bytes).map_err(|e| format!("write {}: {e}", full.display()))?;
+                }
+                None => {
+                    let _ = std::fs::remove_file(&full);
+                }
+            }
+        }
+        let (id, _) = self.snapshot(subject)?;
+        Ok(DeltaReport {
+            outcomes: merged.outcomes,
+            skipped: merged.skipped,
+            conflicted: false,
+            change: Some(id),
         })
     }
 
@@ -7007,6 +7081,89 @@ mod tests {
         // via the merge change's second parent — no side dropped.
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"home side\n");
         let _ = std::fs::remove_dir_all(&area);
+    }
+
+    // --- cherry-pick / revert at the workspace seam (#392/#393) --------------
+
+    #[test]
+    fn cherry_pick_re_applies_a_change_delta_onto_the_current_line() {
+        let dir = std::env::temp_dir().join(format!("loot-cp-happy-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        // The change to cherry-pick: it adds feature.txt.
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("add feature").unwrap();
+        ws.finalize_working().unwrap();
+        let target = ws.heads()[0].clone();
+        // The current line then drops feature.txt (a sibling-shaped history).
+        std::fs::remove_file(dir.join("feature.txt")).unwrap();
+        ws.snapshot("drop feature").unwrap();
+        ws.finalize_working().unwrap();
+        assert!(!dir.join("feature.txt").exists(), "precondition: feature is gone");
+
+        let report = ws.apply_change_delta(&target, false, "add feature").unwrap();
+        assert!(!report.conflicted);
+        assert!(report.skipped.is_empty());
+        assert!(report.change.is_some(), "a new change was minted");
+        assert_eq!(std::fs::read(dir.join("feature.txt")).unwrap(), b"F", "the delta re-applied to disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_undoes_a_change_delta_and_names_it_revert() {
+        let dir = std::env::temp_dir().join(format!("loot-revert-happy-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("add feature").unwrap();
+        ws.finalize_working().unwrap();
+        let target = ws.heads()[0].clone();
+
+        let report = ws.apply_change_delta(&target, true, "revert: add feature").unwrap();
+        assert!(!report.conflicted);
+        assert!(!dir.join("feature.txt").exists(), "reverting the addition deletes the file");
+        assert_eq!(
+            ws.working_message().as_deref(),
+            Some("revert: add feature"),
+            "the new change carries the revert subject"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cherry_pick_records_a_conflict_and_leaves_the_tree_untouched() {
+        let dir = std::env::temp_dir().join(format!("loot-cp-conflict-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"base\n").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        // The change to cherry-pick edits a.txt one way...
+        std::fs::write(dir.join("a.txt"), b"target\n").unwrap();
+        ws.snapshot("target edit").unwrap();
+        ws.finalize_working().unwrap();
+        let target = ws.heads()[0].clone();
+        // ...and the current line edits it another way.
+        std::fs::write(dir.join("a.txt"), b"divergent\n").unwrap();
+        ws.snapshot("divergent edit").unwrap();
+        ws.finalize_working().unwrap();
+
+        let report = ws.apply_change_delta(&target, false, "target edit").unwrap();
+        assert!(report.conflicted, "a genuine same-path divergence conflicts");
+        assert!(report.change.is_none(), "nothing minted on a conflict");
+        assert!(
+            ws.repo().conflicts().contains_key(&PathBuf::from("a.txt")),
+            "the conflict is recorded for `loot resolve`"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"divergent\n",
+            "the working tree is left untouched — ours stays on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
