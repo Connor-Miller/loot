@@ -671,14 +671,17 @@ impl Workspace {
         // change (e.g. `loot new` right after a clean dock merge already sealed the
         // tip) there is nothing to finalize — leave the dock's tip intact.
         //
-        // A lane (ADR 0034) is on the home dock but is *born with a seeded tip*
-        // (spawn pins it at the finalized anchor over the shared store), so
-        // `docks_active()` is false yet the tip is real and must advance — else
-        // it stays stuck at the spawn anchor while `heads` moves on, and a land
-        // from the lane aims git-main at the parent, moving nothing (caught live
-        // by the #195 guard while dogfooding ADR 0036). Advance the tip for a
-        // lane too.
-        if self.docks_active() || self.lane_id.is_some() {
+        // A seeded tip must always advance, even on the pristine-looking home
+        // dock. Two ways the home dock ends up with a real tip while
+        // `docks_active()` is false and it is not a lane: a lane (ADR 0034) is
+        // born with a spawn-seeded tip, and `loot adopt`/`dock merge` (ADR
+        // 0034/0022) pin the home dock's tip on a landed change. In either case
+        // dropping the working change without advancing leaves the tip stuck at
+        // the seed while `heads` moves on, so a land aims git-main at the change's
+        // parent and moves nothing (the #195 guard caught both live — the lane
+        // case dogfooding ADR 0036, the home-dock adopt case landing #234).
+        // `tip.is_some()` subsumes the lane predicate but both are kept explicit.
+        if self.docks_active() || self.lane_id.is_some() || self.tip.is_some() {
             if self.working.is_some() {
                 self.tip = self.working.take();
                 let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
@@ -4616,6 +4619,41 @@ mod tests {
         // And it is the lane's single head — tip and frontier agree.
         assert_eq!(lw.heads(), finalized.into_iter().collect::<Vec<_>>(), "tip == the head");
         let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn finalize_advances_a_seeded_home_dock_tip() {
+        // Regression (#234 land dogfood): `loot adopt`/`dock merge` pins a tip on
+        // the *home* dock, but with no other docks `docks_active()` is false and it
+        // is not a lane — so finalize dropped the signed change WITHOUT advancing
+        // the seeded tip, leaving the dock stuck at the adopt anchor while the
+        // change orphaned. A land then aimed git-main at the anchor and moved
+        // nothing (the #195 guard caught it live). This is the home-dock twin of
+        // the lane seeded-tip case above (ADR 0036).
+        let dir = std::env::temp_dir().join(format!("loot-234-seeded-tip-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (a, _b) = seed_fork(&mut ws);
+        seed_mirror_main(&ws, &"a".repeat(40), &a);
+
+        // Adopt pins the home dock's tip on `a` (a seeded tip; no other docks).
+        let a_hex = loot_core::hex::encode(&a.0);
+        ws.adopt(&a_hex, true).unwrap();
+        assert_eq!(ws.finalized_anchor(), Some(a.clone()), "adopt seeded the tip on the target");
+
+        // Work + finalize on the home dock.
+        std::fs::write(dir.join("work.txt"), b"docs").unwrap();
+        ws.snapshot("home work").unwrap();
+        let finalized = ws.finalize_capturing(&[], false).unwrap();
+
+        assert!(finalized.is_some(), "the change was finalized");
+        assert_ne!(ws.finalized_anchor(), Some(a.clone()), "tip must leave the adopt anchor");
+        assert_eq!(ws.finalized_anchor(), finalized, "the finalized change is the new tip");
+        assert_eq!(
+            ws.repo().heads(),
+            finalized.into_iter().collect::<Vec<_>>(),
+            "tip == the head",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
