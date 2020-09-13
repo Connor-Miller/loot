@@ -1355,6 +1355,13 @@ impl DagRepo {
             .collect()
     }
 
+    /// Whether a change's full tree (the same one `log_detailed` sizes)
+    /// includes `path` — the predicate `loot log --path` filters on (#6).
+    /// `false` for an unknown version id, exactly like an absent path.
+    pub fn change_has_path(&self, id: &Oid, path: &Path) -> bool {
+        self.graph.get(id).is_some_and(|c| c.tree.contains_key(path))
+    }
+
     /// The live, non-durable **version id** for a working tree, plus whether it
     /// is **empty** (no delta vs `tip`) — the figure read-only `status`/`log`
     /// show for the working change (ADR 0030). Computed WITHOUT sealing or
@@ -2732,6 +2739,40 @@ mod tests {
         );
         assert!(obj_dir.join(crate::hex::encode(&new_oid.0)).exists(), "head object retained");
         assert!(!obj_dir.join(crate::hex::encode(&orphan.0)).exists(), "orphan deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #6: `change_has_path` is the primitive `loot log --path` filters on —
+    /// a straight lookup against a change's own recorded (full, not delta)
+    /// tree, the same one `log_detailed` sizes. An unknown id has no path,
+    /// same as an absent one.
+    #[test]
+    fn change_has_path_checks_the_recorded_tree() {
+        let dir = std::env::temp_dir().join(format!("loot-6-change-has-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let a_oid = repo.put(b"a\n", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a.txt"), (a_oid.clone(), Visibility::Public));
+        let c1 = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "adds a".into(), tree: t1 })
+            .unwrap();
+
+        let b_oid = repo.put(b"b\n", Visibility::Public).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("a.txt"), (a_oid, Visibility::Public));
+        t2.insert(PathBuf::from("b.txt"), (b_oid, Visibility::Public));
+        let c2 = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "adds b".into(), tree: t2 })
+            .unwrap();
+
+        assert!(repo.change_has_path(&c1, Path::new("a.txt")));
+        assert!(!repo.change_has_path(&c1, Path::new("b.txt")), "c1's tree never held b.txt");
+        assert!(repo.change_has_path(&c2, Path::new("a.txt")));
+        assert!(repo.change_has_path(&c2, Path::new("b.txt")));
+        assert!(!repo.change_has_path(&Oid([0xff; 32]), Path::new("a.txt")), "unknown id has no path");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
