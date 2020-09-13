@@ -15,8 +15,8 @@
 
 use crate::emit::{self, Emit};
 use crate::error::CliError;
-use crate::render::short;
-use crate::workspace::Workspace;
+use crate::render::{short, short_change};
+use crate::workspace::{AbsorbStay, Workspace};
 use std::fmt::Write as _;
 
 /// `loot split -m <subject> <path...>` — cut the named paths out of the working
@@ -80,6 +80,55 @@ pub fn cmd_squash(args: &[String]) -> Result<Box<dyn Emit>, CliError> {
                 let _ = writeln!(out, "  {}", path.display());
             }
             let _ = writeln!(out, "resolve them (`loot resolve <path> <file>`), then retry");
+        }
+    }
+    Ok(Box::new(emit::Message::new(out)))
+}
+
+/// `loot absorb` — distribute the working change's hunks into the nearest
+/// ancestor that last modified each one (#399). No arguments in v1: it operates
+/// on the whole working change, moving what it can attribute and reporting what
+/// stayed (a new file / novel line, or a hunk whose owning ancestor is sealed).
+pub fn cmd_absorb(_args: &[String]) -> Result<Box<dyn Emit>, CliError> {
+    let mut ws = Workspace::open().map_err(CliError::no_repo)?;
+    let report = ws.absorb()?;
+
+    let mut out = String::new();
+    if report.absorbed.is_empty() {
+        let _ = writeln!(
+            out,
+            "absorb: no hunk had a clear ancestor to fold into — the working change is unchanged"
+        );
+    } else {
+        let g = ws.graph();
+        let _ = writeln!(
+            out,
+            "absorbed {} hunk(s) into their nearest ancestor:",
+            report.absorbed.len()
+        );
+        for (path, ancestor) in &report.absorbed {
+            let handle = g
+                .change_id(ancestor)
+                .map(|c| short_change(&c))
+                .unwrap_or_else(|| short(ancestor));
+            let _ = writeln!(out, "  {} -> {}", path.display(), handle);
+        }
+        if report.rebased > 0 {
+            let _ = writeln!(out, "  re-anchored {} intervening change(s)", report.rebased);
+        }
+    }
+    if !report.stayed.is_empty() {
+        let _ = writeln!(
+            out,
+            "{} hunk(s) stayed in the working change:",
+            report.stayed.len()
+        );
+        for (path, reason) in &report.stayed {
+            let why = match reason {
+                AbsorbStay::NoAncestor => "no ancestor owns these lines (new file or novel lines)",
+                AbsorbStay::Sealed => "the owning ancestor is sealed to you — no key to read it",
+            };
+            let _ = writeln!(out, "  {} — {}", path.display(), why);
         }
     }
     Ok(Box::new(emit::Message::new(out)))
