@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>loot — storage foundation bake-off</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --ink: #e6e8ec; --muted: #9aa3b2;
+    --line: #262b35; --accent: #7cc4ff; --win: #5fd08a; --lose: #ff7a7a;
+    --warn: #ffce6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 48px 24px 96px; }
+  h1 { font-size: 30px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 32px; }
+  h2 {
+    font-size: 21px; margin: 44px 0 12px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  h3 { font-size: 16px; margin: 24px 0 8px; color: var(--accent); }
+  p, li { color: var(--ink); }
+  .muted { color: var(--muted); }
+  code {
+    background: var(--panel); padding: 1px 6px; border-radius: 4px;
+    font: 13px/1.5 "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    color: #d8dee9;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 20px; margin: 16px 0;
+  }
+  .verdict {
+    border-left: 3px solid var(--win); background: #14241a;
+  }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 15px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+  td.win { color: var(--win); font-weight: 600; }
+  td.lose { color: var(--lose); font-weight: 600; }
+  .tag {
+    display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); margin-left: 8px; vertical-align: middle;
+  }
+  .tag.win { color: var(--win); border-color: #2c5e42; }
+  .axis { display: flex; gap: 12px; align-items: baseline; }
+  .axis .n { color: var(--accent); font-weight: 700; font-size: 14px; min-width: 58px; }
+  ol.steps { padding-left: 20px; }
+  ol.steps li { margin: 6px 0; }
+  .foot { margin-top: 56px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 16px; }
+  .kbd { font-size: 13px; }
+  .callout { border-left: 3px solid var(--warn); background: #241f12; }
+</style>
+</head>
+<body>
+<main>
+  <h1>loot — storage foundation bake-off</h1>
+  <p class="sub">How we chose the foundational storage model, and the evidence behind it.</p>
+
+  <div class="panel verdict">
+    <strong>Verdict:</strong> the <strong>encrypted content-addressed DAG</strong> is loot's foundation.
+    <span class="tag win">decided</span>
+    <p class="muted" style="margin:8px 0 0">
+      Not a judgment call — the deciding test produced hard numbers. Under loot's
+      per-content encryption, the CRDT silently dropped concurrent edits
+      (0 of 4 survived); the DAG surfaced conflicts safely and was ~4.5× faster at scale.
+      Full record below. Recorded in <code>docs/adr/0002-encrypted-dag-foundation.md</code>.
+    </p>
+  </div>
+
+  <h2>The question</h2>
+  <p>
+    loot's thesis: <em>visibility and permissions belong to content and changes,
+    not the repository.</em> You can commit a <code>.env</code> (encrypted, only
+    keyholders decrypt), keep files private inside a shared repo, and embargo a
+    security fix until a reveal time. Every one of those reduces to the same
+    primitive: <strong>per-unit encryption with a key-access policy.</strong>
+  </p>
+  <p>
+    Two storage models could host that primitive. We refused to pick on intuition
+    and instead built both as competing spikes, then measured.
+  </p>
+  <div class="panel">
+    <div class="axis"><span class="n">DAG</span><div><strong>Encrypted content-addressed DAG.</strong>
+      Git-like objects in a DAG, but each object encrypted independently; addressed
+      by ciphertext hash, with a separate plaintext identity hash for dedup.
+      Log-structured store (no loose-file explosion), in-memory capable.</div></div>
+    <div class="axis" style="margin-top:12px"><span class="n">CRDT</span><div><strong>Automerge document store.</strong>
+      The repo is a CRDT document; the working tree is a projection. Native
+      strength: conflict-free convergence of concurrent edits.</div></div>
+  </div>
+
+  <h2>Methodology</h2>
+  <p>The bake-off was designed so the comparison could not be rigged:</p>
+  <ol class="steps">
+    <li><strong>One shared contract.</strong> Both models implement the same
+      <code>Repo</code> trait in <code>loot-core</code> (put/get/commit/checkout +
+      sync via bundle/apply). Neither could change the contract.</li>
+    <li><strong>One shared workload.</strong> All scenarios live in
+      <code>loot-bench</code> and are generic over <code>R: Repo</code> — identical
+      code scores both spikes. Neither defines its own benchmark.</li>
+    <li><strong>Sync was put <em>into</em> the bake-off on purpose.</strong> The
+      easy mistake was to measure only local performance, which would bias toward
+      the DAG before any code ran. We added concurrent-offline-edit convergence
+      precisely so the CRDT could show its one structural advantage.</li>
+    <li><strong>Convergence rule fixed up front</strong> (ADR 0001): per-content,
+      decrypt-then-merge. Keyholders merge; a peer lacking the key may only relay
+      ciphertext. Both models obey the same rule.</li>
+    <li><strong>We measured the real artifact, not the summary.</strong> When the
+      CRDT reported "0 conflicts," we did not accept it. We materialized the
+      converged file to disk and counted how many peers' edits actually survived.
+      That single check flipped a false win into the deciding evidence.</li>
+    <li><strong>Reproducible.</strong> Every number below comes from
+      <code class="kbd">cargo test --release</code> over the two spike crates,
+      run repeatedly to confirm stability.</li>
+  </ol>
+
+  <h2>The three axes</h2>
+
+  <h3>Axis 1 — Thesis fit</h3>
+  <table>
+    <tr><th>Model</th><th>Discrete, embargoable change</th></tr>
+    <tr><td>DAG</td><td class="win">Native — a change <em>is</em> a node in the DAG.</td></tr>
+    <tr><td>CRDT</td><td class="lose">Bolted on — a CRDT converges <em>state</em>, not commits,
+      so a reviewable change must be synthesized as an explicit record on top of the op-soup.</td></tr>
+  </table>
+
+  <h3>Axis 2 — Local &amp; scale performance</h3>
+  <table>
+    <tr><th>Workload</th><th>DAG</th><th>CRDT</th></tr>
+    <tr><td>2,000 files (write + 2-reader checkout)</td><td>~220–270&nbsp;ms</td><td>~240–300&nbsp;ms</td></tr>
+    <tr><td>50,000 files (write + checkout)</td><td class="win">375&nbsp;ms</td><td class="lose">1.68&nbsp;s (~4.5×)</td></tr>
+    <tr><td>50,000-file sync bundle size</td><td class="win">12.2&nbsp;MB</td><td>13.3&nbsp;MB</td></tr>
+  </table>
+  <p class="muted">At small scale it's a tie — performance alone does not decide this. At scale the DAG pulls clearly ahead.</p>
+
+  <h3>Axis 3 — Sync (the deciding test)</h3>
+  <p>
+    The CRDT's best case: <strong>4 keyholders edit the same file concurrently
+    while offline, then converge.</strong> This is the only workload where a true
+    CRDT should beat a 3-way-merge DAG. We ran it and read back the converged file.
+  </p>
+  <table>
+    <tr><th>Model</th><th>Conflicts</th><th>Edits surviving</th><th>Outcome</th></tr>
+    <tr><td>DAG</td><td>3</td><td class="win">1 of 4</td>
+      <td>Safe. Peer 0's edit auto-applied; the other 3 flagged for a human — nothing lost.</td></tr>
+    <tr><td>CRDT</td><td>0</td><td class="lose">0 of 4</td>
+      <td>Silent data loss. "Conflict-free" meant every peer's edit was overwritten.</td></tr>
+  </table>
+
+  <div class="panel callout">
+    <strong>Why the CRDT lost its own best case.</strong> Content is stored
+    <em>encrypted</em>. Automerge merges by reading content — but it cannot read
+    ciphertext, so it treats each file as an opaque register and resolves
+    concurrent writes last-writer-wins. The CRDT's one advantage is
+    <strong>structurally unavailable</strong> exactly where loot needs it. In a
+    non-encrypted VCS, Automerge would genuinely shine here; that is not the
+    product we are building.
+  </div>
+  <p>
+    For source control, a conflict a human resolves is strictly better than an
+    edit that silently vanishes. The DAG fails safe; the CRDT fails silent.
+  </p>
+
+  <h2>Decision &amp; honesty</h2>
+  <p>
+    We lock the <strong>encrypted content-addressed DAG</strong>. The decision is
+    backed by the numbers above, not by preference. To stay honest, the DAG has
+    its own sharp edge we are <em>not</em> hiding: dedup keys on a plaintext
+    identity hash, which leaks a same-plaintext equality oracle and partially
+    undercuts the privacy thesis. It's a tracked follow-up (drop cross-key dedup,
+    or use a keyed identity hash) — a fixable detail, not a foundational defect
+    like the CRDT's silent loss.
+  </p>
+  <p>
+    <code>spike-crdt</code> is kept in the tree, marked non-canonical, as the
+    reproducible record behind this page.
+  </p>
+
+  <div class="foot">
+    Reproduce: <code class="kbd">cargo test --release -p spike-dag</code> and
+    <code class="kbd">-p spike-crdt</code>. The CRDT's
+    <code>same_file_concurrent_is_silent_data_loss</code> test passes by
+    <em>asserting</em> the documented loss (0 conflicts, edits dropped); if the
+    CRDT ever preserved edits there, that test fails loudly and this decision
+    must be revisited. Sources: <code>crates/loot-core</code> (contract),
+    <code>crates/loot-bench</code> (workload), ADRs
+    <code>0001</code> &amp; <code>0002</code>.
+  </div>
+</main>
+</body>
+</html>

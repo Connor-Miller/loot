@@ -30,14 +30,23 @@ pub struct Blob {
 #[derive(Debug, Default)]
 pub struct ScenarioResult {
     pub checks: Vec<(String, bool)>,
+    /// Named quantitative metrics (e.g. conflict count, bundle bytes) for axes
+    /// where the interesting result is a number, not a pass/fail.
+    pub metrics: Vec<(String, u64)>,
 }
 
 impl ScenarioResult {
     fn check(&mut self, name: &str, passed: bool) {
         self.checks.push((name.to_string(), passed));
     }
+    fn metric(&mut self, name: &str, value: u64) {
+        self.metrics.push((name.to_string(), value));
+    }
     pub fn all_passed(&self) -> bool {
         self.checks.iter().all(|(_, ok)| *ok)
+    }
+    pub fn metric_value(&self, name: &str) -> Option<u64> {
+        self.metrics.iter().find(|(n, _)| n == name).map(|(_, v)| *v)
     }
 }
 
@@ -212,5 +221,147 @@ pub fn scenario_concurrent_converge<R: Repo>(
             .unwrap_or(true),
     );
 
+    Ok(res)
+}
+
+/// AXIS 3 — THE VERDICT TEST (the CRDT's genuine best case).
+///
+/// `n_peers` keyholders all start from a shared base, then each makes a
+/// DIFFERENT concurrent edit to the SAME public file while offline, then all
+/// converge into peer 0. This is the only workload where a true CRDT should
+/// win: it should converge conflict-free, while a 3-way-merge DAG should
+/// surface conflicts on the overlapping edits.
+///
+/// Records two metrics so the result is a number, not a vibe:
+///   - `conflicts` — paths that came back `MergeOutcome::Conflict`
+///   - `merged` — paths that came back `Merged` (resolved without a human)
+///
+/// A model "wins" this axis by converging the same-file edits with zero
+/// conflicts. The point is to measure, not to assume.
+pub fn scenario_same_file_concurrent<R: Repo>(
+    base: &Path,
+    n_peers: usize,
+    now: u64,
+) -> Result<ScenarioResult, RepoError> {
+    let mut res = ScenarioResult::default();
+    assert!(n_peers >= 2, "need at least 2 peers to conflict");
+
+    // All peers are keyholders for a single PUBLIC file, so everyone is a
+    // merger (the relay role is deliberately excluded — this isolates the
+    // CRDT's conflict-free-merge advantage).
+    let ids: Vec<String> = (0..n_peers).map(|i| format!("peer{i}")).collect();
+    let mut peers: Vec<R> = ids
+        .iter()
+        .map(|id| R::init(base.join(id), id))
+        .collect::<Result<_, _>>()?;
+
+    // Shared base: a multi-line public file, seeded to every peer.
+    let base_blob = vec![Blob {
+        path: PathBuf::from("shared.txt"),
+        bytes: b"line A\nline B\nline C\n".to_vec(),
+        vis: Visibility::Public,
+    }];
+    commit_blobs(&mut peers[0], &base_blob, vec![], "base")?;
+    let seed = peers[0].bundle(&[])?;
+    for p in peers.iter_mut().skip(1) {
+        p.apply(&seed, now)?;
+    }
+
+    // Each peer edits the SAME file differently, offline. Peer i rewrites a
+    // different line, the edits overlap on the same file (and peer 0 + peer 1
+    // touch an overlapping region) so a 3-way merge has something to conflict on.
+    for (i, p) in peers.iter_mut().enumerate() {
+        let edited = format!("line A (by peer{i})\nline B\nline C (by peer{i})\n");
+        let blob = vec![Blob {
+            path: PathBuf::from("shared.txt"),
+            bytes: edited.into_bytes(),
+            vis: Visibility::Public,
+        }];
+        let heads = p.heads();
+        commit_blobs(p, &blob, heads, &format!("peer{i} offline edit"))?;
+    }
+
+    // Converge everyone into peer 0. Split the borrow: take peer 0 out first.
+    let (head, rest) = peers.split_at_mut(1);
+    let sink = &mut head[0];
+    let mut conflicts = 0u64;
+    let mut merged = 0u64;
+    let mut converged = 0u64;
+    let mut relayed = 0u64;
+    let mut applies_with_outcome = 0u64;
+    for p in rest.iter() {
+        let bundle = p.bundle(&sink.heads())?;
+        let outcomes = sink.apply(&bundle, now)?;
+        if !outcomes.is_empty() {
+            applies_with_outcome += 1;
+        }
+        for o in outcomes.values() {
+            match o {
+                MergeOutcome::Conflict => conflicts += 1,
+                MergeOutcome::Merged => merged += 1,
+                MergeOutcome::Converged => converged += 1,
+                MergeOutcome::RelayedUnmerged => relayed += 1,
+            }
+        }
+    }
+
+    res.metric("conflicts", conflicts);
+    res.metric("merged", merged);
+    res.metric("converged", converged);
+    res.metric("relayed", relayed);
+    res.metric("applies_with_outcome", applies_with_outcome);
+
+    // MODEL-NEUTRAL DATA-LOSS MEASUREMENT. Materialize the converged file to
+    // disk and count how many distinct peers' edit markers survived. Each peer
+    // i wrote "(by peer{i})" markers; with 4 peers and 2 markers each there are
+    // up to `n_peers` distinct contributions. This is the real question behind
+    // "0 conflicts": did convergence PRESERVE the edits or silently drop them?
+    let sink_path = base.join("peer0");
+    for h in sink.heads() {
+        let _ = sink.checkout(&h, "peer0", now);
+    }
+    let contents = std::fs::read_to_string(sink_path.join("shared.txt")).unwrap_or_default();
+    let surviving_peers = (0..n_peers)
+        .filter(|i| contents.contains(&format!("by peer{i}")))
+        .count() as u64;
+    res.metric("surviving_peer_edits", surviving_peers);
+    res.metric("total_peer_edits", n_peers as u64);
+
+    // The honest check: convergence must not SILENTLY discard edits. A model is
+    // allowed to surface conflicts (that preserves the edits for a human) OR to
+    // genuinely merge them. It is NOT allowed to report zero conflicts AND lose
+    // edits — that is silent data loss, the worst outcome for source control.
+    let silently_dropped = conflicts == 0 && surviving_peers < n_peers as u64;
+    res.check(
+        "no silent data loss (zero conflicts must mean all edits survived)",
+        !silently_dropped,
+    );
+    // Relay must NOT appear: this scenario is all-keyholder public content.
+    res.check("all-keyholder scenario has no relays", relayed == 0);
+    Ok(res)
+}
+
+/// AXIS 2 + sync efficiency: scale to `n` files and report the size in bytes of
+/// a full sync bundle (what one peer ships another). Pure measurement; the
+/// only check is that the round-trips through bundle/apply stay lossless.
+pub fn scenario_scale_and_transfer<R: Repo>(
+    base: &Path,
+    n: usize,
+    now: u64,
+) -> Result<ScenarioResult, RepoError> {
+    let mut res = ScenarioResult::default();
+
+    let mut a = R::init(base.join("scale_a"), "alice")?;
+    let blobs = small_file_workload(n, "alice");
+    commit_blobs(&mut a, &blobs, vec![], "scale commit")?;
+
+    let bundle = a.bundle(&[])?;
+    res.metric("bundle_bytes", bundle.0.len() as u64);
+    res.metric("files", n as u64);
+
+    // A fresh peer applies the full bundle; it must not error (lossless).
+    let mut b = R::init(base.join("scale_b"), "alice")?;
+    let applied = b.apply(&bundle, now);
+    res.check("full bundle applies without error", applied.is_ok());
     Ok(res)
 }

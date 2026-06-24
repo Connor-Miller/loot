@@ -7,4 +7,11 @@ license.workspace = true
 [dependencies]
 loot-core.workspace = true
 thiserror.workspace = true
-# TODO: add a CRDT lib (e.g. `automerge` or `yrs`) when fleshing out the spike.
+# CRDT document store (source of truth; FS is a projection).
+automerge = "0.5"
+# Vetted AEAD for per-content encryption (do NOT roll our own crypto).
+chacha20poly1305 = "0.10"
+blake3 = "1"
+
+[dev-dependencies]
+loot-bench = { path = "../loot-bench" }

@@ -14,6 +14,7 @@ to a git commit). A Change carries a set of paths, each with its own
 visibility. Permissions attach here, not to the repo.
 
 **Visibility** — the access policy on a unit of content. One of:
+
 - *Public* — readable by anyone who can read the repo.
 - *Restricted* — readable only by named identities (key holders).
 - *Embargoed* — encrypted to all; key withheld until a reveal time. Models
@@ -50,13 +51,23 @@ See ADR 0001.
 These are excluded from the *foundation* so the first slice ships fast and
 nothing built on top forces a teardown.
 
+## Foundation (decided — ADR 0002)
+
+The foundation is the **encrypted content-addressed DAG** (`crates/spike-dag`'s
+model graduates into `loot-core`). Decided by running the bake-off, not by
+argument: under per-content encryption the CRDT degrades to last-writer-wins
+and silently dropped concurrent edits (0 of 4 survived), while the DAG surfaced
+conflicts (safe) and was ~4.5x faster at 50k files. See ADR 0002 and
+`docs/bakeoff/index.html` for full methodology and results.
+
+`crates/spike-crdt` is **retained but non-canonical** — it is the benchmark
+record backing the decision, not part of the product. `crates/loot-bench` and
+both spikes stay in the tree so the decision is reproducible
+(`cargo test --release`).
+
 ## Open / undecided
 
-- **Foundation: encrypted content-addressed DAG vs CRDT document store.**
-  Being decided by spiking both (`crates/spike-dag`, `crates/spike-crdt`)
-  against a shared `Repo` trait and the `benches/` workload, then measuring
-  speed and feel. The winner graduates into `loot-core`; the loser is deleted.
-  The bake-off scores three axes: **thesis fit** (can it cleanly model a
-  per-path-encrypted, reviewable, embargoable Change), **local perf** (write
-  thousands of small objects, checkout a tree — the APFS small-file workload),
-  and **sync** (concurrent offline edits converge per the rule above).
+- **Dedup equality-oracle (the DAG's sharp edge).** Dedup keys on a plaintext
+  identity hash, which lets the store recognize equal plaintext across keys —
+  a leak that partially undercuts the privacy thesis. Options: drop cross-key
+  dedup, or use a keyed identity hash. Tracked in ADR 0002, not yet decided.
