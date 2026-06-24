@@ -10,17 +10,21 @@
 //!
 //! TODO(spike): implement `Repo` for `DagRepo`, then run `benches/` against it.
 
-use loot_core::{Change, Oid, Repo, RepoError, Visibility};
+use loot_core::{
+    Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility,
+};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub struct DagRepo {
     _root: PathBuf,
+    _identity: String,
     // TODO: packed object store (single append-only file + index), in-memory variant.
     // TODO: per-object content key, wrapped per authorized identity.
 }
 
 impl Repo for DagRepo {
-    fn init(_path: PathBuf) -> Result<Self, RepoError> {
+    fn init(_path: PathBuf, _identity: &str) -> Result<Self, RepoError> {
         todo!("spike-dag: init packed/in-memory store")
     }
     fn put(&mut self, _bytes: &[u8], _vis: Visibility) -> Result<Oid, RepoError> {
@@ -34,5 +38,18 @@ impl Repo for DagRepo {
     }
     fn checkout(&self, _change: &Oid, _reader: &str, _now: u64) -> Result<(), RepoError> {
         todo!("spike-dag: materialize visible tree; measure small-file write perf")
+    }
+    fn bundle(&self, _have: &[Oid]) -> Result<SyncBundle, RepoError> {
+        todo!("spike-dag: pack reachable-not-have changes as ciphertext bundle")
+    }
+    fn apply(
+        &mut self,
+        _bundle: &SyncBundle,
+        _now: u64,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
+        todo!("spike-dag: 3-way merge per path; relay where no key (ADR 0001)")
+    }
+    fn heads(&self) -> Vec<Oid> {
+        todo!("spike-dag: current change ids")
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "loot-bench"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# The shared bake-off workload. Generic over any `Repo` impl so spike-dag and
+# spike-crdt are measured by identical code. Neither spike defines its own
+# workload — that would make the comparison meaningless.
+
+[dependencies]
+loot-core.workspace = true

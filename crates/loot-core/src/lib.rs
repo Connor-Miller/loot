@@ -50,13 +50,43 @@ pub enum RepoError {
     Backend(String),
 }
 
-/// The contract under test. Deliberately tiny: just enough to run the
-/// workload from Theo's perf rant (write thousands of small objects,
-/// read them back, materialize a tree) plus the visibility hook.
+/// An opaque, transport-ready bundle of changes produced by one repo and
+/// applied by another. Its bytes are ciphertext + metadata: a peer can carry
+/// and forward it without holding any key (the *relay* role from ADR 0001).
+#[derive(Clone, Debug)]
+pub struct SyncBundle(pub Vec<u8>);
+
+/// The outcome of merging a peer's content into ours for a single path.
+/// See ADR 0001 (per-content, decrypt-then-merge).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Disjoint or identical edits; converged with no human needed.
+    Converged,
+    /// Both sides edited the same content and we hold the key: a fine-grained
+    /// merge was performed (this is where the CRDT model should shine).
+    Merged,
+    /// Both sides edited the same content but we lack the key, so we could only
+    /// relay ciphertext, not merge. Records that convergence was deferred to a
+    /// keyholder rather than silently dropping a side.
+    RelayedUnmerged,
+    /// Same content, both sides keyholders, but the edits genuinely conflict
+    /// and need a human. Expected for the DAG model's 3-way merge.
+    Conflict,
+}
+
+/// The contract under test. Covers the three bake-off axes:
+///   - thesis fit: `put`/`get`/`commit`/`checkout` with per-path visibility
+///   - local perf: write many small objects, materialize a tree (`checkout`)
+///   - sync: `bundle` + `apply` with concurrent-offline convergence (ADR 0001)
+///
+/// Both spikes implement this identically; the bench harness is generic over
+/// any `Repo`, so the comparison is apples-to-apples.
 pub trait Repo {
     /// Create an empty repo rooted at `path` (a real dir, or in-memory if
-    /// the backend ignores it).
-    fn init(path: PathBuf) -> Result<Self, RepoError>
+    /// the backend ignores it). `identity` is this repo's keyholder identity;
+    /// it determines which content this repo can decrypt, and thus whether it
+    /// acts as a *merger* or a *relay* during sync.
+    fn init(path: PathBuf, identity: &str) -> Result<Self, RepoError>
     where
         Self: Sized;
 
@@ -72,4 +102,21 @@ pub trait Repo {
     /// Materialize the tree of `change` to the working area, skipping
     /// content `reader` cannot see. This is the operation APFS makes slow.
     fn checkout(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError>;
+
+    // --- sync axis (ADR 0001) ---
+
+    /// Produce a transport bundle of every change reachable here but not
+    /// implied by `have` (the recipient's known change ids). Content stays
+    /// encrypted; this repo need not hold keys to bundle ciphertext it relays.
+    fn bundle(&self, have: &[Oid]) -> Result<SyncBundle, RepoError>;
+
+    /// Apply a peer's bundle, converging per path. For each path touched on
+    /// both sides, return its [`MergeOutcome`]. Whether this repo *merges* or
+    /// merely *relays* a given path depends on whether it holds that content's
+    /// key (its `identity` from `init`).
+    fn apply(&mut self, bundle: &SyncBundle, now: u64)
+        -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError>;
+
+    /// Change ids this repo currently has — what a peer passes as `have`.
+    fn heads(&self) -> Vec<Oid>;
 }

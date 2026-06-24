@@ -3,6 +3,7 @@
 //! Thesis to prove out:
 //!   - native live sync between machines ("Dropbox for devs")
 //!   - in-memory by nature
+//!
 //! Open questions this spike must answer honestly:
 //!   - how do you model a *reviewable, embargoable change* when a CRDT
 //!     converges state rather than recording discrete changes?
@@ -12,16 +13,20 @@
 //!
 //! TODO(spike): implement `Repo` for `CrdtRepo`, then run `benches/` against it.
 
-use loot_core::{Change, Oid, Repo, RepoError, Visibility};
+use loot_core::{
+    Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility,
+};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub struct CrdtRepo {
     _root: PathBuf,
+    _identity: String,
     // TODO: CRDT doc (automerge/yrs) as source of truth; FS = projection.
 }
 
 impl Repo for CrdtRepo {
-    fn init(_path: PathBuf) -> Result<Self, RepoError> {
+    fn init(_path: PathBuf, _identity: &str) -> Result<Self, RepoError> {
         todo!("spike-crdt: init CRDT doc + FS projection")
     }
     fn put(&mut self, _bytes: &[u8], _vis: Visibility) -> Result<Oid, RepoError> {
@@ -35,5 +40,18 @@ impl Repo for CrdtRepo {
     }
     fn checkout(&self, _change: &Oid, _reader: &str, _now: u64) -> Result<(), RepoError> {
         todo!("spike-crdt: project doc to working tree; measure write perf")
+    }
+    fn bundle(&self, _have: &[Oid]) -> Result<SyncBundle, RepoError> {
+        todo!("spike-crdt: export CRDT delta as bundle")
+    }
+    fn apply(
+        &mut self,
+        _bundle: &SyncBundle,
+        _now: u64,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
+        todo!("spike-crdt: CRDT auto-merge among keyholders; relay otherwise (ADR 0001)")
+    }
+    fn heads(&self) -> Vec<Oid> {
+        todo!("spike-crdt: current change ids")
     }
 }
