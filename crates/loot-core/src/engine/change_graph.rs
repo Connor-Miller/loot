@@ -64,6 +64,31 @@ impl ChangeGraph {
         self.heads.clone()
     }
 
+    /// Remove a head node (one nobody is a child of) and restore any of its
+    /// parents that become heads as a result. Used to rewrite the working change
+    /// in place (ADR 0006): the working change is always a head, so this is safe.
+    /// No-op if `id` is unknown or is not a head.
+    pub fn remove_head(&mut self, id: &Oid) {
+        if !self.heads.contains(id) {
+            return;
+        }
+        let Some(node) = self.changes.remove(id) else {
+            return;
+        };
+        self.heads.retain(|h| h != id);
+        // A parent becomes a head iff no remaining change lists it as a parent.
+        for parent in &node.parents {
+            let still_referenced = self
+                .changes
+                .values()
+                .any(|n| n.parents.contains(parent));
+            if !still_referenced && self.changes.contains_key(parent) && !self.heads.contains(parent)
+            {
+                self.heads.push(parent.clone());
+            }
+        }
+    }
+
     pub fn get(&self, id: &Oid) -> Option<&ChangeNode> {
         self.changes.get(id)
     }

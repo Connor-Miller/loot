@@ -79,6 +79,75 @@ impl DagRepo {
         Ok(())
     }
 
+    /// Visibility-aware snapshot of a working tree into the working change
+    /// (ADR 0006). `entries` is the tree the caller can see — `(path, bytes,
+    /// intended visibility)` — typically every file the Workspace read from disk.
+    /// `working` is the id of the current working change to rewrite in place, or
+    /// `None` on the first snapshot. `message` names it; `now` evaluates embargo.
+    ///
+    /// The working change is rewritten in place (true JJ): the prior working
+    /// node is removed first, so reconcile always bases on FINALIZED history.
+    /// Reconcile against that base tree:
+    ///   - a base path THIS identity can open now: update to match `entries`,
+    ///     or delete if absent from `entries` (a keyholder removing own content);
+    ///   - a base path it cannot open: carried forward unchanged (never seen);
+    ///   - an `entries` path that collides with a base path it CANNOT open:
+    ///     refused (no silent clobber of sealed content).
+    ///
+    /// Returns the new working-change id. Idempotent on an unchanged tree.
+    pub fn snapshot(
+        &mut self,
+        working: Option<&Oid>,
+        entries: &[(PathBuf, Vec<u8>, Visibility)],
+        message: &str,
+        now: u64,
+    ) -> Result<Oid, RepoError> {
+        // Drop the prior working change so we reconcile against finalized history,
+        // not against our own last snapshot.
+        if let Some(w) = working {
+            self.graph.remove_head(w);
+        }
+
+        let base = self.graph.current_tree();
+        let by_path: BTreeMap<&PathBuf, &(PathBuf, Vec<u8>, Visibility)> =
+            entries.iter().map(|e| (&e.0, e)).collect();
+
+        // Refuse any write that lands on a base path we cannot open: it would
+        // silently clobber sealed content we can't even see.
+        for (path, (oid, _vis)) in &base {
+            if by_path.contains_key(path) && self.get(oid, &self.identity, now).is_err() {
+                return Err(RepoError::Backend(format!(
+                    "sealed content exists at {}; cannot overwrite content you can't see",
+                    path.display()
+                )));
+            }
+        }
+
+        let mut tree: BTreeMap<PathBuf, (Oid, Visibility)> = BTreeMap::new();
+
+        // Carry forward every base path NOT visible to us, untouched.
+        for (path, entry) in &base {
+            if self.get(&entry.0, &self.identity, now).is_err() {
+                tree.insert(path.clone(), entry.clone());
+            }
+        }
+
+        // Seal every working-tree entry (visible by construction — we read it).
+        // Absent-but-visible base paths simply don't get re-added => deleted.
+        for (path, bytes, vis) in entries {
+            let oid = self.put(bytes, vis.clone())?;
+            tree.insert(path.clone(), (oid, vis.clone()));
+        }
+
+        let change = Change {
+            id: Oid([0; 32]),
+            parents: self.graph.heads(),
+            message: message.to_string(),
+            tree,
+        };
+        self.commit(change)
+    }
+
     /// Change history in topo order (parents before children), as
     /// `(change id, message)` pairs — the data a `log` command needs without
     /// exposing the change graph's internals.
@@ -713,5 +782,124 @@ mod tests {
         assert!(loaded.heads().contains(&change_id));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- snapshot / reconcile (ADR 0006) ---
+
+    fn entry(path: &str, body: &[u8], vis: Visibility) -> (PathBuf, Vec<u8>, Visibility) {
+        (PathBuf::from(path), body.to_vec(), vis)
+    }
+
+    #[test]
+    fn snapshot_rewrites_working_change_in_place() {
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(None, &[entry("a.txt", b"one", Visibility::Public)], "wip", 0)
+            .unwrap();
+        // Re-snapshot with new content -> same working slot, not a second change.
+        let w2 = repo
+            .snapshot(Some(&w1), &[entry("a.txt", b"two", Visibility::Public)], "wip", 0)
+            .unwrap();
+        assert_eq!(repo.log().len(), 1, "working change rewritten, not appended");
+        assert!(repo.heads().contains(&w2));
+        // Latest content wins.
+        let tree = repo.graph.current_tree();
+        let oid = &tree[&PathBuf::from("a.txt")].0;
+        assert_eq!(repo.get(oid, "alice", 0).unwrap(), b"two");
+    }
+
+    #[test]
+    fn snapshot_deletes_a_visible_path_absent_from_the_tree() {
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w = repo
+            .snapshot(
+                None,
+                &[
+                    entry("keep.txt", b"k", Visibility::Public),
+                    entry("gone.txt", b"g", Visibility::Public),
+                ],
+                "wip",
+                0,
+            )
+            .unwrap();
+        // Re-snapshot with gone.txt removed from the tree -> it's deleted.
+        let w2 = repo
+            .snapshot(Some(&w), &[entry("keep.txt", b"k", Visibility::Public)], "wip", 0)
+            .unwrap();
+        let tree = repo.graph.current_tree();
+        assert!(tree.contains_key(&PathBuf::from("keep.txt")));
+        assert!(!tree.contains_key(&PathBuf::from("gone.txt")), "visible+absent => deleted");
+        let _ = w2;
+    }
+
+    #[test]
+    fn non_keyholder_snapshot_preserves_sealed_content() {
+        // The core safety property (ADR 0006): a non-keyholder snapshotting their
+        // partial tree must NOT delete the sealed file they cannot see.
+        // Build a repo where alice committed a restricted .env + public README.
+        let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let _ = alice
+            .snapshot(
+                None,
+                &[
+                    entry(".env", b"SECRET", Visibility::Restricted(vec!["alice".into()])),
+                    entry("README", b"hi", Visibility::Public),
+                ],
+                "init",
+                0,
+            )
+            .unwrap();
+        // Sync the full history to bob (non-keyholder) via a bundle.
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+
+        // Bob's visible tree is README only (he can't open .env). He has no
+        // working change yet (just applied finalized history), so working=None:
+        // his snapshot appends on alice's change, carrying .env forward.
+        let sealed_env_oid = bob.graph.current_tree()[&PathBuf::from(".env")].0.clone();
+        bob.snapshot(
+            None,
+            &[entry("README", b"hi edited by bob", Visibility::Public)],
+            "bob edits readme",
+            0,
+        )
+        .unwrap();
+
+        // .env must still be present in bob's tree, carried forward as ciphertext.
+        let tree = bob.graph.current_tree();
+        assert!(tree.contains_key(&PathBuf::from(".env")), ".env must survive bob's snapshot");
+        assert_eq!(tree[&PathBuf::from(".env")].0, sealed_env_oid, ".env carried forward unchanged");
+        // And bob still cannot read it.
+        assert!(matches!(
+            bob.get(&sealed_env_oid, "bob", 0),
+            Err(RepoError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_refuses_write_onto_sealed_invisible_path() {
+        // Bob (non-keyholder) tries to write his own .env where alice's sealed
+        // .env already lives -> refused, no silent clobber.
+        let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let _ = alice
+            .snapshot(
+                None,
+                &[entry(".env", b"ALICE", Visibility::Restricted(vec!["alice".into()]))],
+                "init",
+                0,
+            )
+            .unwrap();
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+
+        let result = bob.snapshot(
+            None,
+            &[entry(".env", b"BOB", Visibility::Restricted(vec!["bob".into()]))],
+            "bob writes own env",
+            0,
+        );
+        assert!(matches!(result, Err(RepoError::Backend(_))), "must refuse the collision");
     }
 }

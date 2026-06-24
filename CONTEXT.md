@@ -13,6 +13,24 @@ it is loot's reason to exist.
 to a git commit). A Change carries a set of paths, each with its own
 visibility. Permissions attach here, not to the repo.
 
+**Working change** — the always-present change at the tip that the working tree
+*is* (JJ-style, ADR 0006). There is no separate "commit" step: `status`
+snapshots the tree into the working change; `describe` names it; `new` finalizes
+it and starts a fresh one on top. This kills git's add/commit ceremony.
+
+**Snapshot (reconcile)** — turning the current working tree into the working
+change, *visibility-aware* (ADR 0006). Against the last change's full tree, at
+time `now`: paths the current identity can open are updated/deleted to match the
+tree; paths it cannot open are carried forward unchanged (never seen, so never
+changed); a write onto a non-visible path is refused (no silent clobber of
+sealed content). Lives in the engine (`DagRepo::snapshot`); the Workspace only
+supplies the tree.
+
+**Workspace** — the CLI module owning the *process-bound ambient repo*: it
+discovers `.loot/`, supplies the current identity and the clock, and persists on
+mutation. Commands are thin verbs over it; the snapshot invariant and clock
+injection live here. See ADR 0006.
+
 **Visibility** — the access policy on a unit of content. One of:
 
 - *Public* — readable by anyone who can read the repo.
@@ -44,15 +62,16 @@ identity's keys, LOCAL-ONLY — never bundled). Written/read by the engine's
 `save`/`load`; the CLI is process-per-command and round-trips through it.
 
 **`.lootattributes`** — a gitattributes-style file mapping path globs to
-visibility (`.env restricted=alice`, `*.md public`). `loot commit` reads it to
-seal each path; unmatched paths default to Public. This is the user-facing
-surface of the thesis — where you declare a file private.
+visibility (`.env restricted=alice`, `*.md public`). The Workspace reads it on
+snapshot to seal each path; unmatched paths default to Public. This is the
+user-facing surface of the thesis — where you declare a file private.
 
 **loot (the CLI)** — the first product crate (`loot-cli`, binary `loot`):
-`init`, `commit`, `checkout`, `log`, `bundle`, `apply`. A thin adapter that
-supplies the ambient identity and real clock to the engine's `Repo` calls.
-Demonstrated end-to-end: a committed `.env` checks out for its keyholder and is
-silently skipped for anyone else, from the same repo and commit.
+`init`, `status`, `describe`, `new`, `checkout`, `log`, `bundle`, `apply`. Thin
+verbs over the [[Workspace]]; the JJ-style working change replaces git's
+add/commit ceremony. Demonstrated end-to-end: a sealed `.env` checks out for its
+keyholder and is silently skipped for anyone else, from the same repo and change
+— and a non-keyholder's re-snapshot carries it forward rather than deleting it.
 
 **Sync (`bundle`/`apply`)** — one-way transport via a bundle file (ADR 0001
 realized in the CLI). `loot bundle <file>` writes ciphertext plus *only* the
