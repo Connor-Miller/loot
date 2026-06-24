@@ -65,6 +65,48 @@ impl DagRepo {
     fn object(&self, oid: &Oid) -> Result<&SealedObject, RepoError> {
         self.objects.get(oid)
     }
+
+    /// Persist the whole repo under `dir` (typically `.loot/`): all sealed
+    /// objects, the full change graph, and this identity's keyring. The keyring
+    /// is written to its own LOCAL-ONLY file — it is custody, not repo content,
+    /// and never travels in a bundle (ADR 0003, 0005).
+    pub fn save(&self, dir: &std::path::Path) -> Result<(), RepoError> {
+        let io = |e: std::io::Error| RepoError::Backend(e.to_string());
+        std::fs::create_dir_all(dir).map_err(io)?;
+        std::fs::write(dir.join("identity"), self.identity.as_bytes()).map_err(io)?;
+        std::fs::write(dir.join("repo"), wire::encode_repo(&self.objects, &self.graph)).map_err(io)?;
+        std::fs::write(dir.join("keyring"), wire::encode_keyring(&self.keyring)).map_err(io)?;
+        Ok(())
+    }
+
+    /// Change history in topo order (parents before children), as
+    /// `(change id, message)` pairs — the data a `log` command needs without
+    /// exposing the change graph's internals.
+    pub fn log(&self) -> Vec<(Oid, String)> {
+        self.graph
+            .in_order()
+            .into_iter()
+            .map(|c| (c.id.clone(), c.message.clone()))
+            .collect()
+    }
+
+    /// Load a repo previously written by [`save`] from `dir`. `root` is the
+    /// working directory `checkout` will materialize into (kept separate from
+    /// `dir` so the store can live in `.loot/` while files land in the repo).
+    pub fn load(dir: &std::path::Path, root: PathBuf) -> Result<Self, RepoError> {
+        let io = |e: std::io::Error| RepoError::Backend(e.to_string());
+        let identity = String::from_utf8(std::fs::read(dir.join("identity")).map_err(io)?)
+            .map_err(|e| RepoError::Backend(e.to_string()))?;
+        let (objects, graph) = wire::decode_repo(&std::fs::read(dir.join("repo")).map_err(io)?)?;
+        let keyring = wire::decode_keyring(&std::fs::read(dir.join("keyring")).map_err(io)?)?;
+        Ok(DagRepo {
+            root,
+            identity,
+            keyring,
+            objects,
+            graph,
+        })
+    }
 }
 
 impl Repo for DagRepo {
@@ -425,6 +467,128 @@ mod wire {
 
         Ok((changes, objs, public_keys))
     }
+
+    // --- whole-repo persistence (ADR 0005) ---
+    //
+    // Distinct from the bundle format above: persistence serializes EVERY object
+    // and change (no have-set filtering) and does NOT touch keys. The keyring is
+    // serialized separately, to its own local-only file.
+
+    use super::{ChangeGraph, ObjectStore};
+    use crate::sealed::Keyring;
+
+    fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
+        out.extend_from_slice(&c.id.0);
+        put_u32(out, c.parents.len());
+        for p in &c.parents {
+            out.extend_from_slice(&p.0);
+        }
+        put_bytes(out, c.message.as_bytes());
+        put_u32(out, c.tree.len());
+        for (path, (oid, vis)) in &c.tree {
+            put_bytes(out, path.to_string_lossy().as_bytes());
+            out.extend_from_slice(&oid.0);
+            put_vis(out, vis);
+        }
+    }
+
+    pub fn encode_repo(objects: &ObjectStore, graph: &ChangeGraph) -> Vec<u8> {
+        let mut out = Vec::new();
+        let objs: Vec<_> = objects.iter().collect();
+        put_u32(&mut out, objs.len());
+        for (addr, obj) in objs {
+            out.extend_from_slice(&addr.0);
+            out.extend_from_slice(&obj.nonce);
+            put_bytes(&mut out, &obj.ciphertext);
+            put_vis(&mut out, &obj.vis);
+            put_u32(&mut out, obj.grant_ids.len());
+            for id in &obj.grant_ids {
+                put_bytes(&mut out, id.as_bytes());
+            }
+        }
+        // Changes in topo order so load() can replay them parents-first.
+        let changes = graph.in_order();
+        put_u32(&mut out, changes.len());
+        for c in changes {
+            put_change(&mut out, c);
+        }
+        out
+    }
+
+    pub fn decode_repo(b: &[u8]) -> Result<(ObjectStore, ChangeGraph), RepoError> {
+        let mut c = Cursor { b, i: 0 };
+        let mut objects = ObjectStore::new();
+        let n_objs = c.u32()?;
+        for _ in 0..n_objs {
+            let addr = Oid(c.arr32()?);
+            let nonce = c.arr12()?;
+            let ciphertext = c.bytes()?;
+            let vis = c.vis()?;
+            let n_grants = c.u32()?;
+            let mut grant_ids = Vec::with_capacity(n_grants);
+            for _ in 0..n_grants {
+                grant_ids.push(c.string()?);
+            }
+            objects.put(
+                addr,
+                SealedObject {
+                    nonce,
+                    ciphertext,
+                    vis,
+                    grant_ids,
+                },
+            );
+        }
+        let mut graph = ChangeGraph::new();
+        let n_changes = c.u32()?;
+        for _ in 0..n_changes {
+            let id = Oid(c.arr32()?);
+            let n_parents = c.u32()?;
+            let mut parents = Vec::with_capacity(n_parents);
+            for _ in 0..n_parents {
+                parents.push(Oid(c.arr32()?));
+            }
+            let message = c.string()?;
+            let n_tree = c.u32()?;
+            let mut tree = BTreeMap::new();
+            for _ in 0..n_tree {
+                let path = PathBuf::from(c.string()?);
+                let oid = Oid(c.arr32()?);
+                let vis = c.vis()?;
+                tree.insert(path, (oid, vis));
+            }
+            graph.insert(ChangeNode {
+                id,
+                parents,
+                message,
+                tree,
+            });
+        }
+        Ok((objects, graph))
+    }
+
+    pub fn encode_keyring(keyring: &Keyring) -> Vec<u8> {
+        let mut out = Vec::new();
+        let entries: Vec<_> = keyring.iter().collect();
+        put_u32(&mut out, entries.len());
+        for (oid, key) in entries {
+            out.extend_from_slice(&oid.0);
+            out.extend_from_slice(&key);
+        }
+        out
+    }
+
+    pub fn decode_keyring(b: &[u8]) -> Result<Keyring, RepoError> {
+        let mut c = Cursor { b, i: 0 };
+        let mut keyring = Keyring::new();
+        let n = c.u32()?;
+        for _ in 0..n {
+            let oid = Oid(c.arr32()?);
+            let key = c.arr32()?;
+            keyring.insert(oid, key);
+        }
+        Ok(keyring)
+    }
 }
 
 #[cfg(test)]
@@ -511,5 +675,43 @@ mod tests {
 
     fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// ADR 0005: a repo survives save -> load with identity, content, history,
+    /// and key custody intact — so a process-per-command CLI works.
+    #[test]
+    fn save_load_round_trips() {
+        let dir = std::env::temp_dir().join(format!("loot-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let secret_oid;
+        let change_id;
+        {
+            let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+            secret_oid = repo
+                .put(b"TOKEN=abc\n", Visibility::Restricted(vec!["alice".into()]))
+                .unwrap();
+            let pub_oid = repo.put(b"hi\n", Visibility::Public).unwrap();
+            let mut tree = BTreeMap::new();
+            tree.insert(PathBuf::from(".env"), (secret_oid.clone(), Visibility::Restricted(vec!["alice".into()])));
+            tree.insert(PathBuf::from("README"), (pub_oid, Visibility::Public));
+            change_id = repo
+                .commit(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+                .unwrap();
+            repo.save(&dir).unwrap();
+        }
+
+        let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        // Identity preserved -> alice can still decrypt her restricted content.
+        assert_eq!(loaded.get(&secret_oid, "alice", 0).unwrap(), b"TOKEN=abc\n");
+        // A different identity still cannot.
+        assert!(matches!(
+            loaded.get(&secret_oid, "mallory", 0),
+            Err(RepoError::Unauthorized(_))
+        ));
+        // History preserved.
+        assert!(loaded.heads().contains(&change_id));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

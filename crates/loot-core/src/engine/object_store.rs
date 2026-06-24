@@ -62,6 +62,14 @@ impl ObjectStore {
             .map(|&pos| &self.log[pos])
             .ok_or_else(|| RepoError::NotFound(oid.clone()))
     }
+
+    /// Every stored object with its address, in insertion order. Used by the
+    /// engine to serialize the store for persistence.
+    pub fn iter(&self) -> impl Iterator<Item = (Oid, &SealedObject)> {
+        self.by_addr
+            .iter()
+            .map(move |(addr, &pos)| (addr.clone(), &self.log[pos]))
+    }
 }
 
 #[cfg(test)]

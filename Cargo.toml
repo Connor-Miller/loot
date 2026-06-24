@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/loot-core",
+    "crates/loot-cli",
     "crates/loot-bench",
     "crates/spike-dag",
     "crates/spike-crdt",

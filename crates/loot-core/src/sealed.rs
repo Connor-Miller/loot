@@ -86,6 +86,13 @@ impl Keyring {
         self.keys.get(oid).copied()
     }
 
+    /// Every (oid, key) pair, for persisting an identity's custody to a
+    /// LOCAL-ONLY file. This must never feed a sync bundle — the whole point of
+    /// the keyring is that keys do not travel (ADR 0003).
+    pub fn iter(&self) -> impl Iterator<Item = (Oid, ContentKey)> + '_ {
+        self.keys.iter().map(|(oid, key)| (oid.clone(), *key))
+    }
+
     fn get(&self, oid: &Oid) -> Option<&ContentKey> {
         self.keys.get(oid)
     }

@@ -430,6 +430,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "loot-cli"
+version = "0.0.0"
+dependencies = [
+ "loot-core",
+]
+
+[[package]]
 name = "loot-core"
 version = "0.0.0"
 dependencies = [

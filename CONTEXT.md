@@ -38,6 +38,22 @@ content key, so storing or syncing a Sealed object can never leak a key.
 separately from Sealed objects. `open` reads from the keyring; a relay simply
 has no keyring entry and therefore cannot decrypt. Keys live here and only here.
 
+**`.loot/`** — a repo's on-disk state (ADR 0005): `identity` (the ambient
+keyholder), `repo` (sealed objects + change graph), and `keyring` (this
+identity's keys, LOCAL-ONLY — never bundled). Written/read by the engine's
+`save`/`load`; the CLI is process-per-command and round-trips through it.
+
+**`.lootattributes`** — a gitattributes-style file mapping path globs to
+visibility (`.env restricted=alice`, `*.md public`). `loot commit` reads it to
+seal each path; unmatched paths default to Public. This is the user-facing
+surface of the thesis — where you declare a file private.
+
+**loot (the CLI)** — the first product crate (`loot-cli`, binary `loot`):
+`init`, `commit`, `checkout`, `log`. A thin adapter that supplies the ambient
+identity and real clock to the engine's `Repo` calls. Demonstrated end-to-end:
+a committed `.env` checks out for its keyholder and is silently skipped for
+anyone else, from the same repo and commit.
+
 **Object** — a content-addressed unit of stored bytes. In the encrypted-DAG
 model, objects are encrypted independently (see *Sealed object*) and addressed
 **solely** by the hash of their *ciphertext*. There is no plaintext-derived

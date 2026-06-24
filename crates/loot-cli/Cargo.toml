@@ -1,0 +1,15 @@
+[package]
+name = "loot-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# The first product crate: a CLI over the canonical engine (ADR 0005).
+# Dependency-light by design — args are parsed by hand, no clap.
+
+[[bin]]
+name = "loot"
+path = "src/main.rs"
+
+[dependencies]
+loot-core.workspace = true
