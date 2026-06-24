@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub mod converge;
+pub mod engine;
 pub mod sealed;
+
+pub use engine::DagRepo;
 
 /// Content identity. A stable handle to a unit of content, independent of
 /// where (or whether) it is currently materialized on disk.

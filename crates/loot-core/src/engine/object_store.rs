@@ -8,8 +8,8 @@
 //! (ADR 0004). Backend-private; a different backend would store bytes
 //! differently.
 
-use loot_core::sealed::SealedObject;
-use loot_core::{Oid, RepoError};
+use crate::sealed::SealedObject;
+use crate::{Oid, RepoError};
 use std::collections::BTreeMap;
 
 /// What `put` did. The caller (which owns key custody) files a freshly-minted
@@ -67,8 +67,8 @@ impl ObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loot_core::sealed::seal;
-    use loot_core::Visibility;
+    use crate::sealed::seal;
+    use crate::Visibility;
 
     #[test]
     fn put_then_get_round_trips() {

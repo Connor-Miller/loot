@@ -83,17 +83,21 @@ nothing built on top forces a teardown.
 
 ## Foundation (decided — ADR 0002)
 
-The foundation is the **encrypted content-addressed DAG** (`crates/spike-dag`'s
-model graduates into `loot-core`). Decided by running the bake-off, not by
-argument: under per-content encryption the CRDT degrades to last-writer-wins
-and silently dropped concurrent edits (0 of 4 survived), while the DAG surfaced
-conflicts (safe) and was ~4.5x faster at 50k files. See ADR 0002 and
-`docs/bakeoff/index.html` for full methodology and results.
+The foundation is the **encrypted content-addressed DAG**, now the canonical
+engine at `loot_core::engine` (`DagRepo`, re-exported as `loot_core::DagRepo`).
+Decided by running the bake-off, not by argument: under per-content encryption
+the CRDT degrades to last-writer-wins and silently dropped concurrent edits
+(0 of 4 survived), while the DAG surfaced conflicts (safe) and was ~4.5x faster
+at 50k files. See ADR 0002 and `docs/bakeoff/index.html` for full methodology.
 
-`crates/spike-crdt` is **retained but non-canonical** — it is the benchmark
-record backing the decision, not part of the product. `crates/loot-bench` and
-both spikes stay in the tree so the decision is reproducible
-(`cargo test --release`).
+The engine is built from deep modules: `sealed` (encryption/visibility/embargo,
+ADR 0003), `converge` (the merge classifier, ADR 0001), and the engine-private
+`object_store` + `change_graph`. `crates/spike-dag` is now a thin shim that
+re-exports the engine so the bake-off keeps its DAG-vs-CRDT symmetry.
+
+`crates/spike-crdt` is **retained but non-canonical** — the benchmark record,
+not part of the product. `crates/loot-bench` and both spike shims stay in the
+tree so the decision is reproducible (`cargo test --release`).
 
 ## Open / undecided
 

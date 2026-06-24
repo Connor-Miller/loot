@@ -5,8 +5,8 @@
 //! bytes, ciphertext, or keys — only change identity and parent/child shape.
 //! Backend-private.
 
-use loot_core::converge::Tree;
-use loot_core::{Change, Oid, Visibility};
+use crate::converge::Tree;
+use crate::{Change, Oid, Visibility};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

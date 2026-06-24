@@ -60,11 +60,15 @@ and fails safe (conflict, not loss).
 
 ## Consequences
 
-- `spike-dag`'s model graduates into `loot-core`. `spike-crdt` is **retained,
-  not deleted**, as the benchmark record backing this decision; it is marked
-  non-canonical in CONTEXT.md and is not part of the product.
-- The benchmark harness (`loot-bench`) and both spikes stay in the tree so the
-  decision is reproducible (`cargo test --release`).
+- `spike-dag`'s model graduates into `loot-core`. **Done:** the canonical engine
+  is `loot_core::engine` (`DagRepo`, re-exported as `loot_core::DagRepo`).
+  `spike-dag` is reduced to a thin re-export shim that exists only to run the
+  bake-off scenarios against the engine, preserving DAG-vs-CRDT symmetry.
+  `spike-crdt` is **retained, not deleted**, as the benchmark record; it is
+  marked non-canonical in CONTEXT.md and is not part of the product.
+- The benchmark harness (`loot-bench`) and both spike shims stay in the tree so
+  the decision is reproducible (`cargo test --release`). The engine's white-box
+  guards (key-leak, equality-oracle) live with the engine in `loot-core`.
 - **Known follow-up (the DAG's own sharp edge):** dedup keyed on a plaintext
   identity hash leaked a same-plaintext equality oracle. **Resolved in ADR 0004:
   drop plaintext dedup entirely.**
