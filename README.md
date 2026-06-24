@@ -7,10 +7,11 @@ the *repository*. Commit your `.env`. Keep files private inside a shared repo.
 Embargo a security fix: merge it, cut the release, reveal the source later.
 
 This is the unsolved problem in modern version control. Ergonomics
-(jj already nails them) and live sync are layers we add later — the foundation
-exists to make per-change permissioning clean and fast.
+(jj already nails them) are a layer we add later. Sync, however, is part of the
+foundation bake-off: the hardest question in loot is how concurrent offline
+edits converge when content may be encrypted to peers who lack the key.
 
-## Status: early. Deciding the foundation.
+## Status: early — deciding the foundation
 
 Two storage models implement the same [`Repo`](crates/loot-core/src/lib.rs)
 contract so we can compare them apples-to-apples on speed and feel:
