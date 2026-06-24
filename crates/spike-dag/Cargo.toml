@@ -6,13 +6,10 @@ license.workspace = true
 
 [dependencies]
 loot-core.workspace = true
+# blake3 for change-id hashing only. Encryption/keys now live in
+# loot_core::sealed (ADR 0003), so spike-dag no longer depends on aes-gcm.
 blake3.workspace = true
 thiserror.workspace = true
-# Vetted AEAD for honest per-content encryption in the spike. AES-256-GCM is a
-# standard, well-reviewed construction; `aes-gcm` is the RustCrypto impl. We do
-# NOT roll our own crypto. `getrandom` gives us OS entropy for nonces/keys.
-aes-gcm = "0.10"
-getrandom = "0.2"
 
 [dev-dependencies]
 loot-bench = { path = "../loot-bench" }

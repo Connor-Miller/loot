@@ -23,9 +23,25 @@ visibility. Permissions attach here, not to the repo.
 **Identity** — a keyholder. Visibility is ultimately enforced by who holds the
 decryption key for a unit of content. "Permissioning is key management."
 
+**Sealed content** — the module that owns loot's thesis: encryption, visibility,
+and embargo behind two operations. `seal(bytes, visibility)` produces a
+*Sealed object* plus a freshly-minted content key; `open(sealed, reader, now)`
+is the single authorization chokepoint — it enforces embargo (by `now`), then
+visibility, then decrypts. Nothing else in the system decides who may read
+content. See ADR 0003.
+
+**Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
+identities permitted to hold a key). It deliberately does **not** contain any
+content key, so storing or syncing a Sealed object can never leak a key.
+
+**Keyring** — an identity's private custody of content keys (`oid -> key`), held
+separately from Sealed objects. `open` reads from the keyring; a relay simply
+has no keyring entry and therefore cannot decrypt. Keys live here and only here.
+
 **Object** — a content-addressed unit of stored bytes. In the encrypted-DAG
-model, objects are encrypted independently and addressed by the hash of their
-*ciphertext*, with a separate plaintext *identity hash* used only for dedup.
+model, objects are encrypted independently (see *Sealed object*) and addressed
+by the hash of their *ciphertext*, with a separate plaintext *identity hash*
+used only for dedup.
 
 **Content address vs identity hash** — the address locates stored (encrypted)
 bytes; the identity hash recognizes equal plaintext across keys for dedup.

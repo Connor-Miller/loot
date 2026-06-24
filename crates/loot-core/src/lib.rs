@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub mod sealed;
+
 /// Content identity. A stable handle to a unit of content, independent of
 /// where (or whether) it is currently materialized on disk.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -8,3 +8,8 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+blake3.workspace = true
+# Vetted AEAD for the Sealed content module (no novel crypto). AES-256-GCM via
+# RustCrypto, matching what spike-dag already validated in the bake-off.
+aes-gcm = "0.10"
+getrandom = "0.2"

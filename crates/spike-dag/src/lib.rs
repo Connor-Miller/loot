@@ -9,40 +9,18 @@
 //!     small-file perf disaster
 //!   - runs fully in-memory; `checkout` is the only thing that touches disk
 //!
-//! Crypto is honest but simple: a fresh AES-256-GCM content key per object
-//! (RustCrypto `aes-gcm`, a vetted impl — no novel crypto). "Holding a key"
-//! is modelled by an in-object grant map: an authorized identity has the
-//! content key, an outsider does not and literally cannot decrypt. Embargo =
-//! the grant exists for everyone but is withheld until `now >= reveal_at`.
+//! Encryption, visibility, and embargo are NOT implemented here — they live in
+//! the deep `loot_core::sealed` module (ADR 0003). This backend stores
+//! [`SealedObject`]s (ciphertext, no keys) in its packed log and holds content
+//! keys in a separate [`Keyring`]. It calls `sealed::seal`/`sealed::open` and
+//! never touches crypto directly. Because keys live only in the keyring, a sync
+//! bundle cannot leak them: it ships SealedObjects, plus keys for `ANYONE`-
+//! granted (Public/Embargoed) content only — Restricted keys never travel.
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use loot_core::sealed::{self, ContentKey, Keyring, SealedObject, ANYONE};
 use loot_core::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-
-/// Wildcard grant key id — content readable by anyone who can read the repo.
-const ANYONE: &str = "*";
-
-type ContentKey = [u8; 32];
-
-/// One encrypted object in the packed log. Addressed by the blake3 hash of its
-/// ciphertext (`Oid`). The plaintext `identity_hash` is kept ONLY for dedup —
-/// deliberately a different value from the address (the sharp edge: two repos
-/// that encrypt the same plaintext under different keys produce different
-/// addresses but the same identity hash, so dedup must key on identity hash).
-#[derive(Clone)]
-struct StoredObject {
-    nonce: [u8; 12],
-    ciphertext: Vec<u8>,
-    vis: Visibility,
-    /// identity -> content key. `ANYONE` for Public/Embargoed; the listed
-    /// identities for Restricted. A repo that lacks an entry for its own
-    /// identity (and for `ANYONE`) cannot decrypt — it can only relay bytes.
-    grants: BTreeMap<String, ContentKey>,
-    /// blake3(plaintext) — dedup identity, NOT the address.
-    identity_hash: [u8; 32],
-}
 
 /// A change node in the DAG.
 #[derive(Clone)]
@@ -56,8 +34,10 @@ struct ChangeNode {
 pub struct DagRepo {
     root: PathBuf,
     identity: String,
-    /// Append-only packed object log. Indexes point into this.
-    log: Vec<StoredObject>,
+    /// This identity's private key custody. Keys live here and only here.
+    keyring: Keyring,
+    /// Append-only packed object log of SealedObjects. Indexes point into this.
+    log: Vec<SealedObject>,
     /// content address -> position in `log`.
     by_addr: BTreeMap<Oid, usize>,
     /// plaintext identity hash -> content address (dedup).
@@ -69,123 +49,53 @@ pub struct DagRepo {
 }
 
 impl DagRepo {
-    fn random_bytes<const N: usize>() -> Result<[u8; N], RepoError> {
-        let mut buf = [0u8; N];
-        getrandom::getrandom(&mut buf).map_err(|e| RepoError::Backend(e.to_string()))?;
-        Ok(buf)
+    /// Whether this identity is entitled to hold the key for content with these
+    /// grant ids — used to decide what to file into the local keyring.
+    fn entitled(&self, grant_ids: &[String]) -> bool {
+        grant_ids.iter().any(|g| g == ANYONE || g == &self.identity)
     }
 
-    /// Authorized grant key ids for a visibility policy.
-    fn grant_ids(vis: &Visibility) -> Vec<String> {
-        match vis {
-            Visibility::Public | Visibility::Embargoed { .. } => vec![ANYONE.to_string()],
-            Visibility::Restricted(ids) => ids.clone(),
-        }
-    }
-
-    /// Encrypt `bytes` under a fresh content key and build a `StoredObject`
-    /// plus its content address. Pure — no store mutation — so it's reused for
-    /// both `put` and (re-)sealing is unnecessary on bundle ingest.
-    fn seal(bytes: &[u8], vis: &Visibility) -> Result<(Oid, StoredObject), RepoError> {
-        let key_bytes: ContentKey = Self::random_bytes()?;
-        let nonce_bytes: [u8; 12] = Self::random_bytes()?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), bytes)
-            .map_err(|e| RepoError::Backend(format!("encrypt: {e}")))?;
-
-        // Address = hash of ciphertext (+ nonce). Identity hash = hash of
-        // plaintext, used for dedup only.
-        let mut addr_hasher = blake3::Hasher::new();
-        addr_hasher.update(&nonce_bytes);
-        addr_hasher.update(&ciphertext);
-        let addr = Oid(*addr_hasher.finalize().as_bytes());
-        let identity_hash = *blake3::hash(bytes).as_bytes();
-
-        let grants = Self::grant_ids(vis)
-            .into_iter()
-            .map(|id| (id, key_bytes))
-            .collect();
-
-        Ok((
-            addr,
-            StoredObject {
-                nonce: nonce_bytes,
-                ciphertext,
-                vis: vis.clone(),
-                grants,
-                identity_hash,
-            },
-        ))
-    }
-
-    /// Insert an object into the packed log + indexes, deduping on identity
-    /// hash. Returns the address actually stored (an existing one on a hit).
-    fn store(&mut self, addr: Oid, obj: StoredObject) -> Oid {
-        if self.by_addr.contains_key(&addr) {
-            return addr;
-        }
-        // Dedup: same plaintext already present under another address. Merge
-        // any new grants in so newly-authorized identities gain the key.
-        if let Some(existing) = self.by_identity.get(&obj.identity_hash).cloned() {
-            let pos = self.by_addr[&existing];
-            for (id, k) in &obj.grants {
-                self.log[pos].grants.entry(id.clone()).or_insert(*k);
+    /// Store a SealedObject in the packed log + indexes, deduping on identity
+    /// hash. If `key` is supplied AND this identity is entitled, file it into
+    /// the keyring. Returns the address actually stored (existing one on a hit).
+    fn store(&mut self, addr: Oid, obj: SealedObject, key: Option<ContentKey>) -> Oid {
+        let stored_addr = if self.by_addr.contains_key(&addr) {
+            addr.clone()
+        } else if let Some(existing) = self.by_identity.get(&obj.identity_hash).cloned() {
+            // Same plaintext already present under another address (dedup).
+            existing
+        } else {
+            let pos = self.log.len();
+            self.by_identity.insert(obj.identity_hash, addr.clone());
+            self.log.push(obj.clone());
+            self.by_addr.insert(addr.clone(), pos);
+            addr.clone()
+        };
+        // A content key belongs to a specific ciphertext (address). Only file it
+        // when the address we stored IS the one this key seals; if dedup
+        // collapsed us onto a different existing address, the minted key is for
+        // ciphertext we discarded and would corrupt the keyring. Don't overwrite
+        // a key already filed for this address either.
+        if let Some(k) = key {
+            if stored_addr == addr && self.entitled(&obj.grant_ids) && !self.keyring.holds(&addr) {
+                self.keyring.insert(stored_addr.clone(), k);
             }
-            return existing;
         }
-        let pos = self.log.len();
-        self.by_identity.insert(obj.identity_hash, addr.clone());
-        self.log.push(obj);
-        self.by_addr.insert(addr.clone(), pos);
-        addr
+        stored_addr
     }
 
-    fn object(&self, oid: &Oid) -> Result<&StoredObject, RepoError> {
+    fn object(&self, oid: &Oid) -> Result<&SealedObject, RepoError> {
         self.by_addr
             .get(oid)
             .map(|&pos| &self.log[pos])
             .ok_or_else(|| RepoError::NotFound(oid.clone()))
     }
 
-    /// The content key `reader` can obtain for `obj` at time `now`, enforcing
-    /// the visibility policy. Single chokepoint for authorization. Returns
-    /// `Embargoed` if sealed, `Unauthorized` if no grant, else the key.
-    fn resolve_key(
-        obj: &StoredObject,
-        oid: &Oid,
-        reader: &str,
-        now: u64,
-    ) -> Result<ContentKey, RepoError> {
-        // Embargo: the key is withheld until reveal time, for everyone.
-        if let Visibility::Embargoed { reveal_at } = obj.vis {
-            if now < reveal_at {
-                return Err(RepoError::Embargoed(reveal_at));
-            }
-        }
-        // A grant for ANYONE means anyone who can read the repo holds the key.
-        if let Some(k) = obj.grants.get(ANYONE) {
-            return Ok(*k);
-        }
-        // Otherwise the reader must be an explicitly authorized keyholder.
-        obj.grants
-            .get(reader)
-            .copied()
-            .ok_or_else(|| RepoError::Unauthorized(oid.clone()))
-    }
-
-    fn decrypt(obj: &StoredObject, key: &ContentKey) -> Result<Vec<u8>, RepoError> {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-        cipher
-            .decrypt(Nonce::from_slice(&obj.nonce), obj.ciphertext.as_ref())
-            .map_err(|e| RepoError::Backend(format!("decrypt: {e}")))
-    }
-
-    /// Whether this repo's own identity can obtain the key for `oid` right now.
-    /// Used to decide merger vs relay role during `apply` (ADR 0001).
+    /// Whether this repo's own identity can open `oid` right now (authorized,
+    /// holds the key, and not embargoed). Decides merger vs relay (ADR 0001).
     fn can_decrypt(&self, oid: &Oid, now: u64) -> bool {
         match self.object(oid) {
-            Ok(obj) => Self::resolve_key(obj, oid, &self.identity, now).is_ok(),
+            Ok(obj) => sealed::open(obj, oid, &self.identity, &self.keyring, now).is_ok(),
             Err(_) => false,
         }
     }
@@ -262,6 +172,7 @@ impl Repo for DagRepo {
         Ok(DagRepo {
             root: path,
             identity: identity.to_string(),
+            keyring: Keyring::new(),
             log: Vec::new(),
             by_addr: BTreeMap::new(),
             by_identity: BTreeMap::new(),
@@ -271,14 +182,14 @@ impl Repo for DagRepo {
     }
 
     fn put(&mut self, bytes: &[u8], vis: Visibility) -> Result<Oid, RepoError> {
-        let (addr, obj) = Self::seal(bytes, &vis)?;
-        Ok(self.store(addr, obj))
+        let (addr, obj, key) = sealed::seal(bytes, &vis)?;
+        // We minted the key, so we file it (entitlement is enforced in `store`).
+        Ok(self.store(addr, obj, Some(key)))
     }
 
     fn get(&self, oid: &Oid, reader: &str, now: u64) -> Result<Vec<u8>, RepoError> {
         let obj = self.object(oid)?;
-        let key = Self::resolve_key(obj, oid, reader, now)?;
-        Self::decrypt(obj, &key)
+        sealed::open(obj, oid, reader, &self.keyring, now)
     }
 
     fn commit(&mut self, change: Change) -> Result<Oid, RepoError> {
@@ -320,8 +231,6 @@ impl Repo for DagRepo {
     fn bundle(&self, have: &[Oid]) -> Result<SyncBundle, RepoError> {
         // Changes reachable here but not already known to the recipient. For
         // the spike, "reachable-not-have" = every change id not in `have`.
-        // Content stays encrypted; we ship ciphertext + grants so a keyholder
-        // peer can decrypt and a relay can only forward.
         let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
         let send: Vec<&ChangeNode> = self
             .changes_in_order()
@@ -329,16 +238,25 @@ impl Repo for DagRepo {
             .filter(|c| !have_set.contains(&c.id))
             .collect();
 
-        let mut needed: BTreeMap<Oid, &StoredObject> = BTreeMap::new();
+        // Ship SealedObjects (ciphertext, no keys) plus the keys for ANYONE-
+        // granted (Public/Embargoed) content ONLY. Restricted keys NEVER travel
+        // (ADR 0003): a peer without them becomes a relay, by construction.
+        let mut needed: BTreeMap<Oid, &SealedObject> = BTreeMap::new();
+        let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
         for c in &send {
             for (oid, _vis) in c.tree.values() {
                 if let Ok(obj) = self.object(oid) {
                     needed.insert(oid.clone(), obj);
+                    if obj.grant_ids.iter().any(|g| g == ANYONE) {
+                        if let Some(k) = self.keyring.key_for(oid) {
+                            public_keys.insert(oid.clone(), k);
+                        }
+                    }
                 }
             }
         }
 
-        Ok(SyncBundle(wire::encode(&send, &needed)))
+        Ok(SyncBundle(wire::encode(&send, &needed, &public_keys)))
     }
 
     fn apply(
@@ -346,14 +264,17 @@ impl Repo for DagRepo {
         bundle: &SyncBundle,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
-        let (incoming_changes, incoming_objs) = wire::decode(&bundle.0)?;
+        let (incoming_changes, incoming_objs, incoming_keys) = wire::decode(&bundle.0)?;
 
         // Our tree before applying, used to detect concurrent same-path edits.
         let local_before = self.current_tree();
 
-        // Ingest objects first (dedup handles overlap).
+        // Ingest SealedObjects, filing only the public keys that rode along
+        // (entitlement still enforced in `store`). No Restricted key can be
+        // here to file, so a relay structurally cannot gain one.
         for (addr, obj) in incoming_objs {
-            self.store(addr, obj);
+            let key = incoming_keys.get(&addr).copied();
+            self.store(addr, obj, key);
         }
 
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
@@ -441,7 +362,8 @@ fn three_way(repo: &DagRepo, ours: &Oid, theirs: &Oid, now: u64) -> MergeOutcome
 /// keep spike-dag dependency-light (no serde/bincode). The format is internal:
 /// bundles produced by `bundle` are only ever read by `apply`.
 mod wire {
-    use super::{ChangeNode, StoredObject};
+    use super::ChangeNode;
+    use loot_core::sealed::{ContentKey, SealedObject};
     use loot_core::{Oid, RepoError, Visibility};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -470,9 +392,14 @@ mod wire {
         }
     }
 
-    pub fn encode(changes: &[&ChangeNode], objs: &BTreeMap<Oid, &StoredObject>) -> Vec<u8> {
+    pub fn encode(
+        changes: &[&ChangeNode],
+        objs: &BTreeMap<Oid, &SealedObject>,
+        public_keys: &BTreeMap<Oid, ContentKey>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
 
+        // SealedObjects: ciphertext + policy + grant_ids (NAMES), never keys.
         put_u32(&mut out, objs.len());
         for (addr, obj) in objs {
             out.extend_from_slice(&addr.0);
@@ -480,11 +407,19 @@ mod wire {
             put_bytes(&mut out, &obj.ciphertext);
             put_vis(&mut out, &obj.vis);
             out.extend_from_slice(&obj.identity_hash);
-            put_u32(&mut out, obj.grants.len());
-            for (id, key) in &obj.grants {
+            put_u32(&mut out, obj.grant_ids.len());
+            for id in &obj.grant_ids {
                 put_bytes(&mut out, id.as_bytes());
-                out.extend_from_slice(key);
             }
+        }
+
+        // Keys for ANYONE-granted content only (ADR 0003). The caller guarantees
+        // no Restricted key is present here; this section can carry only the
+        // keys a relay is already entitled to as a repo reader.
+        put_u32(&mut out, public_keys.len());
+        for (addr, key) in public_keys {
+            out.extend_from_slice(&addr.0);
+            out.extend_from_slice(key);
         }
 
         put_u32(&mut out, changes.len());
@@ -567,7 +502,16 @@ mod wire {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn decode(b: &[u8]) -> Result<(Vec<ChangeNode>, Vec<(Oid, StoredObject)>), RepoError> {
+    pub fn decode(
+        b: &[u8],
+    ) -> Result<
+        (
+            Vec<ChangeNode>,
+            Vec<(Oid, SealedObject)>,
+            BTreeMap<Oid, ContentKey>,
+        ),
+        RepoError,
+    > {
         let mut c = Cursor { b, i: 0 };
 
         let n_objs = c.u32()?;
@@ -579,22 +523,28 @@ mod wire {
             let vis = c.vis()?;
             let identity_hash = c.arr32()?;
             let n_grants = c.u32()?;
-            let mut grants = BTreeMap::new();
+            let mut grant_ids = Vec::with_capacity(n_grants);
             for _ in 0..n_grants {
-                let id = c.string()?;
-                let key = c.arr32()?;
-                grants.insert(id, key);
+                grant_ids.push(c.string()?);
             }
             objs.push((
                 addr,
-                StoredObject {
+                SealedObject {
                     nonce,
                     ciphertext,
                     vis,
-                    grants,
+                    grant_ids,
                     identity_hash,
                 },
             ));
+        }
+
+        let n_keys = c.u32()?;
+        let mut public_keys = BTreeMap::new();
+        for _ in 0..n_keys {
+            let addr = Oid(c.arr32()?);
+            let key = c.arr32()?;
+            public_keys.insert(addr, key);
         }
 
         let n_changes = c.u32()?;
@@ -623,7 +573,7 @@ mod wire {
             });
         }
 
-        Ok((changes, objs))
+        Ok((changes, objs, public_keys))
     }
 }
 
@@ -711,5 +661,46 @@ mod tests {
             t.elapsed(),
         );
         assert!(res.all_passed(), "checks: {:?}", res.checks);
+    }
+
+    /// ADR 0003 leak guard: a Restricted content key must NEVER appear in a sync
+    /// bundle. We mint a restricted blob, capture the actual content key from
+    /// the producer's keyring, and assert its raw bytes are absent from the
+    /// bundle. Public keys may ride along; restricted ones may not.
+    #[test]
+    fn bundle_never_carries_restricted_keys() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let secret_oid = alice
+            .put(b"TOKEN=supersecret\n", Visibility::Restricted(vec!["alice".into()]))
+            .unwrap();
+        let pub_oid = alice.put(b"readme\n", Visibility::Public).unwrap();
+
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from(".env"), (secret_oid.clone(), Visibility::Restricted(vec!["alice".into()])));
+        tree.insert(PathBuf::from("README"), (pub_oid.clone(), Visibility::Public));
+        let cid = alice
+            .commit(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
+            .unwrap();
+        let _ = cid;
+
+        let restricted_key = alice.keyring.key_for(&secret_oid).expect("alice holds her key");
+        let public_key = alice.keyring.key_for(&pub_oid).expect("alice holds public key");
+
+        let bundle = alice.bundle(&[]).unwrap();
+
+        // The restricted key's 32 raw bytes must not occur anywhere in the wire.
+        assert!(
+            !contains_window(&bundle.0, &restricted_key),
+            "restricted content key leaked into the sync bundle"
+        );
+        // The public key is allowed to travel (relay is a repo reader).
+        assert!(
+            contains_window(&bundle.0, &public_key),
+            "public content key should ride along for ANYONE-granted content"
+        );
+    }
+
+    fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

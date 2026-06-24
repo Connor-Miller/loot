@@ -433,6 +433,9 @@ dependencies = [
 name = "loot-core"
 version = "0.0.0"
 dependencies = [
+ "aes-gcm",
+ "blake3",
+ "getrandom 0.2.17",
  "thiserror 2.0.18",
 ]
 
@@ -642,9 +645,7 @@ dependencies = [
 name = "spike-dag"
 version = "0.0.0"
 dependencies = [
- "aes-gcm",
  "blake3",
- "getrandom 0.2.17",
  "loot-bench",
  "loot-core",
  "tempfile",
