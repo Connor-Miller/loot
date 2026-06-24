@@ -49,10 +49,19 @@ seal each path; unmatched paths default to Public. This is the user-facing
 surface of the thesis — where you declare a file private.
 
 **loot (the CLI)** — the first product crate (`loot-cli`, binary `loot`):
-`init`, `commit`, `checkout`, `log`. A thin adapter that supplies the ambient
-identity and real clock to the engine's `Repo` calls. Demonstrated end-to-end:
-a committed `.env` checks out for its keyholder and is silently skipped for
-anyone else, from the same repo and commit.
+`init`, `commit`, `checkout`, `log`, `bundle`, `apply`. A thin adapter that
+supplies the ambient identity and real clock to the engine's `Repo` calls.
+Demonstrated end-to-end: a committed `.env` checks out for its keyholder and is
+silently skipped for anyone else, from the same repo and commit.
+
+**Sync (`bundle`/`apply`)** — one-way transport via a bundle file (ADR 0001
+realized in the CLI). `loot bundle <file>` writes ciphertext plus *only* the
+keys for `ANYONE`-granted content (restricted keys never travel). `loot apply
+<file>` merges idempotently and prints each path's outcome: *converged* (new or
+identical), *merged*, *conflict*, or *relayed* — the last being the novel role,
+where a non-keyholder carries ciphertext it cannot read. Demonstrated: Bob
+applies Alice's bundle and stores her sealed `.env` as ciphertext he can't
+decrypt.
 
 **Object** — a content-addressed unit of stored bytes. In the encrypted-DAG
 model, objects are encrypted independently (see *Sealed object*) and addressed

@@ -35,6 +35,20 @@ loot checkout            # mallory: restores README.md; .env stays sealed
 The `.env` ciphertext is present in `.loot/` the whole time — mallory simply
 can't decrypt it. Privacy is per-content, not per-repo.
 
+### Sync carries ciphertext, not keys
+
+```bash
+# alice (keyholder) ships a bundle
+loot bundle alice.loot
+
+# bob, a different identity, applies it
+loot apply alice.loot     # .env -> relayed (sealed, bob lacks the key)
+loot checkout             # bob gets the public files; .env stays sealed
+```
+
+A non-keyholder can carry and forward your encrypted content without ever
+reading it — the *relay* role. Restricted keys never travel in a bundle.
+
 ## Architecture
 
 - [`crates/loot-core`](crates/loot-core) — the canonical engine and its deep
@@ -42,7 +56,7 @@ can't decrypt it. Privacy is per-content, not per-repo.
   `sealed` (encryption/visibility/embargo, ADR 0003), `converge` (the
   merger/relay convergence rule, ADR 0001).
 - [`crates/loot-cli`](crates/loot-cli) — the `loot` binary: `init`, `commit`,
-  `checkout`, `log` (ADR 0005).
+  `checkout`, `log`, `bundle`, `apply` (ADR 0005).
 - [`crates/spike-crdt`](crates/spike-crdt) + [`crates/loot-bench`](crates/loot-bench)
   — the non-canonical CRDT model and shared workload, retained so the
   foundation bake-off stays reproducible (`docs/bakeoff/index.html`).

@@ -1,11 +1,12 @@
 //! `loot` — a CLI over the canonical engine (ADR 0005).
 //!
-//! Commands: init, commit, checkout, log. State persists under `.loot/` between
-//! invocations (engine `save`/`load`). The current identity comes from
-//! `.loot/identity`; the clock is real system time. Per-path visibility is
-//! declared in `.lootattributes`. No sync yet.
+//! Commands: init, commit, checkout, log, bundle, apply. State persists under
+//! `.loot/` between invocations (engine `save`/`load`). The current identity
+//! comes from `.loot/identity`; the clock is real system time. Per-path
+//! visibility is declared in `.lootattributes`. Sync is a one-way bundle file:
+//! `bundle` writes a transport artifact, `apply` merges it (idempotently).
 
-use loot_core::{Change, DagRepo, Oid, Repo, Visibility};
+use loot_core::{Change, DagRepo, MergeOutcome, Oid, Repo, SyncBundle, Visibility};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -23,6 +24,8 @@ fn main() -> ExitCode {
         "commit" => cmd_commit(rest),
         "checkout" => cmd_checkout(rest),
         "log" => cmd_log(),
+        "bundle" => cmd_bundle(rest),
+        "apply" => cmd_apply(rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -44,7 +47,9 @@ usage:
   loot init --identity <name>   initialize a repo here, owned by <name>
   loot commit -m <message>      seal + record the working tree per .lootattributes
   loot checkout                 materialize what the current identity may see
-  loot log                      show change history";
+  loot log                      show change history
+  loot bundle <file>            write a sync bundle (ciphertext, no private keys)
+  loot apply <file>             merge a peer's bundle (idempotent)";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -163,6 +168,52 @@ fn cmd_log() -> Result<(), String> {
         println!("{}  {}", short(&id), message);
     }
     Ok(())
+}
+
+fn cmd_bundle(args: &[String]) -> Result<(), String> {
+    require_repo()?;
+    let out = args.first().ok_or("bundle requires <file>")?;
+    let repo = DagRepo::load(&dot_dir(), PathBuf::from(".")).map_err(|e| e.to_string())?;
+    // Full bundle (have = []): apply is idempotent, so the recipient dedups
+    // anything it already has. Ships ciphertext + ANYONE-granted keys only;
+    // restricted keys never travel (ADR 0003).
+    let bundle = repo.bundle(&[]).map_err(|e| e.to_string())?;
+    std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
+    println!("wrote {} ({} bytes) — copy it to a peer and `loot apply`", out, bundle.0.len());
+    Ok(())
+}
+
+fn cmd_apply(args: &[String]) -> Result<(), String> {
+    require_repo()?;
+    let infile = args.first().ok_or("apply requires <file>")?;
+    let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
+    let mut repo = DagRepo::load(&dot_dir(), PathBuf::from(".")).map_err(|e| e.to_string())?;
+    let outcomes = repo
+        .apply(&SyncBundle(bytes), now())
+        .map_err(|e| e.to_string())?;
+    repo.save(&dot_dir()).map_err(|e| e.to_string())?;
+
+    if outcomes.is_empty() {
+        println!("applied {infile}: nothing new (already up to date)");
+    } else {
+        let identity = read_identity()?;
+        println!("applied {infile} as {identity}:");
+        for (path, outcome) in &outcomes {
+            println!("  {:<24} {}", path.display(), describe(outcome));
+        }
+        println!("run `loot checkout` to materialize what you may see");
+    }
+    Ok(())
+}
+
+/// Human phrasing for a merge outcome, naming the relay role explicitly.
+fn describe(o: &MergeOutcome) -> &'static str {
+    match o {
+        MergeOutcome::Converged => "converged",
+        MergeOutcome::Merged => "merged",
+        MergeOutcome::Conflict => "conflict (needs resolution)",
+        MergeOutcome::RelayedUnmerged => "relayed (sealed — you lack the key)",
+    }
 }
 
 // --- helpers ---
@@ -336,5 +387,13 @@ mod tests {
         assert!(matches!(attrs.visibility_for("README.md"), Visibility::Public));
         assert!(matches!(attrs.visibility_for("main.rs"), Visibility::Public)); // default
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describe_names_the_relay_role() {
+        assert_eq!(describe(&MergeOutcome::Converged), "converged");
+        assert_eq!(describe(&MergeOutcome::Merged), "merged");
+        assert!(describe(&MergeOutcome::RelayedUnmerged).contains("sealed"));
+        assert!(describe(&MergeOutcome::Conflict).contains("conflict"));
     }
 }
