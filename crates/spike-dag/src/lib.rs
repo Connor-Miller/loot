@@ -17,35 +17,28 @@
 //! bundle cannot leak them: it ships SealedObjects, plus keys for `ANYONE`-
 //! granted (Public/Embargoed) content only — Restricted keys never travel.
 
+mod change_graph;
+mod object_store;
+
+use change_graph::{compute_change_id, ChangeGraph, ChangeNode};
 use loot_core::sealed::{self, ContentKey, Keyring, SealedObject, ANYONE};
 use loot_core::{converge, Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
+use object_store::{ObjectStore, Stored};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// A change node in the DAG.
-#[derive(Clone)]
-struct ChangeNode {
-    id: Oid,
-    parents: Vec<Oid>,
-    message: String,
-    tree: BTreeMap<PathBuf, (Oid, Visibility)>,
-}
-
+/// The DAG backend: a thin composition of an [`ObjectStore`] (content-addressed
+/// ciphertext), a [`ChangeGraph`] (history), a [`Keyring`] (this identity's key
+/// custody), and calls into `loot_core::sealed`/`converge` for policy. DagRepo
+/// itself holds no storage or merge logic — it wires the modules to the `Repo`
+/// seam.
 pub struct DagRepo {
     root: PathBuf,
     identity: String,
     /// This identity's private key custody. Keys live here and only here.
     keyring: Keyring,
-    /// Append-only packed object log of SealedObjects. Indexes point into this.
-    log: Vec<SealedObject>,
-    /// content address -> position in `log`.
-    by_addr: BTreeMap<Oid, usize>,
-    /// plaintext identity hash -> content address (dedup).
-    by_identity: BTreeMap<[u8; 32], Oid>,
-    /// change id -> change node.
-    changes: BTreeMap<Oid, ChangeNode>,
-    /// current DAG heads (change ids that are nobody's parent).
-    heads: Vec<Oid>,
+    objects: ObjectStore,
+    graph: ChangeGraph,
 }
 
 impl DagRepo {
@@ -55,29 +48,16 @@ impl DagRepo {
         grant_ids.iter().any(|g| g == ANYONE || g == &self.identity)
     }
 
-    /// Store a SealedObject in the packed log + indexes, deduping on identity
-    /// hash. If `key` is supplied AND this identity is entitled, file it into
-    /// the keyring. Returns the address actually stored (existing one on a hit).
+    /// Store a SealedObject, then file `key` into the keyring iff this identity
+    /// is entitled AND the key actually seals what we stored. If dedup collapsed
+    /// us onto a different existing address, the minted key is for ciphertext we
+    /// discarded, so it must not be filed (it would corrupt the keyring).
     fn store(&mut self, addr: Oid, obj: SealedObject, key: Option<ContentKey>) -> Oid {
-        let stored_addr = if self.by_addr.contains_key(&addr) {
-            addr.clone()
-        } else if let Some(existing) = self.by_identity.get(&obj.identity_hash).cloned() {
-            // Same plaintext already present under another address (dedup).
-            existing
-        } else {
-            let pos = self.log.len();
-            self.by_identity.insert(obj.identity_hash, addr.clone());
-            self.log.push(obj.clone());
-            self.by_addr.insert(addr.clone(), pos);
-            addr.clone()
-        };
-        // A content key belongs to a specific ciphertext (address). Only file it
-        // when the address we stored IS the one this key seals; if dedup
-        // collapsed us onto a different existing address, the minted key is for
-        // ciphertext we discarded and would corrupt the keyring. Don't overwrite
-        // a key already filed for this address either.
+        let entitled = self.entitled(&obj.grant_ids);
+        let stored = self.objects.put(addr, obj);
+        let stored_addr = stored.addr().clone();
         if let Some(k) = key {
-            if stored_addr == addr && self.entitled(&obj.grant_ids) && !self.keyring.holds(&addr) {
+            if matches!(stored, Stored::New(_)) && entitled && !self.keyring.holds(&stored_addr) {
                 self.keyring.insert(stored_addr.clone(), k);
             }
         }
@@ -85,76 +65,7 @@ impl DagRepo {
     }
 
     fn object(&self, oid: &Oid) -> Result<&SealedObject, RepoError> {
-        self.by_addr
-            .get(oid)
-            .map(|&pos| &self.log[pos])
-            .ok_or_else(|| RepoError::NotFound(oid.clone()))
-    }
-
-    fn compute_change_id(change: &Change) -> Oid {
-        let mut h = blake3::Hasher::new();
-        h.update(change.message.as_bytes());
-        for p in &change.parents {
-            h.update(&p.0);
-        }
-        for (path, (oid, _vis)) in &change.tree {
-            h.update(path.to_string_lossy().as_bytes());
-            h.update(&[0]);
-            h.update(&oid.0);
-        }
-        Oid(*h.finalize().as_bytes())
-    }
-
-    fn insert_change(&mut self, node: ChangeNode) {
-        let id = node.id.clone();
-        if self.changes.contains_key(&id) {
-            return;
-        }
-        // Maintain heads: drop any parent that was a head, add this node.
-        self.heads.retain(|h| !node.parents.contains(h));
-        self.changes.insert(id.clone(), node);
-        if !self.heads.contains(&id) {
-            self.heads.push(id);
-        }
-    }
-
-    /// Latest-known content address per path (later writes win), using a topo
-    /// order so parents are applied before children.
-    fn current_tree(&self) -> BTreeMap<PathBuf, (Oid, Visibility)> {
-        let mut tree: BTreeMap<PathBuf, (Oid, Visibility)> = BTreeMap::new();
-        for node in self.changes_in_order() {
-            for (path, entry) in &node.tree {
-                tree.insert(path.clone(), entry.clone());
-            }
-        }
-        tree
-    }
-
-    /// Changes ordered so parents precede children (topo sort via DFS).
-    fn changes_in_order(&self) -> Vec<&ChangeNode> {
-        fn visit<'a>(
-            id: &Oid,
-            changes: &'a BTreeMap<Oid, ChangeNode>,
-            visited: &mut BTreeMap<Oid, bool>,
-            out: &mut Vec<&'a ChangeNode>,
-        ) {
-            if visited.get(id).copied().unwrap_or(false) {
-                return;
-            }
-            visited.insert(id.clone(), true);
-            if let Some(node) = changes.get(id) {
-                for p in &node.parents {
-                    visit(p, changes, visited, out);
-                }
-                out.push(node);
-            }
-        }
-        let mut ordered = Vec::with_capacity(self.changes.len());
-        let mut visited: BTreeMap<Oid, bool> = BTreeMap::new();
-        for id in self.changes.keys() {
-            visit(id, &self.changes, &mut visited, &mut ordered);
-        }
-        ordered
+        self.objects.get(oid)
     }
 }
 
@@ -164,11 +75,8 @@ impl Repo for DagRepo {
             root: path,
             identity: identity.to_string(),
             keyring: Keyring::new(),
-            log: Vec::new(),
-            by_addr: BTreeMap::new(),
-            by_identity: BTreeMap::new(),
-            changes: BTreeMap::new(),
-            heads: Vec::new(),
+            objects: ObjectStore::new(),
+            graph: ChangeGraph::new(),
         })
     }
 
@@ -184,20 +92,20 @@ impl Repo for DagRepo {
     }
 
     fn commit(&mut self, change: Change) -> Result<Oid, RepoError> {
-        let id = Self::compute_change_id(&change);
+        let id = compute_change_id(&change);
         let node = ChangeNode {
             id: id.clone(),
             parents: change.parents,
             message: change.message,
             tree: change.tree,
         };
-        self.insert_change(node);
+        self.graph.insert(node);
         Ok(id)
     }
 
     fn checkout(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError> {
         let node = self
-            .changes
+            .graph
             .get(change)
             .ok_or_else(|| RepoError::NotFound(change.clone()))?;
 
@@ -224,7 +132,8 @@ impl Repo for DagRepo {
         // the spike, "reachable-not-have" = every change id not in `have`.
         let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
         let send: Vec<&ChangeNode> = self
-            .changes_in_order()
+            .graph
+            .in_order()
             .into_iter()
             .filter(|c| !have_set.contains(&c.id))
             .collect();
@@ -258,7 +167,7 @@ impl Repo for DagRepo {
         let (incoming_changes, incoming_objs, incoming_keys) = wire::decode(&bundle.0)?;
 
         // Our tree before applying, used to detect concurrent same-path edits.
-        let local_before = self.current_tree();
+        let local_before = self.graph.current_tree();
 
         // Ingest SealedObjects, filing only the public keys that rode along
         // (entitlement still enforced in `store`). No Restricted key can be
@@ -282,14 +191,14 @@ impl Repo for DagRepo {
         }
 
         for node in incoming_changes {
-            self.insert_change(node);
+            self.graph.insert(node);
         }
 
         Ok(outcomes)
     }
 
     fn heads(&self) -> Vec<Oid> {
-        self.heads.clone()
+        self.graph.heads()
     }
 }
 
