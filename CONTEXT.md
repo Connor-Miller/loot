@@ -58,6 +58,18 @@ merge that content and may only **relay** its ciphertext. This splits peers
 into two roles *per path*: *merger* (keyholder) and *relay* (non-keyholder).
 See ADR 0001.
 
+**Convergence classifier** — the module that decides, per path, what happens
+when an incoming change meets the local tree: *Converged* (disjoint or
+identical), *Merged*, *Conflict*, or *RelayedUnmerged*. It is a pure function
+of (local tree, incoming change, a *Key oracle*) — it owns the ADR 0001 rule
+and touches no storage or disk, so it is unit-testable with a fake oracle.
+
+**Key oracle** — the narrow seam the classifier uses to ask the repo for
+plaintext: `open(oid, now) -> Option<bytes>`. `None` *is* the relay role (this
+identity can't open the content now); `Some(plaintext)` is what the merger uses
+to tell a clean *Merged* from a *Conflict*. The classifier never sees keys or
+ciphertext — only this oracle.
+
 ## Deliberately out of scope (for now)
 
 - **jj-style ergonomics** (auto-snapshot working copy, stable change-ids,

@@ -18,7 +18,7 @@
 //! granted (Public/Embargoed) content only — Restricted keys never travel.
 
 use loot_core::sealed::{self, ContentKey, Keyring, SealedObject, ANYONE};
-use loot_core::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
+use loot_core::{converge, Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -89,15 +89,6 @@ impl DagRepo {
             .get(oid)
             .map(|&pos| &self.log[pos])
             .ok_or_else(|| RepoError::NotFound(oid.clone()))
-    }
-
-    /// Whether this repo's own identity can open `oid` right now (authorized,
-    /// holds the key, and not embargoed). Decides merger vs relay (ADR 0001).
-    fn can_decrypt(&self, oid: &Oid, now: u64) -> bool {
-        match self.object(oid) {
-            Ok(obj) => sealed::open(obj, oid, &self.identity, &self.keyring, now).is_ok(),
-            Err(_) => false,
-        }
     }
 
     fn compute_change_id(change: &Change) -> Oid {
@@ -277,30 +268,16 @@ impl Repo for DagRepo {
             self.store(addr, obj, key);
         }
 
+        // Classify every incoming change against our pre-apply tree using the
+        // shared ADR 0001 classifier (loot_core::converge). We are the KeyOracle:
+        // it asks us for plaintext, we answer via sealed::open. The classifier
+        // owns the rule; we own only storage and crypto.
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
         for node in &incoming_changes {
-            for (path, (their_oid, _vis)) in &node.tree {
-                let outcome = match local_before.get(path) {
-                    // Path we never had -> disjoint, converges.
-                    None => MergeOutcome::Converged,
-                    // Same content address -> identical, converges.
-                    Some((our_oid, _)) if our_oid == their_oid => MergeOutcome::Converged,
-                    // Concurrent same-path edit: role depends on key (ADR 0001).
-                    Some((our_oid, _)) => {
-                        let we_have_key =
-                            self.can_decrypt(our_oid, now) && self.can_decrypt(their_oid, now);
-                        if we_have_key {
-                            three_way(self, our_oid, their_oid, now)
-                        } else {
-                            // Non-keyholder: relay ciphertext, defer the merge.
-                            MergeOutcome::RelayedUnmerged
-                        }
-                    }
-                };
-                let entry = outcomes
-                    .entry(path.clone())
-                    .or_insert(MergeOutcome::Converged);
-                *entry = worst(entry.clone(), outcome);
+            let per_change = converge::classify(&local_before, &node.tree, self, now);
+            for (path, outcome) in per_change {
+                let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
+                *slot = converge::worst(slot.clone(), outcome);
             }
         }
 
@@ -316,45 +293,12 @@ impl Repo for DagRepo {
     }
 }
 
-/// Order merge outcomes by "how much human attention is needed" so a repeated
-/// path keeps its worst result.
-fn worst(a: MergeOutcome, b: MergeOutcome) -> MergeOutcome {
-    fn rank(o: &MergeOutcome) -> u8 {
-        match o {
-            MergeOutcome::Converged => 0,
-            MergeOutcome::Merged => 1,
-            MergeOutcome::RelayedUnmerged => 2,
-            MergeOutcome::Conflict => 3,
-        }
-    }
-    if rank(&a) >= rank(&b) {
-        a
-    } else {
-        b
-    }
-}
-
-/// Spike 3-way merge of two blobs a keyholder can decrypt. Without a stored
-/// common base we approximate: identical plaintext converges; if one side's
-/// line set subsumes the other it merges cleanly; otherwise it's a genuine
-/// conflict. Crude on purpose — the point the DAG model makes here is that
-/// merging *requires plaintext access*, which is the thesis tension.
-fn three_way(repo: &DagRepo, ours: &Oid, theirs: &Oid, now: u64) -> MergeOutcome {
-    let id = repo.identity.clone();
-    let (a, b) = match (repo.get(ours, &id, now), repo.get(theirs, &id, now)) {
-        (Ok(a), Ok(b)) => (a, b),
-        // Thought we had keys but couldn't read -> relay instead.
-        _ => return MergeOutcome::RelayedUnmerged,
-    };
-    if a == b {
-        return MergeOutcome::Merged;
-    }
-    let al: std::collections::BTreeSet<&[u8]> = a.split(|&c| c == b'\n').collect();
-    let bl: std::collections::BTreeSet<&[u8]> = b.split(|&c| c == b'\n').collect();
-    if al.is_subset(&bl) || bl.is_subset(&al) {
-        MergeOutcome::Merged
-    } else {
-        MergeOutcome::Conflict
+/// The repo answers the convergence classifier's content questions (ADR 0001).
+/// `open` returns plaintext iff our own identity may read it now; `None` is the
+/// relay role. The classifier owns the merge rule; we own crypto + storage.
+impl converge::KeyOracle for DagRepo {
+    fn open(&self, oid: &Oid, now: u64) -> Option<Vec<u8>> {
+        self.get(oid, &self.identity, now).ok()
     }
 }
 
