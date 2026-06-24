@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/loot-core",
+    "crates/spike-dag",
+    "crates/spike-crdt",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Connor Miller"]
+repository = "https://github.com/connormiller/loot"
+
+[workspace.dependencies]
+loot-core = { path = "crates/loot-core" }
+blake3 = "1"
+thiserror = "2"
