@@ -40,12 +40,14 @@ has no keyring entry and therefore cannot decrypt. Keys live here and only here.
 
 **Object** — a content-addressed unit of stored bytes. In the encrypted-DAG
 model, objects are encrypted independently (see *Sealed object*) and addressed
-by the hash of their *ciphertext*, with a separate plaintext *identity hash*
-used only for dedup.
+**solely** by the hash of their *ciphertext*. There is no plaintext-derived
+identity; equal plaintext sealed under different keys is stored separately.
 
-**Content address vs identity hash** — the address locates stored (encrypted)
-bytes; the identity hash recognizes equal plaintext across keys for dedup.
-They are deliberately different. (The known sharp edge of the encrypted model.)
+**Content address** — `blake3(nonce || ciphertext)`. The only identity an object
+has. Two objects share an address only if their ciphertext is byte-identical,
+which reveals nothing a relay didn't already hold — so address-equality dedup is
+safe. Plaintext-equality dedup was removed because it leaked an equality oracle
+to relays (ADR 0004).
 
 **Sync** — bringing two repos into agreement. Now an *evaluation axis* of the
 bake-off, not a deferred concern. The semantics under test: two machines edit
@@ -95,7 +97,6 @@ both spikes stay in the tree so the decision is reproducible
 
 ## Open / undecided
 
-- **Dedup equality-oracle (the DAG's sharp edge).** Dedup keys on a plaintext
-  identity hash, which lets the store recognize equal plaintext across keys —
-  a leak that partially undercuts the privacy thesis. Options: drop cross-key
-  dedup, or use a keyed identity hash. Tracked in ADR 0002, not yet decided.
+- **Spike-honest embargo (ADR 0003).** `open()` time-gates on `now`, so a
+  determined keyholder could bypass embargo locally. A real guarantee needs
+  key-escrow / time-lock crypto and a threat model. Deferred.

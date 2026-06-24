@@ -2,10 +2,10 @@
 //!
 //! Thesis being proven out:
 //!   - each object is encrypted independently; visibility == key possession
-//!   - addressing is by CIPHERTEXT hash (the content address), with a separate
-//!     plaintext identity hash used only for dedup (the known sharp edge)
+//!   - addressing is by CIPHERTEXT hash only; there is no plaintext-derived
+//!     identity, so the store leaks no plaintext-equality oracle (ADR 0004)
 //!   - storage is log-structured / packed (one append-only `Vec` + in-memory
-//!     indexes), NOT git-style loose files, so we don't reproduce the APFS
+//!     index), NOT git-style loose files, so we don't reproduce the APFS
 //!     small-file perf disaster
 //!   - runs fully in-memory; `checkout` is the only thing that touches disk
 //!
@@ -252,14 +252,15 @@ mod wire {
     ) -> Vec<u8> {
         let mut out = Vec::new();
 
-        // SealedObjects: ciphertext + policy + grant_ids (NAMES), never keys.
+        // SealedObjects: ciphertext + policy + grant_ids (NAMES), never keys,
+        // and no plaintext-derived field — so the wire leaks no equality signal
+        // to a relay (ADR 0004).
         put_u32(&mut out, objs.len());
         for (addr, obj) in objs {
             out.extend_from_slice(&addr.0);
             out.extend_from_slice(&obj.nonce);
             put_bytes(&mut out, &obj.ciphertext);
             put_vis(&mut out, &obj.vis);
-            out.extend_from_slice(&obj.identity_hash);
             put_u32(&mut out, obj.grant_ids.len());
             for id in &obj.grant_ids {
                 put_bytes(&mut out, id.as_bytes());
@@ -374,7 +375,6 @@ mod wire {
             let nonce = c.arr12()?;
             let ciphertext = c.bytes()?;
             let vis = c.vis()?;
-            let identity_hash = c.arr32()?;
             let n_grants = c.u32()?;
             let mut grant_ids = Vec::with_capacity(n_grants);
             for _ in 0..n_grants {
@@ -387,7 +387,6 @@ mod wire {
                     ciphertext,
                     vis,
                     grant_ids,
-                    identity_hash,
                 },
             ));
         }
@@ -551,6 +550,52 @@ mod tests {
             contains_window(&bundle.0, &public_key),
             "public content key should ride along for ANYONE-granted content"
         );
+    }
+
+    /// ADR 0004 leak guard: the sync wire must carry no plaintext-equality
+    /// oracle. We commit the SAME restricted plaintext into two separate repos
+    /// and bundle each. The bundles must not share any plaintext-derived marker:
+    /// specifically, blake3(plaintext) must appear in neither bundle.
+    #[test]
+    fn bundle_carries_no_plaintext_equality_oracle() {
+        let secret = b"DUPLICATED SECRET VALUE";
+        let plaintext_hash = *blake3::hash(secret).as_bytes();
+
+        let bundle_for = |identity: &str| {
+            let mut repo = DagRepo::init(tmp(), identity).unwrap();
+            let oid = repo
+                .put(secret, Visibility::Restricted(vec![identity.into()]))
+                .unwrap();
+            let mut tree = BTreeMap::new();
+            tree.insert(PathBuf::from(".env"), (oid, Visibility::Restricted(vec![identity.into()])));
+            repo.commit(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
+                .unwrap();
+            repo.bundle(&[]).unwrap().0
+        };
+
+        let a = bundle_for("alice");
+        let b = bundle_for("bob");
+
+        // The plaintext hash must not be present in either bundle: there is no
+        // plaintext-derived field on the wire, so a relay cannot recompute or
+        // match it.
+        assert!(!contains_window(&a, &plaintext_hash));
+        assert!(!contains_window(&b, &plaintext_hash));
+
+        // And the same plaintext yields different ciphertext in each repo
+        // (random key+nonce per seal), so the ciphertext blocks don't match
+        // either — a relay holding both bundles cannot link them by content.
+        let ct_a = single_ciphertext(&a);
+        let ct_b = single_ciphertext(&b);
+        assert_ne!(ct_a, ct_b, "same plaintext must not produce equal ciphertext on the wire");
+    }
+
+    /// Decode a bundle and return its single object's ciphertext, for asserting
+    /// that equal plaintext does not yield equal ciphertext.
+    fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
+        let (_changes, objs, _keys) = wire::decode(bundle).unwrap();
+        assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
+        objs.into_iter().next().unwrap().1.ciphertext
     }
 
     fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {

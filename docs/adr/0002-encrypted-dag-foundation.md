@@ -65,9 +65,8 @@ and fails safe (conflict, not loss).
   non-canonical in CONTEXT.md and is not part of the product.
 - The benchmark harness (`loot-bench`) and both spikes stay in the tree so the
   decision is reproducible (`cargo test --release`).
-- **Known follow-up (the DAG's own sharp edge):** dedup keys on a plaintext
-  identity hash, which leaks a same-plaintext equality oracle and partially
-  undercuts the privacy thesis. Options: drop cross-key dedup, or use a keyed
-  identity hash. Tracked, not yet decided.
+- **Known follow-up (the DAG's own sharp edge):** dedup keyed on a plaintext
+  identity hash leaked a same-plaintext equality oracle. **Resolved in ADR 0004:
+  drop plaintext dedup entirely.**
 - Methodology and results are written up for humans in
   `docs/bakeoff/index.html`.

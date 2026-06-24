@@ -41,8 +41,6 @@ pub struct SealedObject {
     /// Identities permitted to hold this content's key (names, never keys).
     /// `[ANYONE]` for Public/Embargoed; the listed identities for Restricted.
     pub grant_ids: Vec<String>,
-    /// `blake3(plaintext)` — dedup identity, deliberately NOT the address.
-    pub identity_hash: [u8; 32],
 }
 
 impl SealedObject {
@@ -126,7 +124,6 @@ pub fn seal(bytes: &[u8], vis: &Visibility) -> Result<(Oid, SealedObject, Conten
         ciphertext,
         vis: vis.clone(),
         grant_ids: grant_ids(vis),
-        identity_hash: *blake3::hash(bytes).as_bytes(),
     };
     Ok((sealed.address(), sealed, key))
 }
@@ -232,14 +229,29 @@ mod tests {
         let (_oid, sealed, key) = seal(b"x", &Visibility::Public).unwrap();
         assert_ne!(&sealed.ciphertext[..], &key[..]);
         assert_ne!(&sealed.nonce[..], &key[..12]);
-        assert_ne!(sealed.identity_hash, key);
     }
 
     #[test]
-    fn address_is_ciphertext_hash_identity_is_plaintext_hash() {
+    fn address_is_ciphertext_hash() {
         let (oid, sealed, _) = seal(b"abc", &Visibility::Public).unwrap();
         assert_eq!(oid, sealed.address());
-        assert_eq!(sealed.identity_hash, *blake3::hash(b"abc").as_bytes());
-        assert_ne!(oid.0, sealed.identity_hash);
+    }
+
+    #[test]
+    fn no_plaintext_equality_signal_in_sealed_object() {
+        // ADR 0004: a SealedObject must carry nothing derived from plaintext that
+        // would let a relay infer two objects share content. Two seals of the
+        // SAME plaintext must differ in every stored field (random key+nonce ->
+        // different ciphertext, address, and nonce; identical grant_ids/vis are
+        // policy, not content, so equal there is fine).
+        let (oid1, s1, _) = seal(b"same secret", &Visibility::Public).unwrap();
+        let (oid2, s2, _) = seal(b"same secret", &Visibility::Public).unwrap();
+        assert_ne!(oid1, oid2, "addresses must differ for equal plaintext");
+        assert_ne!(s1.ciphertext, s2.ciphertext, "ciphertext must differ");
+        assert_ne!(s1.nonce, s2.nonce, "nonces must differ");
+        // No field on SealedObject is a function of plaintext alone.
+        let plaintext_hash = *blake3::hash(b"same secret").as_bytes();
+        assert_ne!(oid1.0, plaintext_hash);
+        assert_ne!(oid2.0, plaintext_hash);
     }
 }
