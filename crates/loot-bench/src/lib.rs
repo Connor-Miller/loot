@@ -140,6 +140,9 @@ pub fn scenario_embargo<R: Repo>(
         "embargoed content sealed before reveal",
         matches!(before, Err(RepoError::Embargoed(_))),
     );
+    // Promote embargoed key to keyring before reading (ADR 0007: flush_embargo
+    // is the single call site that makes keys available after reveal time).
+    repo.flush_embargo(reveal_at + 1);
     let after = repo.get(&oid, reader, reveal_at + 1);
     res.check("embargoed content opens after reveal", after.is_ok());
     Ok(res)

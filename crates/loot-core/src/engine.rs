@@ -21,6 +21,7 @@ mod change_graph;
 mod object_store;
 
 use crate::converge::{self};
+use crate::escrow::Escrow;
 use crate::sealed::{self, ContentKey, Keyring, SealedObject, ANYONE};
 use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 use change_graph::{compute_change_id, ChangeGraph, ChangeNode};
@@ -33,8 +34,11 @@ use std::path::PathBuf;
 pub struct DagRepo {
     root: PathBuf,
     identity: String,
-    /// This identity's private key custody. Keys live here and only here.
+    /// This identity's private key custody for non-embargoed content.
     keyring: Keyring,
+    /// Embargoed content keys awaiting their reveal time. `flush_escrow` promotes
+    /// eligible entries to `keyring` before any content-reading operation (ADR 0007).
+    escrow: Escrow,
     objects: ObjectStore,
     graph: ChangeGraph,
 }
@@ -46,20 +50,42 @@ impl DagRepo {
         grant_ids.iter().any(|g| g == ANYONE || g == &self.identity)
     }
 
-    /// Store a SealedObject, then file `key` into the keyring iff this identity
-    /// is entitled AND the key actually seals what we stored. If dedup collapsed
-    /// us onto a different existing address, the minted key is for ciphertext we
-    /// discarded, so it must not be filed (it would corrupt the keyring).
+    /// Store a SealedObject and route its key to the right custody (ADR 0007):
+    /// - Embargoed content: key goes to `escrow` (not Keyring) for ALL identities.
+    /// - Everything else: key goes to `keyring` iff entitled.
+    ///
+    /// If dedup collapsed us onto an existing address, the minted key seals
+    /// discarded ciphertext and must not be filed anywhere.
     fn store(&mut self, addr: Oid, obj: SealedObject, key: Option<ContentKey>) -> Oid {
         let entitled = self.entitled(&obj.grant_ids);
+        let reveal_at = if let Visibility::Embargoed { reveal_at } = obj.vis {
+            Some(reveal_at)
+        } else {
+            None
+        };
         let stored = self.objects.put(addr, obj);
         let stored_addr = stored.addr().clone();
         if let Some(k) = key {
-            if matches!(stored, Stored::New(_)) && entitled && !self.keyring.holds(&stored_addr) {
-                self.keyring.insert(stored_addr.clone(), k);
+            if matches!(stored, Stored::New(_)) && entitled {
+                if let Some(t) = reveal_at {
+                    // Embargoed: key stays out of the Keyring until flush (ADR 0007).
+                    if !self.escrow.holds(&stored_addr) {
+                        self.escrow.insert(stored_addr.clone(), k, t);
+                    }
+                } else if !self.keyring.holds(&stored_addr) {
+                    self.keyring.insert(stored_addr.clone(), k);
+                }
             }
         }
         stored_addr
+    }
+
+    /// Promote embargoed keys whose `reveal_at <= now` from Escrow into the
+    /// Keyring. Call this before any content-reading operation (`checkout`,
+    /// `snapshot`). After this, `sealed::open` finds the key in the Keyring
+    /// and decrypts normally — `open` itself is unmodified (ADR 0007).
+    pub fn flush_escrow(&mut self, now: u64) {
+        self.escrow.flush(&mut self.keyring, now);
     }
 
     fn object(&self, oid: &Oid) -> Result<&SealedObject, RepoError> {
@@ -76,6 +102,7 @@ impl DagRepo {
         std::fs::write(dir.join("identity"), self.identity.as_bytes()).map_err(io)?;
         std::fs::write(dir.join("repo"), wire::encode_repo(&self.objects, &self.graph)).map_err(io)?;
         std::fs::write(dir.join("keyring"), wire::encode_keyring(&self.keyring)).map_err(io)?;
+        std::fs::write(dir.join("escrow"), wire::encode_escrow(&self.escrow)).map_err(io)?;
         Ok(())
     }
 
@@ -168,10 +195,16 @@ impl DagRepo {
             .map_err(|e| RepoError::Backend(e.to_string()))?;
         let (objects, graph) = wire::decode_repo(&std::fs::read(dir.join("repo")).map_err(io)?)?;
         let keyring = wire::decode_keyring(&std::fs::read(dir.join("keyring")).map_err(io)?)?;
+        // Escrow file may not exist in repos created before ADR 0007 — default empty.
+        let escrow = match std::fs::read(dir.join("escrow")) {
+            Ok(b) => wire::decode_escrow(&b)?,
+            Err(_) => Escrow::new(),
+        };
         Ok(DagRepo {
             root,
             identity,
             keyring,
+            escrow,
             objects,
             graph,
         })
@@ -184,6 +217,7 @@ impl Repo for DagRepo {
             root: path,
             identity: identity.to_string(),
             keyring: Keyring::new(),
+            escrow: Escrow::new(),
             objects: ObjectStore::new(),
             graph: ChangeGraph::new(),
         })
@@ -247,17 +281,29 @@ impl Repo for DagRepo {
             .filter(|c| !have_set.contains(&c.id))
             .collect();
 
-        // Ship SealedObjects (ciphertext, no keys) plus the keys for ANYONE-
-        // granted (Public/Embargoed) content ONLY. Restricted keys NEVER travel
-        // (ADR 0003): a peer without them becomes a relay, by construction.
+        // Ship SealedObjects (ciphertext, no keys) plus:
+        //   - Public content keys -> plain keyring section (ANYONE-granted, not embargoed)
+        //   - Embargoed content keys -> escrow section (ANYONE-granted, time-gated)
+        //   - Restricted keys NEVER travel (ADR 0003)
         let mut needed: BTreeMap<Oid, &SealedObject> = BTreeMap::new();
         let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
+        let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
         for c in &send {
-            for (oid, _vis) in c.tree.values() {
+            for (oid, vis) in c.tree.values() {
                 if let Ok(obj) = self.object(oid) {
                     needed.insert(oid.clone(), obj);
                     if obj.grant_ids.iter().any(|g| g == ANYONE) {
-                        if let Some(k) = self.keyring.key_for(oid) {
+                        if let Visibility::Embargoed { reveal_at } = vis {
+                            // Embargoed: key rides as an escrow entry so the receiver
+                            // files it into their Escrow, not their Keyring (ADR 0007).
+                            if let Some(k) = self.escrow.iter()
+                                .find(|(o, _)| *o == oid)
+                                .map(|(_, e)| e.key)
+                                .or_else(|| self.keyring.key_for(oid))
+                            {
+                                escrow_entries.insert(oid.clone(), (k, *reveal_at));
+                            }
+                        } else if let Some(k) = self.keyring.key_for(oid) {
                             public_keys.insert(oid.clone(), k);
                         }
                     }
@@ -265,7 +311,7 @@ impl Repo for DagRepo {
             }
         }
 
-        Ok(SyncBundle(wire::encode(&send, &needed, &public_keys)))
+        Ok(SyncBundle(wire::encode(&send, &needed, &public_keys, &escrow_entries)))
     }
 
     fn apply(
@@ -273,17 +319,25 @@ impl Repo for DagRepo {
         bundle: &SyncBundle,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
-        let (incoming_changes, incoming_objs, incoming_keys) = wire::decode(&bundle.0)?;
+        let (incoming_changes, incoming_objs, incoming_keys, incoming_escrow) =
+            wire::decode(&bundle.0)?;
 
         // Our tree before applying, used to detect concurrent same-path edits.
         let local_before = self.graph.current_tree();
 
-        // Ingest SealedObjects, filing only the public keys that rode along
-        // (entitlement still enforced in `store`). No Restricted key can be
-        // here to file, so a relay structurally cannot gain one.
+        // Ingest SealedObjects, filing only the public (non-embargoed) keys that
+        // rode along. Embargoed keys travel in `incoming_escrow` and go into our
+        // Escrow, not the Keyring (ADR 0007). No Restricted key can be here.
         for (addr, obj) in incoming_objs {
             let key = incoming_keys.get(&addr).copied();
             self.store(addr, obj, key);
+        }
+        // File incoming embargoed keys into the local Escrow so they'll be
+        // promoted by `flush_escrow` once their reveal time arrives.
+        for (oid, (key, reveal_at)) in incoming_escrow {
+            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
+                self.escrow.insert(oid, key, reveal_at);
+            }
         }
 
         // Classify every incoming change against our pre-apply tree using the
@@ -308,6 +362,10 @@ impl Repo for DagRepo {
 
     fn heads(&self) -> Vec<Oid> {
         self.graph.heads()
+    }
+
+    fn flush_embargo(&mut self, now: u64) {
+        self.flush_escrow(now);
     }
 }
 
@@ -358,6 +416,7 @@ mod wire {
         changes: &[&ChangeNode],
         objs: &BTreeMap<Oid, &SealedObject>,
         public_keys: &BTreeMap<Oid, ContentKey>,
+        escrow_entries: &BTreeMap<Oid, (ContentKey, u64)>,
     ) -> Vec<u8> {
         let mut out = Vec::new();
 
@@ -376,13 +435,20 @@ mod wire {
             }
         }
 
-        // Keys for ANYONE-granted content only (ADR 0003). The caller guarantees
-        // no Restricted key is present here; this section can carry only the
-        // keys a relay is already entitled to as a repo reader.
+        // Keys for ANYONE-granted, non-embargoed content (ADR 0003).
         put_u32(&mut out, public_keys.len());
         for (addr, key) in public_keys {
             out.extend_from_slice(&addr.0);
             out.extend_from_slice(key);
+        }
+
+        // Embargoed keys as escrow entries: receiver files them into their Escrow
+        // (not Keyring) so they can't be read before reveal_at (ADR 0007).
+        put_u32(&mut out, escrow_entries.len());
+        for (addr, (key, reveal_at)) in escrow_entries {
+            out.extend_from_slice(&addr.0);
+            out.extend_from_slice(key);
+            out.extend_from_slice(&reveal_at.to_le_bytes());
         }
 
         put_u32(&mut out, changes.len());
@@ -472,6 +538,7 @@ mod wire {
             Vec<ChangeNode>,
             Vec<(Oid, SealedObject)>,
             BTreeMap<Oid, ContentKey>,
+            BTreeMap<Oid, (ContentKey, u64)>,
         ),
         RepoError,
     > {
@@ -508,6 +575,15 @@ mod wire {
             public_keys.insert(addr, key);
         }
 
+        let n_escrow = c.u32()?;
+        let mut escrow_entries = BTreeMap::new();
+        for _ in 0..n_escrow {
+            let addr = Oid(c.arr32()?);
+            let key = c.arr32()?;
+            let reveal_at = c.u64()?;
+            escrow_entries.insert(addr, (key, reveal_at));
+        }
+
         let n_changes = c.u32()?;
         let mut changes = Vec::with_capacity(n_changes);
         for _ in 0..n_changes {
@@ -534,7 +610,7 @@ mod wire {
             });
         }
 
-        Ok((changes, objs, public_keys))
+        Ok((changes, objs, public_keys, escrow_entries))
     }
 
     // --- whole-repo persistence (ADR 0005) ---
@@ -658,6 +734,33 @@ mod wire {
         }
         Ok(keyring)
     }
+
+    use crate::escrow::Escrow;
+
+    pub fn encode_escrow(escrow: &Escrow) -> Vec<u8> {
+        let mut out = Vec::new();
+        let entries: Vec<_> = escrow.iter().collect();
+        put_u32(&mut out, entries.len());
+        for (oid, entry) in entries {
+            out.extend_from_slice(&oid.0);
+            out.extend_from_slice(&entry.key);
+            out.extend_from_slice(&entry.reveal_at.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn decode_escrow(b: &[u8]) -> Result<Escrow, RepoError> {
+        let mut c = Cursor { b, i: 0 };
+        let mut escrow = Escrow::new();
+        let n = c.u32()?;
+        for _ in 0..n {
+            let oid = Oid(c.arr32()?);
+            let key = c.arr32()?;
+            let reveal_at = c.u64()?;
+            escrow.insert(oid, key, reveal_at);
+        }
+        Ok(escrow)
+    }
 }
 
 #[cfg(test)]
@@ -737,7 +840,7 @@ mod tests {
     }
 
     fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
-        let (_changes, objs, _keys) = wire::decode(bundle).unwrap();
+        let (_changes, objs, _keys, _escrow) = wire::decode(bundle).unwrap();
         assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
         objs.into_iter().next().unwrap().1.ciphertext
     }
@@ -901,5 +1004,90 @@ mod tests {
             0,
         );
         assert!(matches!(result, Err(RepoError::Backend(_))), "must refuse the collision");
+    }
+
+    // --- embargo / escrow (ADR 0007) ---
+
+    /// Core guarantee: the originator's own embargoed key is in Escrow, not
+    /// the Keyring, so `get` returns Embargoed before flush.
+    #[test]
+    fn embargo_key_in_escrow_not_keyring_before_reveal() {
+        let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let oid = alice.put(b"cve fix", Visibility::Embargoed { reveal_at: 100 }).unwrap();
+
+        // Before flush: Keyring has no entry, Escrow does.
+        assert!(!alice.keyring.holds(&oid), "key must be in escrow, not keyring");
+        assert!(alice.escrow.holds(&oid), "key must be in escrow before reveal");
+        // get() returns Embargoed (open() finds no key in keyring).
+        assert!(matches!(alice.get(&oid, "alice", 99), Err(RepoError::Embargoed(100))));
+    }
+
+    /// After flush_escrow with now >= reveal_at, the key promotes to the Keyring
+    /// and get() succeeds.
+    #[test]
+    fn flush_escrow_promotes_key_and_enables_read() {
+        let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let oid = alice.put(b"cve fix", Visibility::Embargoed { reveal_at: 100 }).unwrap();
+
+        alice.flush_escrow(100);
+
+        assert!(alice.keyring.holds(&oid), "key must be in keyring after flush");
+        assert!(!alice.escrow.holds(&oid), "escrow must be empty after flush");
+        assert_eq!(alice.get(&oid, "alice", 100).unwrap(), b"cve fix");
+    }
+
+    /// A bundle ships embargoed keys in the escrow section, not the keyring
+    /// section, and the receiver's Escrow is populated — not their Keyring.
+    #[test]
+    fn bundle_carries_embargoed_key_as_escrow_entry_not_keyring() {
+        let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let oid = alice.put(b"cve fix", Visibility::Embargoed { reveal_at: 100 }).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("cve.txt"), (oid.clone(), Visibility::Embargoed { reveal_at: 100 }));
+        alice.commit(Change { id: Oid([0; 32]), parents: vec![], message: "cve".into(), tree }).unwrap();
+
+        let bundle = alice.bundle(&[]).unwrap();
+
+        // The raw wire must have the key in the escrow section, not the keyring.
+        let (_changes, _objs, plain_keys, escrow_entries) = wire::decode(&bundle.0).unwrap();
+        assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in keyring section");
+        assert!(escrow_entries.contains_key(&oid), "embargoed key must be in escrow section");
+
+        // Bob applies: key lands in his Escrow, not his Keyring.
+        let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
+        bob.apply(&bundle, 50).unwrap();
+        assert!(bob.escrow.holds(&oid), "bob's escrow must hold the key");
+        assert!(!bob.keyring.holds(&oid), "bob's keyring must be empty before reveal");
+
+        // Before reveal: still blocked.
+        assert!(matches!(bob.get(&oid, "bob", 50), Err(RepoError::Embargoed(100))));
+
+        // After flush at reveal time: bob can read the CVE fix.
+        bob.flush_escrow(100);
+        assert_eq!(bob.get(&oid, "bob", 100).unwrap(), b"cve fix");
+    }
+
+    /// Escrow persists across save/load so reveal works in a new process.
+    #[test]
+    fn escrow_survives_save_load() {
+        let dir = std::env::temp_dir().join(format!("loot-escrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let oid;
+        {
+            let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+            oid = repo.put(b"cve fix", Visibility::Embargoed { reveal_at: 100 }).unwrap();
+            repo.save(&dir).unwrap();
+        }
+
+        let mut loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        // Still embargoed after reload.
+        assert!(loaded.escrow.holds(&oid));
+        assert!(matches!(loaded.get(&oid, "alice", 50), Err(RepoError::Embargoed(100))));
+        // Flush and read.
+        loaded.flush_escrow(100);
+        assert_eq!(loaded.get(&oid, "alice", 100).unwrap(), b"cve fix");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

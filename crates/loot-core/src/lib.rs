@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 pub mod converge;
 pub mod engine;
+pub mod escrow;
 pub mod sealed;
 
 pub use engine::DagRepo;
@@ -125,4 +126,9 @@ pub trait Repo {
 
     /// Change ids this repo currently has — what a peer passes as `have`.
     fn heads(&self) -> Vec<Oid>;
+
+    /// Promote embargoed keys whose reveal time has passed into the keyring.
+    /// Default no-op for implementations that don't use the Escrow model
+    /// (e.g. the non-canonical spike-crdt). DagRepo overrides this (ADR 0007).
+    fn flush_embargo(&mut self, _now: u64) {}
 }

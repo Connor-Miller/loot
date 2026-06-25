@@ -109,7 +109,7 @@ fn cmd_new() -> Result<(), String> {
 }
 
 fn cmd_checkout() -> Result<(), String> {
-    let ws = Workspace::open()?;
+    let mut ws = Workspace::open()?;
     let head = ws.checkout()?;
     println!(
         "checked out {} as {} (content you may not see was skipped)",

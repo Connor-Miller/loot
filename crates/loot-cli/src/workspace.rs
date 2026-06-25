@@ -85,6 +85,9 @@ impl Workspace {
     /// engine, tracks the resulting working id, and persists. Returns the
     /// working-change id and the entries' resolved visibilities for reporting.
     pub fn snapshot(&mut self, message: &str) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+        // Promote any embargoed keys whose reveal time has passed before reading
+        // content — `sealed::open` will then find them in the Keyring (ADR 0007).
+        self.repo.flush_escrow(self.now);
         let attrs = Attributes::load(&self.root.join(ATTRS));
         let mut entries: Vec<(PathBuf, Vec<u8>, Visibility)> = Vec::new();
         let mut reported: Vec<(PathBuf, Visibility)> = Vec::new();
@@ -113,7 +116,10 @@ impl Workspace {
     }
 
     /// Materialize what the current identity may see from the tip change.
-    pub fn checkout(&self) -> Result<Oid, String> {
+    pub fn checkout(&mut self) -> Result<Oid, String> {
+        // Promote embargoed keys before materializing — same flush discipline as
+        // snapshot (ADR 0007). Takes &mut self because flush mutates the escrow.
+        self.repo.flush_escrow(self.now);
         let head = self
             .repo
             .heads()
@@ -123,6 +129,7 @@ impl Workspace {
         self.repo
             .checkout(&head, &self.identity, self.now)
             .map_err(|e| e.to_string())?;
+        self.persist()?;
         Ok(head)
     }
 

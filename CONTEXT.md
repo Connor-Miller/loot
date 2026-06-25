@@ -48,6 +48,17 @@ is the single authorization chokepoint — it enforces embargo (by `now`), then
 visibility, then decrypts. Nothing else in the system decides who may read
 content. See ADR 0003.
 
+**Escrow** — the lifecycle stage between `seal` and `Keyring` for embargoed
+content (ADR 0007). When a `seal` produces an `Embargoed` key, that key goes
+into the Escrow — not the Keyring — for every identity including the originator.
+`flush_escrow(now)` promotes eligible entries into the Keyring once
+`now >= reveal_at`; until then the Keyring holds nothing for that object and
+`open` returns `Embargoed`. The Workspace calls `flush_escrow` before every
+content-reading operation (`checkout`, `snapshot`). Bundles ship embargoed keys
+as a separate escrow section so peers receive them into their own Escrow. This
+closes the D-threat: no identity holds a usable decryption key before reveal
+time, not even the originator.
+
 **Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
 identities permitted to hold a key). It deliberately does **not** contain any
 content key, so storing or syncing a Sealed object can never leak a key.
@@ -145,6 +156,9 @@ tree so the decision is reproducible (`cargo test --release`).
 
 ## Open / undecided
 
-- **Spike-honest embargo (ADR 0003).** `open()` time-gates on `now`, so a
-  determined keyholder could bypass embargo locally. A real guarantee needs
-  key-escrow / time-lock crypto and a threat model. Deferred.
+- **External-service escrow.** The current Escrow module is local: a
+  determined keyholder with access to the `.loot/` directory and a modified
+  binary could still read the key bytes directly. A production guarantee requires
+  a network escrow service that holds the key and only releases it at `reveal_at`.
+  The seam is designed for this: replacing `Escrow::flush` with a network call
+  leaves everything else unmodified. Deferred until the network layer exists.
