@@ -9,11 +9,13 @@
 //! the engine reconciles, and persists state after a mutation.
 
 use loot_core::{DagRepo, Oid, Repo, Visibility};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOT: &str = ".loot";
 const ATTRS: &str = ".lootattributes";
+const CONFIG: &str = "config";
 
 pub struct Workspace {
     dot: PathBuf,
@@ -151,6 +153,33 @@ impl Workspace {
         Ok(out)
     }
 
+    /// Read the URL for a named remote (e.g. "origin") from `.loot/config`.
+    /// Returns `None` if the remote is not set.
+    pub fn remote_url(&self, name: &str) -> Option<String> {
+        Config::load(&self.dot.join(CONFIG)).get(name)
+    }
+
+    /// Add or update a named remote in `.loot/config`.
+    pub fn remote_add(&self, name: &str, url: &str) -> Result<(), String> {
+        let path = self.dot.join(CONFIG);
+        let mut cfg = Config::load(&path);
+        cfg.set(name, url);
+        cfg.save(&path)
+    }
+
+    /// Remove a named remote from `.loot/config`. No-ops if not present.
+    pub fn remote_remove(&self, name: &str) -> Result<(), String> {
+        let path = self.dot.join(CONFIG);
+        let mut cfg = Config::load(&path);
+        cfg.remove(name);
+        cfg.save(&path)
+    }
+
+    /// List all named remotes from `.loot/config`.
+    pub fn remote_list(&self) -> Vec<(String, String)> {
+        Config::load(&self.dot.join(CONFIG)).entries()
+    }
+
     fn persist(&self) -> Result<(), String> {
         self.repo.save(&self.dot).map_err(|e| e.to_string())?;
         match &self.working {
@@ -253,6 +282,53 @@ fn parse_visibility(spec: &str) -> Option<Visibility> {
     }
 }
 
+/// Named remotes from `.loot/config`. Format: one `name = url` pair per line;
+/// blank lines and `#` comments are ignored.
+struct Config {
+    entries: BTreeMap<String, String>,
+}
+
+impl Config {
+    fn load(path: &Path) -> Self {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut entries = BTreeMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                entries.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        Config { entries }
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.entries.get(name).cloned()
+    }
+
+    fn set(&mut self, name: &str, url: &str) {
+        self.entries.insert(name.to_string(), url.to_string());
+    }
+
+    fn remove(&mut self, name: &str) {
+        self.entries.remove(name);
+    }
+
+    fn entries(&self) -> Vec<(String, String)> {
+        self.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    fn save(&self, path: &Path) -> Result<(), String> {
+        let mut out = String::new();
+        for (k, v) in &self.entries {
+            out.push_str(&format!("{k} = {v}\n"));
+        }
+        std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
 /// Minimal glob: `*` matches a run of non-`/`; `**` matches across separators.
 struct Glob {
     pattern: String,
@@ -303,6 +379,45 @@ fn glob_match(pat: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_round_trips_remotes() {
+        let dir = std::env::temp_dir().join(format!("loot-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(CONFIG);
+
+        let mut cfg = Config::load(&p);
+        assert!(cfg.get("origin").is_none());
+
+        cfg.set("origin", "http://localhost:4000");
+        cfg.set("upstream", "http://relay.example.com");
+        cfg.save(&p).unwrap();
+
+        let loaded = Config::load(&p);
+        assert_eq!(loaded.get("origin").as_deref(), Some("http://localhost:4000"));
+        assert_eq!(loaded.get("upstream").as_deref(), Some("http://relay.example.com"));
+
+        let mut loaded2 = Config::load(&p);
+        loaded2.remove("upstream");
+        loaded2.save(&p).unwrap();
+        let loaded3 = Config::load(&p);
+        assert!(loaded3.get("upstream").is_none());
+        assert!(loaded3.get("origin").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_ignores_comments_and_blanks() {
+        let dir = std::env::temp_dir().join(format!("loot-config2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(CONFIG);
+        std::fs::write(&p, "# a comment\n\norigin = http://localhost:4000\n").unwrap();
+        let cfg = Config::load(&p);
+        assert_eq!(cfg.get("origin").as_deref(), Some("http://localhost:4000"));
+        assert_eq!(cfg.entries().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn glob_basics() {

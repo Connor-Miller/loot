@@ -142,7 +142,9 @@ ciphertext — only this oracle.
 
 **Stow** — the relay's ingest operation (`DagRepo::stow`, ADR 0011): accept a bundle, store its sealed objects and add its change-nodes to the graph append-only, record grant facts in the Manifest, and *never* merge, decrypt, or touch a working tree. Nautical to the domain — you stow sealed cargo in the hold without opening it, and the Manifest records what was stowed. Distinct from `apply` ("merge into my working change"): a pure relay only ever calls `stow` (on push) and `bundle` (on pull). Concurrent pushes produce a forked DAG with multiple tips; forks are collapsed only by keyholder peers when they pull and `apply`.
 
-**Network sync (`serve`/`push`/`pull`)** — the transport layer over `bundle`/`stow`/`apply` (ADR 0011). `loot serve` runs an open relay (HTTP, two endpoints: `POST /stow` for push, `POST /negotiate` for pull). `loot push <url>` is a deliberate *disclosure* act — it publishes the changes the relay lacks; `loot pull <url>` fetches the changes the local repo lacks and `apply`s them into the working change. Push and pull are distinct verbs because their security intent differs even though the mechanics are symmetric: a pull receives key-gated ciphertext (safe by construction); a push persists sealed content to another node. File-based `bundle`/`apply` are retained as the offline/sneakernet path.
+**Remote** — a named relay URL stored in `.loot/config` as `name = url` (ADR 0013). Managed via `loot remote add/remove/list`. `loot push` and `loot pull` resolve their target as: explicit URL > `--remote <name>` > `origin` default. Analogous to git's remotes; the name `origin` is the conventional default but nothing is special about it in the engine.
+
+**Network sync (`serve`/`push`/`pull`)** — the transport layer over `bundle`/`stow`/`apply` (ADR 0011). `loot serve` runs an open relay (HTTP, two endpoints: `POST /stow` for push, `POST /negotiate` for pull). `loot push [<url>]` is a deliberate *disclosure* act — it publishes the changes the relay lacks; `loot pull [<url>]` fetches the changes the local repo lacks and `apply`s them into the working change. Both resolve the target relay via the [[Remote]] config when no URL is given. Push and pull are distinct verbs because their security intent differs even though the mechanics are symmetric: a pull receives key-gated ciphertext (safe by construction); a push persists sealed content to another node. File-based `bundle`/`apply` are retained as the offline/sneakernet path.
 
 **Loose object storage** — each SealedObject persists as its own content-addressed file at `objects/<hex-address>`, written once and immutably via atomic rename (ADR 0012). Dedup is "does the file exist"; a push writes only the new objects (O(delta), not O(store)), killing the whole-repo-rewrite bottleneck for relays. Concurrent writes to disjoint objects are lock-free (distinct filenames); only the small graph metadata is serialized. Git's loose-object model, made natural by content addressing.
 
@@ -181,6 +183,8 @@ tree so the decision is reproducible (`cargo test --release`).
   a network escrow service that holds the key and only releases it at `reveal_at`.
   The seam is designed for this: replacing `Escrow::flush` with a network call
   leaves everything else unmodified. Deferred until the network layer exists.
+
+- **Grant bundle relay delivery.** `loot grant` currently writes a bundle file for manual delivery. When identity keypairs land (see below), the grant bundle's keyring section switches from raw bytes to `encrypt(key, recipient_pubkey)` and `loot grant --relay <name>` becomes safe to add. The seam is designed; see ADR 0013.
 
 - **Relay announcement.** A relay peer declaring its relay status so senders
   can discover who holds a key before bundling — enabling selective delivery

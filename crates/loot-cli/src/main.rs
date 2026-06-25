@@ -31,6 +31,7 @@ fn main() -> ExitCode {
         "manifest" => cmd_manifest(),
         "conflicts" => cmd_conflicts(),
         "resolve" => cmd_resolve(rest),
+        "remote" => cmd_remote(rest),
         "serve" => cmd_serve(rest),
         "push" => cmd_push(rest),
         "pull" => cmd_pull(rest),
@@ -52,23 +53,26 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  loot init --identity <name>          initialize a repo here, owned by <name>
-  loot status [-m <message>]           snapshot the working tree into the working change
-  loot describe -m <message>           name the working change
-  loot new                             finalize the working change; start a fresh one
-  loot surface                         materialize what the current identity may see
-  loot log                             show change history
-  loot bundle <file>                   write a sync bundle (ciphertext, no private keys)
-  loot apply <file>                    merge a peer's bundle (idempotent)
-  loot grant <path> <identity> <file>  write a targeted grant bundle for <identity>
+  loot init --identity <name>               initialize a repo here, owned by <name>
+  loot status [-m <message>]                snapshot the working tree into the working change
+  loot describe -m <message>                name the working change
+  loot new                                  finalize the working change; start a fresh one
+  loot surface                              materialize what the current identity may see
+  loot log                                  show change history
+  loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
+  loot apply <file>                         merge a peer's bundle (idempotent)
+  loot grant <path> <identity> <file>       write a targeted grant bundle for <identity>
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
-  loot migrate <path> <vis-spec> [dir]  change a path's visibility (public | restricted=a,b | embargoed=<ts>)
-  loot manifest                        show the grant audit trail
-  loot conflicts                       list paths that need human resolution
-  loot resolve <path> <file>           resolve a conflict at <path> using the content of <file>
+  loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
+  loot manifest                             show the grant audit trail
+  loot conflicts                            list paths that need human resolution
+  loot resolve <path> <file>                resolve a conflict at <path> using the content of <file>
+  loot remote add <name> <url>              register a relay URL under a name
+  loot remote remove <name>                 forget a named relay
+  loot remote list                          show all named relays
   loot serve [--dir <path>] [--addr <host:port>]  run a relay (holds ciphertext, no keys)
-  loot push <url>                      publish your changes to a relay (a disclosure act)
-  loot pull <url>                      fetch changes you lack from a relay, then merge";
+  loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
+  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -399,6 +403,45 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// --- named remotes (ADR 0013) ---
+
+fn cmd_remote(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "add" => {
+            if args.len() < 3 {
+                return Err("remote add requires <name> <url>".into());
+            }
+            let name = &args[1];
+            let url = &args[2];
+            let ws = Workspace::open()?;
+            ws.remote_add(name, url)?;
+            println!("remote '{name}' → {url}");
+            Ok(())
+        }
+        "remove" | "rm" => {
+            let name = args.get(1).ok_or("remote remove requires <name>")?;
+            let ws = Workspace::open()?;
+            ws.remote_remove(name)?;
+            println!("removed remote '{name}'");
+            Ok(())
+        }
+        "list" | "ls" => {
+            let ws = Workspace::open()?;
+            let remotes = ws.remote_list();
+            if remotes.is_empty() {
+                println!("no remotes configured  (use `loot remote add origin <url>`)");
+            } else {
+                for (name, url) in remotes {
+                    println!("{:<16} {url}", name);
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown remote subcommand '{other}': use add | remove | list")),
+    }
+}
+
 // --- network sync (ADR 0011) ---
 
 fn cmd_serve(args: &[String]) -> Result<(), String> {
@@ -409,25 +452,35 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     loot_net::serve(std::path::PathBuf::from(dir), addr).map_err(|e| e.to_string())
 }
 
+fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
+    // Explicit positional URL wins; then --remote <name>; then "origin" default.
+    let positional = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
+    if let Some(url) = positional {
+        return Ok(url.to_string());
+    }
+    let name = flag(args, "--remote").unwrap_or("origin");
+    ws.remote_url(name)
+        .ok_or_else(|| format!("no remote '{name}' configured — use `loot remote add {name} <url>` or pass a URL directly"))
+}
+
 fn cmd_push(args: &[String]) -> Result<(), String> {
-    let url = args.first().ok_or("push requires <url>")?;
-    // Build the bundle from the local repo without mutating it.
     let ws = Workspace::open()?;
+    let url = resolve_remote(args, &ws)?;
     let bundle = ws.repo().bundle(&[]).map_err(|e| e.to_string())?;
     let n = bundle.0.len();
-    loot_net::push(url, bundle.0).map_err(|e| e.to_string())?;
+    loot_net::push(&url, bundle.0).map_err(|e| e.to_string())?;
     println!("pushed {n} bytes to {url}");
     println!("  this published your sealed content to the relay (it still cannot read it)");
     Ok(())
 }
 
 fn cmd_pull(args: &[String]) -> Result<(), String> {
-    let url = args.first().ok_or("pull requires <url>")?;
     let mut ws = Workspace::open()?;
+    let url = resolve_remote(args, &ws)?;
     let now = ws.now();
     let identity = ws.identity().to_string();
     let have = ws.repo().heads();
-    let bytes = loot_net::pull(url, &have).map_err(|e| e.to_string())?;
+    let bytes = loot_net::pull(&url, &have).map_err(|e| e.to_string())?;
     if bytes.is_empty() {
         println!("pulled from {url}: nothing new (already up to date)");
         return Ok(());
