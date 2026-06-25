@@ -127,6 +127,16 @@ identity can't open the content now); `Some(plaintext)` is what the merger uses
 to tell a clean *Merged* from a *Conflict*. The classifier never sees keys or
 ciphertext — only this oracle.
 
+**Grant** — a key handoff event: the act of making an existing content key available to a new identity. Grants travel as targeted bundles (the grantor controls delivery by choosing who receives the bundle); the key itself rides in the bundle's keyring section. Grants are auditable via the Grant log. The primitive underlying revocation and visibility migration.
+
+**Grant log** — an append-only record of grant events (`oid`, `grantee`, `granted_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who was given access to what. Carries only the *fact* of a grant, never the key itself.
+
+**Forward revocation** — stopping the inclusion of a revoked identity in future grants for a given path. Re-seals the content under a new key, re-grants remaining authorized identities, and publishes a new Change. The revokee retains the key for any past versions they already hold — loot makes no promise about past plaintext. Natural for "you may read the old code but not future updates."
+
+**Hard revocation** — forward revocation plus a published purge event signaling all cooperating peers to remove the revokee's Keyring entry for the affected OID. A best-effort operational guarantee (cooperating machines purge; offline or modified-binary machines cannot be forced). Models the "person left the org" case where past access should also be terminated on managed machines.
+
+**Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + revocation over the affected identity set: promoting `Restricted` → `Public` re-seals under a new ANYONE-granted key; demoting `Public` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and revocation working correctly — not a separate primitive.
+
 ## Deliberately out of scope (for now)
 
 - **jj-style ergonomics** (auto-snapshot working copy, stable change-ids,
@@ -162,3 +172,12 @@ tree so the decision is reproducible (`cargo test --release`).
   a network escrow service that holds the key and only releases it at `reveal_at`.
   The seam is designed for this: replacing `Escrow::flush` with a network call
   leaves everything else unmodified. Deferred until the network layer exists.
+
+- **Relay announcement.** A relay peer declaring its relay status so senders
+  can discover who holds a key before bundling — enabling selective delivery
+  rather than ship-everything. Independent of key management; deferred until
+  grant/revocation are working.
+
+- **Embargoed merges across repos.** Accepting a change from a peer but keeping
+  the diff embargoed until a scheduled reveal. Requires a multi-remote model
+  (not yet defined). Deferred until the network layer exists.
