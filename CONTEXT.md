@@ -127,15 +127,16 @@ identity can't open the content now); `Some(plaintext)` is what the merger uses
 to tell a clean *Merged* from a *Conflict*. The classifier never sees keys or
 ciphertext — only this oracle.
 
-**Grant** — a key handoff event: the act of making an existing content key available to a new identity. Grants travel as targeted bundles (the grantor controls delivery by choosing who receives the bundle); the key itself rides in the bundle's keyring section. Grants are auditable via the Grant log. The primitive underlying revocation and visibility migration.
+**Grant** — a key handoff event: the act of making an existing content key available to a new identity. Grants travel as targeted bundles (the grantor controls delivery by choosing who receives the bundle); the key itself rides in the bundle's keyring section. Grants are auditable via the Manifest. The primitive underlying marooning and visibility migration. CLI: `loot grant <path> <identity>`.
 
-**Grant log** — an append-only record of grant events (`oid`, `grantee`, `granted_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who was given access to what. Carries only the *fact* of a grant, never the key itself.
+**Manifest** — an append-only record of grant events (`oid`, `grantee`, `granted_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who was given access to what. Carries only the *fact* of a grant, never the key itself. Named for a ship's manifest recording what cargo was loaded and by whom.
 
-**Forward revocation** — stopping the inclusion of a revoked identity in future grants for a given path. Re-seals the content under a new key, re-grants remaining authorized identities, and publishes a new Change. The revokee retains the key for any past versions they already hold — loot makes no promise about past plaintext. Natural for "you may read the old code but not future updates."
+**Maroon** — to cut off an identity's access to a path. Two levels:
 
-**Hard revocation** — forward revocation plus a published purge event signaling all cooperating peers to remove the revokee's Keyring entry for the affected OID. A best-effort operational guarantee (cooperating machines purge; offline or modified-binary machines cannot be forced). Models the "person left the org" case where past access should also be terminated on managed machines.
+- *Forward maroon* (`loot maroon <path> <identity>`) — re-seals content under a new key, re-grants remaining authorized identities, publishes a new Change. The marooned identity retains the key for any past versions they already hold. Natural for "you may read the old code but not future updates."
+- *Hard maroon* (`loot maroon --hard <path> <identity>`) — forward maroon plus a published purge event signaling all cooperating peers to remove the marooned identity's Keyring entry for the affected OID. Best-effort operational guarantee: cooperating machines purge; offline or modified-binary peers cannot be forced. Models the "person left the org" case.
 
-**Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + revocation over the affected identity set: promoting `Restricted` → `Public` re-seals under a new ANYONE-granted key; demoting `Public` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and revocation working correctly — not a separate primitive.
+**Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + maroon over the affected identity set: promoting `Restricted` → `Public` re-seals under a new ANYONE-granted key; demoting `Public` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and maroon working correctly — not a separate primitive.
 
 ## Deliberately out of scope (for now)
 

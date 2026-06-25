@@ -1,4 +1,4 @@
-# Grant is a targeted bundle; the grant log is append-only and travels with bundles
+# Grant is a targeted bundle; the manifest is append-only and travels with bundles
 
 ## Status
 
@@ -18,7 +18,7 @@ graph records *what content exists and who can see it*, not *who holds which
 key*. Putting key handoffs in the DAG would conflate content history with key
 management history and expose grant entries to relays who can't act on them.
 
-**Does the grant log need to be secret?** A grant log entry `{ oid, grantee,
+**Does the manifest need to be secret?** A manifest entry `{ oid, grantee,
 granted_at }` leaks the social graph of who granted whom access. This is beyond
 what a SealedObject already reveals (its `grant_ids` field). The question is
 whether relays should see this.
@@ -31,17 +31,18 @@ bundle. Security is only as strong as the bundle delivery channel — the same
 model as sending a key over Signal. PKI is deferred.
 
 **Grant is an out-of-band targeted bundle.** A grant bundle carries:
-- The content key in the keyring section (reaching the grantee's Keyring on apply)
-- A Grant log entry (`oid`, `grantee`, `granted_at`) in a new grant log section
 
-The key travels to the grantee via a targeted send; the grant log entry travels
+- The content key in the keyring section (reaching the grantee's Keyring on apply)
+- A Manifest entry (`oid`, `grantee`, `granted_at`) in a new manifest section
+
+The key travels to the grantee via a targeted send; the manifest entry travels
 to all peers via normal bundle propagation.
 
-**The grant log is append-only, fact-only, and travels in bundles.** It records
+**The manifest is append-only, fact-only, and travels in bundles.** It records
 the *fact* of a grant (who, what OID, when), never the key itself. It is a
 separate structure from the change graph and from the Keyring. Leaking the
 social graph to relays is acceptable: a relay already knows from `grant_ids`
-which identities are authorized; the grant log adds only the timing and
+which identities are authorized; the manifest adds only the timing and
 provenance of those grants.
 
 ## Considered alternatives
@@ -62,9 +63,9 @@ provenance of those grants.
 ## Consequences
 
 - `loot grant <path> <identity>` produces a targeted bundle carrying the key
-  and a grant log entry. The grantor sends this bundle directly to the grantee.
-- Every peer accumulates a grant log they can query: "who has been granted
+  and a manifest entry. The grantor sends this bundle directly to the grantee.
+- Every peer accumulates a manifest they can query: "who has been granted
   access to this path?"
 - Revocation and visibility migration are built on top of this primitive.
-- The grant log section is added to the bundle wire format alongside the
+- The manifest section is added to the bundle wire format alongside the
   existing keyring and escrow sections.
