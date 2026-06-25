@@ -10,24 +10,42 @@
 //!   - each object is encrypted independently; visibility == key possession
 //!   - addressing is by CIPHERTEXT hash only; no plaintext-derived identity, so
 //!     the store leaks no plaintext-equality oracle (ADR 0004)
-//!   - storage is log-structured (append-only `Vec` + in-memory index), NOT
-//!     git-style loose files
-//!   - runs fully in-memory; `checkout` is the only thing that touches disk
+//!   - in memory the store is a log-structured `Vec` + index; on disk objects are
+//!     loose, content-addressed files written incrementally (ADR 0012)
 //!
 //! Encryption, visibility, and embargo live in [`crate::sealed`] (ADR 0003);
 //! the merger/relay convergence rule lives in [`crate::converge`] (ADR 0001).
 
 mod change_graph;
 mod object_store;
+mod persist_codec;
 
-use crate::converge::{self};
+use crate::bundle_codec;
+use crate::converge;
 use crate::escrow::Escrow;
+use crate::manifest::Manifest;
 use crate::sealed::{self, ContentKey, Keyring, SealedObject, ANYONE};
 use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
-use change_graph::{compute_change_id, ChangeGraph, ChangeNode};
+pub(crate) use change_graph::ChangeNode;
+use change_graph::{compute_change_id, ChangeGraph};
 use object_store::{ObjectStore, Stored};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Returned by `grant`, `maroon`, and `maroon_hard`: the new object address
+/// plus any targeted grant bundles the caller should forward to remaining
+/// identities (ADR 0008, 0009, 0010).
+pub struct MaroonResult {
+    pub new_oid: Oid,
+    pub grants: Vec<(String, SyncBundle)>,
+}
+
+/// Returned by `migrate`: the new object address plus any targeted grant
+/// bundles the caller should forward to newly-granted identities (ADR 0010).
+pub struct MigrateResult {
+    pub new_oid: Oid,
+    pub grants: Vec<(String, SyncBundle)>,
+}
 
 /// The DAG engine. Composes storage, history, key custody, and policy behind
 /// the [`Repo`] interface.
@@ -39,8 +57,17 @@ pub struct DagRepo {
     /// Embargoed content keys awaiting their reveal time. `flush_escrow` promotes
     /// eligible entries to `keyring` before any content-reading operation (ADR 0007).
     escrow: Escrow,
+    /// Append-only audit trail of grant events (ADR 0008). Travels in bundles.
+    manifest: Manifest,
+    /// Pending purge events: (old-oid, marooned-identity). Shipped in hard-maroon
+    /// bundles so cooperating peers remove the marooned identity's key (ADR 0009).
+    purges: Vec<(Oid, String)>,
     objects: ObjectStore,
     graph: ChangeGraph,
+    /// Paths with unresolved conflicts from the last `apply`, keyed by path,
+    /// value is (our oid, their oid). Populated from `MergeOutcome::Conflict`
+    /// during `apply`; cleared entry-by-entry as `resolve` is called (ADR 0001).
+    conflicts: BTreeMap<PathBuf, (Oid, Oid)>,
 }
 
 impl DagRepo {
@@ -81,7 +108,7 @@ impl DagRepo {
     }
 
     /// Promote embargoed keys whose `reveal_at <= now` from Escrow into the
-    /// Keyring. Call this before any content-reading operation (`checkout`,
+    /// Keyring. Call this before any content-reading operation (`surface`,
     /// `snapshot`). After this, `sealed::open` finds the key in the Keyring
     /// and decrypts normally — `open` itself is unmodified (ADR 0007).
     pub fn flush_escrow(&mut self, now: u64) {
@@ -92,6 +119,324 @@ impl DagRepo {
         self.objects.get(oid)
     }
 
+    /// Produce a targeted grant bundle that gives `grantee` the key for `oid`
+    /// and records the event in the local manifest (ADR 0008). The caller must
+    /// hold the key for `oid`; if not, returns `Unauthorized`.
+    ///
+    /// The bundle carries only the objects and key for this single grant — it is
+    /// a targeted hand-off, not a full sync. Apply it on the grantee side.
+    pub fn grant(&mut self, oid: &Oid, grantee: &str, now: u64) -> Result<SyncBundle, RepoError> {
+        // Must hold the key ourselves before we can grant it.
+        let key = self.keyring.key_for(oid)
+            .ok_or_else(|| RepoError::Unauthorized(oid.clone()))?;
+
+        // Build a bundle carrying just this object + its key, addressed to grantee.
+        let obj = self.object(oid)?;
+        let mut objs: BTreeMap<Oid, &SealedObject> = BTreeMap::new();
+        objs.insert(oid.clone(), obj);
+        let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
+        public_keys.insert(oid.clone(), key);
+
+        // Grant bundles carry no changes — just the object and its key.
+        let payload = bundle_codec::encode_grant(&[], &objs, &public_keys, &BTreeMap::new());
+
+        // Tag this as a grant bundle (tag byte = 1) so apply() routes it through
+        // the grant path: tag(1) || grantee_len(4) || grantee || payload.
+        let mut out = vec![1u8];
+        let gb = grantee.as_bytes();
+        out.extend_from_slice(&(gb.len() as u32).to_le_bytes());
+        out.extend_from_slice(gb);
+        out.extend_from_slice(&payload);
+
+        // Record in the local manifest.
+        self.manifest.record(oid.clone(), grantee.to_string(), now);
+
+        Ok(SyncBundle(out))
+    }
+
+    /// Forward-maroon `marooned` from `path`: re-seal the content under a fresh
+    /// key that excludes `marooned`, update the change tree, and produce grant
+    /// bundles for every remaining identity in the manifest (ADR 0009).
+    ///
+    /// Forward maroon does NOT emit a purge event — the marooned identity keeps
+    /// their existing key for content they already have; they simply won't receive
+    /// the new key. Use `maroon_hard` to also emit a purge event.
+    pub fn maroon(&mut self, path: &Path, marooned: &str, now: u64) -> Result<MaroonResult, RepoError> {
+        self.maroon_inner(path, marooned, now, false)
+    }
+
+    /// Hard-maroon `marooned` from `path`: same as forward maroon, but also emits
+    /// a purge event so cooperating peers remove the marooned identity's old key
+    /// on next bundle apply (ADR 0009).
+    pub fn maroon_hard(&mut self, path: &Path, marooned: &str, now: u64) -> Result<MaroonResult, RepoError> {
+        self.maroon_inner(path, marooned, now, true)
+    }
+
+    fn maroon_inner(&mut self, path: &Path, marooned: &str, now: u64, hard: bool) -> Result<MaroonResult, RepoError> {
+        // Find the current oid for this path.
+        let tree = self.graph.current_tree();
+        let (old_oid, old_vis) = tree.get(path)
+            .ok_or(RepoError::NotFound(Oid([0; 32])))?
+            .clone();
+
+        // Must hold the key to re-seal.
+        let plaintext = self.get(&old_oid, &self.identity, now)
+            .map_err(|_| RepoError::Unauthorized(old_oid.clone()))?;
+
+        // Build the new visibility excluding marooned.
+        let new_vis = match &old_vis {
+            Visibility::Restricted(ids) => {
+                let remaining: Vec<String> = ids.iter().filter(|id| id.as_str() != marooned).cloned().collect();
+                Visibility::Restricted(remaining)
+            }
+            other => other.clone(),
+        };
+
+        // Re-seal under new visibility.
+        let new_oid = self.put(&plaintext, new_vis.clone())?;
+
+        // Record a purge event if hard maroon.
+        if hard {
+            self.purges.push((old_oid.clone(), marooned.to_string()));
+        }
+
+        // Update the current working change (or create a new one) to point to new_oid.
+        let mut new_tree = tree.clone();
+        new_tree.insert(path.to_path_buf(), (new_oid.clone(), new_vis.clone()));
+        let change = Change {
+            id: Oid([0; 32]),
+            parents: self.graph.heads(),
+            message: format!("maroon {} from {}", marooned, path.display()),
+            tree: new_tree,
+        };
+        self.record(change)?;
+
+        // Produce grant bundles for remaining identities.
+        let remaining_grantees: Vec<String> = self.manifest.grants_for(&old_oid)
+            .into_iter()
+            .filter(|e| e.grantee != marooned && e.grantee != self.identity)
+            .map(|e| e.grantee.clone())
+            .collect();
+
+        let mut grants = Vec::new();
+        for grantee in remaining_grantees {
+            if let Ok(bundle) = self.grant(&new_oid, &grantee, now) {
+                grants.push((grantee, bundle));
+            }
+        }
+
+        Ok(MaroonResult { new_oid, grants })
+    }
+
+    /// Migrate `path` to a new visibility policy: re-seal the content under
+    /// `new_vis`, update the change tree, and produce grant bundles for any
+    /// identities newly granted access (ADR 0010).
+    pub fn migrate(&mut self, path: &Path, new_vis: Visibility, now: u64) -> Result<MigrateResult, RepoError> {
+        // Find the current oid for this path.
+        let tree = self.graph.current_tree();
+        let (old_oid, _old_vis) = tree.get(path)
+            .ok_or(RepoError::NotFound(Oid([0; 32])))?
+            .clone();
+
+        // Must hold the key to re-seal.
+        let plaintext = self.get(&old_oid, &self.identity, now)
+            .map_err(|_| RepoError::Unauthorized(old_oid.clone()))?;
+
+        // Re-seal under new visibility.
+        let new_oid = self.put(&plaintext, new_vis.clone())?;
+
+        // Update the current working change (or create a new one) to point to new_oid.
+        let mut new_tree = tree.clone();
+        new_tree.insert(path.to_path_buf(), (new_oid.clone(), new_vis.clone()));
+        let change = Change {
+            id: Oid([0; 32]),
+            parents: self.graph.heads(),
+            message: format!("migrate {} to {:?}", path.display(), new_vis),
+            tree: new_tree,
+        };
+        self.record(change)?;
+
+        // Produce grant bundles for any newly-listed identities.
+        let grants_needed: Vec<String> = match &new_vis {
+            Visibility::Restricted(ids) => ids.iter()
+                .filter(|id| id.as_str() != self.identity.as_str())
+                .cloned()
+                .collect(),
+            _ => vec![],
+        };
+
+        let mut grants = Vec::new();
+        for grantee in grants_needed {
+            if let Ok(bundle) = self.grant(&new_oid, &grantee, now) {
+                grants.push((grantee, bundle));
+            }
+        }
+
+        Ok(MigrateResult { new_oid, grants })
+    }
+
+    /// The grant audit trail.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// The OID for `path` in the current tree, or `NotFound` if absent.
+    pub fn current_tree_oid(&self, path: &Path) -> Result<Oid, RepoError> {
+        self.graph.current_tree()
+            .get(path)
+            .map(|(oid, _)| oid.clone())
+            .ok_or(RepoError::NotFound(Oid([0; 32])))
+    }
+
+    /// All unresolved conflicts from the last `apply`, keyed by path.
+    /// Each value is `(our_oid, their_oid)`.
+    pub fn conflicts(&self) -> &BTreeMap<PathBuf, (Oid, Oid)> {
+        &self.conflicts
+    }
+
+    /// Resolve a conflict at `path` by providing the resolution bytes.
+    /// Seals the resolution under `vis`, records a change, and removes the
+    /// path from the conflict set.
+    pub fn resolve(&mut self, path: &Path, resolution: &[u8], vis: Visibility, now: u64) -> Result<Oid, RepoError> {
+        if !self.conflicts.contains_key(path) {
+            return Err(RepoError::Backend(format!(
+                "no conflict recorded at {}",
+                path.display()
+            )));
+        }
+
+        let new_oid = self.put(resolution, vis.clone())?;
+
+        // Update the tree with the resolution.
+        let mut new_tree = self.graph.current_tree();
+        new_tree.insert(path.to_path_buf(), (new_oid.clone(), vis));
+        let change = Change {
+            id: Oid([0; 32]),
+            parents: self.graph.heads(),
+            message: format!("resolve conflict at {}", path.display()),
+            tree: new_tree,
+        };
+        self.record(change)?;
+
+        // Clear the resolved conflict.
+        self.conflicts.remove(path);
+
+        let _ = now;
+        Ok(new_oid)
+    }
+
+    /// Stow a bundle append-only: store its sealed objects and add its
+    /// change-nodes as new tips, without merging, decrypting, or touching a
+    /// working tree (ADR 0011). This is the **relay** ingest path — the node
+    /// holds ciphertext it cannot read and forwards it for keyholders. Purge
+    /// events are accumulated so they continue to propagate on the next
+    /// `bundle`. Convergence is deferred to whoever pulls and holds keys.
+    ///
+    /// Only sync bundles (tag 0) are stowable. A grant bundle (tag 1) is a
+    /// targeted key handoff with no meaning for a keyless relay, so it is
+    /// rejected rather than silently dropped.
+    pub fn stow(&mut self, bundle: &SyncBundle) -> Result<(), RepoError> {
+        let data = &bundle.0;
+        if data.is_empty() {
+            return Err(RepoError::Backend("empty bundle".into()));
+        }
+        if data[0] != 0 {
+            return Err(RepoError::Backend(
+                "a relay can only stow sync bundles (tag 0), not grant bundles".into(),
+            ));
+        }
+        let parsed = parse_sync_bundle(&data[1..])?;
+
+        // Store ciphertext, retaining any keys that rode along so they keep
+        // forwarding downstream. Only ANYONE-granted (public) keys and embargoed
+        // escrow entries ever travel in a sync bundle — RESTRICTED keys never do
+        // (ADR 0003). So the relay's "keylessness" for restricted content is
+        // automatic: it cannot receive a restricted key here, and thus can never
+        // read restricted content. Public keys are non-secret by definition;
+        // carrying them lets the relay forward readable public content.
+        for (addr, obj) in parsed.objs {
+            let key = parsed.keys.get(&addr).copied();
+            self.store(addr, obj, key);
+        }
+        for (oid, (key, reveal_at)) in parsed.escrow {
+            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
+                self.escrow.insert(oid, key, reveal_at);
+            }
+        }
+        // Accumulate purge events so they keep propagating downstream. A relay
+        // is never the marooned identity for its own keyring (it holds none),
+        // so there is nothing to remove locally.
+        for p in parsed.purges {
+            if !self.purges.contains(&p) {
+                self.purges.push(p);
+            }
+        }
+        // Append change-nodes as new tips. Concurrent pushes legitimately fork
+        // the graph; keyholders collapse the forks on pull.
+        for node in parsed.changes {
+            self.graph.insert(node);
+        }
+        Ok(())
+    }
+
+    /// Merge a parsed sync bundle into our working change — the keyholder path
+    /// shared by `apply`. Honors purges against our own keyring, ingests objects
+    /// and keys, classifies each incoming change against our pre-apply tree via
+    /// the ADR 0001 convergence rule, and records conflicts.
+    fn apply_sync(
+        &mut self,
+        parsed: ParsedSyncBundle,
+        now: u64,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
+        // Honor purge events: if we are the marooned identity, remove the old key.
+        for (purge_oid, marooned) in &parsed.purges {
+            if marooned == &self.identity {
+                self.keyring.remove(purge_oid);
+            }
+        }
+
+        // Our tree before applying, used to detect concurrent same-path edits.
+        let local_before = self.graph.current_tree();
+
+        // Ingest SealedObjects, filing only the public (non-embargoed) keys that
+        // rode along. Embargoed keys travel in escrow and go into our Escrow, not
+        // the Keyring (ADR 0007). No Restricted key can be here.
+        for (addr, obj) in parsed.objs {
+            let key = parsed.keys.get(&addr).copied();
+            self.store(addr, obj, key);
+        }
+        for (oid, (key, reveal_at)) in parsed.escrow {
+            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
+                self.escrow.insert(oid, key, reveal_at);
+            }
+        }
+
+        // Classify every incoming change against our pre-apply tree using the
+        // shared ADR 0001 classifier. We are the KeyOracle: it asks us for
+        // plaintext, we answer via sealed::open. The classifier owns the rule.
+        let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
+        for node in &parsed.changes {
+            let per_change = converge::classify(&local_before, &node.tree, self, now);
+            for (path, outcome) in per_change {
+                let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
+                *slot = converge::worst(slot.clone(), outcome);
+            }
+        }
+
+        // Populate the conflict map from Conflict outcomes.
+        for (path, outcome) in &outcomes {
+            if let MergeOutcome::Conflict { ref ours, ref theirs } = outcome {
+                self.conflicts.insert(path.clone(), (ours.clone(), theirs.clone()));
+            }
+        }
+
+        for node in parsed.changes {
+            self.graph.insert(node);
+        }
+
+        Ok(outcomes)
+    }
+
     /// Persist the whole repo under `dir` (typically `.loot/`): all sealed
     /// objects, the full change graph, and this identity's keyring. The keyring
     /// is written to its own LOCAL-ONLY file — it is custody, not repo content,
@@ -100,9 +445,15 @@ impl DagRepo {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
         std::fs::create_dir_all(dir).map_err(io)?;
         std::fs::write(dir.join("identity"), self.identity.as_bytes()).map_err(io)?;
-        std::fs::write(dir.join("repo"), wire::encode_repo(&self.objects, &self.graph)).map_err(io)?;
-        std::fs::write(dir.join("keyring"), wire::encode_keyring(&self.keyring)).map_err(io)?;
-        std::fs::write(dir.join("escrow"), wire::encode_escrow(&self.escrow)).map_err(io)?;
+        // Objects: loose, content-addressed, incremental (ADR 0012).
+        persist_codec::save_objects_loose(dir, &self.objects)?;
+        // Change graph: small metadata, whole-file.
+        std::fs::write(dir.join("graph"), persist_codec::encode_graph(&self.graph)).map_err(io)?;
+        std::fs::write(dir.join("keyring"), persist_codec::encode_keyring(&self.keyring)).map_err(io)?;
+        std::fs::write(dir.join("escrow"), persist_codec::encode_escrow(&self.escrow)).map_err(io)?;
+        std::fs::write(dir.join("manifest"), encode_manifest(&self.manifest)).map_err(io)?;
+        std::fs::write(dir.join("purges"), encode_purges(&self.purges)).map_err(io)?;
+        std::fs::write(dir.join("conflicts"), encode_conflicts(&self.conflicts)).map_err(io)?;
         Ok(())
     }
 
@@ -172,7 +523,7 @@ impl DagRepo {
             message: message.to_string(),
             tree,
         };
-        self.commit(change)
+        self.record(change)
     }
 
     /// Change history in topo order (parents before children), as
@@ -187,26 +538,42 @@ impl DagRepo {
     }
 
     /// Load a repo previously written by [`save`] from `dir`. `root` is the
-    /// working directory `checkout` will materialize into (kept separate from
+    /// working directory `surface` will materialize into (kept separate from
     /// `dir` so the store can live in `.loot/` while files land in the repo).
     pub fn load(dir: &std::path::Path, root: PathBuf) -> Result<Self, RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
         let identity = String::from_utf8(std::fs::read(dir.join("identity")).map_err(io)?)
             .map_err(|e| RepoError::Backend(e.to_string()))?;
-        let (objects, graph) = wire::decode_repo(&std::fs::read(dir.join("repo")).map_err(io)?)?;
-        let keyring = wire::decode_keyring(&std::fs::read(dir.join("keyring")).map_err(io)?)?;
+        let objects = persist_codec::load_objects_loose(dir)?;
+        let graph = persist_codec::decode_graph(&std::fs::read(dir.join("graph")).map_err(io)?)?;
+        let keyring = persist_codec::decode_keyring(&std::fs::read(dir.join("keyring")).map_err(io)?)?;
         // Escrow file may not exist in repos created before ADR 0007 — default empty.
         let escrow = match std::fs::read(dir.join("escrow")) {
-            Ok(b) => wire::decode_escrow(&b)?,
+            Ok(b) => persist_codec::decode_escrow(&b)?,
             Err(_) => Escrow::new(),
+        };
+        let manifest = match std::fs::read(dir.join("manifest")) {
+            Ok(b) => decode_manifest(&b)?,
+            Err(_) => Manifest::new(),
+        };
+        let purges = match std::fs::read(dir.join("purges")) {
+            Ok(b) => decode_purges(&b)?,
+            Err(_) => Vec::new(),
+        };
+        let conflicts = match std::fs::read(dir.join("conflicts")) {
+            Ok(b) => decode_conflicts(&b)?,
+            Err(_) => BTreeMap::new(),
         };
         Ok(DagRepo {
             root,
             identity,
             keyring,
             escrow,
+            manifest,
+            purges,
             objects,
             graph,
+            conflicts,
         })
     }
 }
@@ -218,8 +585,11 @@ impl Repo for DagRepo {
             identity: identity.to_string(),
             keyring: Keyring::new(),
             escrow: Escrow::new(),
+            manifest: Manifest::new(),
+            purges: Vec::new(),
             objects: ObjectStore::new(),
             graph: ChangeGraph::new(),
+            conflicts: BTreeMap::new(),
         })
     }
 
@@ -234,7 +604,8 @@ impl Repo for DagRepo {
         sealed::open(obj, oid, reader, &self.keyring, now)
     }
 
-    fn commit(&mut self, change: Change) -> Result<Oid, RepoError> {
+    /// Record a change over the current set of put() objects.
+    fn record(&mut self, change: Change) -> Result<Oid, RepoError> {
         let id = compute_change_id(&change);
         let node = ChangeNode {
             id: id.clone(),
@@ -246,7 +617,9 @@ impl Repo for DagRepo {
         Ok(id)
     }
 
-    fn checkout(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError> {
+    /// Materialize the tree of `change` to the working area, skipping
+    /// content `reader` cannot see (ADR 0006).
+    fn surface(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError> {
         let node = self
             .graph
             .get(change)
@@ -311,7 +684,20 @@ impl Repo for DagRepo {
             }
         }
 
-        Ok(SyncBundle(wire::encode(&send, &needed, &public_keys, &escrow_entries)))
+        // Regular sync bundle: tag = 0 (no grantee prefix).
+        let payload = bundle_codec::encode(&send, &needed, &public_keys, &escrow_entries);
+        // Prepend tag=0 and purge list.
+        let mut out = vec![0u8]; // tag: sync bundle
+        // Encode purges: (oid, marooned) pairs.
+        out.extend_from_slice(&(self.purges.len() as u32).to_le_bytes());
+        for (oid, marooned) in &self.purges {
+            out.extend_from_slice(&oid.0);
+            let mb = marooned.as_bytes();
+            out.extend_from_slice(&(mb.len() as u32).to_le_bytes());
+            out.extend_from_slice(mb);
+        }
+        out.extend_from_slice(&payload);
+        Ok(SyncBundle(out))
     }
 
     fn apply(
@@ -319,45 +705,63 @@ impl Repo for DagRepo {
         bundle: &SyncBundle,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
-        let (incoming_changes, incoming_objs, incoming_keys, incoming_escrow) =
-            wire::decode(&bundle.0)?;
-
-        // Our tree before applying, used to detect concurrent same-path edits.
-        let local_before = self.graph.current_tree();
-
-        // Ingest SealedObjects, filing only the public (non-embargoed) keys that
-        // rode along. Embargoed keys travel in `incoming_escrow` and go into our
-        // Escrow, not the Keyring (ADR 0007). No Restricted key can be here.
-        for (addr, obj) in incoming_objs {
-            let key = incoming_keys.get(&addr).copied();
-            self.store(addr, obj, key);
+        let data = &bundle.0;
+        if data.is_empty() {
+            return Err(RepoError::Backend("empty bundle".into()));
         }
-        // File incoming embargoed keys into the local Escrow so they'll be
-        // promoted by `flush_escrow` once their reveal time arrives.
-        for (oid, (key, reveal_at)) in incoming_escrow {
-            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                self.escrow.insert(oid, key, reveal_at);
+
+        let tag = data[0];
+        let rest = &data[1..];
+
+        if tag == 0 {
+            // Sync bundle. Parse, then merge into our working change (the
+            // keyholder path). A relay would call `stow` instead and skip merge.
+            let parsed = parse_sync_bundle(rest)?;
+            return self.apply_sync(parsed, now);
+        }
+
+        if tag == 1 {
+            // Grant bundle: grantee_len(4) || grantee || payload
+            if rest.len() < 4 {
+                return Err(RepoError::Backend("grant bundle truncated".into()));
             }
-        }
-
-        // Classify every incoming change against our pre-apply tree using the
-        // shared ADR 0001 classifier (crate::converge). We are the KeyOracle:
-        // it asks us for plaintext, we answer via sealed::open. The classifier
-        // owns the rule; we own only storage and crypto.
-        let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
-        for node in &incoming_changes {
-            let per_change = converge::classify(&local_before, &node.tree, self, now);
-            for (path, outcome) in per_change {
-                let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
-                *slot = converge::worst(slot.clone(), outcome);
+            let grantee_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            if rest.len() < 4 + grantee_len {
+                return Err(RepoError::Backend("grant bundle grantee truncated".into()));
             }
+            let grantee = std::str::from_utf8(&rest[4..4 + grantee_len])
+                .map_err(|e| RepoError::Backend(e.to_string()))?
+                .to_string();
+            let payload = &rest[4 + grantee_len..];
+
+            let (_changes, incoming_objs, incoming_keys, incoming_escrow) =
+                bundle_codec::decode_grant(payload)?;
+
+            // Install objects and keys.
+            for (addr, obj) in incoming_objs {
+                let key = incoming_keys.get(&addr).copied();
+                // Store the object (may dedup). For grant bundles targeted to us,
+                // file the key directly into the keyring — dedup does not block key
+                // custody since the key is the grant payload, not derived from storage.
+                self.store(addr.clone(), obj, None); // store without key to avoid dedup blocking
+                if grantee == self.identity {
+                    if let Some(k) = key {
+                        if !self.keyring.holds(&addr) {
+                            self.keyring.insert(addr, k);
+                        }
+                    }
+                }
+            }
+            for (oid, (key, reveal_at)) in incoming_escrow {
+                if grantee == self.identity && !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
+                    self.escrow.insert(oid, key, reveal_at);
+                }
+            }
+
+            return Ok(BTreeMap::new());
         }
 
-        for node in incoming_changes {
-            self.graph.insert(node);
-        }
-
-        Ok(outcomes)
+        Err(RepoError::Backend(format!("unknown bundle tag {tag}")))
     }
 
     fn heads(&self) -> Vec<Oid> {
@@ -378,394 +782,136 @@ impl converge::KeyOracle for DagRepo {
     }
 }
 
-/// Minimal length-prefixed binary wire format for `SyncBundle`, hand-rolled to
-/// keep the engine dependency-light (no serde/bincode). The format is internal:
-/// bundles produced by `bundle` are only ever read by `apply`.
-mod wire {
-    use super::ChangeNode;
-    use crate::sealed::{ContentKey, SealedObject};
-    use crate::{Oid, RepoError, Visibility};
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
+/// A decoded tag-0 sync bundle: the purge events, change-nodes, sealed objects,
+/// public keys, and embargoed escrow entries it carries. Produced by
+/// [`parse_sync_bundle`] and consumed by both `apply_sync` (keyholder merge) and
+/// `stow` (relay append-only ingest), so the wire format is parsed in one place.
+struct ParsedSyncBundle {
+    purges: Vec<(Oid, String)>,
+    changes: Vec<ChangeNode>,
+    objs: Vec<(Oid, SealedObject)>,
+    keys: BTreeMap<Oid, ContentKey>,
+    escrow: BTreeMap<Oid, (ContentKey, u64)>,
+}
 
-    fn put_u32(out: &mut Vec<u8>, n: usize) {
-        out.extend_from_slice(&(n as u32).to_le_bytes());
+/// Parse the body of a tag-0 sync bundle (everything after the leading tag byte):
+/// `purge_count(4) || [(oid(32) || marooned_len(4) || marooned)*] || bundle_payload`.
+fn parse_sync_bundle(rest: &[u8]) -> Result<ParsedSyncBundle, RepoError> {
+    if rest.len() < 4 {
+        return Err(RepoError::Backend("sync bundle truncated (purge count)".into()));
     }
-    fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-        put_u32(out, b.len());
-        out.extend_from_slice(b);
+    let purge_count = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let mut pos = 4;
+    let mut purges: Vec<(Oid, String)> = Vec::with_capacity(purge_count);
+    for _ in 0..purge_count {
+        if pos + 32 > rest.len() {
+            return Err(RepoError::Backend("sync bundle truncated (purge oid)".into()));
+        }
+        let mut oid_bytes = [0u8; 32];
+        oid_bytes.copy_from_slice(&rest[pos..pos + 32]);
+        pos += 32;
+        if pos + 4 > rest.len() {
+            return Err(RepoError::Backend("sync bundle truncated (purge identity len)".into()));
+        }
+        let id_len = u32::from_le_bytes([rest[pos], rest[pos + 1], rest[pos + 2], rest[pos + 3]]) as usize;
+        pos += 4;
+        if pos + id_len > rest.len() {
+            return Err(RepoError::Backend("sync bundle truncated (purge identity)".into()));
+        }
+        let marooned = std::str::from_utf8(&rest[pos..pos + id_len])
+            .map_err(|e| RepoError::Backend(e.to_string()))?
+            .to_string();
+        pos += id_len;
+        purges.push((Oid(oid_bytes), marooned));
     }
-    fn put_vis(out: &mut Vec<u8>, vis: &Visibility) {
-        match vis {
-            Visibility::Public => out.push(0),
-            Visibility::Restricted(ids) => {
-                out.push(1);
-                put_u32(out, ids.len());
-                for id in ids {
-                    put_bytes(out, id.as_bytes());
-                }
-            }
-            Visibility::Embargoed { reveal_at } => {
-                out.push(2);
-                out.extend_from_slice(&reveal_at.to_le_bytes());
-            }
-        }
+    let payload = &rest[pos..];
+    let (changes, objs, keys, escrow) = bundle_codec::decode(payload)?;
+    Ok(ParsedSyncBundle { purges, changes, objs, keys, escrow })
+}
+
+// --- local persistence helpers for manifest, purges, conflicts ---
+// These use the same hand-rolled length-prefixed format as the other codecs.
+
+fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
+    use crate::bundle_codec::{put_bytes, put_u32};
+    let mut out = Vec::new();
+    let entries: Vec<_> = manifest.iter().collect();
+    put_u32(&mut out, entries.len());
+    for e in entries {
+        out.extend_from_slice(&e.oid.0);
+        put_bytes(&mut out, e.grantee.as_bytes());
+        out.extend_from_slice(&e.granted_at.to_le_bytes());
     }
+    out
+}
 
-    pub fn encode(
-        changes: &[&ChangeNode],
-        objs: &BTreeMap<Oid, &SealedObject>,
-        public_keys: &BTreeMap<Oid, ContentKey>,
-        escrow_entries: &BTreeMap<Oid, (ContentKey, u64)>,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-
-        // SealedObjects: ciphertext + policy + grant_ids (NAMES), never keys,
-        // and no plaintext-derived field — so the wire leaks no equality signal
-        // to a relay (ADR 0004).
-        put_u32(&mut out, objs.len());
-        for (addr, obj) in objs {
-            out.extend_from_slice(&addr.0);
-            out.extend_from_slice(&obj.nonce);
-            put_bytes(&mut out, &obj.ciphertext);
-            put_vis(&mut out, &obj.vis);
-            put_u32(&mut out, obj.grant_ids.len());
-            for id in &obj.grant_ids {
-                put_bytes(&mut out, id.as_bytes());
-            }
-        }
-
-        // Keys for ANYONE-granted, non-embargoed content (ADR 0003).
-        put_u32(&mut out, public_keys.len());
-        for (addr, key) in public_keys {
-            out.extend_from_slice(&addr.0);
-            out.extend_from_slice(key);
-        }
-
-        // Embargoed keys as escrow entries: receiver files them into their Escrow
-        // (not Keyring) so they can't be read before reveal_at (ADR 0007).
-        put_u32(&mut out, escrow_entries.len());
-        for (addr, (key, reveal_at)) in escrow_entries {
-            out.extend_from_slice(&addr.0);
-            out.extend_from_slice(key);
-            out.extend_from_slice(&reveal_at.to_le_bytes());
-        }
-
-        put_u32(&mut out, changes.len());
-        for c in changes {
-            out.extend_from_slice(&c.id.0);
-            put_u32(&mut out, c.parents.len());
-            for p in &c.parents {
-                out.extend_from_slice(&p.0);
-            }
-            put_bytes(&mut out, c.message.as_bytes());
-            put_u32(&mut out, c.tree.len());
-            for (path, (oid, vis)) in &c.tree {
-                put_bytes(&mut out, path.to_string_lossy().as_bytes());
-                out.extend_from_slice(&oid.0);
-                put_vis(&mut out, vis);
-            }
-        }
-        out
+fn decode_manifest(b: &[u8]) -> Result<Manifest, RepoError> {
+    use crate::bundle_codec::Cursor;
+    let mut c = Cursor { b, i: 0 };
+    let mut m = Manifest::new();
+    let n = c.u32()?;
+    for _ in 0..n {
+        let oid = Oid(c.arr32()?);
+        let grantee = c.string()?;
+        let granted_at = c.u64()?;
+        m.record(oid, grantee, granted_at);
     }
+    Ok(m)
+}
 
-    struct Cursor<'a> {
-        b: &'a [u8],
-        i: usize,
+fn encode_purges(purges: &[(Oid, String)]) -> Vec<u8> {
+    use crate::bundle_codec::{put_bytes, put_u32};
+    let mut out = Vec::new();
+    put_u32(&mut out, purges.len());
+    for (oid, identity) in purges {
+        out.extend_from_slice(&oid.0);
+        put_bytes(&mut out, identity.as_bytes());
     }
-    impl<'a> Cursor<'a> {
-        fn take(&mut self, n: usize) -> Result<&'a [u8], RepoError> {
-            if self.i + n > self.b.len() {
-                return Err(RepoError::Backend("bundle truncated".into()));
-            }
-            let s = &self.b[self.i..self.i + n];
-            self.i += n;
-            Ok(s)
-        }
-        fn u32(&mut self) -> Result<usize, RepoError> {
-            let s = self.take(4)?;
-            Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
-        }
-        fn u64(&mut self) -> Result<u64, RepoError> {
-            let s = self.take(8)?;
-            let mut a = [0u8; 8];
-            a.copy_from_slice(s);
-            Ok(u64::from_le_bytes(a))
-        }
-        fn arr32(&mut self) -> Result<[u8; 32], RepoError> {
-            let s = self.take(32)?;
-            let mut a = [0u8; 32];
-            a.copy_from_slice(s);
-            Ok(a)
-        }
-        fn arr12(&mut self) -> Result<[u8; 12], RepoError> {
-            let s = self.take(12)?;
-            let mut a = [0u8; 12];
-            a.copy_from_slice(s);
-            Ok(a)
-        }
-        fn bytes(&mut self) -> Result<Vec<u8>, RepoError> {
-            let n = self.u32()?;
-            Ok(self.take(n)?.to_vec())
-        }
-        fn string(&mut self) -> Result<String, RepoError> {
-            String::from_utf8(self.bytes()?).map_err(|e| RepoError::Backend(e.to_string()))
-        }
-        fn vis(&mut self) -> Result<Visibility, RepoError> {
-            match self.take(1)?[0] {
-                0 => Ok(Visibility::Public),
-                1 => {
-                    let n = self.u32()?;
-                    let mut ids = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        ids.push(self.string()?);
-                    }
-                    Ok(Visibility::Restricted(ids))
-                }
-                2 => Ok(Visibility::Embargoed {
-                    reveal_at: self.u64()?,
-                }),
-                t => Err(RepoError::Backend(format!("bad vis tag {t}"))),
-            }
-        }
+    out
+}
+
+fn decode_purges(b: &[u8]) -> Result<Vec<(Oid, String)>, RepoError> {
+    use crate::bundle_codec::Cursor;
+    let mut c = Cursor { b, i: 0 };
+    let n = c.u32()?;
+    let mut purges = Vec::with_capacity(n);
+    for _ in 0..n {
+        let oid = Oid(c.arr32()?);
+        let identity = c.string()?;
+        purges.push((oid, identity));
     }
+    Ok(purges)
+}
 
-    #[allow(clippy::type_complexity)]
-    pub fn decode(
-        b: &[u8],
-    ) -> Result<
-        (
-            Vec<ChangeNode>,
-            Vec<(Oid, SealedObject)>,
-            BTreeMap<Oid, ContentKey>,
-            BTreeMap<Oid, (ContentKey, u64)>,
-        ),
-        RepoError,
-    > {
-        let mut c = Cursor { b, i: 0 };
-
-        let n_objs = c.u32()?;
-        let mut objs = Vec::with_capacity(n_objs);
-        for _ in 0..n_objs {
-            let addr = Oid(c.arr32()?);
-            let nonce = c.arr12()?;
-            let ciphertext = c.bytes()?;
-            let vis = c.vis()?;
-            let n_grants = c.u32()?;
-            let mut grant_ids = Vec::with_capacity(n_grants);
-            for _ in 0..n_grants {
-                grant_ids.push(c.string()?);
-            }
-            objs.push((
-                addr,
-                SealedObject {
-                    nonce,
-                    ciphertext,
-                    vis,
-                    grant_ids,
-                },
-            ));
-        }
-
-        let n_keys = c.u32()?;
-        let mut public_keys = BTreeMap::new();
-        for _ in 0..n_keys {
-            let addr = Oid(c.arr32()?);
-            let key = c.arr32()?;
-            public_keys.insert(addr, key);
-        }
-
-        let n_escrow = c.u32()?;
-        let mut escrow_entries = BTreeMap::new();
-        for _ in 0..n_escrow {
-            let addr = Oid(c.arr32()?);
-            let key = c.arr32()?;
-            let reveal_at = c.u64()?;
-            escrow_entries.insert(addr, (key, reveal_at));
-        }
-
-        let n_changes = c.u32()?;
-        let mut changes = Vec::with_capacity(n_changes);
-        for _ in 0..n_changes {
-            let id = Oid(c.arr32()?);
-            let n_parents = c.u32()?;
-            let mut parents = Vec::with_capacity(n_parents);
-            for _ in 0..n_parents {
-                parents.push(Oid(c.arr32()?));
-            }
-            let message = c.string()?;
-            let n_tree = c.u32()?;
-            let mut tree = BTreeMap::new();
-            for _ in 0..n_tree {
-                let path = PathBuf::from(c.string()?);
-                let oid = Oid(c.arr32()?);
-                let vis = c.vis()?;
-                tree.insert(path, (oid, vis));
-            }
-            changes.push(ChangeNode {
-                id,
-                parents,
-                message,
-                tree,
-            });
-        }
-
-        Ok((changes, objs, public_keys, escrow_entries))
+fn encode_conflicts(conflicts: &BTreeMap<PathBuf, (Oid, Oid)>) -> Vec<u8> {
+    use crate::bundle_codec::{put_bytes, put_u32};
+    let mut out = Vec::new();
+    put_u32(&mut out, conflicts.len());
+    for (path, (ours, theirs)) in conflicts {
+        put_bytes(&mut out, path.to_string_lossy().as_bytes());
+        out.extend_from_slice(&ours.0);
+        out.extend_from_slice(&theirs.0);
     }
+    out
+}
 
-    // --- whole-repo persistence (ADR 0005) ---
-    //
-    // Distinct from the bundle format above: persistence serializes EVERY object
-    // and change (no have-set filtering) and does NOT touch keys. The keyring is
-    // serialized separately, to its own local-only file.
-
-    use super::{ChangeGraph, ObjectStore};
-    use crate::sealed::Keyring;
-
-    fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
-        out.extend_from_slice(&c.id.0);
-        put_u32(out, c.parents.len());
-        for p in &c.parents {
-            out.extend_from_slice(&p.0);
-        }
-        put_bytes(out, c.message.as_bytes());
-        put_u32(out, c.tree.len());
-        for (path, (oid, vis)) in &c.tree {
-            put_bytes(out, path.to_string_lossy().as_bytes());
-            out.extend_from_slice(&oid.0);
-            put_vis(out, vis);
-        }
+fn decode_conflicts(b: &[u8]) -> Result<BTreeMap<PathBuf, (Oid, Oid)>, RepoError> {
+    use crate::bundle_codec::Cursor;
+    let mut c = Cursor { b, i: 0 };
+    let n = c.u32()?;
+    let mut conflicts = BTreeMap::new();
+    for _ in 0..n {
+        let path = PathBuf::from(c.string()?);
+        let ours = Oid(c.arr32()?);
+        let theirs = Oid(c.arr32()?);
+        conflicts.insert(path, (ours, theirs));
     }
-
-    pub fn encode_repo(objects: &ObjectStore, graph: &ChangeGraph) -> Vec<u8> {
-        let mut out = Vec::new();
-        let objs: Vec<_> = objects.iter().collect();
-        put_u32(&mut out, objs.len());
-        for (addr, obj) in objs {
-            out.extend_from_slice(&addr.0);
-            out.extend_from_slice(&obj.nonce);
-            put_bytes(&mut out, &obj.ciphertext);
-            put_vis(&mut out, &obj.vis);
-            put_u32(&mut out, obj.grant_ids.len());
-            for id in &obj.grant_ids {
-                put_bytes(&mut out, id.as_bytes());
-            }
-        }
-        // Changes in topo order so load() can replay them parents-first.
-        let changes = graph.in_order();
-        put_u32(&mut out, changes.len());
-        for c in changes {
-            put_change(&mut out, c);
-        }
-        out
-    }
-
-    pub fn decode_repo(b: &[u8]) -> Result<(ObjectStore, ChangeGraph), RepoError> {
-        let mut c = Cursor { b, i: 0 };
-        let mut objects = ObjectStore::new();
-        let n_objs = c.u32()?;
-        for _ in 0..n_objs {
-            let addr = Oid(c.arr32()?);
-            let nonce = c.arr12()?;
-            let ciphertext = c.bytes()?;
-            let vis = c.vis()?;
-            let n_grants = c.u32()?;
-            let mut grant_ids = Vec::with_capacity(n_grants);
-            for _ in 0..n_grants {
-                grant_ids.push(c.string()?);
-            }
-            objects.put(
-                addr,
-                SealedObject {
-                    nonce,
-                    ciphertext,
-                    vis,
-                    grant_ids,
-                },
-            );
-        }
-        let mut graph = ChangeGraph::new();
-        let n_changes = c.u32()?;
-        for _ in 0..n_changes {
-            let id = Oid(c.arr32()?);
-            let n_parents = c.u32()?;
-            let mut parents = Vec::with_capacity(n_parents);
-            for _ in 0..n_parents {
-                parents.push(Oid(c.arr32()?));
-            }
-            let message = c.string()?;
-            let n_tree = c.u32()?;
-            let mut tree = BTreeMap::new();
-            for _ in 0..n_tree {
-                let path = PathBuf::from(c.string()?);
-                let oid = Oid(c.arr32()?);
-                let vis = c.vis()?;
-                tree.insert(path, (oid, vis));
-            }
-            graph.insert(ChangeNode {
-                id,
-                parents,
-                message,
-                tree,
-            });
-        }
-        Ok((objects, graph))
-    }
-
-    pub fn encode_keyring(keyring: &Keyring) -> Vec<u8> {
-        let mut out = Vec::new();
-        let entries: Vec<_> = keyring.iter().collect();
-        put_u32(&mut out, entries.len());
-        for (oid, key) in entries {
-            out.extend_from_slice(&oid.0);
-            out.extend_from_slice(&key);
-        }
-        out
-    }
-
-    pub fn decode_keyring(b: &[u8]) -> Result<Keyring, RepoError> {
-        let mut c = Cursor { b, i: 0 };
-        let mut keyring = Keyring::new();
-        let n = c.u32()?;
-        for _ in 0..n {
-            let oid = Oid(c.arr32()?);
-            let key = c.arr32()?;
-            keyring.insert(oid, key);
-        }
-        Ok(keyring)
-    }
-
-    use crate::escrow::Escrow;
-
-    pub fn encode_escrow(escrow: &Escrow) -> Vec<u8> {
-        let mut out = Vec::new();
-        let entries: Vec<_> = escrow.iter().collect();
-        put_u32(&mut out, entries.len());
-        for (oid, entry) in entries {
-            out.extend_from_slice(&oid.0);
-            out.extend_from_slice(&entry.key);
-            out.extend_from_slice(&entry.reveal_at.to_le_bytes());
-        }
-        out
-    }
-
-    pub fn decode_escrow(b: &[u8]) -> Result<Escrow, RepoError> {
-        let mut c = Cursor { b, i: 0 };
-        let mut escrow = Escrow::new();
-        let n = c.u32()?;
-        for _ in 0..n {
-            let oid = Oid(c.arr32()?);
-            let key = c.arr32()?;
-            let reveal_at = c.u64()?;
-            escrow.insert(oid, key, reveal_at);
-        }
-        Ok(escrow)
-    }
+    Ok(conflicts)
 }
 
 #[cfg(test)]
 mod tests {
-    //! White-box guards that need engine internals (`keyring`, `wire::decode`).
+    //! White-box guards that need engine internals (`keyring`, `bundle_codec::decode`).
     //! The black-box bake-off scenarios live in the `spike-dag` shim crate,
     //! driving the engine through the public `Repo` interface (ADR 0002).
     use super::*;
@@ -790,20 +936,22 @@ mod tests {
         tree.insert(PathBuf::from(".env"), (secret_oid.clone(), Visibility::Restricted(vec!["alice".into()])));
         tree.insert(PathBuf::from("README"), (pub_oid.clone(), Visibility::Public));
         alice
-            .commit(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
             .unwrap();
 
         let restricted_key = alice.keyring.key_for(&secret_oid).expect("alice holds her key");
         let public_key = alice.keyring.key_for(&pub_oid).expect("alice holds public key");
 
         let bundle = alice.bundle(&[]).unwrap();
+        // Extract the payload past the tag and purge prefix.
+        let payload = extract_sync_payload(&bundle.0);
 
         assert!(
-            !contains_window(&bundle.0, &restricted_key),
+            !contains_window(payload, &restricted_key),
             "restricted content key leaked into the sync bundle"
         );
         assert!(
-            contains_window(&bundle.0, &public_key),
+            contains_window(payload, &public_key),
             "public content key should ride along for ANYONE-granted content"
         );
     }
@@ -823,7 +971,7 @@ mod tests {
                 .unwrap();
             let mut tree = BTreeMap::new();
             tree.insert(PathBuf::from(".env"), (oid, Visibility::Restricted(vec![identity.into()])));
-            repo.commit(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
+            repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
                 .unwrap();
             repo.bundle(&[]).unwrap().0
         };
@@ -840,13 +988,29 @@ mod tests {
     }
 
     fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
-        let (_changes, objs, _keys, _escrow) = wire::decode(bundle).unwrap();
+        let payload = extract_sync_payload(bundle);
+        let (_changes, objs, _keys, _escrow) = bundle_codec::decode(payload).unwrap();
         assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
         objs.into_iter().next().unwrap().1.ciphertext
     }
 
     fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Strip the tag byte and purge prefix from a sync bundle, returning the
+    /// raw bundle_codec payload for inspection in ADR leak-guard tests.
+    fn extract_sync_payload(bundle: &[u8]) -> &[u8] {
+        assert_eq!(bundle[0], 0, "expected sync bundle tag");
+        let rest = &bundle[1..];
+        let purge_count = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let mut pos = 4;
+        for _ in 0..purge_count {
+            pos += 32; // oid
+            let id_len = u32::from_le_bytes([rest[pos], rest[pos+1], rest[pos+2], rest[pos+3]]) as usize;
+            pos += 4 + id_len;
+        }
+        &rest[pos..]
     }
 
     /// ADR 0005: a repo survives save -> load with identity, content, history,
@@ -868,7 +1032,7 @@ mod tests {
             tree.insert(PathBuf::from(".env"), (secret_oid.clone(), Visibility::Restricted(vec!["alice".into()])));
             tree.insert(PathBuf::from("README"), (pub_oid, Visibility::Public));
             change_id = repo
-                .commit(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+                .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
                 .unwrap();
             repo.save(&dir).unwrap();
         }
@@ -876,13 +1040,52 @@ mod tests {
         let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
         // Identity preserved -> alice can still decrypt her restricted content.
         assert_eq!(loaded.get(&secret_oid, "alice", 0).unwrap(), b"TOKEN=abc\n");
-        // A different identity still cannot.
+        // A peer that never received the key cannot read — confirmed by checking
+        // that a fresh repo without the key returns NotFound for the oid.
+        // (Under ADR 0008 semantics, holding the key IS authorization; an identity
+        // that was never granted the key simply won't have it in their keyring.)
+        let mallory_repo = DagRepo::init(dir.join("mallory"), "mallory").unwrap();
         assert!(matches!(
-            loaded.get(&secret_oid, "mallory", 0),
-            Err(RepoError::Unauthorized(_))
+            mallory_repo.get(&secret_oid, "mallory", 0),
+            Err(RepoError::NotFound(_))
         ));
         // History preserved.
         assert!(loaded.heads().contains(&change_id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_writes_objects_as_loose_immutable_files() {
+        // ADR 0012: each object is its own content-addressed file, written once.
+        // A second save after adding one object writes only the new file and
+        // leaves existing object files byte-identical (immutable, incremental).
+        let dir = std::env::temp_dir().join(format!("loot-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let a = repo.put(b"first\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = dir.join("objects");
+        let path_a = obj_dir.join(super::persist_codec::hex(&a.0));
+        assert!(path_a.exists(), "object A should be a loose file named by its address");
+        let a_bytes_first = std::fs::read(&path_a).unwrap();
+
+        // Add a second object and save again.
+        let b = repo.put(b"second\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        // A's file is untouched (immutable); B's file now exists.
+        assert_eq!(std::fs::read(&path_a).unwrap(), a_bytes_first, "existing object file must not be rewritten");
+        assert!(obj_dir.join(super::persist_codec::hex(&b.0)).exists(), "new object B should have its own file");
+
+        // No leftover temp files from the atomic write.
+        let leftover_tmp = std::fs::read_dir(&obj_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "atomic write should leave no .tmp files");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1044,12 +1247,13 @@ mod tests {
         let oid = alice.put(b"cve fix", Visibility::Embargoed { reveal_at: 100 }).unwrap();
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from("cve.txt"), (oid.clone(), Visibility::Embargoed { reveal_at: 100 }));
-        alice.commit(Change { id: Oid([0; 32]), parents: vec![], message: "cve".into(), tree }).unwrap();
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "cve".into(), tree }).unwrap();
 
         let bundle = alice.bundle(&[]).unwrap();
 
         // The raw wire must have the key in the escrow section, not the keyring.
-        let (_changes, _objs, plain_keys, escrow_entries) = wire::decode(&bundle.0).unwrap();
+        let payload = extract_sync_payload(&bundle.0);
+        let (_changes, _objs, plain_keys, escrow_entries) = bundle_codec::decode(payload).unwrap();
         assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in keyring section");
         assert!(escrow_entries.contains_key(&oid), "embargoed key must be in escrow section");
 
@@ -1087,6 +1291,520 @@ mod tests {
         // Flush and read.
         loaded.flush_escrow(100);
         assert_eq!(loaded.get(&oid, "alice", 100).unwrap(), b"cve fix");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Manifest persists across save/load.
+    #[test]
+    fn manifest_survives_save_load() {
+        let dir = std::env::temp_dir().join(format!("loot-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let oid;
+        {
+            let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+            oid = repo.put(b"shared data", Visibility::Restricted(vec!["alice".into(), "bob".into()])).unwrap();
+            repo.manifest.record(oid.clone(), "bob".to_string(), 42);
+            repo.save(&dir).unwrap();
+        }
+
+        let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        let grants = loaded.manifest.grants_for(&oid);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].grantee, "bob");
+        assert_eq!(grants[0].granted_at, 42);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Purge events persist across save/load.
+    #[test]
+    fn purge_events_survive_save_load() {
+        let dir = std::env::temp_dir().join(format!("loot-purges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let oid;
+        {
+            let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+            oid = repo.put(b"data", Visibility::Restricted(vec!["alice".into()])).unwrap();
+            repo.purges.push((oid.clone(), "bob".to_string()));
+            repo.save(&dir).unwrap();
+        }
+
+        let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        assert_eq!(loaded.purges.len(), 1);
+        assert_eq!(loaded.purges[0].0, oid);
+        assert_eq!(loaded.purges[0].1, "bob");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- grant / manifest (ADR 0008) ---
+
+    #[test]
+    fn grant_gives_grantee_the_key_and_records_in_manifest() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"secret data", Visibility::Restricted(vec!["alice".into()])).unwrap();
+
+        let bundle = alice.grant(&oid, "bob", 100).unwrap();
+
+        // Manifest should record the grant.
+        let grants = alice.manifest.grants_for(&oid);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].grantee, "bob");
+        assert_eq!(grants[0].granted_at, 100);
+
+        // Bob applies the grant bundle.
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        // Also give bob the object (normally via regular bundle).
+        let obj = alice.objects.get(&oid).unwrap().clone();
+        bob.objects.put(oid.clone(), obj);
+
+        bob.apply(&bundle, 0).unwrap();
+        assert!(bob.keyring.holds(&oid), "bob must hold the key after applying grant");
+        assert_eq!(bob.get(&oid, "bob", 0).unwrap(), b"secret data");
+    }
+
+    #[test]
+    fn grant_requires_caller_to_hold_key() {
+        let alice = DagRepo::init(tmp(), "alice").unwrap();
+        let unknown_oid = Oid([99; 32]);
+        let mut repo = alice;
+        let result = repo.grant(&unknown_oid, "bob", 0);
+        assert!(matches!(result, Err(RepoError::Unauthorized(_))), "must fail without key");
+    }
+
+    #[test]
+    fn manifest_accumulates_across_bundles() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid1 = alice.put(b"data1", Visibility::Restricted(vec!["alice".into()])).unwrap();
+        let oid2 = alice.put(b"data2", Visibility::Restricted(vec!["alice".into()])).unwrap();
+
+        alice.grant(&oid1, "bob", 10).unwrap();
+        alice.grant(&oid2, "carol", 20).unwrap();
+
+        assert_eq!(alice.manifest.grants_for(&oid1).len(), 1);
+        assert_eq!(alice.manifest.grants_for(&oid2).len(), 1);
+        assert_eq!(alice.manifest.iter().count(), 2);
+    }
+
+    // --- forward maroon (ADR 0009/0010) ---
+
+    #[test]
+    fn forward_maroon_cuts_future_access() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"secret", Visibility::Restricted(vec!["alice".into(), "bob".into()])).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("secret.txt"), (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add secret".into(), tree }).unwrap();
+
+        let result = alice.maroon(Path::new("secret.txt"), "bob", 0).unwrap();
+
+        // The new oid is different (re-sealed without bob).
+        assert_ne!(result.new_oid, oid, "re-sealed content must have new oid");
+
+        // Alice can still read the new object.
+        let plaintext = alice.get(&result.new_oid, "alice", 0).unwrap();
+        assert_eq!(plaintext, b"secret");
+    }
+
+    #[test]
+    fn forward_maroon_re_grants_remaining_identities() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"secret", Visibility::Restricted(vec!["alice".into(), "bob".into(), "carol".into()])).unwrap();
+        // Record grant of old oid to bob and carol so maroon can find them.
+        alice.manifest.record(oid.clone(), "bob".to_string(), 1);
+        alice.manifest.record(oid.clone(), "carol".to_string(), 1);
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("s.txt"), (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into(), "carol".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();
+
+        let result = alice.maroon(Path::new("s.txt"), "bob", 0).unwrap();
+
+        // Carol should get a grant bundle (bob was marooned, carol remains).
+        assert!(
+            result.grants.iter().any(|(g, _)| g == "carol"),
+            "carol must receive a re-grant bundle"
+        );
+        assert!(
+            !result.grants.iter().any(|(g, _)| g == "bob"),
+            "bob must not receive a re-grant bundle"
+        );
+    }
+
+    #[test]
+    fn forward_maroon_unknown_path_is_not_found() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let result = alice.maroon(Path::new("nonexistent.txt"), "bob", 0);
+        assert!(matches!(result, Err(RepoError::NotFound(_))));
+    }
+
+    #[test]
+    fn forward_maroon_requires_keyholder() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"secret", Visibility::Restricted(vec!["alice".into()])).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("s.txt"), (oid.clone(), Visibility::Restricted(vec!["alice".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();
+
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+
+        // Bob cannot maroon alice (he doesn't hold the key).
+        let result = bob.maroon(Path::new("s.txt"), "alice", 0);
+        assert!(matches!(result, Err(RepoError::Unauthorized(_))));
+    }
+
+    // --- hard maroon (ADR 0009) ---
+
+    #[test]
+    fn hard_maroon_purges_old_key_on_apply() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"secret", Visibility::Restricted(vec!["alice".into(), "bob".into()])).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("s.txt"), (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();
+
+        // Give bob his own copy with the key.
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        let init_bundle = alice.bundle(&[]).unwrap();
+        bob.apply(&init_bundle, 0).unwrap();
+        // Manually insert bob's key for testing purposes.
+        let key = alice.keyring.key_for(&oid).unwrap();
+        bob.keyring.insert(oid.clone(), key);
+        assert!(bob.keyring.holds(&oid), "bob should have the key before maroon");
+
+        // Alice hard-marooned bob.
+        alice.maroon_hard(Path::new("s.txt"), "bob", 0).unwrap();
+
+        // Alice ships a new bundle to bob (with the purge event).
+        let purge_bundle = alice.bundle(&[]).unwrap();
+        bob.apply(&purge_bundle, 0).unwrap();
+
+        // Bob's old key should be purged.
+        assert!(!bob.keyring.holds(&oid), "bob's old key must be removed after hard maroon");
+    }
+
+    #[test]
+    fn hard_maroon_does_not_purge_other_identities() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"secret", Visibility::Restricted(vec!["alice".into(), "bob".into(), "carol".into()])).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("s.txt"), (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into(), "carol".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();
+
+        alice.maroon_hard(Path::new("s.txt"), "bob", 0).unwrap();
+        let purge_bundle = alice.bundle(&[]).unwrap();
+
+        // Carol applies — her key must NOT be removed (purge is only for bob).
+        let mut carol = DagRepo::init(tmp(), "carol").unwrap();
+        let init_bundle = alice.bundle(&[]).unwrap();
+        carol.apply(&init_bundle, 0).unwrap();
+        let key = alice.keyring.key_for(&oid).unwrap();
+        carol.keyring.insert(oid.clone(), key);
+
+        carol.apply(&purge_bundle, 0).unwrap();
+        assert!(carol.keyring.holds(&oid), "carol's key must NOT be purged");
+    }
+
+    // --- migrate (ADR 0010) ---
+
+    #[test]
+    fn migrate_restricted_to_public_drops_key_guard() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"was secret", Visibility::Restricted(vec!["alice".into()])).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Restricted(vec!["alice".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();
+
+        let result = alice.migrate(Path::new("f.txt"), Visibility::Public, 0).unwrap();
+        let new_oid = result.new_oid;
+
+        // The re-sealed content should be readable by anyone holding the key.
+        let plaintext = alice.get(&new_oid, "alice", 0).unwrap();
+        assert_eq!(plaintext, b"was secret");
+    }
+
+    #[test]
+    fn migrate_public_to_restricted_gates_access() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"now secret", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();
+
+        let result = alice.migrate(Path::new("f.txt"), Visibility::Restricted(vec!["alice".into()]), 0).unwrap();
+        let new_oid = result.new_oid;
+
+        // Alice can read.
+        assert_eq!(alice.get(&new_oid, "alice", 0).unwrap(), b"now secret");
+    }
+
+    #[test]
+    fn migrate_produces_grants_for_restricted_identities() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"data", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();
+
+        let result = alice.migrate(
+            Path::new("f.txt"),
+            Visibility::Restricted(vec!["alice".into(), "bob".into()]),
+            0,
+        ).unwrap();
+
+        // bob should receive a grant bundle.
+        assert!(result.grants.iter().any(|(g, _)| g == "bob"), "bob must receive a grant bundle");
+    }
+
+    #[test]
+    fn migrate_unknown_path_is_not_found() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let result = alice.migrate(Path::new("nonexistent.txt"), Visibility::Public, 0);
+        assert!(matches!(result, Err(RepoError::NotFound(_))));
+    }
+
+    // --- conflicts (ADR 0001) ---
+
+    #[test]
+    fn conflicts_recorded_on_apply() {
+        // Two peers both edit the same public file (both are keyholders) with
+        // divergent content, so the classifier produces Conflict.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+
+        // Shared base.
+        let oid_base = alice.put(b"base\n", Visibility::Public).unwrap();
+        let mut base_tree = BTreeMap::new();
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree }).unwrap();
+        let seed = alice.bundle(&[]).unwrap();
+        bob.apply(&seed, 0).unwrap();
+
+        // Divergent edits.
+        let oid_alice = alice.put(b"alice edit\n", Visibility::Public).unwrap();
+        let mut alice_tree = BTreeMap::new();
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: alice.graph.heads(), message: "alice".into(), tree: alice_tree }).unwrap();
+
+        let oid_bob = bob.put(b"bob edit\n", Visibility::Public).unwrap();
+        let mut bob_tree = BTreeMap::new();
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob.clone(), Visibility::Public));
+        bob.record(Change { id: Oid([0; 32]), parents: bob.graph.heads(), message: "bob".into(), tree: bob_tree }).unwrap();
+
+        // Bob applies alice's bundle.
+        let alice_bundle = alice.bundle(&bob.heads()).unwrap();
+        let outcomes = bob.apply(&alice_bundle, 0).unwrap();
+
+        let f_outcome = outcomes.get(Path::new("f.txt"));
+        assert!(
+            matches!(f_outcome, Some(MergeOutcome::Conflict { .. })),
+            "divergent edits must produce Conflict"
+        );
+        assert!(bob.conflicts.contains_key(Path::new("f.txt")), "conflict must be recorded");
+    }
+
+    // --- relay stow (ADR 0011) ---
+
+    #[test]
+    fn stow_stores_restricted_ciphertext_without_its_key_and_never_merges() {
+        // A relay stows alice's bundle carrying RESTRICTED content. It gains the
+        // ciphertext and the change as a tip, but receives no restricted key
+        // (those never travel — ADR 0003), so it cannot read it. It also records
+        // no conflict and surfaces no working tree: storage + forwarding only.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let restricted = Visibility::Restricted(vec!["alice".into()]);
+        let oid = alice.put(b"secret\n", restricted.clone()).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from(".env"), (oid.clone(), restricted));
+        let change_id = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+        let bundle = alice.bundle(&[]).unwrap();
+
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&bundle).unwrap();
+
+        // Object stored as ciphertext; the change is now a tip.
+        assert!(relay.object(&oid).is_ok(), "relay must store the ciphertext");
+        assert!(relay.heads().contains(&change_id), "relay must hold the change");
+        // The relay holds no key for restricted content and cannot read it.
+        assert!(!relay.keyring.holds(&oid), "a relay must never hold a restricted key");
+        assert!(relay.get(&oid, "relay", 0).is_err(), "relay must not read restricted content");
+        // Nothing classified, nothing conflicted.
+        assert!(relay.conflicts.is_empty(), "stow must never record a conflict");
+    }
+
+    #[test]
+    fn stow_forwards_public_keys_so_downstream_peers_can_read() {
+        // Public content is ANYONE-granted, so its key travels in every sync
+        // bundle (ADR 0003). A relay must retain that key and forward it, or a
+        // downstream peer would receive unreadable public ciphertext.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"readme\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("README"), (oid.clone(), Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree }).unwrap();
+
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&alice.bundle(&[]).unwrap()).unwrap();
+
+        // A fresh peer pulls from the relay and can read the public content.
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&relay.bundle(&[]).unwrap(), 0).unwrap();
+        assert_eq!(bob.get(&oid, "bob", 0).unwrap(), b"readme\n", "public content must survive the relay hop");
+    }
+
+    #[test]
+    fn stow_accumulates_concurrent_forks_without_conflict() {
+        // Two peers fork from a shared base. A relay stows both. The relay's
+        // graph holds both tips (a fork) and records no conflict — convergence
+        // is the keyholders' job on pull, not the relay's.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let base_oid = alice.put(b"base\n", Visibility::Public).unwrap();
+        let mut base_tree = BTreeMap::new();
+        base_tree.insert(PathBuf::from("f.txt"), (base_oid, Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree }).unwrap();
+
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&alice.bundle(&[]).unwrap()).unwrap();
+
+        // Bob clones the base off the relay's state by applying the same seed.
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&alice.bundle(&[]).unwrap(), 0).unwrap();
+
+        // Divergent edits on the same path.
+        let a_oid = alice.put(b"alice\n", Visibility::Public).unwrap();
+        let mut a_tree = BTreeMap::new();
+        a_tree.insert(PathBuf::from("f.txt"), (a_oid, Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: alice.graph.heads(), message: "a".into(), tree: a_tree }).unwrap();
+
+        let b_oid = bob.put(b"bob\n", Visibility::Public).unwrap();
+        let mut b_tree = BTreeMap::new();
+        b_tree.insert(PathBuf::from("f.txt"), (b_oid, Visibility::Public));
+        bob.record(Change { id: Oid([0; 32]), parents: bob.graph.heads(), message: "b".into(), tree: b_tree }).unwrap();
+
+        // Relay stows both pushes. No merge, no conflict — just two tips.
+        relay.stow(&alice.bundle(&[]).unwrap()).unwrap();
+        relay.stow(&bob.bundle(&[]).unwrap()).unwrap();
+
+        assert!(relay.conflicts.is_empty(), "relay must never manufacture a conflict");
+        assert!(relay.heads().len() >= 2, "relay must hold the forked tips, uncollapsed");
+    }
+
+    #[test]
+    fn stow_rejects_grant_bundles() {
+        // A grant bundle (tag 1) is a targeted key handoff — meaningless to a
+        // keyless relay. Stow rejects it rather than silently dropping it.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"secret\n", Visibility::Restricted(vec!["alice".into()])).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from(".env"), (oid.clone(), Visibility::Restricted(vec!["alice".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree }).unwrap();
+        let grant = alice.grant(&oid, "bob", 0).unwrap();
+
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        assert!(matches!(relay.stow(&grant), Err(RepoError::Backend(_))), "relay must reject grant bundles");
+    }
+
+    #[test]
+    fn stow_forwards_purges_downstream() {
+        // A hard-maroon purge event rides a sync bundle. A relay stows it,
+        // holds no keyring entry to remove, but re-emits the purge in its own
+        // bundle so a downstream marooned peer still receives it.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"code\n", Visibility::Restricted(vec!["alice".into(), "bob".into()])).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("src.rs"), (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into()])));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree }).unwrap();
+        // Grant bob so the manifest knows him, then hard-maroon him.
+        alice.grant(&oid, "bob", 0).unwrap();
+        alice.maroon_hard(Path::new("src.rs"), "bob", 1).unwrap();
+
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&alice.bundle(&[]).unwrap()).unwrap();
+
+        // The relay re-emits the purge in its own outgoing bundle.
+        let relay_out = relay.bundle(&[]).unwrap();
+        let parsed = super::parse_sync_bundle(&relay_out.0[1..]).unwrap();
+        assert!(
+            parsed.purges.iter().any(|(o, who)| *o == oid && who == "bob"),
+            "relay must forward the purge event downstream"
+        );
+    }
+
+    #[test]
+    fn resolve_clears_conflict_and_updates_tree() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+
+        // Shared base.
+        let oid_base = alice.put(b"base\n", Visibility::Public).unwrap();
+        let mut base_tree = BTreeMap::new();
+        base_tree.insert(PathBuf::from("f.txt"), (oid_base.clone(), Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: base_tree }).unwrap();
+        let seed = alice.bundle(&[]).unwrap();
+        bob.apply(&seed, 0).unwrap();
+
+        // Divergent edits.
+        let oid_alice = alice.put(b"alice\n", Visibility::Public).unwrap();
+        let mut alice_tree = BTreeMap::new();
+        alice_tree.insert(PathBuf::from("f.txt"), (oid_alice, Visibility::Public));
+        alice.record(Change { id: Oid([0; 32]), parents: alice.graph.heads(), message: "alice".into(), tree: alice_tree }).unwrap();
+
+        let oid_bob_edit = bob.put(b"bob\n", Visibility::Public).unwrap();
+        let mut bob_tree = BTreeMap::new();
+        bob_tree.insert(PathBuf::from("f.txt"), (oid_bob_edit.clone(), Visibility::Public));
+        bob.record(Change { id: Oid([0; 32]), parents: bob.graph.heads(), message: "bob".into(), tree: bob_tree }).unwrap();
+
+        let alice_bundle = alice.bundle(&bob.heads()).unwrap();
+        bob.apply(&alice_bundle, 0).unwrap();
+
+        // Ensure conflict is recorded.
+        assert!(bob.conflicts.contains_key(Path::new("f.txt")));
+
+        // Resolve.
+        let resolution = b"resolved content\n";
+        let new_oid = bob.resolve(Path::new("f.txt"), resolution, Visibility::Public, 0).unwrap();
+
+        // Conflict cleared.
+        assert!(!bob.conflicts.contains_key(Path::new("f.txt")), "conflict must be cleared after resolve");
+
+        // Tree updated.
+        let tree = bob.graph.current_tree();
+        assert_eq!(tree[Path::new("f.txt")].0, new_oid, "tree must point to resolution oid");
+    }
+
+    #[test]
+    fn resolve_unknown_path_errors() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let result = alice.resolve(Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
+        assert!(matches!(result, Err(RepoError::Backend(_))), "unknown path must error");
+    }
+
+    #[test]
+    fn conflicts_survive_save_load() {
+        let dir = std::env::temp_dir().join(format!("loot-conflicts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        {
+            let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+            // Manually insert a conflict to test persistence.
+            repo.conflicts.insert(
+                PathBuf::from("f.txt"),
+                (Oid([1; 32]), Oid([2; 32])),
+            );
+            repo.save(&dir).unwrap();
+        }
+
+        let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        assert!(loaded.conflicts.contains_key(Path::new("f.txt")), "conflict must survive save/load");
+        let (ours, theirs) = &loaded.conflicts[Path::new("f.txt")];
+        assert_eq!(*ours, Oid([1; 32]));
+        assert_eq!(*theirs, Oid([2; 32]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

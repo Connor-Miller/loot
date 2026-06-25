@@ -7,7 +7,7 @@
 
 mod workspace;
 
-use loot_core::{MergeOutcome, Oid, Repo, SyncBundle};
+use loot_core::{MaroonResult, MergeOutcome, MigrateResult, Oid, Repo, SyncBundle, Visibility};
 use std::process::ExitCode;
 use workspace::Workspace;
 
@@ -21,10 +21,19 @@ fn main() -> ExitCode {
         "status" => cmd_status(rest),
         "describe" => cmd_describe(rest),
         "new" => cmd_new(),
-        "checkout" => cmd_checkout(),
+        "surface" => cmd_surface(),
         "log" => cmd_log(),
         "bundle" => cmd_bundle(rest),
         "apply" => cmd_apply(rest),
+        "grant" => cmd_grant(rest),
+        "maroon" => cmd_maroon(rest),
+        "migrate" => cmd_migrate(rest),
+        "manifest" => cmd_manifest(),
+        "conflicts" => cmd_conflicts(),
+        "resolve" => cmd_resolve(rest),
+        "serve" => cmd_serve(rest),
+        "push" => cmd_push(rest),
+        "pull" => cmd_pull(rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -43,14 +52,23 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  loot init --identity <name>   initialize a repo here, owned by <name>
-  loot status [-m <message>]    snapshot the working tree into the working change
-  loot describe -m <message>    name the working change
-  loot new                      finalize the working change; start a fresh one
-  loot checkout                 materialize what the current identity may see
-  loot log                      show change history
-  loot bundle <file>            write a sync bundle (ciphertext, no private keys)
-  loot apply <file>             merge a peer's bundle (idempotent)";
+  loot init --identity <name>          initialize a repo here, owned by <name>
+  loot status [-m <message>]           snapshot the working tree into the working change
+  loot describe -m <message>           name the working change
+  loot new                             finalize the working change; start a fresh one
+  loot surface                         materialize what the current identity may see
+  loot log                             show change history
+  loot bundle <file>                   write a sync bundle (ciphertext, no private keys)
+  loot apply <file>                    merge a peer's bundle (idempotent)
+  loot grant <path> <identity> <file>  write a targeted grant bundle for <identity>
+  loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
+  loot migrate <path> <vis-spec> [dir]  change a path's visibility (public | restricted=a,b | embargoed=<ts>)
+  loot manifest                        show the grant audit trail
+  loot conflicts                       list paths that need human resolution
+  loot resolve <path> <file>           resolve a conflict at <path> using the content of <file>
+  loot serve [--dir <path>] [--addr <host:port>]  run a relay (holds ciphertext, no keys)
+  loot push <url>                      publish your changes to a relay (a disclosure act)
+  loot pull <url>                      fetch changes you lack from a relay, then merge";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -108,11 +126,11 @@ fn cmd_new() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_checkout() -> Result<(), String> {
+fn cmd_surface() -> Result<(), String> {
     let mut ws = Workspace::open()?;
-    let head = ws.checkout()?;
+    let head = ws.surface()?;
     println!(
-        "checked out {} as {} (content you may not see was skipped)",
+        "surfaced {} as {} (content you may not see was skipped)",
         short(&head),
         ws.identity()
     );
@@ -160,7 +178,271 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
         for (path, outcome) in &outcomes {
             println!("  {:<24} {}", path.display(), describe(outcome));
         }
-        println!("run `loot checkout` to materialize what you may see");
+        println!("run `loot surface` to materialize what you may see");
+    }
+    Ok(())
+}
+
+fn cmd_grant(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err("grant requires <path> <identity> <file>".into());
+    }
+    let path = &args[0];
+    let grantee = &args[1];
+    let out = &args[2];
+
+    let mut ws = Workspace::open()?;
+    let now = ws.now();
+
+    // Find the OID for this path in the current tree.
+    let oid = ws
+        .repo()
+        .current_tree_oid(std::path::Path::new(path))
+        .map_err(|_| format!("path '{path}' not found in current change"))?;
+
+    let bundle = ws.with_repo(|repo| {
+        repo.grant(&oid, grantee, now).map_err(|e| e.to_string())
+    })?;
+    std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
+    println!(
+        "wrote grant bundle {} ({} bytes) — send it to {grantee}",
+        out,
+        bundle.0.len()
+    );
+    println!("  {path} → {grantee} (recorded in manifest)");
+    Ok(())
+}
+
+fn cmd_maroon(args: &[String]) -> Result<(), String> {
+    let hard = args.iter().any(|a| a == "--hard");
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if positional.len() < 2 {
+        return Err("maroon requires <path> <identity> [dir]".into());
+    }
+    let path = std::path::Path::new(positional[0].as_str());
+    let marooned = positional[1].as_str();
+    let out_dir = positional
+        .get(2)
+        .map(|s| std::path::Path::new(s.as_str()))
+        .unwrap_or(std::path::Path::new("."));
+
+    let mut ws = Workspace::open()?;
+    let now = ws.now();
+    let result: MaroonResult = ws.with_repo(|repo| {
+        if hard {
+            repo.maroon_hard(path, marooned, now).map_err(|e| e.to_string())
+        } else {
+            repo.maroon(path, marooned, now).map_err(|e| e.to_string())
+        }
+    })?;
+
+    let level = if hard { "hard-marooned" } else { "marooned" };
+    println!(
+        "{} {} from {} (new oid: {})",
+        level,
+        marooned,
+        path.display(),
+        short(&result.new_oid)
+    );
+    if hard {
+        println!("  purge event recorded — cooperating peers will remove {marooned}'s old key on next bundle apply");
+    }
+    println!("  {} no longer has future access", marooned);
+
+    if result.grants.is_empty() {
+        println!("  (no remaining grantees — content is now accessible only to you)");
+    } else {
+        std::fs::create_dir_all(out_dir)
+            .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+        for (grantee, bundle) in &result.grants {
+            let filename = format!("grant-{grantee}.bundle");
+            let dest = out_dir.join(&filename);
+            std::fs::write(&dest, &bundle.0)
+                .map_err(|e| format!("write {}: {e}", dest.display()))?;
+            println!(
+                "  grant bundle for {grantee}: {} ({} bytes) — send to {grantee} then `loot apply`",
+                dest.display(),
+                bundle.0.len()
+            );
+        }
+        println!("  also run `loot bundle` to ship the re-sealed object to all peers");
+    }
+    Ok(())
+}
+
+fn parse_vis_spec(spec: &str) -> Result<Visibility, String> {
+    if spec == "public" {
+        Ok(Visibility::Public)
+    } else if let Some(ids) = spec.strip_prefix("restricted=") {
+        let ids: Vec<String> = ids.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+        if ids.is_empty() {
+            Err("restricted= requires at least one identity".into())
+        } else {
+            Ok(Visibility::Restricted(ids))
+        }
+    } else if let Some(reveal) = spec.strip_prefix("embargoed=") {
+        let reveal_at: u64 = reveal.parse().map_err(|_| format!("embargoed= requires a unix timestamp, got '{reveal}'"))?;
+        Ok(Visibility::Embargoed { reveal_at })
+    } else {
+        Err(format!("unknown vis-spec '{spec}': use public | restricted=a,b | embargoed=<unix_seconds>"))
+    }
+}
+
+fn cmd_migrate(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("migrate requires <path> <vis-spec> [dir]".into());
+    }
+    let path = std::path::Path::new(args[0].as_str());
+    let new_vis = parse_vis_spec(&args[1])?;
+    let out_dir = args
+        .get(2)
+        .map(|s| std::path::Path::new(s.as_str()))
+        .unwrap_or(std::path::Path::new("."));
+
+    let mut ws = Workspace::open()?;
+    let now = ws.now();
+    let result: MigrateResult = ws.with_repo(|repo| {
+        repo.migrate(path, new_vis.clone(), now).map_err(|e| e.to_string())
+    })?;
+
+    let vis_label = match &new_vis {
+        Visibility::Public => "public".to_string(),
+        Visibility::Restricted(ids) => format!("restricted={}", ids.join(",")),
+        Visibility::Embargoed { reveal_at } => format!("embargoed@{reveal_at}"),
+    };
+    println!(
+        "migrated {} -> {} (new oid: {})",
+        path.display(),
+        vis_label,
+        short(&result.new_oid)
+    );
+
+    if result.grants.is_empty() {
+        println!("  run `loot bundle` to ship the re-sealed object to all peers");
+    } else {
+        std::fs::create_dir_all(out_dir)
+            .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+        for (grantee, bundle) in &result.grants {
+            let filename = format!("grant-{grantee}.bundle");
+            let dest = out_dir.join(&filename);
+            std::fs::write(&dest, &bundle.0)
+                .map_err(|e| format!("write {}: {e}", dest.display()))?;
+            println!(
+                "  grant bundle for {grantee}: {} ({} bytes) — send to {grantee} then `loot apply`",
+                dest.display(),
+                bundle.0.len()
+            );
+        }
+        println!("  run `loot bundle` to ship the re-sealed object to all peers");
+    }
+    Ok(())
+}
+
+fn cmd_manifest() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let entries: Vec<_> = ws.repo().manifest().iter().collect();
+    if entries.is_empty() {
+        println!("no grants recorded");
+        return Ok(());
+    }
+    println!("{:<12} {:<32} oid", "granted_at", "grantee");
+    println!("{}", "-".repeat(72));
+    let mut sorted = entries;
+    sorted.sort_by_key(|e| e.granted_at);
+    for e in sorted {
+        println!("{:<12} {:<32} {}", e.granted_at, e.grantee, short_oid(&e.oid));
+    }
+    Ok(())
+}
+
+fn cmd_conflicts() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let conflicts = ws.repo().conflicts();
+    if conflicts.is_empty() {
+        println!("no conflicts");
+        return Ok(());
+    }
+    for (path, (our_oid, their_oid)) in conflicts {
+        println!("conflict at {}", path.display());
+        println!("  ours:   {}", short(our_oid));
+        println!("  theirs: {}", short(their_oid));
+    }
+    Ok(())
+}
+
+fn cmd_resolve(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("resolve requires <path> <file>".into());
+    }
+    let path = std::path::Path::new(args[0].as_str());
+    let infile = &args[1];
+
+    let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
+
+    let mut ws = Workspace::open()?;
+    let now = ws.now();
+
+    // Determine the visibility for this path from .lootattributes (same logic
+    // snapshot uses). Unrecognized paths default to Public.
+    let vis = ws.visibility_for(&path.to_string_lossy());
+
+    let new_oid = ws.with_repo(|repo| {
+        repo.resolve(path, &bytes, vis, now).map_err(|e| e.to_string())
+    })?;
+
+    println!("resolved {} (new oid: {})", path.display(), short(&new_oid));
+
+    // Check if all conflicts are now clear.
+    if ws.repo().conflicts().is_empty() {
+        println!("all conflicts resolved — run `loot new` to finalize");
+    }
+    Ok(())
+}
+
+// --- network sync (ADR 0011) ---
+
+fn cmd_serve(args: &[String]) -> Result<(), String> {
+    let dir = flag(args, "--dir").unwrap_or(".loot-relay");
+    let addr = flag(args, "--addr").unwrap_or("127.0.0.1:4000");
+    println!("starting loot relay (dir = {dir}, addr = {addr})");
+    println!("  a relay holds ciphertext and forwards it — it holds no keys and reads nothing");
+    loot_net::serve(std::path::PathBuf::from(dir), addr).map_err(|e| e.to_string())
+}
+
+fn cmd_push(args: &[String]) -> Result<(), String> {
+    let url = args.first().ok_or("push requires <url>")?;
+    // Build the bundle from the local repo without mutating it.
+    let ws = Workspace::open()?;
+    let bundle = ws.repo().bundle(&[]).map_err(|e| e.to_string())?;
+    let n = bundle.0.len();
+    loot_net::push(url, bundle.0).map_err(|e| e.to_string())?;
+    println!("pushed {n} bytes to {url}");
+    println!("  this published your sealed content to the relay (it still cannot read it)");
+    Ok(())
+}
+
+fn cmd_pull(args: &[String]) -> Result<(), String> {
+    let url = args.first().ok_or("pull requires <url>")?;
+    let mut ws = Workspace::open()?;
+    let now = ws.now();
+    let identity = ws.identity().to_string();
+    let have = ws.repo().heads();
+    let bytes = loot_net::pull(url, &have).map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        println!("pulled from {url}: nothing new (already up to date)");
+        return Ok(());
+    }
+    let outcomes = ws.with_repo(|repo| {
+        repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
+    })?;
+    if outcomes.is_empty() {
+        println!("pulled from {url}: nothing new (already up to date)");
+    } else {
+        println!("pulled from {url} as {identity}:");
+        for (path, outcome) in &outcomes {
+            println!("  {:<24} {}", path.display(), describe(outcome));
+        }
+        println!("run `loot surface` to materialize what you may see");
     }
     Ok(())
 }
@@ -181,13 +463,17 @@ fn describe(o: &MergeOutcome) -> &'static str {
     match o {
         MergeOutcome::Converged => "converged",
         MergeOutcome::Merged => "merged",
-        MergeOutcome::Conflict => "conflict (needs resolution)",
+        MergeOutcome::Conflict { .. } => "conflict (needs resolution)",
         MergeOutcome::RelayedUnmerged => "relayed (sealed — you lack the key)",
     }
 }
 
 fn short(oid: &Oid) -> String {
     oid.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn short_oid(oid: &Oid) -> String {
+    short(oid)
 }
 
 #[cfg(test)]
@@ -200,7 +486,7 @@ mod tests {
         assert_eq!(describe(&MergeOutcome::Converged), "converged");
         assert_eq!(describe(&MergeOutcome::Merged), "merged");
         assert!(describe(&MergeOutcome::RelayedUnmerged).contains("sealed"));
-        assert!(describe(&MergeOutcome::Conflict).contains("conflict"));
+        assert!(describe(&MergeOutcome::Conflict { ours: loot_core::Oid([0; 32]), theirs: loot_core::Oid([1; 32]) }).contains("conflict"));
     }
 
     #[test]

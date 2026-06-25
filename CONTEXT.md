@@ -133,10 +133,18 @@ ciphertext — only this oracle.
 
 **Maroon** — to cut off an identity's access to a path. Two levels:
 
-- *Forward maroon* (`loot maroon <path> <identity>`) — re-seals content under a new key, re-grants remaining authorized identities, publishes a new Change. The marooned identity retains the key for any past versions they already hold. Natural for "you may read the old code but not future updates."
-- *Hard maroon* (`loot maroon --hard <path> <identity>`) — forward maroon plus a published purge event signaling all cooperating peers to remove the marooned identity's Keyring entry for the affected OID. Best-effort operational guarantee: cooperating machines purge; offline or modified-binary peers cannot be forced. Models the "person left the org" case.
+- *Forward maroon* (`loot maroon <path> <identity>`) — re-seals content under a new key, re-grants remaining authorized identities (each receives a targeted grant bundle), publishes a new Change. The marooned identity retains the key for any past versions they already hold. Natural for "you may read the old code but not future updates." Implemented (ADR 0010).
+- *Hard maroon* (`loot maroon --hard <path> <identity>`) — forward maroon plus a published purge event signaling all cooperating peers to remove the marooned identity's Keyring entry for the affected OID. Best-effort operational guarantee: cooperating machines purge; offline or modified-binary peers cannot be forced. Models the "person left the org" case. Implemented (ADR 0009, ADR 0010).
 
 **Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + maroon over the affected identity set: promoting `Restricted` → `Public` re-seals under a new ANYONE-granted key; demoting `Public` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and maroon working correctly — not a separate primitive.
+
+**Relay** — a node that stores and forwards sealed content it cannot read (the non-keyholder role from ADR 0001). It holds **no restricted keys** — those never travel in a sync bundle (ADR 0003), so a relay can never read restricted content. It does forward public keys (non-secret by definition) so downstream peers receive readable public content. **A host is a relay that never sleeps** — a laptop, a `loot serve` box, and a future hosted service are the same protocol role, differing only in uptime. This makes a loot host a *zero-knowledge code host*: it physically cannot read private code, the thing a plaintext host like GitHub structurally cannot offer. Services that need plaintext (CI, server-side diff/search) are not ambient repo permissions but explicit, audited [[Grant]]s to a service Identity.
+
+**Stow** — the relay's ingest operation (`DagRepo::stow`, ADR 0011): accept a bundle, store its sealed objects and add its change-nodes to the graph append-only, record grant facts in the Manifest, and *never* merge, decrypt, or touch a working tree. Nautical to the domain — you stow sealed cargo in the hold without opening it, and the Manifest records what was stowed. Distinct from `apply` ("merge into my working change"): a pure relay only ever calls `stow` (on push) and `bundle` (on pull). Concurrent pushes produce a forked DAG with multiple tips; forks are collapsed only by keyholder peers when they pull and `apply`.
+
+**Network sync (`serve`/`push`/`pull`)** — the transport layer over `bundle`/`stow`/`apply` (ADR 0011). `loot serve` runs an open relay (HTTP, two endpoints: `POST /stow` for push, `POST /negotiate` for pull). `loot push <url>` is a deliberate *disclosure* act — it publishes the changes the relay lacks; `loot pull <url>` fetches the changes the local repo lacks and `apply`s them into the working change. Push and pull are distinct verbs because their security intent differs even though the mechanics are symmetric: a pull receives key-gated ciphertext (safe by construction); a push persists sealed content to another node. File-based `bundle`/`apply` are retained as the offline/sneakernet path.
+
+**Loose object storage** — each SealedObject persists as its own content-addressed file at `objects/<hex-address>`, written once and immutably via atomic rename (ADR 0012). Dedup is "does the file exist"; a push writes only the new objects (O(delta), not O(store)), killing the whole-repo-rewrite bottleneck for relays. Concurrent writes to disjoint objects are lock-free (distinct filenames); only the small graph metadata is serialized. Git's loose-object model, made natural by content addressing.
 
 ## Deliberately out of scope (for now)
 
@@ -179,6 +187,26 @@ tree so the decision is reproducible (`cargo test --release`).
   rather than ship-everything. Independent of key management; deferred until
   grant/revocation are working.
 
+- **Object-level sync negotiation.** Sync negotiates at the *change-id* level:
+  the client sends its tips, the relay ships every change the client lacks plus
+  the full object closure. This can re-transmit ciphertext the receiver already
+  holds when object sharing crosses change boundaries (the receiver discards
+  known addresses on `apply`, so it is correct, just not minimal). Acceptable
+  for the first slice. **Revisit with scaling benchmarks**: if over-shipping
+  shows up as a real cost, add a content-address "wants" round (client filters
+  the relay's offered addresses down to the ones it is missing before bytes
+  move). The wire format already carries everything, so this is additive.
+
 - **Embargoed merges across repos.** Accepting a change from a peer but keeping
   the diff embargoed until a scheduled reveal. Requires a multi-remote model
   (not yet defined). Deferred until the network layer exists.
+
+- **Identity keypairs and push authentication.** Today an Identity is just a
+  string name; the Keyring holds *content* keys, not an identity signing key.
+  The first relay slice is therefore an *open relay*: anyone reachable can
+  push/pull. Content stays sealed (the relay holds no keys), so this is not a
+  confidentiality hole — the exposure is storage abuse (junk-object spam) and
+  no accountability for who pushed what. Closing this needs a real identity
+  keypair foundation (per-identity public/private keys) so pushes can be signed
+  and the relay can verify them against an allowed set. That keypair system is
+  its own foundation, deferred until after transport works.

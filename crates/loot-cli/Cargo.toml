@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 # The first product crate: a CLI over the canonical engine (ADR 0005).
-# Dependency-light by design — args are parsed by hand, no clap.
+# Dependency-light by design — args are parsed by hand, no clap. The async/HTTP
+# transport tree is quarantined in loot-net; the CLI only calls its sync API.
 
 [[bin]]
 name = "loot"
@@ -13,3 +14,4 @@ path = "src/main.rs"
 
 [dependencies]
 loot-core.workspace = true
+loot-net.workspace = true

@@ -1,0 +1,137 @@
+//! End-to-end relay sync (ADR 0011): serve a relay, push alice's sealed bundle,
+//! pull it into bob over real HTTP, and confirm the relay never holds a key.
+
+use loot_core::{Change, DagRepo, Oid, Repo, SyncBundle, Visibility};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+fn tmp(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("loot-net-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn wait_for_relay(base: &str) {
+    // Poll the relay until it answers a negotiate, so the test does not race the
+    // server's bind. Bounded so a real failure still terminates the test.
+    for _ in 0..50 {
+        if loot_net::pull(base, &[]).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("relay did not come up");
+}
+
+#[test]
+fn push_then_pull_syncs_public_content_through_a_keyless_relay() {
+    let relay_dir = tmp("relay");
+    let addr = "127.0.0.1:47193";
+    let base = format!("http://{addr}");
+
+    // Relay server in a background thread (serve blocks).
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr);
+    });
+    wait_for_relay(&base);
+
+    // Alice builds a public change and pushes its bundle.
+    let alice_dir = tmp("alice");
+    let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
+    let oid = alice.put(b"shared\n", Visibility::Public).unwrap();
+    let mut tree = BTreeMap::new();
+    tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+    let change_id = alice
+        .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+        .unwrap();
+    let alice_bundle = alice.bundle(&[]).unwrap();
+    loot_net::push(&base, alice_bundle.0).unwrap();
+
+    // Bob pulls (he has nothing yet) and applies.
+    let bob_dir = tmp("bob");
+    let mut bob = DagRepo::init(bob_dir.join("work"), "bob").unwrap();
+    let pulled = loot_net::pull(&base, &bob.heads()).unwrap();
+    assert!(!pulled.is_empty(), "relay should return alice's change");
+    bob.apply(&SyncBundle(pulled), 0).unwrap();
+
+    // Bob now holds the change and can read the public content.
+    assert!(bob.heads().contains(&change_id), "bob must have alice's change");
+    assert_eq!(bob.get(&oid, "bob", 0).unwrap(), b"shared\n");
+
+    assert!(loot_net::is_relay(&relay_dir), "relay dir must be marked as a relay");
+}
+
+#[test]
+fn relay_cannot_read_restricted_content_it_relays() {
+    // The load-bearing guarantee: a relay forwards RESTRICTED ciphertext it can
+    // never read, because restricted keys never travel in a sync bundle
+    // (ADR 0003). Public keys do travel (non-secret), so a relay can read public
+    // content — that is fine; the secrecy guarantee is about restricted content.
+    let relay_dir = tmp("relay-restricted");
+    let addr = "127.0.0.1:47195";
+    let base = format!("http://{addr}");
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr);
+    });
+    wait_for_relay(&base);
+
+    let alice_dir = tmp("alice-restricted");
+    let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
+    let restricted = Visibility::Restricted(vec!["alice".into()]);
+    let oid = alice.put(b"TOKEN=secret\n", restricted.clone()).unwrap();
+    let mut tree = BTreeMap::new();
+    tree.insert(PathBuf::from(".env"), (oid.clone(), restricted));
+    alice
+        .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+        .unwrap();
+    loot_net::push(&base, alice.bundle(&[]).unwrap().0).unwrap();
+
+    // The relay stored the change (the path resolves in its tree) but holds no
+    // key for the restricted content and cannot read it.
+    let relay_repo = DagRepo::load(&relay_dir, relay_dir.clone()).unwrap();
+    let stored_oid = relay_repo
+        .current_tree_oid(std::path::Path::new(".env"))
+        .expect("relay must store the change referencing the restricted object");
+    assert_eq!(stored_oid, oid, "relay must reference the same restricted ciphertext");
+    assert!(
+        relay_repo.get(&oid, "@relay", 0).is_err(),
+        "relay must NOT be able to read restricted content it relays"
+    );
+}
+
+#[test]
+fn pull_with_up_to_date_have_returns_empty() {
+    let relay_dir = tmp("relay2");
+    let addr = "127.0.0.1:47194";
+    let base = format!("http://{addr}");
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr);
+    });
+    wait_for_relay(&base);
+
+    let alice_dir = tmp("alice2");
+    let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
+    let oid = alice.put(b"x\n", Visibility::Public).unwrap();
+    let mut tree = BTreeMap::new();
+    tree.insert(PathBuf::from("f.txt"), (oid, Visibility::Public));
+    let change_id = alice
+        .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+        .unwrap();
+    loot_net::push(&base, alice.bundle(&[]).unwrap().0).unwrap();
+
+    // Pulling with the change already in `have` yields a bundle with no changes.
+    let pulled = loot_net::pull(&base, &[change_id]).unwrap();
+    let parsed_empty = {
+        // tag(1) + purge_count(4) + objs(4)+keys(4)+escrow(4)+changes(4) for an
+        // all-empty bundle; rather than re-parse, assert apply finds nothing new.
+        let mut bob = DagRepo::init(tmp("bob2").join("work"), "bob").unwrap();
+        let outcomes = bob.apply(&SyncBundle(pulled), 0).unwrap();
+        outcomes.is_empty()
+    };
+    assert!(parsed_empty, "pull with up-to-date have must yield no new changes");
+}

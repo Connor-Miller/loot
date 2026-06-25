@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/loot-core",
+    "crates/loot-net",
     "crates/loot-cli",
     "crates/loot-bench",
     "crates/spike-dag",
@@ -16,5 +17,9 @@ repository = "https://github.com/connormiller/loot"
 
 [workspace.dependencies]
 loot-core = { path = "crates/loot-core" }
+loot-net = { path = "crates/loot-net" }
 blake3 = "1"
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["blocking"] }

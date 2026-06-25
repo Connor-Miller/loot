@@ -74,6 +74,11 @@ impl Keyring {
         self.keys.insert(oid, key);
     }
 
+    /// Remove the key for `oid`, if held. Used to honor purge events (ADR 0009).
+    pub fn remove(&mut self, oid: &Oid) {
+        self.keys.remove(oid);
+    }
+
     /// Does this keyring hold the key for `oid`?
     pub fn holds(&self, oid: &Oid) -> bool {
         self.keys.contains_key(oid)
@@ -160,21 +165,31 @@ pub fn open(
         }
     }
 
-    // 2. Visibility gate.
+    // 2. Key custody gate — holding the key IS the authorization ("permissioning
+    //    is key management"). If the keyring has the key, decrypt directly: a
+    //    grant that delivered this key is the policy enforcement event, so the
+    //    grant_ids list need not include this reader.
+    //
+    //    If no key is held, fall through to the visibility gate to give the
+    //    right error: Unauthorized means "you are not on the list and should not
+    //    seek the key"; reaching here without a key while on the list means the
+    //    key simply hasn't arrived yet.
+    if let Some(key) = keyring.get(oid) {
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+        return cipher
+            .decrypt(Nonce::from_slice(&sealed.nonce), sealed.ciphertext.as_ref())
+            .map_err(|e| RepoError::Backend(format!("decrypt: {e}")));
+    }
+
+    // 3. Visibility gate — no key held; check if reader is authorized to
+    //    obtain one (on the grant_ids list or ANYONE).
     let authorized = sealed.grant_ids.iter().any(|g| g == ANYONE || g == reader);
     if !authorized {
         return Err(RepoError::Unauthorized(oid.clone()));
     }
 
-    // 3. Key custody gate.
-    let key = keyring
-        .get(oid)
-        .ok_or_else(|| RepoError::Unauthorized(oid.clone()))?;
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher
-        .decrypt(Nonce::from_slice(&sealed.nonce), sealed.ciphertext.as_ref())
-        .map_err(|e| RepoError::Backend(format!("decrypt: {e}")))
+    // Authorized in policy but no key — should obtain via a grant bundle.
+    Err(RepoError::Unauthorized(oid.clone()))
 }
 
 #[cfg(test)]
@@ -195,16 +210,23 @@ mod tests {
     }
 
     #[test]
-    fn restricted_denies_unlisted_reader_before_touching_key() {
+    fn restricted_denies_reader_without_key() {
         let (oid, sealed, key) =
             seal(b"secret", &Visibility::Restricted(vec!["alice".into()])).unwrap();
-        // Even a keyring holding the key must not help an unauthorized reader.
+        // A reader with no key entry cannot decrypt, regardless of grant_ids.
         let kr = keyring_with(oid.clone(), key);
+        let empty = Keyring::new();
         assert!(matches!(
-            open(&sealed, &oid, "mallory", &kr, 0),
+            open(&sealed, &oid, "mallory", &empty, 0),
             Err(RepoError::Unauthorized(_))
         ));
+        // Alice holds the key and can decrypt.
         assert_eq!(open(&sealed, &oid, "alice", &kr, 0).unwrap(), b"secret");
+        // If mallory somehow obtains the key (e.g. via a grant), she can also
+        // decrypt — holding the key IS the authorization ("permissioning is key
+        // management", ADR 0008).
+        let mallory_kr = keyring_with(oid.clone(), key);
+        assert_eq!(open(&sealed, &oid, "mallory", &mallory_kr, 0).unwrap(), b"secret");
     }
 
     #[test]

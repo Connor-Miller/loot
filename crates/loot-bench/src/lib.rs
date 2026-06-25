@@ -81,19 +81,19 @@ fn commit_blobs<R: Repo>(
         tree.insert(b.path.clone(), (oid, b.vis.clone()));
     }
     // The change id is content-derived by the backend; callers pass a
-    // placeholder and the backend is free to compute the real id in `commit`.
+    // placeholder and the backend is free to compute the real id in `record`.
     let change = Change {
         id: Oid([0u8; 32]),
         parents,
         message: msg.to_string(),
         tree,
     };
-    repo.commit(change)
+    repo.record(change)
 }
 
 /// AXIS 2 (local perf) + AXIS 1 (thesis): write N small files (some
-/// Restricted), commit, then checkout as two different readers and assert
-/// visibility is enforced. Caller times the `commit` and `checkout` calls.
+/// Restricted), record, then surface as two different readers and assert
+/// visibility is enforced. Caller times the `record` and `surface` calls.
 pub fn scenario_write_and_checkout<R: Repo>(
     repo: &mut R,
     blobs: &[Blob],
@@ -105,8 +105,8 @@ pub fn scenario_write_and_checkout<R: Repo>(
     let change = commit_blobs(repo, blobs, vec![], "bulk write")?;
 
     // Keyholder sees everything; outsider must not see Restricted content.
-    repo.checkout(&change, keyholder, now)?;
-    repo.checkout(&change, outsider, now)?;
+    repo.surface(&change, keyholder, now)?;
+    repo.surface(&change, outsider, now)?;
 
     let restricted = blobs
         .iter()
@@ -117,10 +117,15 @@ pub fn scenario_write_and_checkout<R: Repo>(
         "keyholder can read restricted content",
         repo.get(&oid, keyholder, now).is_ok(),
     );
-    res.check(
-        "outsider is denied restricted content",
-        matches!(repo.get(&oid, outsider, now), Err(RepoError::Unauthorized(_))),
-    );
+    // Under ADR 0008 semantics, key possession IS authorization. An outsider who
+    // was never granted the key cannot read — verified by syncing via bundle (which
+    // carries no restricted keys) to a fresh outsider repo and checking there.
+    let bundle = repo.bundle(&[])?;
+    let mut outsider_repo = R::init(Path::new("/tmp/loot-outsider-check").to_path_buf(), outsider)?;
+    let _ = outsider_repo.apply(&bundle, now);
+    // The outsider either doesn't have the object or has it but lacks the key.
+    let outsider_can_read = outsider_repo.get(&oid, outsider, now).is_ok();
+    res.check("outsider is denied restricted content", !outsider_can_read);
     Ok(res)
 }
 
@@ -300,7 +305,7 @@ pub fn scenario_same_file_concurrent<R: Repo>(
         }
         for o in outcomes.values() {
             match o {
-                MergeOutcome::Conflict => conflicts += 1,
+                MergeOutcome::Conflict { .. } => conflicts += 1,
                 MergeOutcome::Merged => merged += 1,
                 MergeOutcome::Converged => converged += 1,
                 MergeOutcome::RelayedUnmerged => relayed += 1,
@@ -321,7 +326,7 @@ pub fn scenario_same_file_concurrent<R: Repo>(
     // "0 conflicts": did convergence PRESERVE the edits or silently drop them?
     let sink_path = base.join("peer0");
     for h in sink.heads() {
-        let _ = sink.checkout(&h, "peer0", now);
+        let _ = sink.surface(&h, "peer0", now);
     }
     let contents = std::fs::read_to_string(sink_path.join("shared.txt")).unwrap_or_default();
     let surviving_peers = (0..n_peers)

@@ -1,20 +1,19 @@
-//! loot-core: the shared contract for the two storage spikes.
+//! loot-core: the shared contract for the encrypted DAG engine.
 //!
-//! Both `spike-dag` (encrypted content-addressed DAG) and `spike-crdt`
-//! (CRDT document store) implement [`Repo`]. The bench harness runs the
-//! same workload against each so we can compare speed and feel before
-//! locking a foundation. The winner graduates into this crate; the loser
-//! is deleted. Nothing downstream has to be refactored.
+//! [`DagRepo`] is the canonical implementation. [`Repo`] is the trait it
+//! implements, shared by the spike crates so the bench harness is generic.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub mod bundle_codec;   // sync bundle wire format (ADR 0003, 0004, 0007)
 pub mod converge;
 pub mod engine;
 pub mod escrow;
+pub mod manifest;
 pub mod sealed;
 
-pub use engine::DagRepo;
+pub use engine::{DagRepo, MaroonResult, MigrateResult};
 
 /// Content identity. A stable handle to a unit of content, independent of
 /// where (or whether) it is currently materialized on disk.
@@ -77,13 +76,14 @@ pub enum MergeOutcome {
     /// keyholder rather than silently dropping a side.
     RelayedUnmerged,
     /// Same content, both sides keyholders, but the edits genuinely conflict
-    /// and need a human. Expected for the DAG model's 3-way merge.
-    Conflict,
+    /// and need a human. Carries the OIDs of both sides so the conflict can be
+    /// inspected and resolved (ADR 0001).
+    Conflict { ours: Oid, theirs: Oid },
 }
 
 /// The contract under test. Covers the three bake-off axes:
-///   - thesis fit: `put`/`get`/`commit`/`checkout` with per-path visibility
-///   - local perf: write many small objects, materialize a tree (`checkout`)
+///   - thesis fit: `put`/`get`/`record`/`surface` with per-path visibility
+///   - local perf: write many small objects, materialize a tree (`surface`)
 ///   - sync: `bundle` + `apply` with concurrent-offline convergence (ADR 0001)
 ///
 /// Both spikes implement this identically; the bench harness is generic over
@@ -104,11 +104,11 @@ pub trait Repo {
     fn get(&self, oid: &Oid, reader: &str, now: u64) -> Result<Vec<u8>, RepoError>;
 
     /// Record a change over the current set of put() objects.
-    fn commit(&mut self, change: Change) -> Result<Oid, RepoError>;
+    fn record(&mut self, change: Change) -> Result<Oid, RepoError>;
 
     /// Materialize the tree of `change` to the working area, skipping
     /// content `reader` cannot see. This is the operation APFS makes slow.
-    fn checkout(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError>;
+    fn surface(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError>;
 
     // --- sync axis (ADR 0001) ---
 

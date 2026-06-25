@@ -72,6 +72,13 @@ impl Workspace {
         &self.identity
     }
 
+    /// Resolve the visibility for `path` according to `.lootattributes` — the
+    /// same rule `snapshot` uses. Returns `Public` if no rule matches.
+    pub fn visibility_for(&self, path: &str) -> Visibility {
+        let attrs = Attributes::load(&self.root.join(ATTRS));
+        attrs.visibility_for(path)
+    }
+
     pub fn now(&self) -> u64 {
         self.now
     }
@@ -116,7 +123,7 @@ impl Workspace {
     }
 
     /// Materialize what the current identity may see from the tip change.
-    pub fn checkout(&mut self) -> Result<Oid, String> {
+    pub fn surface(&mut self) -> Result<Oid, String> {
         // Promote embargoed keys before materializing — same flush discipline as
         // snapshot (ADR 0007). Takes &mut self because flush mutates the escrow.
         self.repo.flush_escrow(self.now);
@@ -125,9 +132,9 @@ impl Workspace {
             .heads()
             .into_iter()
             .next()
-            .ok_or("nothing to check out (no commits yet)")?;
+            .ok_or("nothing to surface yet (no changes recorded)")?;
         self.repo
-            .checkout(&head, &self.identity, self.now)
+            .surface(&head, &self.identity, self.now)
             .map_err(|e| e.to_string())?;
         self.persist()?;
         Ok(head)

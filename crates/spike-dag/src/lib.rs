@@ -36,7 +36,7 @@ mod tests {
     #[test]
     fn embargo_passes() {
         let mut repo = DagRepo::init(tmp(), "alice").unwrap();
-        let res = scenario_embargo(&mut repo, 5000, "anyone").unwrap();
+        let res = scenario_embargo(&mut repo, 5000, "alice").unwrap();
         assert!(res.all_passed(), "checks: {:?}", res.checks);
     }
 

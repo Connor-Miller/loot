@@ -57,7 +57,7 @@ pub fn classify(
 /// merger role; failing to open either is the relay role.
 fn merge_pair(ours: &Oid, theirs: &Oid, oracle: &dyn KeyOracle, now: u64) -> MergeOutcome {
     match (oracle.open(ours, now), oracle.open(theirs, now)) {
-        (Some(a), Some(b)) => line_set_merge(&a, &b),
+        (Some(a), Some(b)) => line_set_merge(ours, theirs, &a, &b),
         // Can't open at least one side -> relay, defer to a keyholder.
         _ => MergeOutcome::RelayedUnmerged,
     }
@@ -68,7 +68,7 @@ fn merge_pair(ours: &Oid, theirs: &Oid, oracle: &dyn KeyOracle, now: u64) -> Mer
 /// subsumes the other it merges cleanly; otherwise it's a genuine `Conflict`.
 /// Crude on purpose — the point is that merging *requires plaintext access*,
 /// which is the thesis tension. A real 3-way merge is a later internal seam.
-fn line_set_merge(a: &[u8], b: &[u8]) -> MergeOutcome {
+fn line_set_merge(ours: &Oid, theirs: &Oid, a: &[u8], b: &[u8]) -> MergeOutcome {
     if a == b {
         return MergeOutcome::Merged;
     }
@@ -77,7 +77,10 @@ fn line_set_merge(a: &[u8], b: &[u8]) -> MergeOutcome {
     if al.is_subset(&bl) || bl.is_subset(&al) {
         MergeOutcome::Merged
     } else {
-        MergeOutcome::Conflict
+        MergeOutcome::Conflict {
+            ours: ours.clone(),
+            theirs: theirs.clone(),
+        }
     }
 }
 
@@ -89,7 +92,7 @@ pub fn worst(a: MergeOutcome, b: MergeOutcome) -> MergeOutcome {
             MergeOutcome::Converged => 0,
             MergeOutcome::Merged => 1,
             MergeOutcome::RelayedUnmerged => 2,
-            MergeOutcome::Conflict => 3,
+            MergeOutcome::Conflict { .. } => 3,
         }
     }
     if rank(&a) >= rank(&b) {
@@ -170,6 +173,9 @@ mod tests {
         plain.insert(oid(1), b"left\n".to_vec());
         plain.insert(oid(2), b"right\n".to_vec());
         let out = classify(&local, &inc, &FakeOracle(plain), 0);
-        assert_eq!(out[&PathBuf::from("a.txt")], MergeOutcome::Conflict);
+        assert_eq!(
+            out[&PathBuf::from("a.txt")],
+            MergeOutcome::Conflict { ours: oid(1), theirs: oid(2) }
+        );
     }
 }

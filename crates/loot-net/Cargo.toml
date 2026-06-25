@@ -1,0 +1,15 @@
+[package]
+name = "loot-net"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Network transport for loot sync (ADR 0011): the relay server (`serve`) and the
+# push/pull client. This is the ONE crate that holds the async/HTTP dependency
+# tree, keeping loot-core pure-sync and the CLI's hand-rolled arg parsing intact.
+
+[dependencies]
+loot-core.workspace = true
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true

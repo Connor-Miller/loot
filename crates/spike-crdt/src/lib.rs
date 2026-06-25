@@ -407,7 +407,7 @@ impl Repo for CrdtRepo {
         Err(RepoError::NotFound(oid.clone()))
     }
 
-    fn commit(&mut self, change: Change) -> Result<Oid, RepoError> {
+    fn record(&mut self, change: Change) -> Result<Oid, RepoError> {
         let backend = |e: automerge::AutomergeError| RepoError::Backend(e.to_string());
 
         // The path content was already placed in the doc by `put`/`put_in_doc`.
@@ -468,7 +468,7 @@ impl Repo for CrdtRepo {
         Ok(change_id)
     }
 
-    fn checkout(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError> {
+    fn surface(&self, change: &Oid, reader: &str, now: u64) -> Result<(), RepoError> {
         let backend = |e: automerge::AutomergeError| RepoError::Backend(e.to_string());
         // Find the change record and project its tree to the working area,
         // skipping content the reader can't see (visibility or missing key).
