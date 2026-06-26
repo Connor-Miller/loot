@@ -154,6 +154,96 @@ impl DagRepo {
         Ok(SyncBundle(out))
     }
 
+    /// Produce a sealed-key grant bundle (tag 3) where the content key is
+    /// ECIES-wrapped to the recipient's x25519 pubkey. Safe to relay — the relay
+    /// cannot read the key. The caller supplies `seal_fn` to do the wrapping,
+    /// keeping identity crypto outside the engine (ADR 0014).
+    ///
+    /// Wire format: `[3][grantee_len(4)][grantee][wrapped_key(80)][oid(32)][payload]`
+    /// where payload is the standard grant encode with no key section.
+    pub fn grant_sealed(
+        &mut self,
+        oid: &Oid,
+        grantee: &str,
+        now: u64,
+        seal: impl FnOnce(&[u8; 32]) -> Result<[u8; 80], RepoError>,
+    ) -> Result<SyncBundle, RepoError> {
+        let key = self.keyring.key_for(oid)
+            .ok_or_else(|| RepoError::Unauthorized(oid.clone()))?;
+        let wrapped = seal(&key)?;
+
+        let obj = self.object(oid)?;
+        let mut objs: BTreeMap<Oid, &SealedObject> = BTreeMap::new();
+        objs.insert(oid.clone(), obj);
+        // No key section — key travels in wrapped_key field.
+        let payload = bundle_codec::encode_grant(&[], &objs, &BTreeMap::new(), &BTreeMap::new());
+
+        let mut out = vec![3u8];
+        let gb = grantee.as_bytes();
+        out.extend_from_slice(&(gb.len() as u32).to_le_bytes());
+        out.extend_from_slice(gb);
+        out.extend_from_slice(&wrapped);
+        out.extend_from_slice(&oid.0);
+        out.extend_from_slice(&payload);
+
+        self.manifest.record(oid.clone(), grantee.to_string(), now);
+        Ok(SyncBundle(out))
+    }
+
+    /// Apply a sealed-key grant bundle (tag 3). The caller supplies an unseal
+    /// closure that decrypts the 80-byte wrapped key — keeping identity crypto
+    /// outside the engine. On success, the content key is filed in the keyring.
+    pub fn apply_sealed_grant(
+        &mut self,
+        bundle: &SyncBundle,
+        unseal: impl FnOnce(&[u8; 80]) -> Result<[u8; 32], RepoError>,
+    ) -> Result<(), RepoError> {
+        let data = &bundle.0;
+        if data.is_empty() || data[0] != 3 {
+            return Err(RepoError::Backend("not a sealed-key grant bundle (tag 3)".into()));
+        }
+        let rest = &data[1..];
+        if rest.len() < 4 {
+            return Err(RepoError::Backend("sealed grant bundle truncated".into()));
+        }
+        let grantee_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        if rest.len() < 4 + grantee_len + 80 + 32 {
+            return Err(RepoError::Backend("sealed grant bundle too short".into()));
+        }
+        let grantee = std::str::from_utf8(&rest[4..4 + grantee_len])
+            .map_err(|e| RepoError::Backend(e.to_string()))?;
+        let after_grantee = &rest[4 + grantee_len..];
+        let mut wrapped = [0u8; 80];
+        wrapped.copy_from_slice(&after_grantee[..80]);
+        let mut oid_bytes = [0u8; 32];
+        oid_bytes.copy_from_slice(&after_grantee[80..112]);
+        let oid = Oid(oid_bytes);
+        let payload = &after_grantee[112..];
+
+        if grantee != self.identity {
+            return Err(RepoError::Backend(format!(
+                "sealed grant addressed to '{}', not '{}'", grantee, self.identity
+            )));
+        }
+
+        let key = unseal(&wrapped)?;
+
+        let (_changes, incoming_objs, _keys, incoming_escrow) =
+            bundle_codec::decode_grant(payload)?;
+        for (addr, obj) in incoming_objs {
+            self.store(addr.clone(), obj, None);
+        }
+        for (escrow_oid, (escrow_key, reveal_at)) in incoming_escrow {
+            if !self.escrow.holds(&escrow_oid) && !self.keyring.holds(&escrow_oid) {
+                self.escrow.insert(escrow_oid, escrow_key, reveal_at);
+            }
+        }
+        if !self.keyring.holds(&oid) {
+            self.keyring.insert(oid, key);
+        }
+        Ok(())
+    }
+
     /// Forward-maroon `marooned` from `path`: re-seal the content under a fresh
     /// key that excludes `marooned`, update the change tree, and produce grant
     /// bundles for every remaining identity in the manifest (ADR 0009).
@@ -765,6 +855,16 @@ impl Repo for DagRepo {
             }
 
             return Ok(BTreeMap::new());
+        }
+
+        if tag == 3 {
+            // Sealed-key grant bundle: grantee_len(4) || grantee ||
+            // wrapped_key(80) || oid(32) || standard grant payload (object only,
+            // no key section — key is in the wrapped_key field above).
+            // The caller supplies `unseal_fn` to unwrap the key outside the engine.
+            return Err(RepoError::Backend(
+                "sealed-key grant bundle (tag 3) must be applied via apply_sealed_grant".into(),
+            ));
         }
 
         Err(RepoError::Backend(format!("unknown bundle tag {tag}")))

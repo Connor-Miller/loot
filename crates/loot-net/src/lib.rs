@@ -7,13 +7,14 @@
 //! drives. It is the ONE crate that pulls in the async/HTTP dependency tree, so
 //! `loot-core` stays pure-sync.
 //!
-//! Two endpoints, mirroring the two deliberate verbs:
-//! - `POST /stow` — push: body is a signed envelope (ADR 0014):
-//!   `[0x01][pubkey 32][sig 64][bundle...]`. The relay verifies the signature,
-//!   checks against the allowlist (if configured), then stows the inner bundle
-//!   append-only (never merges — it holds no restricted keys).
-//! - `POST /negotiate` — pull: body is the caller's change-ids (`have`); the
-//!   relay replies with a bundle of everything it has that the caller lacks.
+//! Four endpoints:
+//! - `POST /stow` — push sync bundle: signed envelope `[0x01][pubkey 32][sig 64][bundle...]`.
+//!   Relay verifies signature, checks allowlist, stows append-only.
+//! - `POST /negotiate` — pull sync: body is caller's `have` change-ids; relay returns bundle.
+//! - `POST /grant` — deposit a sealed grant blob for a named recipient. Body:
+//!   `[recipient_len(4)][recipient][blob...]`. No auth — blob is ECIES-sealed.
+//! - `POST /pull-grants` — fetch mailbox: body is `[name_len(4)][name]`; relay returns
+//!   `[count(4)][len(4)][blob...]...` and deletes delivered blobs.
 //!
 //! Content is sealed end-to-end, so the relay learns nothing it could not relay
 //! anyway; transport security (TLS, when added) protects metadata and integrity,
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 mod relay_store;
+mod mailbox;
 pub use relay_store::{is_relay, RelayStore};
 
 #[derive(Debug)]
@@ -78,6 +80,8 @@ fn decode_have(body: &[u8]) -> Result<Vec<Oid>, NetError> {
 #[derive(Clone)]
 struct ServerState {
     relay: Arc<Mutex<RelayStore>>,
+    /// Root directory of the relay store (for mailbox access).
+    relay_dir: Arc<PathBuf>,
     /// Allowed pusher public keys. Empty = open relay (any valid signature accepted).
     allowed_keys: Arc<Vec<[u8; 32]>>,
 }
@@ -94,20 +98,23 @@ pub fn serve(dir: PathBuf, addr: &str, allowed_keys: Vec<[u8; 32]>) -> Result<()
         .enable_all()
         .build()
         .map_err(|e| NetError::Io(e.to_string()))?;
-    rt.block_on(serve_async(store, addr, allowed_keys))
+    rt.block_on(serve_async(store, dir, addr, allowed_keys))
 }
 
-async fn serve_async(store: RelayStore, addr: &str, allowed_keys: Vec<[u8; 32]>) -> Result<(), NetError> {
+async fn serve_async(store: RelayStore, dir: PathBuf, addr: &str, allowed_keys: Vec<[u8; 32]>) -> Result<(), NetError> {
     use axum::routing::post;
     use axum::Router;
 
     let state = ServerState {
         relay: Arc::new(Mutex::new(store)),
+        relay_dir: Arc::new(dir),
         allowed_keys: Arc::new(allowed_keys),
     };
     let app = Router::new()
         .route("/stow", post(handle_stow))
         .route("/negotiate", post(handle_negotiate))
+        .route("/grant", post(handle_deposit_grant))
+        .route("/pull-grants", post(handle_pull_grants))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -143,6 +150,43 @@ async fn handle_negotiate(
         .bundle(&have)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(bundle.0)
+}
+
+async fn handle_deposit_grant(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    body: axum::body::Bytes,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    if body.len() < 4 {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "body too short".into()));
+    }
+    let name_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    if body.len() < 4 + name_len {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "recipient name truncated".into()));
+    }
+    let recipient = std::str::from_utf8(&body[4..4 + name_len])
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    let blob = &body[4 + name_len..];
+    mailbox::deposit(&state.relay_dir, recipient, blob)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok("deposited".into())
+}
+
+async fn handle_pull_grants(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    body: axum::body::Bytes,
+) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
+    if body.len() < 4 {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "body too short".into()));
+    }
+    let name_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    if body.len() < 4 + name_len {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "recipient name truncated".into()));
+    }
+    let recipient = std::str::from_utf8(&body[4..4 + name_len])
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    let blobs = mailbox::fetch_and_drain(&state.relay_dir, recipient)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(mailbox::encode_blobs(&blobs))
 }
 
 // --- client (`loot push` / `loot pull`) ---
@@ -193,4 +237,45 @@ pub fn pull(base_url: &str, have: &[Oid]) -> Result<Vec<u8>, NetError> {
 pub fn heads_of(dot: &Path, root: PathBuf) -> Result<Vec<Oid>, NetError> {
     let repo = DagRepo::load(dot, root).map_err(|e| NetError::Engine(e.to_string()))?;
     Ok(repo.heads())
+}
+
+/// Deposit a sealed grant blob for `recipient` at the relay's `/grant` mailbox.
+/// No signing required — the blob is ECIES-sealed to the recipient's key.
+pub fn deliver_grant(base_url: &str, recipient: &str, blob: &[u8]) -> Result<(), NetError> {
+    let url = format!("{}/grant", base_url.trim_end_matches('/'));
+    let rb = recipient.as_bytes();
+    let mut body = Vec::with_capacity(4 + rb.len() + blob.len());
+    body.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+    body.extend_from_slice(rb);
+    body.extend_from_slice(blob);
+    let client = reqwest::blocking::Client::new();
+    let resp = client.post(&url).body(body).send()
+        .map_err(|e| NetError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let msg = resp.text().unwrap_or_default();
+        return Err(NetError::Http(format!("relay rejected grant deposit ({code}): {msg}")));
+    }
+    Ok(())
+}
+
+/// Fetch and drain all sealed grant blobs addressed to `recipient`.
+/// Returns raw blob bytes; caller is responsible for unsealing and applying.
+/// Blobs are deleted from the relay on delivery.
+pub fn fetch_grants(base_url: &str, recipient: &str) -> Result<Vec<Vec<u8>>, NetError> {
+    let url = format!("{}/pull-grants", base_url.trim_end_matches('/'));
+    let rb = recipient.as_bytes();
+    let mut body = Vec::with_capacity(4 + rb.len());
+    body.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+    body.extend_from_slice(rb);
+    let client = reqwest::blocking::Client::new();
+    let resp = client.post(&url).body(body).send()
+        .map_err(|e| NetError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let msg = resp.text().unwrap_or_default();
+        return Err(NetError::Http(format!("relay rejected pull-grants ({code}): {msg}")));
+    }
+    let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
+    mailbox::decode_blobs(&bytes)
 }

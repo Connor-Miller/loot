@@ -2,7 +2,8 @@
 //! bundle, pull it into bob over real HTTP, and confirm the relay never holds
 //! a key. Also exercises the allowlist: an unknown key is rejected.
 
-use loot_core::{Change, DagRepo, Oid, Repo, SyncBundle, Visibility};
+use loot_core::{Change, DagRepo, Oid, Repo, RepoError, SyncBundle, Visibility};
+use loot_identity::key_seal;
 use loot_identity::Identity;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,6 +28,15 @@ fn wait_for_relay(base: &str) {
 
 fn alice_identity() -> Identity {
     Identity::generate()
+}
+
+fn build_restricted_repo(dir: &PathBuf, owner: &str) -> (DagRepo, Oid) {
+    let mut repo = DagRepo::init(dir.join("work"), owner).unwrap();
+    let oid = repo.put(b"secret bytes\n", Visibility::Restricted(vec![owner.into()])).unwrap();
+    let mut tree = BTreeMap::new();
+    tree.insert(PathBuf::from("secret.txt"), (oid.clone(), Visibility::Restricted(vec![owner.into()])));
+    repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree }).unwrap();
+    (repo, oid)
 }
 
 #[test]
@@ -167,4 +177,59 @@ fn allowlist_rejects_unknown_pusher() {
         assert!(!e.to_string().contains("401"),
             "alice should pass auth but got 401: {e}");
     }
+}
+
+/// Sealed grant relay round-trip: alice seals a content key for bob (x25519/ECIES),
+/// deposits it at the relay mailbox, bob fetches it and applies it — then he can
+/// read content he previously couldn't decrypt.
+#[test]
+fn sealed_grant_relay_round_trip() {
+    let relay_dir = tmp("relay-grant");
+    let addr = "127.0.0.1:47197";
+    let base = format!("http://{addr}");
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
+    });
+    wait_for_relay(&base);
+
+    // Alice creates restricted content and holds the key.
+    let alice_dir = tmp("alice-grant");
+    let (mut alice_repo, oid) = build_restricted_repo(&alice_dir, "alice");
+
+    // Bob has an identity keypair; alice registers his public key.
+    let bob_id = Identity::generate();
+    let bob_x25519 = bob_id.x25519_pubkey_bytes();
+
+    // Alice produces a sealed grant bundle (tag 3) — key wrapped to bob's x25519 key.
+    let sealed_bundle = alice_repo.grant_sealed(&oid, "bob", 0, |content_key| {
+        key_seal::seal_key(content_key, &bob_x25519)
+            .map_err(|e| RepoError::Backend(e.to_string()))
+    }).unwrap();
+
+    // Alice delivers the sealed bundle to the relay mailbox.
+    loot_net::deliver_grant(&base, "bob", &sealed_bundle.0).unwrap();
+
+    // Bob fetches his grants. The relay held the ciphertext — it cannot read it.
+    let blobs = loot_net::fetch_grants(&base, "bob").unwrap();
+    assert_eq!(blobs.len(), 1, "bob should have exactly one pending grant");
+
+    // Mailbox is now drained.
+    let after_drain = loot_net::fetch_grants(&base, "bob").unwrap();
+    assert!(after_drain.is_empty(), "grants must be deleted on delivery");
+
+    // Bob applies the sealed grant — his identity unseals the wrapped key.
+    let mut bob_repo = DagRepo::init(tmp("bob-grant").join("work"), "bob").unwrap();
+    let grant_bundle = SyncBundle(blobs.into_iter().next().unwrap());
+    bob_repo.apply_sealed_grant(&grant_bundle, |wrapped| {
+        bob_id.unseal_key(wrapped)
+            .map_err(|e| RepoError::Backend(e.to_string()))
+    }).unwrap();
+
+    // Bob now holds alice's object (from the grant payload) and can read it.
+    assert_eq!(
+        bob_repo.get(&oid, "bob", 0).unwrap(),
+        b"secret bytes\n",
+        "bob must be able to read the content after receiving the sealed grant"
+    );
 }

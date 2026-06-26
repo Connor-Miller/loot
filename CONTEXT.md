@@ -188,8 +188,6 @@ tree so the decision is reproducible (`cargo test --release`).
   The seam is designed for this: replacing `Escrow::flush` with a network call
   leaves everything else unmodified. Deferred until the network layer exists.
 
-- **Grant bundle relay delivery.** `loot grant` currently writes a bundle file for manual delivery. When identity keypairs land (see below), the grant bundle's keyring section switches from raw bytes to `encrypt(key, recipient_pubkey)` and `loot grant --relay <name>` becomes safe to add. The seam is designed; see ADR 0013.
-
 - **Relay announcement.** A relay peer declaring its relay status so senders
   can discover who holds a key before bundling — enabling selective delivery
   rather than ship-everything. Independent of key management; deferred until
@@ -208,5 +206,3 @@ tree so the decision is reproducible (`cargo test --release`).
 - **Embargoed merges across repos.** Accepting a change from a peer but keeping
   the diff embargoed until a scheduled reveal. Requires a multi-remote model
   (not yet defined). Deferred until the network layer exists.
-
-- **Sealed grant bundle relay delivery.** `loot grant` writes a bundle file; relay delivery requires: (1) a relay `/grant` mailbox endpoint in `loot-net` where senders deposit sealed grant blobs, (2) `loot grant --relay <name>` in the CLI that seals the content key via `identity::seal_key` (x25519/ECIES — already in `loot-identity`) and posts to the mailbox, (3) `loot pull-grants` to fetch and unseal, (4) a new bundle tag (3) so the engine routes sealed-key grants through identity-aware unseal before filing the key. The ECIES seam and `DagRepo::content_key_for` are in place; this is additive plumbing with no redesign.

@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         "serve" => cmd_serve(rest),
         "push" => cmd_push(rest),
         "pull" => cmd_pull(rest),
+        "pull-grants" => cmd_pull_grants(rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -81,7 +82,10 @@ usage:
   loot peer list                            show all known peers
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
-  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay";
+  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay
+  loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
+  loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
+  loot pull-grants [<url>] [--remote <name>]   fetch sealed grants from relay and apply them";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -205,8 +209,11 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_grant(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "--relay") {
+        return cmd_grant_relay(args);
+    }
     if args.len() < 3 {
-        return Err("grant requires <path> <identity> <file>".into());
+        return Err("grant requires <path> <identity> <file>\n  or: grant --relay <remote> <path> <identity>".into());
     }
     let path = &args[0];
     let grantee = &args[1];
@@ -215,7 +222,6 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let now = ws.now();
 
-    // Find the OID for this path in the current tree.
     let oid = ws
         .repo()
         .current_tree_oid(std::path::Path::new(path))
@@ -231,6 +237,55 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
         bundle.0.len()
     );
     println!("  {path} → {grantee} (recorded in manifest)");
+    Ok(())
+}
+
+fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
+    // Usage: grant --relay <remote-name-or-url> <path> <identity>
+    let relay_target = flag(args, "--relay")
+        .ok_or("grant --relay requires a relay name or URL after --relay")?;
+    let positional: Vec<&str> = args.iter()
+        .filter(|a| !a.starts_with('-') && a.as_str() != relay_target)
+        .map(String::as_str)
+        .collect();
+    if positional.len() < 2 {
+        return Err("grant --relay <remote> <path> <identity>".into());
+    }
+    let path = positional[0];
+    let grantee = positional[1];
+
+    let mut ws = Workspace::open()?;
+    let dot = ws.dot().to_owned();
+
+    // Resolve the relay URL: named remote or direct URL.
+    let url = ws.remote_url(relay_target)
+        .unwrap_or_else(|| relay_target.to_string());
+
+    // Look up the recipient's ed25519 pubkey and convert to x25519 for sealing.
+    let reg = identity::PeerRegistry::load(&dot);
+    let ed_pubkey = reg.pubkey_bytes(grantee)
+        .map_err(|e| format!("peer '{grantee}': {e}"))?
+        .ok_or_else(|| format!("peer '{grantee}' not found — run `loot peer add {grantee} <pubkey>` first"))?;
+    let recipient_x25519 = identity::x25519_pubkey_from_ed25519_bytes(&ed_pubkey)
+        .map_err(|e| format!("could not derive x25519 key for '{grantee}': {e}"))?;
+
+    let now = ws.now();
+    let oid = ws
+        .repo()
+        .current_tree_oid(std::path::Path::new(path))
+        .map_err(|_| format!("path '{path}' not found in current change"))?;
+
+    let bundle = ws.with_repo(|repo| {
+        repo.grant_sealed(&oid, grantee, now, |content_key| {
+            identity::seal_key(content_key, &recipient_x25519)
+                .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+        }).map_err(|e| e.to_string())
+    })?;
+
+    loot_net::deliver_grant(&url, grantee, &bundle.0).map_err(|e| e.to_string())?;
+    println!("delivered sealed grant for '{grantee}' via relay {url}");
+    println!("  {path} → {grantee} (sealed, recorded in manifest)");
+    println!("  recipient runs `loot pull-grants` to receive it");
     Ok(())
 }
 
@@ -416,6 +471,43 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     // Check if all conflicts are now clear.
     if ws.repo().conflicts().is_empty() {
         println!("all conflicts resolved — run `loot new` to finalize");
+    }
+    Ok(())
+}
+
+fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
+    let mut ws = Workspace::open()?;
+    let dot = ws.dot().to_owned();
+    let url = resolve_remote(args, &ws)?;
+
+    let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
+    let my_name = ws.identity().to_string();
+    let now = ws.now();
+
+    let blobs = loot_net::fetch_grants(&url, &my_name).map_err(|e| e.to_string())?;
+    if blobs.is_empty() {
+        println!("no pending grants at {url}");
+        return Ok(());
+    }
+
+    let mut applied = 0usize;
+    for blob in &blobs {
+        let bundle = loot_core::SyncBundle(blob.clone());
+        let result = ws.with_repo(|repo| {
+            repo.apply_sealed_grant(&bundle, |wrapped| {
+                id.unseal_key(wrapped)
+                    .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+            }).map_err(|e| e.to_string())
+        });
+        match result {
+            Ok(()) => applied += 1,
+            Err(e) => eprintln!("loot: skipping grant (could not apply): {e}"),
+        }
+    }
+    let _ = now;
+    println!("applied {applied}/{n} grant(s) from {url}", n = blobs.len());
+    if applied > 0 {
+        println!("run `loot surface` to materialize newly-accessible content");
     }
     Ok(())
 }
