@@ -10,7 +10,7 @@ mod workspace;
 use loot_core::{MaroonResult, MergeOutcome, MigrateResult, Oid, Repo, SyncBundle, Visibility};
 use loot_identity as identity;
 use std::process::ExitCode;
-use workspace::Workspace;
+use workspace::{GlobalConfig, Workspace};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -41,6 +41,8 @@ fn main() -> ExitCode {
         "pull" => cmd_pull(rest),
         "pull-grants" => cmd_pull_grants(rest),
         "grants" => cmd_grants(rest),
+        "clone" => cmd_clone(rest),
+        "config" => cmd_config(rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -59,7 +61,9 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  loot init --identity <name>               initialize a repo here, owned by <name>
+  loot init [--identity <name>]             initialize a repo here (identity from global config if omitted)
+  loot clone <url> <dir> [--identity <name>]  clone a relay into <dir>
+  loot config [set <key> <val>] [unset <key>] [list]  manage global config (~/.config/loot/config)
   loot status [-m <message>]                snapshot the working tree into the working change
   loot describe -m <message>                name the working change
   loot new                                  finalize the working change; start a fresh one
@@ -67,7 +71,10 @@ usage:
   loot log                                  show change history
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file>                         merge a peer's bundle (idempotent)
-  loot grant <path> <identity> <file>       write a targeted grant bundle for <identity>
+  loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
+  loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
+  loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
+  loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
   loot manifest                             show the grant audit trail
@@ -83,11 +90,7 @@ usage:
   loot peer list                            show all known peers
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
-  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay
-  loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
-  loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
-  loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
-  loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay";
+  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -107,14 +110,22 @@ fn message_flag(args: &[String]) -> Option<&str> {
 // --- commands ---
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
-    let id_name = flag(args, "--identity").ok_or("init requires --identity <name>")?;
-    let ws = Workspace::init(id_name)?;
+    let id_name = flag(args, "--identity")
+        .map(String::from)
+        .or_else(|| GlobalConfig::load().get("identity").map(String::from))
+        .ok_or("init requires --identity <name> (or set `identity` in `loot config`)")?;
+    init_repo(std::path::Path::new("."), &id_name)
+}
+
+/// Shared init logic: initialize a repo at `dir`, generate keypair, print summary.
+fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
+    let ws = Workspace::init_at(dir, id_name)?;
     let dot = ws.dot();
     let keypair = identity::generate_and_save(dot, &format!("{id_name}@loot"))
         .map_err(|e| e.to_string())?;
     let pub_line = std::fs::read_to_string(dot.join("id.pub"))
         .map_err(|e| format!("read id.pub: {e}"))?;
-    println!("initialized empty loot repo, identity = {id_name}");
+    println!("initialized empty loot repo at {}, identity = {id_name}", dir.display());
     println!("public key: {}", pub_line.trim());
     println!("tip: share your public key with peers via `loot whoami`");
     println!("tip: declare per-file privacy in .lootattributes, e.g. `.env restricted={id_name}`");
@@ -298,6 +309,78 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     println!("  {path} → {grantee} (sealed, signed, recorded in manifest)");
     println!("  recipient runs `loot pull-grants` to receive it");
     Ok(())
+}
+
+fn cmd_clone(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("clone requires <url> <dir>".into());
+    }
+    let url = &args[0];
+    let dir = std::path::Path::new(args[1].as_str());
+
+    let id_name = flag(args, "--identity")
+        .map(String::from)
+        .or_else(|| GlobalConfig::load().get("identity").map(String::from))
+        .ok_or("clone requires --identity <name> (or set `identity` in `loot config`)")?;
+
+    // Init repo at the target directory.
+    init_repo(dir, &id_name)?;
+
+    // Register origin so subsequent push/pull work out-of-the-box.
+    let mut ws = Workspace::open_at(dir)?;
+    ws.remote_add("origin", url)?;
+
+    // Pull from the relay and surface what this identity can see.
+    let now = ws.now();
+    let have = ws.repo().heads();
+    let bytes = loot_net::pull(url, &have).map_err(|e| e.to_string())?;
+    if !bytes.is_empty() {
+        let outcomes = ws.with_repo(|repo| {
+            repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
+        })?;
+        if !outcomes.is_empty() {
+            println!("pulled {} change(s) from {url}", outcomes.len());
+        }
+    }
+    ws.surface().map_err(|e| e.to_string())?;
+    println!("cloned {url} → {}", dir.display());
+    println!("run `loot status` to see the working tree");
+    Ok(())
+}
+
+fn cmd_config(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "set" => {
+            if args.len() < 3 {
+                return Err("config set requires <key> <value>".into());
+            }
+            let key = &args[1];
+            let val = &args[2];
+            GlobalConfig::load().set(key, val)?;
+            println!("set {key} = {val}");
+            Ok(())
+        }
+        "unset" => {
+            let key = args.get(1).ok_or("config unset requires <key>")?;
+            GlobalConfig::load().unset(key)?;
+            println!("unset {key}");
+            Ok(())
+        }
+        "list" | "ls" => {
+            let cfg = GlobalConfig::load();
+            let pairs = cfg.list();
+            if pairs.is_empty() {
+                println!("global config is empty  (~/.config/loot/config)");
+            } else {
+                for (k, v) in pairs {
+                    println!("{k} = {v}");
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown config subcommand '{other}': use set | unset | list")),
+    }
 }
 
 fn cmd_maroon(args: &[String]) -> Result<(), String> {

@@ -32,12 +32,19 @@ pub struct Workspace {
 impl Workspace {
     /// Discover `.loot/` from the current directory and load the repo.
     pub fn open() -> Result<Self, String> {
-        let dot = PathBuf::from(DOT);
+        Self::open_at(Path::new("."))
+    }
+
+    /// Load a repo rooted at an explicit directory (used by `clone`).
+    pub fn open_at(dir: &Path) -> Result<Self, String> {
+        let dot = dir.join(DOT);
         if !dot.join("identity").exists() {
-            return Err("not a loot repo (no .loot/). Run `loot init --identity <name>` first.".into());
+            return Err(format!(
+                "not a loot repo at {} (no .loot/). Run `loot init` first.",
+                dir.display()
+            ));
         }
-        let root = PathBuf::from(".");
-        let repo = DagRepo::load(&dot, root.clone()).map_err(|e| e.to_string())?;
+        let repo = DagRepo::load(&dot, dir.to_path_buf()).map_err(|e| e.to_string())?;
         let identity = read_to_string(&dot.join("identity"))?;
         let working = match std::fs::read(dot.join("working")) {
             Ok(bytes) if bytes.len() == 32 => {
@@ -47,27 +54,7 @@ impl Workspace {
             }
             _ => None,
         };
-        Ok(Workspace { dot, root, identity, repo, working, now: real_now() })
-    }
-
-    /// Create a fresh repo here, owned by `identity`.
-    pub fn init(identity: &str) -> Result<Self, String> {
-        let dot = PathBuf::from(DOT);
-        if dot.join("identity").exists() {
-            return Err("already a loot repo (.loot/ exists)".into());
-        }
-        let root = PathBuf::from(".");
-        let repo = DagRepo::init(root.clone(), identity).map_err(|e| e.to_string())?;
-        let ws = Workspace {
-            dot,
-            root,
-            identity: identity.to_string(),
-            repo,
-            working: None,
-            now: real_now(),
-        };
-        ws.persist()?;
-        Ok(ws)
+        Ok(Workspace { dot, root: dir.to_path_buf(), identity, repo, working, now: real_now() })
     }
 
     pub fn identity(&self) -> &str {
@@ -185,6 +172,29 @@ impl Workspace {
         Config::load(&self.dot.join(CONFIG)).entries()
     }
 
+    /// Create a fresh repo inside `dir`, owned by `identity`. `dir` is created if
+    /// it doesn't exist. Unlike `init()` this targets an explicit path rather than
+    /// the current directory, so `clone` can materialize the repo anywhere.
+    pub fn init_at(dir: &Path, identity: &str) -> Result<Self, String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let dot = dir.join(DOT);
+        if dot.join("identity").exists() {
+            return Err(format!("already a loot repo at {}", dir.display()));
+        }
+        let repo = DagRepo::init(dir.to_path_buf(), identity).map_err(|e| e.to_string())?;
+        let ws = Workspace {
+            dot,
+            root: dir.to_path_buf(),
+            identity: identity.to_string(),
+            repo,
+            working: None,
+            now: real_now(),
+        };
+        ws.persist()?;
+        Ok(ws)
+    }
+
     fn persist(&self) -> Result<(), String> {
         self.repo.save(&self.dot).map_err(|e| e.to_string())?;
         match &self.working {
@@ -287,6 +297,20 @@ fn parse_visibility(spec: &str) -> Option<Visibility> {
     }
 }
 
+fn parse_config_text(text: &str) -> BTreeMap<String, String> {
+    let mut entries = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            entries.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    entries
+}
+
 /// Named remotes from `.loot/config`. Format: one `name = url` pair per line;
 /// blank lines and `#` comments are ignored.
 struct Config {
@@ -296,17 +320,7 @@ struct Config {
 impl Config {
     fn load(path: &Path) -> Self {
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut entries = BTreeMap::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                entries.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
-        Config { entries }
+        Config { entries: parse_config_text(&text) }
     }
 
     fn get(&self, name: &str) -> Option<String> {
@@ -332,6 +346,71 @@ impl Config {
         }
         std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
     }
+}
+
+/// Global user config at `~/.config/loot/config` (XDG base-dir convention).
+///
+/// Stores identity-scope settings only — keys like `identity = alice`.
+/// Format is the same `key = value` text as the per-repo config.
+pub struct GlobalConfig {
+    entries: BTreeMap<String, String>,
+    path: PathBuf,
+}
+
+impl GlobalConfig {
+    /// Load from the XDG config path. Missing file = empty config.
+    pub fn load() -> Self {
+        let path = global_config_path();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        GlobalConfig { entries: parse_config_text(&text), path }
+    }
+
+    /// Read a key. Returns `None` if not set.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    /// Set a key and persist.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.entries.insert(key.to_string(), value.to_string());
+        self.save()
+    }
+
+    /// Remove a key and persist.
+    pub fn unset(&mut self, key: &str) -> Result<(), String> {
+        self.entries.remove(key);
+        self.save()
+    }
+
+    /// All key/value pairs.
+    pub fn list(&self) -> Vec<(&str, &str)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+    }
+
+    fn save(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create config dir: {e}"))?;
+        }
+        let mut out = String::new();
+        for (k, v) in &self.entries {
+            out.push_str(&format!("{k} = {v}\n"));
+        }
+        std::fs::write(&self.path, out)
+            .map_err(|e| format!("write {}: {e}", self.path.display()))
+    }
+}
+
+fn global_config_path() -> PathBuf {
+    // XDG_CONFIG_HOME takes precedence; fall back to $HOME/.config
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".config"))
+                .unwrap_or_else(|_| PathBuf::from(".config"))
+        });
+    base.join("loot").join("config")
 }
 
 /// Minimal glob: `*` matches a run of non-`/`; `**` matches across separators.
@@ -446,5 +525,38 @@ mod tests {
         assert!(matches!(attrs.visibility_for("README.md"), Visibility::Public));
         assert!(matches!(attrs.visibility_for("main.rs"), Visibility::Public));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_config_set_get_unset() {
+        // Drive via XDG_CONFIG_HOME so we don't touch the real ~/.config
+        let dir = std::env::temp_dir().join(format!("loot-gcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let mut cfg = GlobalConfig::load();
+        assert!(cfg.get("identity").is_none());
+
+        cfg.set("identity", "alice").unwrap();
+        let cfg2 = GlobalConfig::load();
+        assert_eq!(cfg2.get("identity"), Some("alice"));
+
+        let mut cfg3 = GlobalConfig::load();
+        cfg3.unset("identity").unwrap();
+        let cfg4 = GlobalConfig::load();
+        assert!(cfg4.get("identity").is_none());
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_at_and_open_at_round_trip() {
+        let dir = std::env::temp_dir().join(format!("loot-initat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        Workspace::init_at(&dir, "bob").unwrap();
+        let ws = Workspace::open_at(&dir).unwrap();
+        assert_eq!(ws.identity(), "bob");
     }
 }
