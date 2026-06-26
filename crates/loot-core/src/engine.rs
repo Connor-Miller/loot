@@ -148,8 +148,9 @@ impl DagRepo {
         out.extend_from_slice(gb);
         out.extend_from_slice(&payload);
 
-        // Record in the local manifest.
-        self.manifest.record(oid.clone(), grantee.to_string(), now);
+        // Record in the local manifest (file-based grant: no pubkeys known here).
+        use crate::manifest::UNKNOWN_PUBKEY;
+        self.manifest.record(oid.clone(), grantee.to_string(), UNKNOWN_PUBKEY, UNKNOWN_PUBKEY, now);
 
         Ok(SyncBundle(out))
     }
@@ -159,12 +160,18 @@ impl DagRepo {
     /// cannot read the key. The caller supplies `seal_fn` to do the wrapping,
     /// keeping identity crypto outside the engine (ADR 0014).
     ///
-    /// Wire format: `[3][grantee_len(4)][grantee][wrapped_key(80)][oid(32)][payload]`
-    /// where payload is the standard grant encode with no key section.
+    /// `grantee_pubkey` — the recipient's ed25519 pubkey (32 bytes). Used for
+    /// mailbox addressing and the manifest audit record (ADR 0015).
+    /// `grantor_pubkey` — the issuer's ed25519 pubkey. Recorded in the manifest
+    /// so every peer can verify who issued the grant (ADR 0015).
+    ///
+    /// Wire format: `[3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][payload]`
     pub fn grant_sealed(
         &mut self,
         oid: &Oid,
-        grantee: &str,
+        grantee_name: &str,
+        grantee_pubkey: [u8; 32],
+        grantor_pubkey: [u8; 32],
         now: u64,
         seal: impl FnOnce(&[u8; 32]) -> Result<[u8; 80], RepoError>,
     ) -> Result<SyncBundle, RepoError> {
@@ -178,54 +185,51 @@ impl DagRepo {
         // No key section — key travels in wrapped_key field.
         let payload = bundle_codec::encode_grant(&[], &objs, &BTreeMap::new(), &BTreeMap::new());
 
+        // Wire: [3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][payload]
         let mut out = vec![3u8];
-        let gb = grantee.as_bytes();
-        out.extend_from_slice(&(gb.len() as u32).to_le_bytes());
-        out.extend_from_slice(gb);
+        out.extend_from_slice(&grantee_pubkey);
         out.extend_from_slice(&wrapped);
         out.extend_from_slice(&oid.0);
         out.extend_from_slice(&payload);
 
-        self.manifest.record(oid.clone(), grantee.to_string(), now);
+        self.manifest.record(oid.clone(), grantee_name.to_string(), grantee_pubkey, grantor_pubkey, now);
         Ok(SyncBundle(out))
     }
 
-    /// Apply a sealed-key grant bundle (tag 3). The caller supplies an unseal
-    /// closure that decrypts the 80-byte wrapped key — keeping identity crypto
-    /// outside the engine. On success, the content key is filed in the keyring.
+    /// Apply a sealed-key grant bundle (tag 3). The caller supplies:
+    /// - `grantor_pubkey` — verified ed25519 pubkey of the sender (from the
+    ///   envelope the caller already verified). Recorded in the manifest (ADR 0015).
+    /// - `unseal` — closure that decrypts the 80-byte wrapped key using the
+    ///   recipient's private key. If the key was not sealed for us, this fails.
+    ///
+    /// Authorization is purely cryptographic: if `unseal` succeeds, the grant
+    /// was addressed to us. There is no name-compare gate (ADR 0015).
     pub fn apply_sealed_grant(
         &mut self,
         bundle: &SyncBundle,
+        grantor_pubkey: [u8; 32],
+        now: u64,
         unseal: impl FnOnce(&[u8; 80]) -> Result<[u8; 32], RepoError>,
     ) -> Result<(), RepoError> {
         let data = &bundle.0;
         if data.is_empty() || data[0] != 3 {
             return Err(RepoError::Backend("not a sealed-key grant bundle (tag 3)".into()));
         }
+        // Wire: [3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][payload]
         let rest = &data[1..];
-        if rest.len() < 4 {
-            return Err(RepoError::Backend("sealed grant bundle truncated".into()));
-        }
-        let grantee_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-        if rest.len() < 4 + grantee_len + 80 + 32 {
+        if rest.len() < 32 + 80 + 32 {
             return Err(RepoError::Backend("sealed grant bundle too short".into()));
         }
-        let grantee = std::str::from_utf8(&rest[4..4 + grantee_len])
-            .map_err(|e| RepoError::Backend(e.to_string()))?;
-        let after_grantee = &rest[4 + grantee_len..];
+        let mut grantee_pubkey = [0u8; 32];
+        grantee_pubkey.copy_from_slice(&rest[..32]);
         let mut wrapped = [0u8; 80];
-        wrapped.copy_from_slice(&after_grantee[..80]);
+        wrapped.copy_from_slice(&rest[32..112]);
         let mut oid_bytes = [0u8; 32];
-        oid_bytes.copy_from_slice(&after_grantee[80..112]);
+        oid_bytes.copy_from_slice(&rest[112..144]);
         let oid = Oid(oid_bytes);
-        let payload = &after_grantee[112..];
+        let payload = &rest[144..];
 
-        if grantee != self.identity {
-            return Err(RepoError::Backend(format!(
-                "sealed grant addressed to '{}', not '{}'", grantee, self.identity
-            )));
-        }
-
+        // Cryptographic gate: unseal fails if this grant wasn't addressed to us.
         let key = unseal(&wrapped)?;
 
         let (_changes, incoming_objs, _keys, incoming_escrow) =
@@ -239,8 +243,17 @@ impl DagRepo {
             }
         }
         if !self.keyring.holds(&oid) {
-            self.keyring.insert(oid, key);
+            self.keyring.insert(oid.clone(), key);
         }
+
+        // Record in manifest: we know both pubkeys, and the grantee is ourselves.
+        self.manifest.record(
+            oid,
+            self.identity.clone(),
+            grantee_pubkey,
+            grantor_pubkey,
+            now,
+        );
         Ok(())
     }
 
@@ -946,6 +959,8 @@ fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
     for e in entries {
         out.extend_from_slice(&e.oid.0);
         put_bytes(&mut out, e.grantee.as_bytes());
+        out.extend_from_slice(&e.grantee_pubkey);
+        out.extend_from_slice(&e.grantor_pubkey);
         out.extend_from_slice(&e.granted_at.to_le_bytes());
     }
     out
@@ -959,8 +974,10 @@ fn decode_manifest(b: &[u8]) -> Result<Manifest, RepoError> {
     for _ in 0..n {
         let oid = Oid(c.arr32()?);
         let grantee = c.string()?;
+        let grantee_pubkey = c.arr32()?;
+        let grantor_pubkey = c.arr32()?;
         let granted_at = c.u64()?;
-        m.record(oid, grantee, granted_at);
+        m.record(oid, grantee, grantee_pubkey, grantor_pubkey, granted_at);
     }
     Ok(m)
 }
@@ -1411,7 +1428,7 @@ mod tests {
         {
             let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
             oid = repo.put(b"shared data", Visibility::Restricted(vec!["alice".into(), "bob".into()])).unwrap();
-            repo.manifest.record(oid.clone(), "bob".to_string(), 42);
+            repo.manifest.record(oid.clone(), "bob".to_string(), [0u8;32], [0u8;32], 42);
             repo.save(&dir).unwrap();
         }
 
@@ -1520,8 +1537,8 @@ mod tests {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
         let oid = alice.put(b"secret", Visibility::Restricted(vec!["alice".into(), "bob".into(), "carol".into()])).unwrap();
         // Record grant of old oid to bob and carol so maroon can find them.
-        alice.manifest.record(oid.clone(), "bob".to_string(), 1);
-        alice.manifest.record(oid.clone(), "carol".to_string(), 1);
+        alice.manifest.record(oid.clone(), "bob".to_string(), [0u8;32], [0u8;32], 1);
+        alice.manifest.record(oid.clone(), "carol".to_string(), [0u8;32], [0u8;32], 1);
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from("s.txt"), (oid.clone(), Visibility::Restricted(vec!["alice".into(), "bob".into(), "carol".into()])));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree }).unwrap();

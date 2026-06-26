@@ -55,9 +55,22 @@ into the Escrow — not the Keyring — for every identity including the origina
 `now >= reveal_at`; until then the Keyring holds nothing for that object and
 `open` returns `Embargoed`. The Workspace calls `flush_escrow` before every
 content-reading operation (`checkout`, `snapshot`). Bundles ship embargoed keys
-as a separate escrow section so peers receive them into their own Escrow. This
-closes the D-threat: no identity holds a usable decryption key before reveal
-time, not even the originator.
+as a separate escrow section so peers receive them into their own Escrow.
+
+**Threat model (be precise — the earlier glossary overclaimed).** Embargo is
+currently enforced **cooperatively**, against an *honest holder running an honest
+clock*. The escrow withholds the key from the Keyring until `flush_escrow(now)`
+sees `now >= reveal_at`, where `now` is the local clock injected by the
+Workspace. Against an adversarial holder this is **not** a hard guarantee: they
+can advance their clock, pass a future `now`, or read the escrow key bytes
+directly with a modified binary. So embargo today raises the bar (a normal
+client cannot read embargoed content early) but does not *cryptographically*
+withhold the key from a determined local adversary. The D-threat is closed only
+against honest participants. A hard guarantee requires a third party that holds
+the key and releases it at `reveal_at` (network escrow, time-lock, or threshold
+crypto) — see *External-service escrow* under Open / undecided. The seam is
+designed for that swap; until then, do not represent embargo as
+adversary-proof.
 
 **Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
 identities permitted to hold a key). It deliberately does **not** contain any
@@ -127,9 +140,9 @@ identity can't open the content now); `Some(plaintext)` is what the merger uses
 to tell a clean *Merged* from a *Conflict*. The classifier never sees keys or
 ciphertext — only this oracle.
 
-**Grant** — a key handoff event: the act of making an existing content key available to a new identity. Grants travel as targeted bundles (the grantor controls delivery by choosing who receives the bundle); the key itself rides in the bundle's keyring section. Grants are auditable via the Manifest. The primitive underlying marooning and visibility migration. CLI: `loot grant <path> <identity>`.
+**Grant** — a key handoff event: the act of making an existing content key available to a new identity. Grants travel as targeted bundles (the grantor controls delivery by choosing who receives the bundle); the key itself rides sealed to the recipient's pubkey (ECIES, ADR 0014). A grant is **signed by the grantor** (the push envelope, ADR 0014) so the recipient and every downstream peer can verify who issued it — an unauthenticated grant would let any party forge audit history. The grantee is identified by **pubkey**, not local name: the key is sealed to that pubkey and `apply` accepts the grant iff the recipient's own key unseals it (the cryptographic unseal *is* the authorization gate; there is no name compare). Names are local nicknames resolved to pubkeys via the [[Peer registry]] before a grant is ever issued. The primitive underlying marooning and visibility migration. CLI: `loot grant <path> <identity>`.
 
-**Manifest** — an append-only record of grant events (`oid`, `grantee`, `granted_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who was given access to what. Carries only the *fact* of a grant, never the key itself. Named for a ship's manifest recording what cargo was loaded and by whom.
+**Manifest** — an append-only record of grant events (`oid`, `grantee_pubkey`, `grantor_pubkey`, `granted_at`), separate from the change graph. Travels in bundles alongside objects and escrow entries so every peer has a complete audit trail of who granted what to whom. Both parties are recorded as **pubkeys** (the only globally-stable identity; names are local), resolved to friendly names only at display time. Carries only the *fact* of a grant, never the key itself. The grantor pubkey is bound by the grant's signature, so the trail is forge-evident. Named for a ship's manifest recording what cargo was loaded and by whom.
 
 **Maroon** — to cut off an identity's access to a path. Two levels:
 
@@ -144,11 +157,21 @@ ciphertext — only this oracle.
 
 **Identity keypair** — an ed25519 keypair generated at `loot init` (or backfilled via `loot keygen`), stored as `.loot/id` (private, mode 0600) and `.loot/id.pub` (OpenSSH public key line) (ADR 0014). The keypair serves two purposes: signing push envelopes so relays can verify authenticity, and (via a derived x25519 key) sealing grant bundles to a recipient's public key so relay delivery of grants becomes safe. Identity strings (`"alice"`, `"@relay"`) remain the primary identifier everywhere; the keypair is the credential that backs the name. Peer public keys are registered in `.loot/peers` via `loot peer add <name> <pubkey>`.
 
-**Push envelope** — a 97-byte header wrapping every push body: `[0x01][pubkey 32][signature 64][bundle...]` (ADR 0014). The relay verifies the signature and checks the optional allowlist before stowing. Transport-agnostic by design — works over any future transport, not just HTTP.
+**Peer registry** — a repo's local map of nickname to public key, stored in `.loot/peers` as `name = <openssh-pubkey-line>` pairs, managed via `loot peer add/remove/list` (ADR 0014). It is the `known_hosts` of loot: the place you record "this pubkey is who I call alice" after verifying it out-of-band. Two roles: it resolves a name argument to a pubkey when *issuing* a grant (sealing to the right key), and it gates *accepting* a grant — a grant from a pubkey not in the registry is quarantined, not applied (ADR 0015). Names are purely local; the registry is what binds them to the globally-stable pubkey.
+
+**Identity portability** — moving the *same* identity to another machine via `loot id export <file>` / `loot id import <file>` (ADR 0016). The exported file is always passphrase-wrapped (OpenSSH native encryption) because it travels and is the highest-risk artifact; the in-repo `.loot/id` stays unencrypted at rest (filesystem perms 0600). Distinct from *rotation* (a new key while staying the same identity to peers), which is deferred — likely modeled as "new identity + re-grant wave" reusing [[Grant]] and [[Maroon]] rather than cryptographic key-succession.
+
+**Push envelope** — a 97-byte header wrapping every push body: `[0x01][pubkey 32][signature 64][bundle...]` (ADR 0014). The relay verifies the signature and checks the optional allowlist before stowing. The same envelope also wraps sealed grant bundles so the recipient can verify the grantor (ADR 0015). Transport-agnostic by design — works over any future transport, not just HTTP.
 
 **Remote** — a named relay URL stored in `.loot/config` as `name = url` (ADR 0013). Managed via `loot remote add/remove/list`. `loot push` and `loot pull` resolve their target as: explicit URL > `--remote <name>` > `origin` default. Analogous to git's remotes; the name `origin` is the conventional default but nothing is special about it in the engine.
 
-**Network sync (`serve`/`push`/`pull`)** — the transport layer over `bundle`/`stow`/`apply` (ADR 0011). `loot serve` runs an open relay (HTTP, two endpoints: `POST /stow` for push, `POST /negotiate` for pull). `loot push [<url>]` is a deliberate *disclosure* act — it publishes the changes the relay lacks; `loot pull [<url>]` fetches the changes the local repo lacks and `apply`s them into the working change. Both resolve the target relay via the [[Remote]] config when no URL is given. Push and pull are distinct verbs because their security intent differs even though the mechanics are symmetric: a pull receives key-gated ciphertext (safe by construction); a push persists sealed content to another node. File-based `bundle`/`apply` are retained as the offline/sneakernet path.
+**Global config** — user-level defaults at `$XDG_CONFIG_HOME/loot/config` (falling back to `~/.config/loot/config`), same `key = value` format as the repo `.loot/config`. Holds cross-repo identity defaults so commands like `clone` and `init` need not retype `--identity` every time. Resolution: explicit flag > global config. Scope is deliberately narrow — currently just `identity`; remotes stay per-repo (an `origin` means different URLs in different projects). Once a repo exists, its `.loot/identity` is authoritative and the global default no longer applies.
+
+**Clone** — `loot clone <url> <dir> [--identity <name>]`: the batteries-included front door for getting a repo onto a fresh machine. Composes existing primitives — init (fresh identity, from `--identity` or [[Global config]]) + remote add origin + pull + surface — so it ends with a materialized working tree, like `git clone`. A fresh cloner is a [[Relay]] by default: they receive the ciphertext but can read only public or already-granted content; sealed paths are skipped at surface time with a hint to request a [[Grant]]. Requires an explicit target dir (relay URLs have no natural project name); errors if the dir is non-empty. Bringing an *existing* identity to a new machine is a separate concern (identity portability), not clone.
+
+**Network sync (`serve`/`push`/`pull`)** — the transport layer over `bundle`/`stow`/`apply` (ADR 0011). `loot serve` runs an open relay (HTTP, two endpoints: `POST /stow` for push, `POST /negotiate` for pull). `loot push [<url>]` is a deliberate *disclosure* act — it publishes the changes the relay lacks; `loot pull [<url>]` fetches the changes the local repo lacks and `apply`s them into the working change. Both resolve the target relay via the [[Remote]] config when no URL is given (one shared resolver: explicit URL > `--remote <name>` > `origin` — `grant --relay` and `pull-grants` use it too). Push and pull are distinct verbs because their security intent differs even though the mechanics are symmetric: a pull receives key-gated ciphertext (safe by construction); a push persists sealed content to another node. File-based `bundle`/`apply` are retained as the offline/sneakernet path.
+
+**Grant discovery (`grants` / `pull-grants`)** — three honest verbs with distinct contracts so network I/O never creeps into offline commands. `loot status` stays strictly local (snapshot + report, no network). `loot grants` makes a deliberate network call to *peek* the relay mailbox — reports the pending count without draining ("2 grants pending at origin"). `loot pull-grants` is the mutating fetch: it drains the mailbox, verifies each grant's grantor signature, applies those from registered peers (quarantining unknown grantors, ADR 0015), and files the unsealed keys. This is pull-based discovery — the recipient must run `loot grants` to learn what is waiting; true push notification needs relay-initiated delivery infrastructure and is out of scope.
 
 **Loose object storage** — each SealedObject persists as its own content-addressed file at `objects/<hex-address>`, written once and immutably via atomic rename (ADR 0012). Dedup is "does the file exist"; a push writes only the new objects (O(delta), not O(store)), killing the whole-repo-rewrite bottleneck for relays. Concurrent writes to disjoint objects are lock-free (distinct filenames); only the small graph metadata is serialized. Git's loose-object model, made natural by content addressing.
 
@@ -181,17 +204,32 @@ tree so the decision is reproducible (`cargo test --release`).
 
 ## Open / undecided
 
-- **External-service escrow.** The current Escrow module is local: a
-  determined keyholder with access to the `.loot/` directory and a modified
-  binary could still read the key bytes directly. A production guarantee requires
-  a network escrow service that holds the key and only releases it at `reveal_at`.
-  The seam is designed for this: replacing `Escrow::flush` with a network call
-  leaves everything else unmodified. Deferred until the network layer exists.
+- **External-service escrow (hard embargo enforcement).** The current Escrow
+  module is local and trusts the local clock: a determined keyholder can read the
+  key bytes directly with a modified binary, OR simply advance their clock / pass
+  a future `now` to trigger `flush_escrow` early. Both the *key-custody* gap and
+  the *clock-trust* gap are the same slice — a production guarantee requires a
+  third party that holds the key and releases it at `reveal_at` (network escrow,
+  time-lock, or threshold crypto), which also removes the local-clock dependency.
+  A half-measure (e.g. tamper-evident flush logging, or a second time source) was
+  considered and rejected: it implies unbuilt monitoring/authority infrastructure
+  and would be thrown away when real escrow lands. The seam is designed: replacing
+  `Escrow::flush` with a network call leaves everything else unmodified. Deferred
+  as one coherent slice until the network layer exists.
 
 - **Relay announcement.** A relay peer declaring its relay status so senders
   can discover who holds a key before bundling — enabling selective delivery
   rather than ship-everything. Independent of key management; deferred until
   grant/revocation are working.
+
+- **Key provenance chains.** A grant proves *who* issued it (signature, ADR 0015)
+  but not that the grantor legitimately held the key, traced to the content's
+  originator. Eve can sign a valid grant for content she holds but had no
+  authority over; we accept this. A real fix needs an originator-authority model
+  (not yet defined) plus a back-reference on each grant to the grant that
+  authorized the grantor. The ADR 0015 signature + Manifest structure are the
+  foundation it would build on. Deferred — speculative until originator authority
+  is defined.
 
 - **Object-level sync negotiation.** Sync negotiates at the *change-id* level:
   the client sends its tips, the relay ships every change the client lacks plus

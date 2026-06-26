@@ -104,6 +104,12 @@ pub fn deposit(relay_dir: &Path, recipient: &str, blob: &[u8]) -> Result<String,
     Ok(hash)
 }
 
+/// Return the count of pending grant blobs for `recipient` without fetching or deleting them.
+pub fn peek_count(relay_dir: &Path, recipient: &str) -> Result<usize, NetError> {
+    let index = load_index(relay_dir);
+    Ok(index.get(recipient).map_or(0, |h| h.len()))
+}
+
 /// Fetch and delete all pending grant blobs for `recipient`.
 /// Returns the raw blob bytes. Missing blob files are silently skipped
 /// (may have been partially delivered by a concurrent pull).

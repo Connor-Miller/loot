@@ -180,8 +180,10 @@ fn allowlist_rejects_unknown_pusher() {
 }
 
 /// Sealed grant relay round-trip: alice seals a content key for bob (x25519/ECIES),
-/// deposits it at the relay mailbox, bob fetches it and applies it — then he can
-/// read content he previously couldn't decrypt.
+/// signs it in a push envelope, deposits it at the relay mailbox addressed by
+/// bob's pubkey hex, bob fetches+unwraps the envelope, checks the grantor is
+/// registered, and applies the sealed grant — then he can read content he
+/// previously couldn't decrypt. (ADR 0015)
 #[test]
 fn sealed_grant_relay_round_trip() {
     let relay_dir = tmp("relay-grant");
@@ -193,35 +195,60 @@ fn sealed_grant_relay_round_trip() {
     });
     wait_for_relay(&base);
 
+    // Alice has an identity keypair (she signs the grant envelope).
+    let alice_id = alice_identity();
+    let alice_pubkey = alice_id.public_key_bytes();
+
     // Alice creates restricted content and holds the key.
     let alice_dir = tmp("alice-grant");
     let (mut alice_repo, oid) = build_restricted_repo(&alice_dir, "alice");
 
-    // Bob has an identity keypair; alice registers his public key.
+    // Bob has an identity keypair; alice will address the mailbox by bob's pubkey.
     let bob_id = Identity::generate();
+    let bob_ed_pubkey = bob_id.public_key_bytes();
     let bob_x25519 = bob_id.x25519_pubkey_bytes();
 
-    // Alice produces a sealed grant bundle (tag 3) — key wrapped to bob's x25519 key.
-    let sealed_bundle = alice_repo.grant_sealed(&oid, "bob", 0, |content_key| {
-        key_seal::seal_key(content_key, &bob_x25519)
-            .map_err(|e| RepoError::Backend(e.to_string()))
-    }).unwrap();
+    // Bob's pubkey hex = mailbox address (relay learns no names, ADR 0015).
+    let bob_pubkey_hex: String = bob_ed_pubkey.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Alice delivers the sealed bundle to the relay mailbox.
-    loot_net::deliver_grant(&base, "bob", &sealed_bundle.0).unwrap();
+    let now = 0u64;
 
-    // Bob fetches his grants. The relay held the ciphertext — it cannot read it.
-    let blobs = loot_net::fetch_grants(&base, "bob").unwrap();
-    assert_eq!(blobs.len(), 1, "bob should have exactly one pending grant");
+    // Alice produces a sealed grant bundle (tag 3): grantee_pubkey + wrapped_key + oid + payload.
+    let sealed_bundle = alice_repo.grant_sealed(
+        &oid, "bob", bob_ed_pubkey, alice_pubkey, now,
+        |content_key| {
+            key_seal::seal_key(content_key, &bob_x25519)
+                .map_err(|e| RepoError::Backend(e.to_string()))
+        }
+    ).unwrap();
+
+    // Alice wraps the bundle in a push envelope (she signs it — ADR 0015).
+    let envelope = alice_id.wrap_envelope(&sealed_bundle.0);
+
+    // Alice delivers the envelope to bob's pubkey-addressed mailbox.
+    loot_net::deliver_grant(&base, &bob_pubkey_hex, &envelope).unwrap();
+
+    // Bob peeks: should show 1 pending grant.
+    let count = loot_net::peek_grants(&base, &bob_pubkey_hex).unwrap();
+    assert_eq!(count, 1, "peek should show 1 pending grant before drain");
+
+    // Bob fetches his grants (envelopes). The relay held opaque ciphertext.
+    let envelopes = loot_net::fetch_grants(&base, &bob_pubkey_hex).unwrap();
+    assert_eq!(envelopes.len(), 1, "bob should have exactly one pending grant");
 
     // Mailbox is now drained.
-    let after_drain = loot_net::fetch_grants(&base, "bob").unwrap();
+    let after_drain = loot_net::fetch_grants(&base, &bob_pubkey_hex).unwrap();
     assert!(after_drain.is_empty(), "grants must be deleted on delivery");
+
+    // Unwrap the push envelope: get grantor pubkey + bundle bytes.
+    let (grantor_pubkey, bundle_bytes) =
+        loot_identity::unwrap_envelope(&envelopes[0], &[]).unwrap();
+    assert_eq!(grantor_pubkey, alice_pubkey, "grantor pubkey must match alice's signing key");
 
     // Bob applies the sealed grant — his identity unseals the wrapped key.
     let mut bob_repo = DagRepo::init(tmp("bob-grant").join("work"), "bob").unwrap();
-    let grant_bundle = SyncBundle(blobs.into_iter().next().unwrap());
-    bob_repo.apply_sealed_grant(&grant_bundle, |wrapped| {
+    let grant_bundle = SyncBundle(bundle_bytes.to_vec());
+    bob_repo.apply_sealed_grant(&grant_bundle, grantor_pubkey, now, |wrapped| {
         bob_id.unseal_key(wrapped)
             .map_err(|e| RepoError::Backend(e.to_string()))
     }).unwrap();

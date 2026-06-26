@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         "push" => cmd_push(rest),
         "pull" => cmd_pull(rest),
         "pull-grants" => cmd_pull_grants(rest),
+        "grants" => cmd_grants(rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -85,7 +86,8 @@ usage:
   loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
   loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
-  loot pull-grants [<url>] [--remote <name>]   fetch sealed grants from relay and apply them";
+  loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
+  loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -257,16 +259,20 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let dot = ws.dot().to_owned();
 
-    // Resolve the relay URL: named remote or direct URL.
-    let url = ws.remote_url(relay_target)
-        .unwrap_or_else(|| relay_target.to_string());
+    // Resolve the relay URL via the shared helper (consistent with push/pull).
+    let url = resolve_remote(args, &ws)
+        .unwrap_or_else(|_| relay_target.to_string());
 
-    // Look up the recipient's ed25519 pubkey and convert to x25519 for sealing.
+    // Load our signing identity (grantor).
+    let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
+    let grantor_pubkey = id.public_key_bytes();
+
+    // Look up recipient's ed25519 pubkey; derive x25519 for ECIES sealing.
     let reg = identity::PeerRegistry::load(&dot);
-    let ed_pubkey = reg.pubkey_bytes(grantee)
+    let grantee_ed_pubkey = reg.pubkey_bytes(grantee)
         .map_err(|e| format!("peer '{grantee}': {e}"))?
         .ok_or_else(|| format!("peer '{grantee}' not found — run `loot peer add {grantee} <pubkey>` first"))?;
-    let recipient_x25519 = identity::x25519_pubkey_from_ed25519_bytes(&ed_pubkey)
+    let recipient_x25519 = identity::x25519_pubkey_from_ed25519_bytes(&grantee_ed_pubkey)
         .map_err(|e| format!("could not derive x25519 key for '{grantee}': {e}"))?;
 
     let now = ws.now();
@@ -276,15 +282,20 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
     let bundle = ws.with_repo(|repo| {
-        repo.grant_sealed(&oid, grantee, now, |content_key| {
+        repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, now, |content_key| {
             identity::seal_key(content_key, &recipient_x25519)
                 .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
         }).map_err(|e| e.to_string())
     })?;
 
-    loot_net::deliver_grant(&url, grantee, &bundle.0).map_err(|e| e.to_string())?;
+    // Wrap in a push envelope so the recipient can verify the grantor (ADR 0015).
+    let envelope = id.wrap_envelope(&bundle.0);
+
+    // Address the mailbox by grantee pubkey hex (relay learns no names, ADR 0015).
+    let grantee_pubkey_hex = hex_encode(&grantee_ed_pubkey);
+    loot_net::deliver_grant(&url, &grantee_pubkey_hex, &envelope).map_err(|e| e.to_string())?;
     println!("delivered sealed grant for '{grantee}' via relay {url}");
-    println!("  {path} → {grantee} (sealed, recorded in manifest)");
+    println!("  {path} → {grantee} (sealed, signed, recorded in manifest)");
     println!("  recipient runs `loot pull-grants` to receive it");
     Ok(())
 }
@@ -416,19 +427,37 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
 
 fn cmd_manifest() -> Result<(), String> {
     let ws = Workspace::open()?;
+    let dot = ws.dot().to_owned();
+    let reg = identity::PeerRegistry::load(&dot);
     let entries: Vec<_> = ws.repo().manifest().iter().collect();
     if entries.is_empty() {
         println!("no grants recorded");
         return Ok(());
     }
-    println!("{:<12} {:<32} oid", "granted_at", "grantee");
+    println!("{:<12} {:<16} {:<16} oid", "granted_at", "grantee", "grantor");
     println!("{}", "-".repeat(72));
     let mut sorted = entries;
     sorted.sort_by_key(|e| e.granted_at);
     for e in sorted {
-        println!("{:<12} {:<32} {}", e.granted_at, e.grantee, short_oid(&e.oid));
+        let grantor = if e.has_grantor() {
+            resolve_pubkey_name(&reg, &e.grantor_pubkey)
+        } else {
+            "(file)".to_string()
+        };
+        println!("{:<12} {:<16} {:<16} {}", e.granted_at, e.grantee, grantor, short_oid(&e.oid));
     }
     Ok(())
+}
+
+fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> String {
+    for (name, pubkey_line) in reg.list() {
+        if identity::PeerRegistry::parse_pubkey_bytes_from_line(pubkey_line)
+            .map_or(false, |pk| &pk == pubkey)
+        {
+            return name.to_string();
+        }
+    }
+    hex_short(pubkey)
 }
 
 fn cmd_conflicts() -> Result<(), String> {
@@ -475,26 +504,72 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_grants(args: &[String]) -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let dot = ws.dot().to_owned();
+    let url = resolve_remote(args, &ws)?;
+    let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
+    let my_pubkey_hex = hex_encode(&id.public_key_bytes());
+    let count = loot_net::peek_grants(&url, &my_pubkey_hex).map_err(|e| e.to_string())?;
+    if count == 0 {
+        println!("no pending grants at {url}");
+    } else {
+        println!("{count} grant(s) pending at {url} — run `loot pull-grants` to receive");
+    }
+    Ok(())
+}
+
 fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let dot = ws.dot().to_owned();
     let url = resolve_remote(args, &ws)?;
 
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
-    let my_name = ws.identity().to_string();
+    let my_pubkey = id.public_key_bytes();
+    let my_pubkey_hex = hex_encode(&my_pubkey);
     let now = ws.now();
 
-    let blobs = loot_net::fetch_grants(&url, &my_name).map_err(|e| e.to_string())?;
-    if blobs.is_empty() {
+    // Fetch by pubkey hex — relay addresses mailbox by pubkey, not name (ADR 0015).
+    let envelopes = loot_net::fetch_grants(&url, &my_pubkey_hex).map_err(|e| e.to_string())?;
+    if envelopes.is_empty() {
         println!("no pending grants at {url}");
         return Ok(());
     }
 
+    let reg = identity::PeerRegistry::load(&dot);
     let mut applied = 0usize;
-    for blob in &blobs {
-        let bundle = loot_core::SyncBundle(blob.clone());
+    let mut quarantined = 0usize;
+
+    for envelope_bytes in &envelopes {
+        // Unwrap the push envelope: verifies grantor signature (ADR 0015).
+        let (grantor_pubkey, bundle_bytes) =
+            match identity::unwrap_envelope(envelope_bytes, &[]) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("loot: skipping grant (bad envelope): {e}");
+                    continue;
+                }
+            };
+
+        // Peer-registry gate: only accept grants from registered peers (ADR 0015).
+        let grantor_known = reg.list()
+            .iter()
+            .any(|(_, pubkey_line)| {
+                identity::PeerRegistry::parse_pubkey_bytes_from_line(pubkey_line)
+                    .map_or(false, |pk| pk == grantor_pubkey)
+            });
+        if !grantor_known {
+            eprintln!(
+                "loot: quarantined grant from unknown key {} — run `loot peer add <name> <pubkey>` to trust",
+                hex_short(&grantor_pubkey)
+            );
+            quarantined += 1;
+            continue;
+        }
+
+        let bundle = loot_core::SyncBundle(bundle_bytes.to_vec());
         let result = ws.with_repo(|repo| {
-            repo.apply_sealed_grant(&bundle, |wrapped| {
+            repo.apply_sealed_grant(&bundle, grantor_pubkey, now, |wrapped| {
                 id.unseal_key(wrapped)
                     .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
             }).map_err(|e| e.to_string())
@@ -504,8 +579,11 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
             Err(e) => eprintln!("loot: skipping grant (could not apply): {e}"),
         }
     }
-    let _ = now;
-    println!("applied {applied}/{n} grant(s) from {url}", n = blobs.len());
+
+    println!("applied {applied}/{n} grant(s) from {url}", n = envelopes.len());
+    if quarantined > 0 {
+        println!("  {quarantined} quarantined (unknown grantor) — register the sender as a peer to trust them");
+    }
     if applied > 0 {
         println!("run `loot surface` to materialize newly-accessible content");
     }
@@ -746,6 +824,14 @@ fn short(oid: &Oid) -> String {
 
 fn short_oid(oid: &Oid) -> String {
     short(oid)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_short(bytes: &[u8]) -> String {
+    bytes[..4].iter().map(|b| format!("{b:02x}")).collect::<String>() + "…"
 }
 
 #[cfg(test)]

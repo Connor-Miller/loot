@@ -115,6 +115,7 @@ async fn serve_async(store: RelayStore, dir: PathBuf, addr: &str, allowed_keys: 
         .route("/negotiate", post(handle_negotiate))
         .route("/grant", post(handle_deposit_grant))
         .route("/pull-grants", post(handle_pull_grants))
+        .route("/grants/peek", post(handle_peek_grants))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -169,6 +170,24 @@ async fn handle_deposit_grant(
     mailbox::deposit(&state.relay_dir, recipient, blob)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok("deposited".into())
+}
+
+async fn handle_peek_grants(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    body: axum::body::Bytes,
+) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
+    if body.len() < 4 {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "body too short".into()));
+    }
+    let name_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    if body.len() < 4 + name_len {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "recipient name truncated".into()));
+    }
+    let recipient = std::str::from_utf8(&body[4..4 + name_len])
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    let count = mailbox::peek_count(&state.relay_dir, recipient)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((count as u32).to_le_bytes().to_vec())
 }
 
 async fn handle_pull_grants(
@@ -257,6 +276,28 @@ pub fn deliver_grant(base_url: &str, recipient: &str, blob: &[u8]) -> Result<(),
         return Err(NetError::Http(format!("relay rejected grant deposit ({code}): {msg}")));
     }
     Ok(())
+}
+
+/// Peek the pending grant count for `recipient` without fetching or draining.
+pub fn peek_grants(base_url: &str, recipient: &str) -> Result<usize, NetError> {
+    let url = format!("{}/grants/peek", base_url.trim_end_matches('/'));
+    let rb = recipient.as_bytes();
+    let mut body = Vec::with_capacity(4 + rb.len());
+    body.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+    body.extend_from_slice(rb);
+    let client = reqwest::blocking::Client::new();
+    let resp = client.post(&url).body(body).send()
+        .map_err(|e| NetError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let msg = resp.text().unwrap_or_default();
+        return Err(NetError::Http(format!("relay rejected peek ({code}): {msg}")));
+    }
+    let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
+    if bytes.len() < 4 {
+        return Err(NetError::Http("peek response too short".into()));
+    }
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
 }
 
 /// Fetch and drain all sealed grant blobs addressed to `recipient`.

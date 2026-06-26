@@ -64,6 +64,16 @@ impl PeerRegistry {
         Ok(Some(ed_key.0))
     }
 
+    /// Parse an OpenSSH public key *line* (not a peer name) directly into ed25519
+    /// bytes. Used when verifying a grantor pubkey against all registered peers.
+    pub fn parse_pubkey_bytes_from_line(line: &str) -> Result<[u8; 32], IdentityError> {
+        let pub_key = ssh_key::PublicKey::from_openssh(line)
+            .map_err(|e| IdentityError::Format(e.to_string()))?;
+        let ed_key = pub_key.key_data().ed25519()
+            .ok_or_else(|| IdentityError::Format("key is not ed25519".into()))?;
+        Ok(ed_key.0)
+    }
+
     /// Persist to disk.
     pub fn save(&self) -> Result<(), IdentityError> {
         let mut out = String::new();
