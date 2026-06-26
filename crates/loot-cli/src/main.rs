@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         "grants" => cmd_grants(rest),
         "clone" => cmd_clone(rest),
         "config" => cmd_config(rest),
+        "id" => cmd_id(rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -85,6 +86,8 @@ usage:
   loot remote list                          show all named relays
   loot keygen                               generate an identity keypair (backfills existing repos)
   loot whoami                               show this repo's public key
+  loot id export <file>                     export keypair to <file>, passphrase-encrypted
+  loot id import <file>                     import keypair from passphrase-encrypted <file>
   loot peer add <name> <pubkey>             register a peer's public key
   loot peer remove <name>                   forget a peer
   loot peer list                            show all known peers
@@ -673,7 +676,49 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// --- identity keypairs (ADR 0014) ---
+// --- identity keypairs (ADR 0014, 0016) ---
+
+fn cmd_id(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    match sub {
+        "export" => {
+            let file = args.get(1).ok_or("id export requires <file>")?;
+            let ws = Workspace::open()?;
+            let dot = ws.dot();
+            if !identity::keypair_exists(dot) {
+                return Err("no identity keypair — run `loot keygen` to generate one".into());
+            }
+            let id = identity::load_or_missing(dot).map_err(|e| e.to_string())?;
+            let passphrase = identity::prompt_new_passphrase().map_err(|e| e.to_string())?;
+            id.export_encrypted(std::path::Path::new(file.as_str()), &passphrase, &format!("{}@loot", ws.identity()))
+                .map_err(|e| e.to_string())?;
+            println!("exported identity to {file} (passphrase-encrypted)");
+            println!("  move this file to your other machine and run `loot id import {file}`");
+            Ok(())
+        }
+        "import" => {
+            let file = args.get(1).ok_or("id import requires <file>")?;
+            let ws = Workspace::open()?;
+            let dot = ws.dot();
+            if identity::keypair_exists(dot) {
+                return Err(
+                    "a keypair already exists at .loot/id — remove it first if you want to replace it".into()
+                );
+            }
+            let passphrase = identity::prompt_passphrase().map_err(|e| e.to_string())?;
+            let id = identity::Identity::import_encrypted(std::path::Path::new(file.as_str()), &passphrase)
+                .map_err(|e| e.to_string())?;
+            id.save(dot, &format!("{}@loot", ws.identity()))
+                .map_err(|e| e.to_string())?;
+            let pub_line = std::fs::read_to_string(dot.join("id.pub"))
+                .map_err(|e| format!("read id.pub: {e}"))?;
+            println!("imported identity keypair");
+            println!("public key: {}", pub_line.trim());
+            Ok(())
+        }
+        _ => Err("id subcommands: export <file> | import <file>".into()),
+    }
+}
 
 fn cmd_keygen() -> Result<(), String> {
     let ws = Workspace::open()?;

@@ -30,6 +30,28 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
+/// Prompt for a passphrase twice (new passphrase), confirming they match.
+/// Returns `Err` on mismatch or I/O failure.
+pub fn prompt_new_passphrase() -> Result<String, IdentityError> {
+    let pass = rpassword::prompt_password("Enter export passphrase: ")
+        .map_err(|e| IdentityError::Io(e.to_string()))?;
+    let confirm = rpassword::prompt_password("Confirm passphrase: ")
+        .map_err(|e| IdentityError::Io(e.to_string()))?;
+    if pass != confirm {
+        return Err(IdentityError::Format("passphrases do not match".into()));
+    }
+    if pass.is_empty() {
+        return Err(IdentityError::Format("passphrase must not be empty".into()));
+    }
+    Ok(pass)
+}
+
+/// Prompt for an existing passphrase (import).
+pub fn prompt_passphrase() -> Result<String, IdentityError> {
+    rpassword::prompt_password("Enter passphrase: ")
+        .map_err(|e| IdentityError::Io(e.to_string()))
+}
+
 mod peers;
 pub mod key_seal;
 pub use peers::PeerRegistry;
@@ -148,6 +170,60 @@ impl Identity {
         );
         let pub_key = PublicKey::new(key_data, comment);
         pub_key.to_openssh().map_err(|e| IdentityError::Format(e.to_string()))
+    }
+
+    /// Export this keypair to `path`, passphrase-encrypted (OpenSSH native encryption).
+    /// The exported file is the highest-risk artifact — always passphrase-wrapped,
+    /// unlike the in-repo `.loot/id` which relies on filesystem permissions.
+    pub fn export_encrypted(&self, path: &Path, passphrase: &str, comment: &str) -> Result<(), IdentityError> {
+        let ed_private = ssh_key::private::Ed25519Keypair {
+            public: ssh_key::public::Ed25519PublicKey(self.signing_key.verifying_key().to_bytes()),
+            private: ssh_key::private::Ed25519PrivateKey::from_bytes(&self.signing_key.to_bytes()),
+        };
+        let private = PrivateKey::new(
+            ssh_key::private::KeypairData::Ed25519(ed_private),
+            comment,
+        ).map_err(|e| IdentityError::Format(e.to_string()))?;
+
+        let encrypted = private.encrypt(&mut OsRng, passphrase)
+            .map_err(|e| IdentityError::Format(format!("encrypt: {e}")))?;
+
+        let pem = encrypted.to_openssh(LineEnding::LF)
+            .map_err(|e| IdentityError::Format(e.to_string()))?;
+
+        std::fs::write(path, pem.as_bytes())
+            .map_err(|e| IdentityError::Io(e.to_string()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| IdentityError::Io(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Load an identity from a passphrase-encrypted export file.
+    /// Returns `Err(Format)` if the passphrase is wrong or the file is invalid.
+    pub fn import_encrypted(path: &Path, passphrase: &str) -> Result<Self, IdentityError> {
+        let pem = std::fs::read_to_string(path)
+            .map_err(|e| IdentityError::Io(e.to_string()))?;
+        let encrypted = PrivateKey::from_openssh(&pem)
+            .map_err(|e| IdentityError::Format(e.to_string()))?;
+
+        if !encrypted.is_encrypted() {
+            return Err(IdentityError::Format("export file is not passphrase-encrypted — refusing to import".into()));
+        }
+
+        let private = encrypted.decrypt(passphrase)
+            .map_err(|_| IdentityError::Format("wrong passphrase or corrupt export file".into()))?;
+
+        let key_data = private.key_data();
+        let ed_key = key_data.ed25519()
+            .ok_or_else(|| IdentityError::Format("expected ed25519 key in export file".into()))?;
+        let bytes: [u8; 32] = ed_key.private.to_bytes();
+        Ok(Identity { signing_key: SigningKey::from_bytes(&bytes) })
     }
 
     /// Sign `message` and return a 64-byte signature.
@@ -300,5 +376,57 @@ mod tests {
         let id = Identity::generate();
         id.save(&dir, "test").unwrap();
         assert!(keypair_exists(&dir));
+    }
+
+    #[test]
+    fn export_import_round_trips_keypair() {
+        let dir = tmp("export");
+        let id = Identity::generate();
+        let pubkey = id.public_key_bytes();
+        let export_path = dir.join("id.export");
+
+        id.export_encrypted(&export_path, "hunter2", "alice@loot").unwrap();
+
+        // Exported file must exist and be non-empty.
+        let bytes = std::fs::read(&export_path).unwrap();
+        assert!(!bytes.is_empty());
+
+        // Round-trip: import recovers the same keypair.
+        let imported = Identity::import_encrypted(&export_path, "hunter2").unwrap();
+        assert_eq!(imported.public_key_bytes(), pubkey, "import must recover the original keypair");
+    }
+
+    #[test]
+    fn import_rejects_wrong_passphrase() {
+        let dir = tmp("wrongpass");
+        let id = Identity::generate();
+        let export_path = dir.join("id.export");
+        id.export_encrypted(&export_path, "correct", "test@loot").unwrap();
+
+        let result = Identity::import_encrypted(&export_path, "wrong");
+        assert!(result.is_err(), "wrong passphrase must fail");
+    }
+
+    #[test]
+    fn export_file_is_passphrase_encrypted() {
+        let dir = tmp("encrypted");
+        let id = Identity::generate();
+        let export_path = dir.join("id.export");
+        id.export_encrypted(&export_path, "passphrase", "test@loot").unwrap();
+
+        // Loading the raw file without decrypting it must report is_encrypted.
+        let pem = std::fs::read_to_string(&export_path).unwrap();
+        let raw = ssh_key::PrivateKey::from_openssh(&pem).unwrap();
+        assert!(raw.is_encrypted(), "export file must be passphrase-encrypted");
+    }
+
+    #[test]
+    fn import_rejects_unencrypted_file() {
+        let dir = tmp("unenc");
+        let id = Identity::generate();
+        // save() writes unencrypted — import must refuse it
+        id.save(&dir, "test@loot").unwrap();
+        let result = Identity::import_encrypted(&dir.join("id"), "any-passphrase");
+        assert!(result.is_err(), "unencrypted key file must be rejected by import");
     }
 }

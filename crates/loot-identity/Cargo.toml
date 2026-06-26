@@ -17,3 +17,4 @@ rand.workspace = true
 chacha20poly1305.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
+rpassword = "7"
