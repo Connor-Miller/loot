@@ -85,6 +85,10 @@ impl Workspace {
     /// engine-owned). Reads the tree + `.lootattributes`, hands entries to the
     /// engine, tracks the resulting working id, and persists. Returns the
     /// working-change id and the entries' resolved visibilities for reporting.
+    ///
+    /// Idempotent: if the working tree hash matches the last recorded hash AND
+    /// the message matches, the engine call is skipped and the current working id
+    /// is returned unchanged. This makes repeated `loot status` calls cheap.
     pub fn snapshot(&mut self, message: &str) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
         // Promote any embargoed keys whose reveal time has passed before reading
         // content — `sealed::open` will then find them in the Keyring (ADR 0007).
@@ -99,13 +103,27 @@ impl Workspace {
             reported.push((rel.clone(), vis.clone()));
             entries.push((rel, bytes, vis));
         }
+        reported.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Hash the current working tree content + message. Skip the engine
+        // snapshot if nothing changed — running `loot status` repeatedly is safe.
+        let tree_hash = hash_tree(&entries, message);
+        let hash_path = self.dot.join("tree-hash");
+        let last_hash = std::fs::read(&hash_path).unwrap_or_default();
+        if last_hash == tree_hash {
+            if let Some(id) = &self.working {
+                return Ok((id.clone(), reported));
+            }
+        }
+
         let id = self
             .repo
             .snapshot(self.working.as_ref(), &entries, message, self.now)
             .map_err(|e| e.to_string())?;
         self.working = Some(id.clone());
+        // Persist the new tree hash before persisting the rest of state.
+        let _ = std::fs::write(&hash_path, &tree_hash);
         self.persist()?;
-        reported.sort_by(|a, b| a.0.cmp(&b.0));
         Ok((id, reported))
     }
 
@@ -113,13 +131,20 @@ impl Workspace {
     /// new change rather than rewriting this one.
     pub fn finalize_working(&mut self) -> Result<(), String> {
         self.working = None;
+        // Clear the tree-hash so the next snapshot always runs the engine.
+        let _ = std::fs::remove_file(self.dot.join("tree-hash"));
         self.persist()
     }
 
     /// Materialize what the current identity may see from the tip change.
     pub fn surface(&mut self) -> Result<Oid, String> {
-        // Promote embargoed keys before materializing — same flush discipline as
-        // snapshot (ADR 0007). Takes &mut self because flush mutates the escrow.
+        let (head, _, _) = self.surface_with_report()?;
+        Ok(head)
+    }
+
+    /// Like `surface`, but also returns the written paths+visibility and the
+    /// count of skipped (sealed) paths for richer CLI output.
+    pub fn surface_with_report(&mut self) -> Result<(Oid, Vec<(PathBuf, loot_core::Visibility)>, usize), String> {
         self.repo.flush_escrow(self.now);
         let head = self
             .repo
@@ -127,11 +152,16 @@ impl Workspace {
             .into_iter()
             .next()
             .ok_or("nothing to surface yet (no changes recorded)")?;
-        self.repo
-            .surface(&head, &self.identity, self.now)
+        let (written, skipped) = self.repo
+            .surface_with_report(&head, &self.identity, self.now)
             .map_err(|e| e.to_string())?;
         self.persist()?;
-        Ok(head)
+        Ok((head, written, skipped))
+    }
+
+    /// The id of the current working change, if one is in progress.
+    pub fn working_id(&self) -> Option<&Oid> {
+        self.working.as_ref()
     }
 
     /// Run a closure that mutates the repo, then persist. The single path for
@@ -401,6 +431,23 @@ impl GlobalConfig {
     }
 }
 
+/// Hash the working tree entries + message for idempotent snapshot detection.
+/// Returns 32 raw bytes (blake3). Stable: same inputs always produce the same
+/// hash regardless of platform or rust version.
+fn hash_tree(entries: &[(PathBuf, Vec<u8>, Visibility)], message: &str) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(message.as_bytes());
+    h.update(&[0]);
+    // entries arrive pre-sorted from walk(); hash in that order for stability.
+    for (path, bytes, _vis) in entries {
+        h.update(path.to_string_lossy().as_bytes());
+        h.update(&[0]);
+        h.update(bytes);
+        h.update(&[0]);
+    }
+    h.finalize().as_bytes().to_vec()
+}
+
 fn global_config_path() -> PathBuf {
     // XDG_CONFIG_HOME takes precedence; fall back to $HOME/.config
     let base = std::env::var("XDG_CONFIG_HOME")
@@ -558,5 +605,48 @@ mod tests {
         Workspace::init_at(&dir, "bob").unwrap();
         let ws = Workspace::open_at(&dir).unwrap();
         assert_eq!(ws.identity(), "bob");
+    }
+
+    #[test]
+    fn hash_tree_is_stable() {
+        use loot_core::Visibility;
+        let entries: Vec<(PathBuf, Vec<u8>, Visibility)> = vec![
+            (PathBuf::from("a.txt"), b"hello".to_vec(), Visibility::Public),
+            (PathBuf::from("b.txt"), b"world".to_vec(), Visibility::Public),
+        ];
+        let h1 = hash_tree(&entries, "msg");
+        let h2 = hash_tree(&entries, "msg");
+        assert_eq!(h1, h2);
+
+        // Different content -> different hash.
+        let entries2: Vec<(PathBuf, Vec<u8>, Visibility)> = vec![
+            (PathBuf::from("a.txt"), b"different".to_vec(), Visibility::Public),
+        ];
+        assert_ne!(hash_tree(&entries2, "msg"), h1);
+
+        // Different message -> different hash.
+        assert_ne!(hash_tree(&entries, "other"), h1);
+    }
+
+    #[test]
+    fn snapshot_is_idempotent_when_tree_unchanged() {
+        let dir = std::env::temp_dir().join(format!("loot-idem-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut ws = Workspace::init_at(&dir, "alice").unwrap();
+
+        // Write a file into the repo root.
+        std::fs::write(dir.join("file.txt"), b"content").unwrap();
+
+        let (id1, _) = ws.snapshot("init").unwrap();
+        let (id2, _) = ws.snapshot("init").unwrap();  // same tree + same message
+        assert_eq!(id1, id2, "snapshot must be idempotent when nothing changed");
+
+        // Different message breaks idempotency (message is part of the hash).
+        let (id3, _) = ws.snapshot("new message").unwrap();
+        assert_ne!(id1, id3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

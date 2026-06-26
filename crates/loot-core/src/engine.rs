@@ -646,6 +646,63 @@ impl DagRepo {
             .collect()
     }
 
+    /// Like `log`, but also returns per-change file counts by visibility class.
+    /// Returns `(id, message, total_files, restricted_files, embargoed_files)`.
+    pub fn log_detailed(&self) -> Vec<(Oid, String, usize, usize, usize)> {
+        self.graph
+            .in_order()
+            .into_iter()
+            .map(|c| {
+                let total = c.tree.len();
+                let restricted = c.tree.values()
+                    .filter(|(_, v)| matches!(v, Visibility::Restricted(_)))
+                    .count();
+                let embargoed = c.tree.values()
+                    .filter(|(_, v)| matches!(v, Visibility::Embargoed { .. }))
+                    .count();
+                (c.id.clone(), c.message.clone(), total, restricted, embargoed)
+            })
+            .collect()
+    }
+
+    /// Like `surface`, but also returns the list of materialized paths and their
+    /// visibility, plus a count of skipped (sealed) paths. Lets the CLI report
+    /// what was written without a second pass.
+    pub fn surface_with_report(
+        &self,
+        change: &Oid,
+        reader: &str,
+        now: u64,
+    ) -> Result<(Vec<(PathBuf, Visibility)>, usize), RepoError> {
+        let node = self
+            .graph
+            .get(change)
+            .ok_or_else(|| RepoError::NotFound(change.clone()))?;
+
+        let mut written: Vec<(PathBuf, Visibility)> = Vec::new();
+        let mut skipped = 0usize;
+
+        for (path, (oid, vis)) in &node.tree {
+            let bytes = match self.get(oid, reader, now) {
+                Ok(b) => b,
+                Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let dest = self.root.join(path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| RepoError::Backend(e.to_string()))?;
+            }
+            std::fs::write(&dest, &bytes).map_err(|e| RepoError::Backend(e.to_string()))?;
+            written.push((path.clone(), vis.clone()));
+        }
+
+        Ok((written, skipped))
+    }
+
     /// Load a repo previously written by [`save`] from `dir`. `root` is the
     /// working directory `surface` will materialize into (kept separate from
     /// `dir` so the store can live in `.loot/` while files land in the repo).

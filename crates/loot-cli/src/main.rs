@@ -169,24 +169,39 @@ fn cmd_new() -> Result<(), String> {
 
 fn cmd_surface() -> Result<(), String> {
     let mut ws = Workspace::open()?;
-    let head = ws.surface()?;
-    println!(
-        "surfaced {} as {} (content you may not see was skipped)",
-        short(&head),
-        ws.identity()
-    );
+    let (head, written, skipped) = ws.surface_with_report()?;
+    if written.is_empty() && skipped == 0 {
+        println!("nothing to surface (no changes recorded)");
+        return Ok(());
+    }
+    for (path, vis) in &written {
+        println!("  {:<32} {}", path.display(), mark(vis));
+    }
+    if skipped > 0 {
+        println!("  ({skipped} sealed path(s) skipped — request a grant to access them)");
+    }
+    println!("surfaced {} as {}", short(&head), ws.identity());
     Ok(())
 }
 
 fn cmd_log() -> Result<(), String> {
     let ws = Workspace::open()?;
-    let entries = ws.repo().log();
+    let entries = ws.repo().log_detailed();
     if entries.is_empty() {
         println!("no changes yet");
         return Ok(());
     }
-    for (id, message) in entries.into_iter().rev() {
-        println!("{}  {}", short(&id), message);
+    for (id, message, total, restricted, embargoed) in entries.into_iter().rev() {
+        let hint = match (restricted, embargoed) {
+            (0, 0) => String::new(),
+            (r, 0) => format!("  [{r}/{total} sealed]"),
+            (0, e) => format!("  [{e}/{total} embargoed]"),
+            (r, e) => format!("  [{r} sealed, {e} embargoed / {total}]"),
+        };
+        println!("{}  {}{}", short(&id), message, hint);
+    }
+    if let Some(working) = ws.working_id() {
+        println!("{}  (working change)", short(&working));
     }
     Ok(())
 }
@@ -744,7 +759,11 @@ fn cmd_whoami() -> Result<(), String> {
     }
     let pub_line = std::fs::read_to_string(dot.join("id.pub"))
         .map_err(|e| format!("read id.pub: {e}"))?;
-    println!("{} — {}", ws.identity(), pub_line.trim());
+    let pub_line = pub_line.trim();
+    println!("identity: {}", ws.identity());
+    println!("pubkey:   {pub_line}");
+    println!();
+    println!("share with peers:  loot peer add {} {pub_line}", ws.identity());
     Ok(())
 }
 
