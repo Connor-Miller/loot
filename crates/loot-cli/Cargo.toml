@@ -15,3 +15,4 @@ path = "src/main.rs"
 [dependencies]
 loot-core.workspace = true
 loot-net.workspace = true
+loot-identity.workspace = true

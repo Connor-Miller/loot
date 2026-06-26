@@ -1,4 +1,4 @@
-//! Network transport for loot sync (ADR 0011).
+//! Network transport for loot sync (ADR 0011, 0014).
 //!
 //! A loot **relay** is a node that holds ciphertext but no keys — and **a host
 //! is a relay that never sleeps**. This crate is the always-on incarnation: an
@@ -8,17 +8,19 @@
 //! `loot-core` stays pure-sync.
 //!
 //! Two endpoints, mirroring the two deliberate verbs:
-//! - `POST /stow` — push: body is raw sync-bundle bytes; the relay stows them
+//! - `POST /stow` — push: body is a signed envelope (ADR 0014):
+//!   `[0x01][pubkey 32][sig 64][bundle...]`. The relay verifies the signature,
+//!   checks against the allowlist (if configured), then stows the inner bundle
 //!   append-only (never merges — it holds no restricted keys).
 //! - `POST /negotiate` — pull: body is the caller's change-ids (`have`); the
 //!   relay replies with a bundle of everything it has that the caller lacks.
 //!
 //! Content is sealed end-to-end, so the relay learns nothing it could not relay
 //! anyway; transport security (TLS, when added) protects metadata and integrity,
-//! not content secrecy. Push authentication is out of scope for this slice — the
-//! relay is open (see CONTEXT.md / ADR 0011).
+//! not content secrecy.
 
 use loot_core::{DagRepo, Oid, Repo, SyncBundle};
+use loot_identity as identity;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -76,25 +78,33 @@ fn decode_have(body: &[u8]) -> Result<Vec<Oid>, NetError> {
 #[derive(Clone)]
 struct ServerState {
     relay: Arc<Mutex<RelayStore>>,
+    /// Allowed pusher public keys. Empty = open relay (any valid signature accepted).
+    allowed_keys: Arc<Vec<[u8; 32]>>,
 }
 
 /// Run the relay HTTP server on `addr` (e.g. `0.0.0.0:4000`), serving a relay
 /// store rooted at `dir`. Blocks until the process is killed. Creates the relay
 /// store (empty keyring + role marker) if `dir` is fresh.
-pub fn serve(dir: PathBuf, addr: &str) -> Result<(), NetError> {
+///
+/// `allowed_keys` — ed25519 public keys (32 bytes each) permitted to push. An
+/// empty slice means open relay: any valid signature is accepted.
+pub fn serve(dir: PathBuf, addr: &str, allowed_keys: Vec<[u8; 32]>) -> Result<(), NetError> {
     let store = RelayStore::open_or_init(&dir)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| NetError::Io(e.to_string()))?;
-    rt.block_on(serve_async(store, addr))
+    rt.block_on(serve_async(store, addr, allowed_keys))
 }
 
-async fn serve_async(store: RelayStore, addr: &str) -> Result<(), NetError> {
+async fn serve_async(store: RelayStore, addr: &str, allowed_keys: Vec<[u8; 32]>) -> Result<(), NetError> {
     use axum::routing::post;
     use axum::Router;
 
-    let state = ServerState { relay: Arc::new(Mutex::new(store)) };
+    let state = ServerState {
+        relay: Arc::new(Mutex::new(store)),
+        allowed_keys: Arc::new(allowed_keys),
+    };
     let app = Router::new()
         .route("/stow", post(handle_stow))
         .route("/negotiate", post(handle_negotiate))
@@ -113,7 +123,9 @@ async fn handle_stow(
     axum::extract::State(state): axum::extract::State<ServerState>,
     body: axum::body::Bytes,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let bundle = SyncBundle(body.to_vec());
+    let (_, bundle_bytes) = identity::unwrap_envelope(&body, &state.allowed_keys)
+        .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let bundle = SyncBundle(bundle_bytes.to_vec());
     let mut relay = state.relay.lock().await;
     relay
         .stow(&bundle)
@@ -135,14 +147,17 @@ async fn handle_negotiate(
 
 // --- client (`loot push` / `loot pull`) ---
 
-/// Push raw sync-bundle bytes to a relay's `/stow` endpoint. A deliberate
-/// disclosure act: it publishes sealed content to a node that persists it.
-pub fn push(base_url: &str, bundle_bytes: Vec<u8>) -> Result<(), NetError> {
+/// Push raw sync-bundle bytes to a relay's `/stow` endpoint. The bundle is
+/// wrapped in a signed envelope (ADR 0014) so the relay can verify authenticity.
+/// A deliberate disclosure act: it publishes sealed content to a node that
+/// persists it.
+pub fn push(base_url: &str, bundle_bytes: Vec<u8>, id: &identity::Identity) -> Result<(), NetError> {
     let url = format!("{}/stow", base_url.trim_end_matches('/'));
+    let envelope = id.wrap_envelope(&bundle_bytes);
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(&url)
-        .body(bundle_bytes)
+        .body(envelope)
         .send()
         .map_err(|e| NetError::Http(e.to_string()))?;
     if !resp.status().is_success() {

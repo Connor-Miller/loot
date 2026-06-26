@@ -1,7 +1,9 @@
-//! End-to-end relay sync (ADR 0011): serve a relay, push alice's sealed bundle,
-//! pull it into bob over real HTTP, and confirm the relay never holds a key.
+//! End-to-end relay sync (ADR 0011, 0014): serve a relay, push alice's signed
+//! bundle, pull it into bob over real HTTP, and confirm the relay never holds
+//! a key. Also exercises the allowlist: an unknown key is rejected.
 
 use loot_core::{Change, DagRepo, Oid, Repo, SyncBundle, Visibility};
+use loot_identity::Identity;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,8 +16,6 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn wait_for_relay(base: &str) {
-    // Poll the relay until it answers a negotiate, so the test does not race the
-    // server's bind. Bounded so a real failure still terminates the test.
     for _ in 0..50 {
         if loot_net::pull(base, &[]).is_ok() {
             return;
@@ -25,20 +25,23 @@ fn wait_for_relay(base: &str) {
     panic!("relay did not come up");
 }
 
+fn alice_identity() -> Identity {
+    Identity::generate()
+}
+
 #[test]
 fn push_then_pull_syncs_public_content_through_a_keyless_relay() {
     let relay_dir = tmp("relay");
     let addr = "127.0.0.1:47193";
     let base = format!("http://{addr}");
 
-    // Relay server in a background thread (serve blocks).
     let serve_dir = relay_dir.clone();
     std::thread::spawn(move || {
-        let _ = loot_net::serve(serve_dir, addr);
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
     });
     wait_for_relay(&base);
 
-    // Alice builds a public change and pushes its bundle.
+    let alice_id = alice_identity();
     let alice_dir = tmp("alice");
     let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
     let oid = alice.put(b"shared\n", Visibility::Public).unwrap();
@@ -48,7 +51,7 @@ fn push_then_pull_syncs_public_content_through_a_keyless_relay() {
         .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
         .unwrap();
     let alice_bundle = alice.bundle(&[]).unwrap();
-    loot_net::push(&base, alice_bundle.0).unwrap();
+    loot_net::push(&base, alice_bundle.0, &alice_id).unwrap();
 
     // Bob pulls (he has nothing yet) and applies.
     let bob_dir = tmp("bob");
@@ -66,19 +69,16 @@ fn push_then_pull_syncs_public_content_through_a_keyless_relay() {
 
 #[test]
 fn relay_cannot_read_restricted_content_it_relays() {
-    // The load-bearing guarantee: a relay forwards RESTRICTED ciphertext it can
-    // never read, because restricted keys never travel in a sync bundle
-    // (ADR 0003). Public keys do travel (non-secret), so a relay can read public
-    // content — that is fine; the secrecy guarantee is about restricted content.
     let relay_dir = tmp("relay-restricted");
     let addr = "127.0.0.1:47195";
     let base = format!("http://{addr}");
     let serve_dir = relay_dir.clone();
     std::thread::spawn(move || {
-        let _ = loot_net::serve(serve_dir, addr);
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
     });
     wait_for_relay(&base);
 
+    let alice_id = alice_identity();
     let alice_dir = tmp("alice-restricted");
     let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
     let restricted = Visibility::Restricted(vec!["alice".into()]);
@@ -88,7 +88,7 @@ fn relay_cannot_read_restricted_content_it_relays() {
     alice
         .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
         .unwrap();
-    loot_net::push(&base, alice.bundle(&[]).unwrap().0).unwrap();
+    loot_net::push(&base, alice.bundle(&[]).unwrap().0, &alice_id).unwrap();
 
     // The relay stored the change (the path resolves in its tree) but holds no
     // key for the restricted content and cannot read it.
@@ -110,10 +110,11 @@ fn pull_with_up_to_date_have_returns_empty() {
     let base = format!("http://{addr}");
     let serve_dir = relay_dir.clone();
     std::thread::spawn(move || {
-        let _ = loot_net::serve(serve_dir, addr);
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
     });
     wait_for_relay(&base);
 
+    let alice_id = alice_identity();
     let alice_dir = tmp("alice2");
     let mut alice = DagRepo::init(alice_dir.join("work"), "alice").unwrap();
     let oid = alice.put(b"x\n", Visibility::Public).unwrap();
@@ -122,7 +123,7 @@ fn pull_with_up_to_date_have_returns_empty() {
     let change_id = alice
         .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
         .unwrap();
-    loot_net::push(&base, alice.bundle(&[]).unwrap().0).unwrap();
+    loot_net::push(&base, alice.bundle(&[]).unwrap().0, &alice_id).unwrap();
 
     // Pulling with the change already in `have` yields a bundle with no changes.
     let pulled = loot_net::pull(&base, &[change_id]).unwrap();
@@ -134,4 +135,36 @@ fn pull_with_up_to_date_have_returns_empty() {
         outcomes.is_empty()
     };
     assert!(parsed_empty, "pull with up-to-date have must yield no new changes");
+}
+
+#[test]
+fn allowlist_rejects_unknown_pusher() {
+    let relay_dir = tmp("relay-allowlist");
+    let addr = "127.0.0.1:47196";
+    let base = format!("http://{addr}");
+
+    // Relay configured to only accept alice's key.
+    let alice_id = Identity::generate();
+    let allowed = vec![alice_id.public_key_bytes()];
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, allowed);
+    });
+    wait_for_relay(&base);
+
+    // Eve (unknown key) tries to push — should be rejected.
+    let eve_id = Identity::generate();
+    let bundle = b"garbage bundle bytes";
+    let err = loot_net::push(&base, bundle.to_vec(), &eve_id).unwrap_err();
+    assert!(err.to_string().contains("401") || err.to_string().contains("rejected"),
+        "expected relay to reject unknown pusher, got: {err}");
+
+    // Alice (known key) can push (even if the bundle fails to stow as garbage,
+    // the rejection is from stow not auth — a different error).
+    let result = loot_net::push(&base, bundle.to_vec(), &alice_id);
+    // May fail at stow level (bad bundle), but must NOT fail at auth level.
+    if let Err(e) = result {
+        assert!(!e.to_string().contains("401"),
+            "alice should pass auth but got 401: {e}");
+    }
 }

@@ -74,6 +74,11 @@ impl Workspace {
         &self.identity
     }
 
+    /// The `.loot/` directory for this repo (used by identity keypair commands).
+    pub fn dot(&self) -> &std::path::Path {
+        &self.dot
+    }
+
     /// Resolve the visibility for `path` according to `.lootattributes` — the
     /// same rule `snapshot` uses. Returns `Public` if no rule matches.
     pub fn visibility_for(&self, path: &str) -> Visibility {

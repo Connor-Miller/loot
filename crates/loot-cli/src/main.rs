@@ -8,6 +8,7 @@
 mod workspace;
 
 use loot_core::{MaroonResult, MergeOutcome, MigrateResult, Oid, Repo, SyncBundle, Visibility};
+use loot_identity as identity;
 use std::process::ExitCode;
 use workspace::Workspace;
 
@@ -32,6 +33,9 @@ fn main() -> ExitCode {
         "conflicts" => cmd_conflicts(),
         "resolve" => cmd_resolve(rest),
         "remote" => cmd_remote(rest),
+        "keygen" => cmd_keygen(),
+        "whoami" => cmd_whoami(),
+        "peer" => cmd_peer(rest),
         "serve" => cmd_serve(rest),
         "push" => cmd_push(rest),
         "pull" => cmd_pull(rest),
@@ -70,7 +74,12 @@ usage:
   loot remote add <name> <url>              register a relay URL under a name
   loot remote remove <name>                 forget a named relay
   loot remote list                          show all named relays
-  loot serve [--dir <path>] [--addr <host:port>]  run a relay (holds ciphertext, no keys)
+  loot keygen                               generate an identity keypair (backfills existing repos)
+  loot whoami                               show this repo's public key
+  loot peer add <name> <pubkey>             register a peer's public key
+  loot peer remove <name>                   forget a peer
+  loot peer list                            show all known peers
+  loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
   loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay";
 
@@ -92,10 +101,18 @@ fn message_flag(args: &[String]) -> Option<&str> {
 // --- commands ---
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
-    let identity = flag(args, "--identity").ok_or("init requires --identity <name>")?;
-    Workspace::init(identity)?;
-    println!("initialized empty loot repo, identity = {identity}");
-    println!("tip: declare per-file privacy in .lootattributes, e.g. `.env restricted={identity}`");
+    let id_name = flag(args, "--identity").ok_or("init requires --identity <name>")?;
+    let ws = Workspace::init(id_name)?;
+    let dot = ws.dot();
+    let keypair = identity::generate_and_save(dot, &format!("{id_name}@loot"))
+        .map_err(|e| e.to_string())?;
+    let pub_line = std::fs::read_to_string(dot.join("id.pub"))
+        .map_err(|e| format!("read id.pub: {e}"))?;
+    println!("initialized empty loot repo, identity = {id_name}");
+    println!("public key: {}", pub_line.trim());
+    println!("tip: share your public key with peers via `loot whoami`");
+    println!("tip: declare per-file privacy in .lootattributes, e.g. `.env restricted={id_name}`");
+    let _ = keypair;
     Ok(())
 }
 
@@ -403,6 +420,78 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// --- identity keypairs (ADR 0014) ---
+
+fn cmd_keygen() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let dot = ws.dot();
+    if identity::keypair_exists(dot) {
+        return Err("keypair already exists at .loot/id — remove it first if you want to regenerate".into());
+    }
+    let keypair = identity::generate_and_save(dot, &format!("{}@loot", ws.identity()))
+        .map_err(|e| e.to_string())?;
+    let pub_line = std::fs::read_to_string(dot.join("id.pub"))
+        .map_err(|e| format!("read id.pub: {e}"))?;
+    println!("generated keypair at .loot/id (private) and .loot/id.pub (public)");
+    println!("public key: {}", pub_line.trim());
+    let _ = keypair;
+    Ok(())
+}
+
+fn cmd_whoami() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let dot = ws.dot();
+    if !identity::keypair_exists(dot) {
+        return Err("no identity keypair — run `loot keygen` to generate one".into());
+    }
+    let pub_line = std::fs::read_to_string(dot.join("id.pub"))
+        .map_err(|e| format!("read id.pub: {e}"))?;
+    println!("{} — {}", ws.identity(), pub_line.trim());
+    Ok(())
+}
+
+fn cmd_peer(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "add" => {
+            if args.len() < 3 {
+                return Err("peer add requires <name> <pubkey>".into());
+            }
+            let name = &args[1];
+            let pubkey = &args[2];
+            let ws = Workspace::open()?;
+            let mut reg = identity::PeerRegistry::load(ws.dot());
+            reg.add(name, pubkey);
+            reg.save().map_err(|e| e.to_string())?;
+            println!("registered peer '{name}'");
+            Ok(())
+        }
+        "remove" | "rm" => {
+            let name = args.get(1).ok_or("peer remove requires <name>")?;
+            let ws = Workspace::open()?;
+            let mut reg = identity::PeerRegistry::load(ws.dot());
+            reg.remove(name);
+            reg.save().map_err(|e| e.to_string())?;
+            println!("removed peer '{name}'");
+            Ok(())
+        }
+        "list" | "ls" => {
+            let ws = Workspace::open()?;
+            let reg = identity::PeerRegistry::load(ws.dot());
+            let peers = reg.list();
+            if peers.is_empty() {
+                println!("no peers registered  (use `loot peer add <name> <pubkey>`)");
+            } else {
+                for (name, pubkey) in peers {
+                    println!("{:<16} {pubkey}", name);
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown peer subcommand '{other}': use add | remove | list")),
+    }
+}
+
 // --- named remotes (ADR 0013) ---
 
 fn cmd_remote(args: &[String]) -> Result<(), String> {
@@ -447,9 +536,46 @@ fn cmd_remote(args: &[String]) -> Result<(), String> {
 fn cmd_serve(args: &[String]) -> Result<(), String> {
     let dir = flag(args, "--dir").unwrap_or(".loot-relay");
     let addr = flag(args, "--addr").unwrap_or("127.0.0.1:4000");
-    println!("starting loot relay (dir = {dir}, addr = {addr})");
+
+    // Collect zero or more --allow <pubkey-hex> arguments.
+    let allowed_keys: Vec<[u8; 32]> = {
+        let mut keys = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--allow" {
+                if let Some(hex) = args.get(i + 1) {
+                    let bytes = parse_pubkey_hex(hex)?;
+                    keys.push(bytes);
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        keys
+    };
+
+    if allowed_keys.is_empty() {
+        println!("starting open loot relay (dir = {dir}, addr = {addr}) — any signed push accepted");
+    } else {
+        println!("starting loot relay (dir = {dir}, addr = {addr}) — {n} key(s) allowed", n = allowed_keys.len());
+    }
     println!("  a relay holds ciphertext and forwards it — it holds no keys and reads nothing");
-    loot_net::serve(std::path::PathBuf::from(dir), addr).map_err(|e| e.to_string())
+    loot_net::serve(std::path::PathBuf::from(dir), addr, allowed_keys).map_err(|e| e.to_string())
+}
+
+fn parse_pubkey_hex(hex: &str) -> Result<[u8; 32], String> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return Err(format!("public key must be 64 hex chars (32 bytes), got {} chars", hex.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[i] = u8::from_str_radix(s, 16)
+            .map_err(|_| format!("invalid hex byte '{s}' in public key"))?;
+    }
+    Ok(out)
 }
 
 fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
@@ -466,9 +592,10 @@ fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
 fn cmd_push(args: &[String]) -> Result<(), String> {
     let ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
+    let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
     let bundle = ws.repo().bundle(&[]).map_err(|e| e.to_string())?;
     let n = bundle.0.len();
-    loot_net::push(&url, bundle.0).map_err(|e| e.to_string())?;
+    loot_net::push(&url, bundle.0, &id).map_err(|e| e.to_string())?;
     println!("pushed {n} bytes to {url}");
     println!("  this published your sealed content to the relay (it still cannot read it)");
     Ok(())
