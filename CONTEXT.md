@@ -209,4 +209,4 @@ tree so the decision is reproducible (`cargo test --release`).
   the diff embargoed until a scheduled reveal. Requires a multi-remote model
   (not yet defined). Deferred until the network layer exists.
 
-- **Sealed grant bundle relay delivery.** `loot grant` writes a bundle file; relay delivery is deferred because the x25519 encryption seam (ADR 0014) exists but `loot grant --relay` has not been wired. The derivation is in place; this is additive plumbing.
+- **Sealed grant bundle relay delivery.** `loot grant` writes a bundle file; relay delivery requires: (1) a relay `/grant` mailbox endpoint in `loot-net` where senders deposit sealed grant blobs, (2) `loot grant --relay <name>` in the CLI that seals the content key via `identity::seal_key` (x25519/ECIES — already in `loot-identity`) and posts to the mailbox, (3) `loot pull-grants` to fetch and unseal, (4) a new bundle tag (3) so the engine routes sealed-key grants through identity-aware unseal before filing the key. The ECIES seam and `DagRepo::content_key_for` are in place; this is additive plumbing with no redesign.

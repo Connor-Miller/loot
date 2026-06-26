@@ -26,5 +26,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["reusable_secrets", "static_secrets"] }
 ssh-key = { version = "0.6", features = ["ed25519"] }
 rand = "0.8"
+chacha20poly1305 = "0.10"

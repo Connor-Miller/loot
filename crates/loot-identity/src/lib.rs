@@ -31,7 +31,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 mod peers;
+pub mod key_seal;
 pub use peers::PeerRegistry;
+pub use key_seal::{seal_key, unseal_key, x25519_pubkey_from_verifying_key, x25519_pubkey_from_ed25519_bytes, WRAPPED_KEY_SIZE};
 
 /// Version byte for the push envelope.
 pub const ENVELOPE_VERSION: u8 = 0x01;
@@ -119,6 +121,16 @@ impl Identity {
     /// The ed25519 public key bytes (32 bytes).
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// The x25519 public key bytes for sealed grant delivery (ADR 0014).
+    pub fn x25519_pubkey_bytes(&self) -> [u8; 32] {
+        key_seal::x25519_pubkey_from_verifying_key(&self.signing_key.verifying_key())
+    }
+
+    /// Unseal a wrapped content key addressed to this identity.
+    pub fn unseal_key(&self, wrapped: &[u8; WRAPPED_KEY_SIZE]) -> Result<[u8; 32], IdentityError> {
+        key_seal::unseal_key(wrapped, &self.signing_key)
     }
 
     /// The OpenSSH public key line (for sharing with peers / `loot whoami`).

@@ -280,6 +280,12 @@ impl DagRepo {
         &self.manifest
     }
 
+    /// The raw content key for `oid`, if held. Used by the CLI to seal the key
+    /// for relay delivery of grant bundles without pulling crypto into the engine.
+    pub fn content_key_for(&self, oid: &Oid) -> Option<[u8; 32]> {
+        self.keyring.key_for(oid)
+    }
+
     /// The OID for `path` in the current tree, or `NotFound` if absent.
     pub fn current_tree_oid(&self, path: &Path) -> Result<Oid, RepoError> {
         self.graph.current_tree()
