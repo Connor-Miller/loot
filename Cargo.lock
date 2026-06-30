@@ -1003,6 +1003,7 @@ dependencies = [
 name = "loot-cli"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "loot-core",
  "loot-identity",
  "loot-net",
