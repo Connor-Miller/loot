@@ -29,8 +29,32 @@ use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 pub(crate) use change_graph::ChangeNode;
 use change_graph::{compute_change_id, ChangeGraph};
 use object_store::{ObjectStore, Stored};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// One change in a [`LogGraph`]: its id, message, and which heads can reach it
+/// (as indices into [`LogGraph::heads`]). A change reachable from exactly one
+/// head is unique to that head's lineage; one reachable from several is shared
+/// ancestry across the divergence.
+#[derive(Clone, Debug)]
+pub struct LogNode {
+    pub id: Oid,
+    pub message: String,
+    /// Indices (into `LogGraph::heads`) of the heads that can reach this change,
+    /// ascending. Never empty for a change in the graph.
+    pub reachable_from: Vec<usize>,
+}
+
+/// Structured history for rendering `log` when the graph has diverged into
+/// multiple heads (ADR 0001, issue #18). `changes` is in reverse-topo order
+/// (children before parents), so a head appears before its ancestors.
+#[derive(Clone, Debug)]
+pub struct LogGraph {
+    /// The current heads (tips), in stable ascending order.
+    pub heads: Vec<Oid>,
+    /// Every change with its head-reachability, children-first.
+    pub changes: Vec<LogNode>,
+}
 
 /// Returned by `grant`, `maroon`, and `maroon_hard`: the new object address
 /// plus any targeted grant bundles the caller should forward to remaining
@@ -665,6 +689,59 @@ impl DagRepo {
             .collect()
     }
 
+    /// All ancestors of `id` (including `id` itself), by walking parent edges.
+    /// Used to compute head reachability for multi-head `log` display.
+    fn ancestors_of(&self, id: &Oid) -> BTreeSet<Oid> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![id.clone()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(node) = self.graph.get(&cur) {
+                for p in &node.parents {
+                    stack.push(p.clone());
+                }
+            }
+        }
+        seen
+    }
+
+    /// Structured history for multi-head `log` (issue #18). Reports the current
+    /// heads (ascending) and, per change, which heads can reach it — enough for
+    /// a caller to show branch structure when peers have diverged. Changes are
+    /// returned children-first (reverse topo), so a head precedes its ancestors.
+    ///
+    /// This is independent of head count; the CLI keeps its flat rendering when
+    /// there is a single head and only switches to a branch view for two or more.
+    pub fn log_graph(&self) -> LogGraph {
+        let mut heads = self.graph.heads();
+        heads.sort();
+
+        // For each head, mark every ancestor as reachable from that head index.
+        let mut reach: BTreeMap<Oid, Vec<usize>> = BTreeMap::new();
+        for (hi, head) in heads.iter().enumerate() {
+            for anc in self.ancestors_of(head) {
+                reach.entry(anc).or_default().push(hi);
+            }
+        }
+
+        // Children-first: reverse the parents-first topo order.
+        let changes = self
+            .graph
+            .in_order()
+            .into_iter()
+            .rev()
+            .map(|c| LogNode {
+                id: c.id.clone(),
+                message: c.message.clone(),
+                reachable_from: reach.get(&c.id).cloned().unwrap_or_default(),
+            })
+            .collect();
+
+        LogGraph { heads, changes }
+    }
+
     /// Like `surface`, but also returns the list of materialized paths and their
     /// visibility, plus a count of skipped (sealed) paths. Lets the CLI report
     /// what was written without a second pass.
@@ -1268,6 +1345,72 @@ mod tests {
         assert!(!leftover_tmp, "atomic write should leave no .tmp files");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- multi-head log display (ADR 0001, issue #18) ---
+
+    fn empty_change(parents: Vec<Oid>, message: &str) -> Change {
+        Change { id: Oid([0; 32]), parents, message: message.into(), tree: BTreeMap::new() }
+    }
+
+    #[test]
+    fn log_graph_single_head_is_linear() {
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let root = repo.record(empty_change(vec![], "root")).unwrap();
+        let tip = repo.record(empty_change(vec![root.clone()], "tip")).unwrap();
+
+        let g = repo.log_graph();
+        assert_eq!(g.heads, vec![tip.clone()], "one head: the tip");
+        // Every change is reachable from the single head (index 0).
+        for node in &g.changes {
+            assert_eq!(node.reachable_from, vec![0]);
+        }
+        // Children-first ordering: the tip precedes its ancestor.
+        let ids: Vec<&Oid> = g.changes.iter().map(|n| &n.id).collect();
+        assert_eq!(ids, vec![&tip, &root]);
+    }
+
+    #[test]
+    fn log_graph_shows_two_diverged_heads() {
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let root = repo.record(empty_change(vec![], "root")).unwrap();
+        let a = repo.record(empty_change(vec![root.clone()], "head A")).unwrap();
+        let b = repo.record(empty_change(vec![root.clone()], "head B")).unwrap();
+
+        let g = repo.log_graph();
+        assert_eq!(g.heads.len(), 2);
+        assert!(g.heads.contains(&a) && g.heads.contains(&b));
+
+        let find = |id: &Oid| g.changes.iter().find(|n| &n.id == id).unwrap();
+        // Root is shared by both heads; each tip is unique to one head.
+        assert_eq!(find(&root).reachable_from.len(), 2, "root shared across the divergence");
+        assert_eq!(find(&a).reachable_from.len(), 1);
+        assert_eq!(find(&b).reachable_from.len(), 1);
+        assert_ne!(
+            find(&a).reachable_from,
+            find(&b).reachable_from,
+            "the two tips belong to different heads"
+        );
+    }
+
+    #[test]
+    fn log_graph_shows_three_diverged_heads() {
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let root = repo.record(empty_change(vec![], "root")).unwrap();
+        let a = repo.record(empty_change(vec![root.clone()], "head A")).unwrap();
+        let b = repo.record(empty_change(vec![root.clone()], "head B")).unwrap();
+        let c = repo.record(empty_change(vec![root.clone()], "head C")).unwrap();
+
+        let g = repo.log_graph();
+        assert_eq!(g.heads.len(), 3);
+        for h in [&a, &b, &c] {
+            assert!(g.heads.contains(h), "each tip is a head");
+        }
+        let find = |id: &Oid| g.changes.iter().find(|n| &n.id == id).unwrap();
+        assert_eq!(find(&root).reachable_from.len(), 3, "root shared by all three heads");
+        assert_eq!(find(&a).reachable_from.len(), 1);
+        assert_eq!(find(&b).reachable_from.len(), 1);
+        assert_eq!(find(&c).reachable_from.len(), 1);
     }
 
     // --- snapshot / reconcile (ADR 0006) ---

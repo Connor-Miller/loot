@@ -186,24 +186,64 @@ fn cmd_surface() -> Result<(), String> {
 
 fn cmd_log() -> Result<(), String> {
     let ws = Workspace::open()?;
-    let entries = ws.repo().log_detailed();
-    if entries.is_empty() {
+    let detailed = ws.repo().log_detailed();
+    if detailed.is_empty() {
         println!("no changes yet");
         return Ok(());
     }
-    for (id, message, total, restricted, embargoed) in entries.into_iter().rev() {
-        let hint = match (restricted, embargoed) {
-            (0, 0) => String::new(),
-            (r, 0) => format!("  [{r}/{total} sealed]"),
-            (0, e) => format!("  [{e}/{total} embargoed]"),
-            (r, e) => format!("  [{r} sealed, {e} embargoed / {total}]"),
-        };
-        println!("{}  {}{}", short(&id), message, hint);
+
+    // A single head keeps the flat, newest-first listing (unchanged). Only a
+    // diverged graph (2+ heads, e.g. after a pull) switches to a branch view.
+    if ws.repo().heads().len() <= 1 {
+        for (id, message, total, restricted, embargoed) in detailed.into_iter().rev() {
+            println!("{}  {}{}", short(&id), message, seal_hint(total, restricted, embargoed));
+        }
+        if let Some(working) = ws.working_id() {
+            println!("{}  (working change)", short(&working));
+        }
+        return Ok(());
     }
-    if let Some(working) = ws.working_id() {
-        println!("{}  (working change)", short(&working));
+
+    // Multi-head: show each head's own lineage indented under a label, then the
+    // shared ancestry once. Makes the divergence visible before `loot apply`.
+    let hints: std::collections::BTreeMap<Oid, String> = detailed
+        .iter()
+        .map(|(id, _m, total, restricted, embargoed)| {
+            (id.clone(), seal_hint(*total, *restricted, *embargoed))
+        })
+        .collect();
+    let hint_for = |id: &Oid| hints.get(id).map(String::as_str).unwrap_or("");
+
+    let g = ws.repo().log_graph();
+    println!("{} heads — diverged; run `loot apply` to converge", g.heads.len());
+    for (hi, head) in g.heads.iter().enumerate() {
+        println!();
+        println!("head {} — {}", hi + 1, short(head));
+        for node in g.changes.iter().filter(|n| n.reachable_from == [hi]) {
+            println!("  {}  {}{}", short(&node.id), node.message, hint_for(&node.id));
+        }
+    }
+
+    let shared: Vec<&loot_core::LogNode> =
+        g.changes.iter().filter(|n| n.reachable_from.len() > 1).collect();
+    if !shared.is_empty() {
+        println!();
+        println!("shared history");
+        for node in shared {
+            println!("  {}  {}{}", short(&node.id), node.message, hint_for(&node.id));
+        }
     }
     Ok(())
+}
+
+/// Annotate a change with its sealed/embargoed file counts, or "" if all public.
+fn seal_hint(total: usize, restricted: usize, embargoed: usize) -> String {
+    match (restricted, embargoed) {
+        (0, 0) => String::new(),
+        (r, 0) => format!("  [{r}/{total} sealed]"),
+        (0, e) => format!("  [{e}/{total} embargoed]"),
+        (r, e) => format!("  [{r} sealed, {e} embargoed / {total}]"),
+    }
 }
 
 fn cmd_bundle(args: &[String]) -> Result<(), String> {
