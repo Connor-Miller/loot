@@ -258,10 +258,13 @@ pub fn heads_of(dot: &Path, root: PathBuf) -> Result<Vec<Oid>, NetError> {
     Ok(repo.heads())
 }
 
-/// Deposit a sealed grant blob for `recipient` at the relay's `/grant` mailbox.
-/// No signing required — the blob is ECIES-sealed to the recipient's key.
-pub fn deliver_grant(base_url: &str, recipient: &str, blob: &[u8]) -> Result<(), NetError> {
+/// Deposit a sealed grant blob for the recipient identified by `recipient_pubkey`
+/// at the relay's `/grant` mailbox. No signing required — the blob is ECIES-sealed
+/// to the recipient's key. The mailbox is addressed by the pubkey's hex, resolved
+/// here so the relay never sees a name (ADR 0015); callers pass raw key bytes.
+pub fn deliver_grant(base_url: &str, recipient_pubkey: &[u8; 32], blob: &[u8]) -> Result<(), NetError> {
     let url = format!("{}/grant", base_url.trim_end_matches('/'));
+    let recipient = loot_core::hex::encode(recipient_pubkey);
     let rb = recipient.as_bytes();
     let mut body = Vec::with_capacity(4 + rb.len() + blob.len());
     body.extend_from_slice(&(rb.len() as u32).to_le_bytes());
@@ -278,9 +281,11 @@ pub fn deliver_grant(base_url: &str, recipient: &str, blob: &[u8]) -> Result<(),
     Ok(())
 }
 
-/// Peek the pending grant count for `recipient` without fetching or draining.
-pub fn peek_grants(base_url: &str, recipient: &str) -> Result<usize, NetError> {
+/// Peek the pending grant count for `recipient_pubkey` without fetching or
+/// draining. Addressed by the pubkey's hex (resolved here), never by name.
+pub fn peek_grants(base_url: &str, recipient_pubkey: &[u8; 32]) -> Result<usize, NetError> {
     let url = format!("{}/grants/peek", base_url.trim_end_matches('/'));
+    let recipient = loot_core::hex::encode(recipient_pubkey);
     let rb = recipient.as_bytes();
     let mut body = Vec::with_capacity(4 + rb.len());
     body.extend_from_slice(&(rb.len() as u32).to_le_bytes());
@@ -300,11 +305,13 @@ pub fn peek_grants(base_url: &str, recipient: &str) -> Result<usize, NetError> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
 }
 
-/// Fetch and drain all sealed grant blobs addressed to `recipient`.
+/// Fetch and drain all sealed grant blobs addressed to `recipient_pubkey`.
 /// Returns raw blob bytes; caller is responsible for unsealing and applying.
-/// Blobs are deleted from the relay on delivery.
-pub fn fetch_grants(base_url: &str, recipient: &str) -> Result<Vec<Vec<u8>>, NetError> {
+/// Blobs are deleted from the relay on delivery. Addressed by the pubkey's hex
+/// (resolved here), never by name.
+pub fn fetch_grants(base_url: &str, recipient_pubkey: &[u8; 32]) -> Result<Vec<Vec<u8>>, NetError> {
     let url = format!("{}/pull-grants", base_url.trim_end_matches('/'));
+    let recipient = loot_core::hex::encode(recipient_pubkey);
     let rb = recipient.as_bytes();
     let mut body = Vec::with_capacity(4 + rb.len());
     body.extend_from_slice(&(rb.len() as u32).to_le_bytes());
