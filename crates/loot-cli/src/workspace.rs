@@ -18,6 +18,7 @@ const ATTRS: &str = ".lootattributes";
 
 pub struct Workspace {
     dot: PathBuf,
+    store: RepoStore,
     root: PathBuf,
     identity: String,
     repo: DagRepo,
@@ -47,7 +48,7 @@ impl Workspace {
         let repo = DagRepo::load(&dot, dir.to_path_buf()).map_err(|e| e.to_string())?;
         let identity = read_to_string(&store.identity())?;
         let working = store.read_working();
-        Ok(Workspace { dot, root: dir.to_path_buf(), identity, repo, working, now: real_now() })
+        Ok(Workspace { dot, store, root: dir.to_path_buf(), identity, repo, working, now: real_now() })
     }
 
     pub fn identity(&self) -> &str {
@@ -57,12 +58,6 @@ impl Workspace {
     /// The `.loot/` directory for this repo (used by identity keypair commands).
     pub fn dot(&self) -> &std::path::Path {
         &self.dot
-    }
-
-    /// The on-disk layout for this repo's `.loot/` (single source of truth for
-    /// where each artifact lives).
-    fn store(&self) -> RepoStore {
-        RepoStore::new(&self.dot)
     }
 
     /// Resolve the visibility for `path` according to `.lootattributes` — the
@@ -107,7 +102,7 @@ impl Workspace {
         // Hash the current working tree content + message. Skip the engine
         // snapshot if nothing changed — running `loot status` repeatedly is safe.
         let tree_hash = hash_tree(&entries, message);
-        let last_hash = self.store().read_tree_hash();
+        let last_hash = self.store.read_tree_hash();
         if last_hash == tree_hash {
             if let Some(id) = &self.working {
                 return Ok((id.clone(), reported));
@@ -120,7 +115,7 @@ impl Workspace {
             .map_err(|e| e.to_string())?;
         self.working = Some(id.clone());
         // Persist the new tree hash before persisting the rest of state.
-        let _ = self.store().write_tree_hash(&tree_hash);
+        let _ = self.store.write_tree_hash(&tree_hash);
         self.persist()?;
         Ok((id, reported))
     }
@@ -130,7 +125,7 @@ impl Workspace {
     pub fn finalize_working(&mut self) -> Result<(), String> {
         self.working = None;
         // Clear the tree-hash so the next snapshot always runs the engine.
-        self.store().clear_tree_hash();
+        self.store.clear_tree_hash();
         self.persist()
     }
 
@@ -176,12 +171,12 @@ impl Workspace {
     /// Read the URL for a named remote (e.g. "origin") from `.loot/config`.
     /// Returns `None` if the remote is not set.
     pub fn remote_url(&self, name: &str) -> Option<String> {
-        Config::load(&self.store().config()).get(name)
+        Config::load(&self.store.config()).get(name)
     }
 
     /// Add or update a named remote in `.loot/config`.
     pub fn remote_add(&self, name: &str, url: &str) -> Result<(), String> {
-        let path = self.store().config();
+        let path = self.store.config();
         let mut cfg = Config::load(&path);
         cfg.set(name, url);
         cfg.save(&path)
@@ -189,7 +184,7 @@ impl Workspace {
 
     /// Remove a named remote from `.loot/config`. No-ops if not present.
     pub fn remote_remove(&self, name: &str) -> Result<(), String> {
-        let path = self.store().config();
+        let path = self.store.config();
         let mut cfg = Config::load(&path);
         cfg.remove(name);
         cfg.save(&path)
@@ -197,7 +192,7 @@ impl Workspace {
 
     /// List all named remotes from `.loot/config`.
     pub fn remote_list(&self) -> Vec<(String, String)> {
-        Config::load(&self.store().config()).entries()
+        Config::load(&self.store.config()).entries()
     }
 
     /// Create a fresh repo inside `dir`, owned by `identity`. `dir` is created if
@@ -210,9 +205,11 @@ impl Workspace {
         if RepoStore::new(&dot).identity().exists() {
             return Err(format!("already a loot repo at {}", dir.display()));
         }
+        let store = RepoStore::new(&dot);
         let repo = DagRepo::init(dir.to_path_buf(), identity).map_err(|e| e.to_string())?;
         let ws = Workspace {
             dot,
+            store,
             root: dir.to_path_buf(),
             identity: identity.to_string(),
             repo,
@@ -225,7 +222,7 @@ impl Workspace {
 
     fn persist(&self) -> Result<(), String> {
         self.repo.save(&self.dot).map_err(|e| e.to_string())?;
-        self.store()
+        self.store
             .write_working(self.working.as_ref())
             .map_err(|e| format!("write working: {e}"))
     }
@@ -432,10 +429,28 @@ fn hash_tree(entries: &[(PathBuf, Vec<u8>, Visibility)], message: &str) -> Vec<u
     h.update(message.as_bytes());
     h.update(&[0]);
     // entries arrive pre-sorted from walk(); hash in that order for stability.
-    for (path, bytes, _vis) in entries {
+    // Visibility is included so a .lootattributes-only change (same content,
+    // different access policy) triggers a new snapshot rather than being skipped.
+    for (path, bytes, vis) in entries {
         h.update(path.to_string_lossy().as_bytes());
         h.update(&[0]);
         h.update(bytes);
+        h.update(&[0]);
+        // Stable encoding: Public=0, Restricted=1+names, Embargoed=2+timestamp.
+        match vis {
+            Visibility::Public => { h.update(&[0]); }
+            Visibility::Restricted(ids) => {
+                h.update(&[1]);
+                for id in ids {
+                    h.update(id.as_bytes());
+                    h.update(&[0]);
+                }
+            }
+            Visibility::Embargoed { reveal_at } => {
+                h.update(&[2]);
+                h.update(&reveal_at.to_le_bytes());
+            }
+        }
         h.update(&[0]);
     }
     h.finalize().as_bytes().to_vec()
