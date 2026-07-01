@@ -95,7 +95,7 @@ impl<'a> Cursor<'a> {
 
 pub fn encode(
     changes: &[&ChangeNode],
-    objs: &BTreeMap<Oid, &SealedObject>,
+    objs: &BTreeMap<Oid, SealedObject>,
     public_keys: &BTreeMap<Oid, ContentKey>,
     escrow_entries: &BTreeMap<Oid, (ContentKey, u64)>,
 ) -> Vec<u8> {
@@ -233,26 +233,197 @@ pub fn decode(
     Ok((changes, objs, public_keys, escrow_entries))
 }
 
-pub fn encode_grant(
-    changes: &[&ChangeNode],
-    objs: &BTreeMap<Oid, &SealedObject>,
-    public_keys: &BTreeMap<Oid, ContentKey>,
-    escrow_entries: &BTreeMap<Oid, (ContentKey, u64)>,
-) -> Vec<u8> {
-    encode(changes, objs, public_keys, escrow_entries)
+/// The decoded payload every bundle carries: changes plus the sealed objects,
+/// public keys, and embargoed escrow entries riding with them. This is exactly
+/// what the low-level [`encode`]/[`decode`] body codec moves; `Frame` wraps it
+/// with the per-kind header.
+#[derive(Clone)]
+pub struct BundleBody {
+    pub changes: Vec<ChangeNode>,
+    /// Keyed by content address so `encode_body` can borrow directly into
+    /// `encode()` without rebuilding a map.
+    pub objs: BTreeMap<Oid, SealedObject>,
+    pub keys: BTreeMap<Oid, ContentKey>,
+    pub escrow: BTreeMap<Oid, (ContentKey, u64)>,
 }
 
-#[allow(clippy::type_complexity)]
-pub fn decode_grant(
-    b: &[u8],
-) -> Result<
-    (
-        Vec<ChangeNode>,
-        Vec<(Oid, SealedObject)>,
-        BTreeMap<Oid, ContentKey>,
-        BTreeMap<Oid, (ContentKey, u64)>,
-    ),
-    RepoError,
-> {
-    decode(b)
+/// A whole bundle on the wire, tag already resolved: the one value callers match
+/// on. The leading tag byte, the Sync purge prefix, the Grant grantee prefix,
+/// and the SealedGrant `[pubkey·wrapped·oid]` header all live behind
+/// [`Frame::decode`]/[`Frame::encode`] and never escape this module (arch
+/// review C1). The engine stops doing offset math.
+///
+/// A `SealedGrant`'s `wrapped_key` is surfaced verbatim and never unwrapped
+/// here — unsealing is the caller's job (identity crypto stays out of loot-core,
+/// ADR 0014/0015).
+pub enum Frame {
+    /// tag 0. Produced by `bundle`; consumed by `apply` (merge) and `stow` (relay).
+    Sync {
+        purges: Vec<(Oid, String)>,
+        body: BundleBody,
+    },
+    /// tag 1. A targeted key handoff whose key rides in `body.keys`.
+    Grant {
+        grantee: String,
+        body: BundleBody,
+    },
+    /// tag 3. A sealed-key grant: the content key is ECIES-wrapped to the
+    /// recipient's pubkey and carried in `wrapped_key`, not `body`.
+    SealedGrant {
+        grantee_pubkey: [u8; 32],
+        wrapped_key: [u8; 80],
+        oid: Oid,
+        body: BundleBody,
+    },
+}
+
+/// Serialize a `BundleBody` via the low-level body codec, reusing [`encode`] so
+/// there is exactly one definition of the payload layout.
+fn encode_body(body: &BundleBody) -> Vec<u8> {
+    let changes: Vec<&ChangeNode> = body.changes.iter().collect();
+    encode(&changes, &body.objs, &body.keys, &body.escrow)
+}
+
+fn decode_body(b: &[u8]) -> Result<BundleBody, RepoError> {
+    let (changes, objs_vec, keys, escrow) = decode(b)?;
+    let objs = objs_vec.into_iter().collect();
+    Ok(BundleBody { changes, objs, keys, escrow })
+}
+
+impl Frame {
+    /// Serialize to the exact bytes the old hand-rolled framing emitted —
+    /// byte-identical, so the ADR 0003/0004/0007 leak-guards still pass.
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Frame::Sync { purges, body } => {
+                let mut out = vec![0u8];
+                put_u32(&mut out, purges.len());
+                for (oid, marooned) in purges {
+                    out.extend_from_slice(&oid.0);
+                    put_bytes(&mut out, marooned.as_bytes());
+                }
+                out.extend_from_slice(&encode_body(body));
+                out
+            }
+            Frame::Grant { grantee, body } => {
+                let mut out = vec![1u8];
+                put_bytes(&mut out, grantee.as_bytes());
+                out.extend_from_slice(&encode_body(body));
+                out
+            }
+            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body } => {
+                let mut out = vec![3u8];
+                out.extend_from_slice(grantee_pubkey);
+                out.extend_from_slice(wrapped_key);
+                out.extend_from_slice(&oid.0);
+                out.extend_from_slice(&encode_body(body));
+                out
+            }
+        }
+    }
+
+    /// Decode a whole bundle. Pure and total: no keys, no I/O, no crypto — so it
+    /// serves both `apply` (keyholder) and `stow` (relay). Errors on empty input,
+    /// an unknown tag, or any truncation.
+    pub fn decode(bytes: &[u8]) -> Result<Frame, RepoError> {
+        let Some((&tag, rest)) = bytes.split_first() else {
+            return Err(RepoError::Backend("empty bundle".into()));
+        };
+        match tag {
+            0 => {
+                let mut c = Cursor { b: rest, i: 0 };
+                let purge_count = c.u32()?;
+                let mut purges = Vec::with_capacity(purge_count);
+                for _ in 0..purge_count {
+                    let oid = Oid(c.arr32()?);
+                    let marooned = c.string()?;
+                    purges.push((oid, marooned));
+                }
+                let body = decode_body(&c.b[c.i..])?;
+                Ok(Frame::Sync { purges, body })
+            }
+            1 => {
+                let mut c = Cursor { b: rest, i: 0 };
+                let grantee = c.string()?;
+                let body = decode_body(&c.b[c.i..])?;
+                Ok(Frame::Grant { grantee, body })
+            }
+            // tag 2: reserved — do not assign (the Visibility codec uses 2 for Embargoed
+            // in its own sub-stream; assigning it as a bundle tag would be ambiguous
+            // to any reader that sees both streams).
+            3 => {
+                let mut c = Cursor { b: rest, i: 0 };
+                let grantee_pubkey = c.arr32()?;
+                let mut wrapped_key = [0u8; 80];
+                wrapped_key.copy_from_slice(c.take(80)?);
+                let oid = Oid(c.arr32()?);
+                let body = decode_body(&c.b[c.i..])?;
+                Ok(Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body })
+            }
+            t => Err(RepoError::Backend(format!("unknown bundle tag {t}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_body() -> BundleBody {
+        BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), escrow: BTreeMap::new() }
+    }
+
+    #[test]
+    fn sync_frame_round_trips_with_purges() {
+        let f = Frame::Sync {
+            purges: vec![(Oid([7; 32]), "bob".into())],
+            body: empty_body(),
+        };
+        let bytes = f.encode();
+        assert_eq!(bytes[0], 0, "sync tag");
+        match Frame::decode(&bytes).unwrap() {
+            Frame::Sync { purges, body } => {
+                assert_eq!(purges, vec![(Oid([7; 32]), "bob".to_string())]);
+                assert!(body.objs.is_empty() && body.changes.is_empty());
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn grant_frame_round_trips_grantee() {
+        let f = Frame::Grant { grantee: "alice".into(), body: empty_body() };
+        let bytes = f.encode();
+        assert_eq!(bytes[0], 1, "grant tag");
+        match Frame::decode(&bytes).unwrap() {
+            Frame::Grant { grantee, .. } => assert_eq!(grantee, "alice"),
+            _ => panic!("expected Grant"),
+        }
+    }
+
+    #[test]
+    fn sealed_grant_frame_round_trips_header() {
+        let f = Frame::SealedGrant {
+            grantee_pubkey: [1; 32],
+            wrapped_key: [2; 80],
+            oid: Oid([3; 32]),
+            body: empty_body(),
+        };
+        let bytes = f.encode();
+        assert_eq!(bytes[0], 3, "sealed-grant tag");
+        match Frame::decode(&bytes).unwrap() {
+            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, .. } => {
+                assert_eq!(grantee_pubkey, [1; 32]);
+                assert_eq!(wrapped_key, [2; 80]);
+                assert_eq!(oid, Oid([3; 32]));
+            }
+            _ => panic!("expected SealedGrant"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_empty_and_unknown_tag() {
+        assert!(Frame::decode(&[]).is_err(), "empty input");
+        assert!(Frame::decode(&[9]).is_err(), "unknown tag");
+    }
 }
