@@ -106,6 +106,20 @@ where a non-keyholder carries ciphertext it cannot read. Demonstrated: Bob
 applies Alice's bundle and stores her sealed `.env` as ciphertext he can't
 decrypt.
 
+**Frame** — the typed, tag-resolved form of a bundle on the wire, and the single
+value the engine matches on. There are three: *Sync* (tag 0, carries purge
+events + the change/object/key/escrow body), *Grant* (tag 1, a targeted key
+handoff whose key rides in the body), and *SealedGrant* (tag 3, the content key
+ECIES-wrapped to a recipient pubkey, carried beside the body). All wire framing
+— the tag byte, the Sync purge prefix, the Grant grantee prefix, the SealedGrant
+`[pubkey·wrapped·oid]` header, and every length/offset — lives behind
+`bundle_codec::Frame::{decode, encode}`; the engine does no byte arithmetic. Both
+`apply` (keyholder merge) and `stow` (relay ingest) decode to a `Frame` and match;
+`stow` accepts only *Sync*. A `SealedGrant`'s wrapped key is surfaced verbatim and
+never unwrapped inside the engine — unsealing is the caller's injected closure
+(ADR 0014/0015). The low-level body codec (`encode`/`decode`) is the module's
+private plumbing beneath the `Frame` seam.
+
 **Object** — a content-addressed unit of stored bytes. In the encrypted-DAG
 model, objects are encrypted independently (see *Sealed object*) and addressed
 **solely** by the hash of their *ciphertext*. There is no plaintext-derived

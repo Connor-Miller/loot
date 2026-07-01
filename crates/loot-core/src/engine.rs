@@ -20,7 +20,7 @@ mod change_graph;
 mod object_store;
 mod persist_codec;
 
-use crate::bundle_codec;
+use crate::bundle_codec::{BundleBody, Frame};
 use crate::converge;
 use crate::escrow::Escrow;
 use crate::manifest::Manifest;
@@ -130,29 +130,22 @@ impl DagRepo {
         let key = self.keyring.key_for(oid)
             .ok_or_else(|| RepoError::Unauthorized(oid.clone()))?;
 
-        // Build a bundle carrying just this object + its key, addressed to grantee.
-        let obj = self.object(oid)?;
-        let mut objs: BTreeMap<Oid, &SealedObject> = BTreeMap::new();
-        objs.insert(oid.clone(), obj);
-        let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
-        public_keys.insert(oid.clone(), key);
-
-        // Grant bundles carry no changes — just the object and its key.
-        let payload = bundle_codec::encode_grant(&[], &objs, &public_keys, &BTreeMap::new());
-
-        // Tag this as a grant bundle (tag byte = 1) so apply() routes it through
-        // the grant path: tag(1) || grantee_len(4) || grantee || payload.
-        let mut out = vec![1u8];
-        let gb = grantee.as_bytes();
-        out.extend_from_slice(&(gb.len() as u32).to_le_bytes());
-        out.extend_from_slice(gb);
-        out.extend_from_slice(&payload);
+        // A grant carries just this object and its key, addressed to grantee.
+        let obj = self.object(oid)?.clone();
+        let mut keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
+        keys.insert(oid.clone(), key);
+        let body = BundleBody {
+            changes: Vec::new(),
+            objs: vec![(oid.clone(), obj)],
+            keys,
+            escrow: BTreeMap::new(),
+        };
 
         // Record in the local manifest (file-based grant: no pubkeys known here).
         use crate::manifest::UNKNOWN_PUBKEY;
         self.manifest.record(oid.clone(), grantee.to_string(), UNKNOWN_PUBKEY, UNKNOWN_PUBKEY, now);
 
-        Ok(SyncBundle(out))
+        Ok(SyncBundle(Frame::Grant { grantee: grantee.to_string(), body }.encode()))
     }
 
     /// Produce a sealed-key grant bundle (tag 3) where the content key is
@@ -179,21 +172,20 @@ impl DagRepo {
             .ok_or_else(|| RepoError::Unauthorized(oid.clone()))?;
         let wrapped = seal(&key)?;
 
-        let obj = self.object(oid)?;
-        let mut objs: BTreeMap<Oid, &SealedObject> = BTreeMap::new();
-        objs.insert(oid.clone(), obj);
-        // No key section — key travels in wrapped_key field.
-        let payload = bundle_codec::encode_grant(&[], &objs, &BTreeMap::new(), &BTreeMap::new());
-
-        // Wire: [3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][payload]
-        let mut out = vec![3u8];
-        out.extend_from_slice(&grantee_pubkey);
-        out.extend_from_slice(&wrapped);
-        out.extend_from_slice(&oid.0);
-        out.extend_from_slice(&payload);
+        // Object only — the key travels ECIES-wrapped in the frame's wrapped_key
+        // field, never in the body.
+        let obj = self.object(oid)?.clone();
+        let body = BundleBody {
+            changes: Vec::new(),
+            objs: vec![(oid.clone(), obj)],
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+        };
 
         self.manifest.record(oid.clone(), grantee_name.to_string(), grantee_pubkey, grantor_pubkey, now);
-        Ok(SyncBundle(out))
+        Ok(SyncBundle(
+            Frame::SealedGrant { grantee_pubkey, wrapped_key: wrapped, oid: oid.clone(), body }.encode(),
+        ))
     }
 
     /// Apply a sealed-key grant bundle (tag 3). The caller supplies:
@@ -211,33 +203,20 @@ impl DagRepo {
         now: u64,
         unseal: impl FnOnce(&[u8; 80]) -> Result<[u8; 32], RepoError>,
     ) -> Result<(), RepoError> {
-        let data = &bundle.0;
-        if data.is_empty() || data[0] != 3 {
+        // Decode through the one codec; reject anything that isn't a sealed grant.
+        let Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body } =
+            Frame::decode(&bundle.0)?
+        else {
             return Err(RepoError::Backend("not a sealed-key grant bundle (tag 3)".into()));
-        }
-        // Wire: [3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][payload]
-        let rest = &data[1..];
-        if rest.len() < 32 + 80 + 32 {
-            return Err(RepoError::Backend("sealed grant bundle too short".into()));
-        }
-        let mut grantee_pubkey = [0u8; 32];
-        grantee_pubkey.copy_from_slice(&rest[..32]);
-        let mut wrapped = [0u8; 80];
-        wrapped.copy_from_slice(&rest[32..112]);
-        let mut oid_bytes = [0u8; 32];
-        oid_bytes.copy_from_slice(&rest[112..144]);
-        let oid = Oid(oid_bytes);
-        let payload = &rest[144..];
+        };
 
         // Cryptographic gate: unseal fails if this grant wasn't addressed to us.
-        let key = unseal(&wrapped)?;
+        let key = unseal(&wrapped_key)?;
 
-        let (_changes, incoming_objs, _keys, incoming_escrow) =
-            bundle_codec::decode_grant(payload)?;
-        for (addr, obj) in incoming_objs {
-            self.store(addr.clone(), obj, None);
+        for (addr, obj) in body.objs {
+            self.store(addr, obj, None);
         }
-        for (escrow_oid, (escrow_key, reveal_at)) in incoming_escrow {
+        for (escrow_oid, (escrow_key, reveal_at)) in body.escrow {
             if !self.escrow.holds(&escrow_oid) && !self.keyring.holds(&escrow_oid) {
                 self.escrow.insert(escrow_oid, escrow_key, reveal_at);
             }
@@ -445,16 +424,14 @@ impl DagRepo {
     /// targeted key handoff with no meaning for a keyless relay, so it is
     /// rejected rather than silently dropped.
     pub fn stow(&mut self, bundle: &SyncBundle) -> Result<(), RepoError> {
-        let data = &bundle.0;
-        if data.is_empty() {
-            return Err(RepoError::Backend("empty bundle".into()));
-        }
-        if data[0] != 0 {
+        // A relay only ever stows Sync frames; a Grant/SealedGrant is a targeted
+        // key handoff with no meaning for a keyless relay, so reject it.
+        let Frame::Sync { purges, body } = Frame::decode(&bundle.0)? else {
             return Err(RepoError::Backend(
                 "a relay can only stow sync bundles (tag 0), not grant bundles".into(),
             ));
-        }
-        let parsed = parse_sync_bundle(&data[1..])?;
+        };
+        let BundleBody { changes, objs, keys, escrow } = body;
 
         // Store ciphertext, retaining any keys that rode along so they keep
         // forwarding downstream. Only ANYONE-granted (public) keys and embargoed
@@ -463,11 +440,11 @@ impl DagRepo {
         // automatic: it cannot receive a restricted key here, and thus can never
         // read restricted content. Public keys are non-secret by definition;
         // carrying them lets the relay forward readable public content.
-        for (addr, obj) in parsed.objs {
-            let key = parsed.keys.get(&addr).copied();
+        for (addr, obj) in objs {
+            let key = keys.get(&addr).copied();
             self.store(addr, obj, key);
         }
-        for (oid, (key, reveal_at)) in parsed.escrow {
+        for (oid, (key, reveal_at)) in escrow {
             if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
                 self.escrow.insert(oid, key, reveal_at);
             }
@@ -475,14 +452,14 @@ impl DagRepo {
         // Accumulate purge events so they keep propagating downstream. A relay
         // is never the marooned identity for its own keyring (it holds none),
         // so there is nothing to remove locally.
-        for p in parsed.purges {
+        for p in purges {
             if !self.purges.contains(&p) {
                 self.purges.push(p);
             }
         }
         // Append change-nodes as new tips. Concurrent pushes legitimately fork
         // the graph; keyholders collapse the forks on pull.
-        for node in parsed.changes {
+        for node in changes {
             self.graph.insert(node);
         }
         Ok(())
@@ -494,11 +471,14 @@ impl DagRepo {
     /// the ADR 0001 convergence rule, and records conflicts.
     fn apply_sync(
         &mut self,
-        parsed: ParsedSyncBundle,
+        purges: Vec<(Oid, String)>,
+        body: BundleBody,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
+        let BundleBody { changes, objs, keys, escrow } = body;
+
         // Honor purge events: if we are the marooned identity, remove the old key.
-        for (purge_oid, marooned) in &parsed.purges {
+        for (purge_oid, marooned) in &purges {
             if marooned == &self.identity {
                 self.keyring.remove(purge_oid);
             }
@@ -510,11 +490,11 @@ impl DagRepo {
         // Ingest SealedObjects, filing only the public (non-embargoed) keys that
         // rode along. Embargoed keys travel in escrow and go into our Escrow, not
         // the Keyring (ADR 0007). No Restricted key can be here.
-        for (addr, obj) in parsed.objs {
-            let key = parsed.keys.get(&addr).copied();
+        for (addr, obj) in objs {
+            let key = keys.get(&addr).copied();
             self.store(addr, obj, key);
         }
-        for (oid, (key, reveal_at)) in parsed.escrow {
+        for (oid, (key, reveal_at)) in escrow {
             if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
                 self.escrow.insert(oid, key, reveal_at);
             }
@@ -524,7 +504,7 @@ impl DagRepo {
         // shared ADR 0001 classifier. We are the KeyOracle: it asks us for
         // plaintext, we answer via sealed::open. The classifier owns the rule.
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
-        for node in &parsed.changes {
+        for node in &changes {
             let per_change = converge::classify(&local_before, &node.tree, self, now);
             for (path, outcome) in per_change {
                 let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
@@ -539,7 +519,7 @@ impl DagRepo {
             }
         }
 
-        for node in parsed.changes {
+        for node in changes {
             self.graph.insert(node);
         }
 
@@ -824,13 +804,13 @@ impl Repo for DagRepo {
         //   - Public content keys -> plain keyring section (ANYONE-granted, not embargoed)
         //   - Embargoed content keys -> escrow section (ANYONE-granted, time-gated)
         //   - Restricted keys NEVER travel (ADR 0003)
-        let mut needed: BTreeMap<Oid, &SealedObject> = BTreeMap::new();
+        let mut needed: BTreeMap<Oid, SealedObject> = BTreeMap::new();
         let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
         let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
         for c in &send {
             for (oid, vis) in c.tree.values() {
                 if let Ok(obj) = self.object(oid) {
-                    needed.insert(oid.clone(), obj);
+                    needed.insert(oid.clone(), obj.clone());
                     if obj.grant_ids.iter().any(|g| g == ANYONE) {
                         if let Visibility::Embargoed { reveal_at } = vis {
                             // Embargoed: key rides as an escrow entry so the receiver
@@ -850,20 +830,15 @@ impl Repo for DagRepo {
             }
         }
 
-        // Regular sync bundle: tag = 0 (no grantee prefix).
-        let payload = bundle_codec::encode(&send, &needed, &public_keys, &escrow_entries);
-        // Prepend tag=0 and purge list.
-        let mut out = vec![0u8]; // tag: sync bundle
-        // Encode purges: (oid, marooned) pairs.
-        out.extend_from_slice(&(self.purges.len() as u32).to_le_bytes());
-        for (oid, marooned) in &self.purges {
-            out.extend_from_slice(&oid.0);
-            let mb = marooned.as_bytes();
-            out.extend_from_slice(&(mb.len() as u32).to_le_bytes());
-            out.extend_from_slice(mb);
-        }
-        out.extend_from_slice(&payload);
-        Ok(SyncBundle(out))
+        // A Sync frame: the codec owns the tag byte and purge prefix. `objs` is
+        // sorted by address (BTreeMap -> Vec) so the wire stays byte-identical.
+        let body = BundleBody {
+            changes: send.into_iter().cloned().collect(),
+            objs: needed.into_iter().collect(),
+            keys: public_keys,
+            escrow: escrow_entries,
+        };
+        Ok(SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode()))
     }
 
     fn apply(
@@ -871,73 +846,39 @@ impl Repo for DagRepo {
         bundle: &SyncBundle,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
-        let data = &bundle.0;
-        if data.is_empty() {
-            return Err(RepoError::Backend("empty bundle".into()));
-        }
-
-        let tag = data[0];
-        let rest = &data[1..];
-
-        if tag == 0 {
-            // Sync bundle. Parse, then merge into our working change (the
-            // keyholder path). A relay would call `stow` instead and skip merge.
-            let parsed = parse_sync_bundle(rest)?;
-            return self.apply_sync(parsed, now);
-        }
-
-        if tag == 1 {
-            // Grant bundle: grantee_len(4) || grantee || payload
-            if rest.len() < 4 {
-                return Err(RepoError::Backend("grant bundle truncated".into()));
-            }
-            let grantee_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-            if rest.len() < 4 + grantee_len {
-                return Err(RepoError::Backend("grant bundle grantee truncated".into()));
-            }
-            let grantee = std::str::from_utf8(&rest[4..4 + grantee_len])
-                .map_err(|e| RepoError::Backend(e.to_string()))?
-                .to_string();
-            let payload = &rest[4 + grantee_len..];
-
-            let (_changes, incoming_objs, incoming_keys, incoming_escrow) =
-                bundle_codec::decode_grant(payload)?;
-
-            // Install objects and keys.
-            for (addr, obj) in incoming_objs {
-                let key = incoming_keys.get(&addr).copied();
-                // Store the object (may dedup). For grant bundles targeted to us,
-                // file the key directly into the keyring — dedup does not block key
-                // custody since the key is the grant payload, not derived from storage.
-                self.store(addr.clone(), obj, None); // store without key to avoid dedup blocking
-                if grantee == self.identity {
-                    if let Some(k) = key {
-                        if !self.keyring.holds(&addr) {
-                            self.keyring.insert(addr, k);
+        // One decode, then dispatch on the typed frame. A relay would call `stow`
+        // instead and skip the merge. Sealed-key grants (tag 3) need the caller's
+        // unseal closure, so they go through `apply_sealed_grant`, not here.
+        match Frame::decode(&bundle.0)? {
+            Frame::Sync { purges, body } => self.apply_sync(purges, body, now),
+            Frame::Grant { grantee, body } => {
+                let BundleBody { objs, keys, escrow, .. } = body;
+                // Install objects and, if the grant is addressed to us, its keys.
+                for (addr, obj) in objs {
+                    let key = keys.get(&addr).copied();
+                    // Store the object (may dedup). For grant bundles targeted to us,
+                    // file the key directly into the keyring — dedup does not block key
+                    // custody since the key is the grant payload, not derived from storage.
+                    self.store(addr.clone(), obj, None);
+                    if grantee == self.identity {
+                        if let Some(k) = key {
+                            if !self.keyring.holds(&addr) {
+                                self.keyring.insert(addr, k);
+                            }
                         }
                     }
                 }
-            }
-            for (oid, (key, reveal_at)) in incoming_escrow {
-                if grantee == self.identity && !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                    self.escrow.insert(oid, key, reveal_at);
+                for (oid, (key, reveal_at)) in escrow {
+                    if grantee == self.identity && !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
+                        self.escrow.insert(oid, key, reveal_at);
+                    }
                 }
+                Ok(BTreeMap::new())
             }
-
-            return Ok(BTreeMap::new());
-        }
-
-        if tag == 3 {
-            // Sealed-key grant bundle: grantee_len(4) || grantee ||
-            // wrapped_key(80) || oid(32) || standard grant payload (object only,
-            // no key section — key is in the wrapped_key field above).
-            // The caller supplies `unseal_fn` to unwrap the key outside the engine.
-            return Err(RepoError::Backend(
+            Frame::SealedGrant { .. } => Err(RepoError::Backend(
                 "sealed-key grant bundle (tag 3) must be applied via apply_sealed_grant".into(),
-            ));
+            )),
         }
-
-        Err(RepoError::Backend(format!("unknown bundle tag {tag}")))
     }
 
     fn heads(&self) -> Vec<Oid> {
@@ -956,53 +897,6 @@ impl converge::KeyOracle for DagRepo {
     fn open(&self, oid: &Oid, now: u64) -> Option<Vec<u8>> {
         self.get(oid, &self.identity, now).ok()
     }
-}
-
-/// A decoded tag-0 sync bundle: the purge events, change-nodes, sealed objects,
-/// public keys, and embargoed escrow entries it carries. Produced by
-/// [`parse_sync_bundle`] and consumed by both `apply_sync` (keyholder merge) and
-/// `stow` (relay append-only ingest), so the wire format is parsed in one place.
-struct ParsedSyncBundle {
-    purges: Vec<(Oid, String)>,
-    changes: Vec<ChangeNode>,
-    objs: Vec<(Oid, SealedObject)>,
-    keys: BTreeMap<Oid, ContentKey>,
-    escrow: BTreeMap<Oid, (ContentKey, u64)>,
-}
-
-/// Parse the body of a tag-0 sync bundle (everything after the leading tag byte):
-/// `purge_count(4) || [(oid(32) || marooned_len(4) || marooned)*] || bundle_payload`.
-fn parse_sync_bundle(rest: &[u8]) -> Result<ParsedSyncBundle, RepoError> {
-    if rest.len() < 4 {
-        return Err(RepoError::Backend("sync bundle truncated (purge count)".into()));
-    }
-    let purge_count = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    let mut pos = 4;
-    let mut purges: Vec<(Oid, String)> = Vec::with_capacity(purge_count);
-    for _ in 0..purge_count {
-        if pos + 32 > rest.len() {
-            return Err(RepoError::Backend("sync bundle truncated (purge oid)".into()));
-        }
-        let mut oid_bytes = [0u8; 32];
-        oid_bytes.copy_from_slice(&rest[pos..pos + 32]);
-        pos += 32;
-        if pos + 4 > rest.len() {
-            return Err(RepoError::Backend("sync bundle truncated (purge identity len)".into()));
-        }
-        let id_len = u32::from_le_bytes([rest[pos], rest[pos + 1], rest[pos + 2], rest[pos + 3]]) as usize;
-        pos += 4;
-        if pos + id_len > rest.len() {
-            return Err(RepoError::Backend("sync bundle truncated (purge identity)".into()));
-        }
-        let marooned = std::str::from_utf8(&rest[pos..pos + id_len])
-            .map_err(|e| RepoError::Backend(e.to_string()))?
-            .to_string();
-        pos += id_len;
-        purges.push((Oid(oid_bytes), marooned));
-    }
-    let payload = &rest[pos..];
-    let (changes, objs, keys, escrow) = bundle_codec::decode(payload)?;
-    Ok(ParsedSyncBundle { purges, changes, objs, keys, escrow })
 }
 
 // --- local persistence helpers for manifest, purges, conflicts ---
@@ -1095,6 +989,8 @@ mod tests {
     //! The black-box bake-off scenarios live in the `spike-dag` shim crate,
     //! driving the engine through the public `Repo` interface (ADR 0002).
     use super::*;
+    // White-box tests reach into the low-level body codec directly.
+    use crate::bundle_codec;
 
     fn tmp() -> PathBuf {
         std::env::temp_dir()
@@ -1909,9 +1805,12 @@ mod tests {
 
         // The relay re-emits the purge in its own outgoing bundle.
         let relay_out = relay.bundle(&[]).unwrap();
-        let parsed = super::parse_sync_bundle(&relay_out.0[1..]).unwrap();
+        let purges = match bundle_codec::Frame::decode(&relay_out.0).unwrap() {
+            bundle_codec::Frame::Sync { purges, .. } => purges,
+            _ => panic!("relay bundle must be a sync frame"),
+        };
         assert!(
-            parsed.purges.iter().any(|(o, who)| *o == oid && who == "bob"),
+            purges.iter().any(|(o, who)| *o == oid && who == "bob"),
             "relay must forward the purge event downstream"
         );
     }
