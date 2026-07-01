@@ -85,6 +85,19 @@ keyholder), `repo` (sealed objects + change graph), and `keyring` (this
 identity's keys, LOCAL-ONLY — never bundled). Written/read by the engine's
 `save`/`load`; the CLI is process-per-command and round-trips through it.
 
+**RepoStore** — the single source of truth for the `.loot/` layout: where every
+artifact lives under the directory, plus the small process-file encodings
+(`working`, `tree-hash`). Path construction for `identity`, `graph`, `keyring`,
+`escrow`, `manifest`, `purges`, `conflicts`, `working`, `tree-hash`, `config`,
+`objects/`, and the keypair/peers files lives in one place (`loot_core::store`,
+ADR 0017) rather than as string literals scattered across the engine, the
+Workspace, and loot-identity. It owns *layout, not policy* — which identity, when
+to snapshot, and what a change means stay with the engine and the Workspace;
+RepoStore is only the filesystem adapter between logical artifacts and paths. The
+`objects/` subdirectory is still written by `persist_codec` (ADR 0012) and the
+keypair/`peers` files by loot-identity (ADR 0014); RepoStore names their paths so
+the layout has one documented home.
+
 **`.lootattributes`** — a gitattributes-style file mapping path globs to
 visibility (`.env restricted=alice`, `*.md public`). The Workspace reads it on
 snapshot to seal each path; unmatched paths default to Public. This is the
