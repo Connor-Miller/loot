@@ -360,9 +360,8 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     // Wrap in a push envelope so the recipient can verify the grantor (ADR 0015).
     let envelope = id.wrap_envelope(&bundle.0);
 
-    // Address the mailbox by grantee pubkey hex (relay learns no names, ADR 0015).
-    let grantee_pubkey_hex = loot_core::hex::encode(&grantee_ed_pubkey);
-    loot_net::deliver_grant(&url, &grantee_pubkey_hex, &envelope).map_err(|e| e.to_string())?;
+    // Address the mailbox by grantee pubkey (loot-net hexes it; relay learns no names, ADR 0015).
+    loot_net::deliver_grant(&url, &grantee_ed_pubkey, &envelope).map_err(|e| e.to_string())?;
     println!("delivered sealed grant for '{grantee}' via relay {url}");
     println!("  {path} → {grantee} (sealed, signed, recorded in manifest)");
     println!("  recipient runs `loot pull-grants` to receive it");
@@ -650,8 +649,7 @@ fn cmd_grants(args: &[String]) -> Result<(), String> {
     let dot = ws.dot().to_owned();
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
-    let my_pubkey_hex = loot_core::hex::encode(&id.public_key_bytes());
-    let count = loot_net::peek_grants(&url, &my_pubkey_hex).map_err(|e| e.to_string())?;
+    let count = loot_net::peek_grants(&url, &id.public_key_bytes()).map_err(|e| e.to_string())?;
     if count == 0 {
         println!("no pending grants at {url}");
     } else {
@@ -667,11 +665,10 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
 
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
     let my_pubkey = id.public_key_bytes();
-    let my_pubkey_hex = loot_core::hex::encode(&my_pubkey);
     let now = ws.now();
 
-    // Fetch by pubkey hex — relay addresses mailbox by pubkey, not name (ADR 0015).
-    let envelopes = loot_net::fetch_grants(&url, &my_pubkey_hex).map_err(|e| e.to_string())?;
+    // Fetch by pubkey — loot-net hexes it; relay addresses mailbox by pubkey, not name (ADR 0015).
+    let envelopes = loot_net::fetch_grants(&url, &my_pubkey).map_err(|e| e.to_string())?;
     if envelopes.is_empty() {
         println!("no pending grants at {url}");
         return Ok(());
