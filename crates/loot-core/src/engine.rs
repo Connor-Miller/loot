@@ -28,6 +28,7 @@ use crate::sealed::{self, ContentKey, Keyring, SealedObject, ANYONE};
 use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 pub(crate) use change_graph::ChangeNode;
 use change_graph::{compute_change_id, ChangeGraph};
+use crate::store::RepoStore;
 use object_store::{ObjectStore, Stored};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -560,17 +561,18 @@ impl DagRepo {
     /// and never travels in a bundle (ADR 0003, 0005).
     pub fn save(&self, dir: &std::path::Path) -> Result<(), RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
+        let store = RepoStore::new(dir);
         std::fs::create_dir_all(dir).map_err(io)?;
-        std::fs::write(dir.join("identity"), self.identity.as_bytes()).map_err(io)?;
+        std::fs::write(store.identity(), self.identity.as_bytes()).map_err(io)?;
         // Objects: loose, content-addressed, incremental (ADR 0012).
         persist_codec::save_objects_loose(dir, &self.objects)?;
-        // Change graph: small metadata, whole-file.
-        std::fs::write(dir.join("graph"), persist_codec::encode_graph(&self.graph)).map_err(io)?;
-        std::fs::write(dir.join("keyring"), persist_codec::encode_keyring(&self.keyring)).map_err(io)?;
-        std::fs::write(dir.join("escrow"), persist_codec::encode_escrow(&self.escrow)).map_err(io)?;
-        std::fs::write(dir.join("manifest"), encode_manifest(&self.manifest)).map_err(io)?;
-        std::fs::write(dir.join("purges"), encode_purges(&self.purges)).map_err(io)?;
-        std::fs::write(dir.join("conflicts"), encode_conflicts(&self.conflicts)).map_err(io)?;
+        // Change graph + custody metadata: small, whole-file. RepoStore names them.
+        std::fs::write(store.graph(), persist_codec::encode_graph(&self.graph)).map_err(io)?;
+        std::fs::write(store.keyring(), persist_codec::encode_keyring(&self.keyring)).map_err(io)?;
+        std::fs::write(store.escrow(), persist_codec::encode_escrow(&self.escrow)).map_err(io)?;
+        std::fs::write(store.manifest(), encode_manifest(&self.manifest)).map_err(io)?;
+        std::fs::write(store.purges(), encode_purges(&self.purges)).map_err(io)?;
+        std::fs::write(store.conflicts(), encode_conflicts(&self.conflicts)).map_err(io)?;
         Ok(())
     }
 
@@ -769,25 +771,26 @@ impl DagRepo {
     /// `dir` so the store can live in `.loot/` while files land in the repo).
     pub fn load(dir: &std::path::Path, root: PathBuf) -> Result<Self, RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-        let identity = String::from_utf8(std::fs::read(dir.join("identity")).map_err(io)?)
+        let store = RepoStore::new(dir);
+        let identity = String::from_utf8(std::fs::read(store.identity()).map_err(io)?)
             .map_err(|e| RepoError::Backend(e.to_string()))?;
         let objects = persist_codec::load_objects_loose(dir)?;
-        let graph = persist_codec::decode_graph(&std::fs::read(dir.join("graph")).map_err(io)?)?;
-        let keyring = persist_codec::decode_keyring(&std::fs::read(dir.join("keyring")).map_err(io)?)?;
+        let graph = persist_codec::decode_graph(&std::fs::read(store.graph()).map_err(io)?)?;
+        let keyring = persist_codec::decode_keyring(&std::fs::read(store.keyring()).map_err(io)?)?;
         // Escrow file may not exist in repos created before ADR 0007 — default empty.
-        let escrow = match std::fs::read(dir.join("escrow")) {
+        let escrow = match std::fs::read(store.escrow()) {
             Ok(b) => persist_codec::decode_escrow(&b)?,
             Err(_) => Escrow::new(),
         };
-        let manifest = match std::fs::read(dir.join("manifest")) {
+        let manifest = match std::fs::read(store.manifest()) {
             Ok(b) => decode_manifest(&b)?,
             Err(_) => Manifest::new(),
         };
-        let purges = match std::fs::read(dir.join("purges")) {
+        let purges = match std::fs::read(store.purges()) {
             Ok(b) => decode_purges(&b)?,
             Err(_) => Vec::new(),
         };
-        let conflicts = match std::fs::read(dir.join("conflicts")) {
+        let conflicts = match std::fs::read(store.conflicts()) {
             Ok(b) => decode_conflicts(&b)?,
             Err(_) => BTreeMap::new(),
         };

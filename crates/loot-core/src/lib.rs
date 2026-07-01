@@ -13,8 +13,10 @@ pub mod escrow;
 pub mod hex;            // shared byte<->hex conversion (one home for all crates)
 pub mod manifest;
 pub mod sealed;
+pub mod store;          // the .loot/ on-disk layout (single source of truth)
 
 pub use engine::{DagRepo, LogGraph, LogNode, MaroonResult, MigrateResult};
+pub use store::RepoStore;
 
 /// Content identity. A stable handle to a unit of content, independent of
 /// where (or whether) it is currently materialized on disk.
