@@ -1325,7 +1325,7 @@ mod tests {
         repo.save(&dir).unwrap();
 
         let obj_dir = dir.join("objects");
-        let path_a = obj_dir.join(super::persist_codec::hex(&a.0));
+        let path_a = obj_dir.join(crate::hex::encode(&a.0));
         assert!(path_a.exists(), "object A should be a loose file named by its address");
         let a_bytes_first = std::fs::read(&path_a).unwrap();
 
@@ -1335,7 +1335,7 @@ mod tests {
 
         // A's file is untouched (immutable); B's file now exists.
         assert_eq!(std::fs::read(&path_a).unwrap(), a_bytes_first, "existing object file must not be rewritten");
-        assert!(obj_dir.join(super::persist_codec::hex(&b.0)).exists(), "new object B should have its own file");
+        assert!(obj_dir.join(crate::hex::encode(&b.0)).exists(), "new object B should have its own file");
 
         // No leftover temp files from the atomic write.
         let leftover_tmp = std::fs::read_dir(&obj_dir)

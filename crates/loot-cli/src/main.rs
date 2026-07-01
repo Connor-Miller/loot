@@ -361,7 +361,7 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     let envelope = id.wrap_envelope(&bundle.0);
 
     // Address the mailbox by grantee pubkey hex (relay learns no names, ADR 0015).
-    let grantee_pubkey_hex = hex_encode(&grantee_ed_pubkey);
+    let grantee_pubkey_hex = loot_core::hex::encode(&grantee_ed_pubkey);
     loot_net::deliver_grant(&url, &grantee_pubkey_hex, &envelope).map_err(|e| e.to_string())?;
     println!("delivered sealed grant for '{grantee}' via relay {url}");
     println!("  {path} → {grantee} (sealed, signed, recorded in manifest)");
@@ -650,7 +650,7 @@ fn cmd_grants(args: &[String]) -> Result<(), String> {
     let dot = ws.dot().to_owned();
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
-    let my_pubkey_hex = hex_encode(&id.public_key_bytes());
+    let my_pubkey_hex = loot_core::hex::encode(&id.public_key_bytes());
     let count = loot_net::peek_grants(&url, &my_pubkey_hex).map_err(|e| e.to_string())?;
     if count == 0 {
         println!("no pending grants at {url}");
@@ -667,7 +667,7 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
 
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
     let my_pubkey = id.public_key_bytes();
-    let my_pubkey_hex = hex_encode(&my_pubkey);
+    let my_pubkey_hex = loot_core::hex::encode(&my_pubkey);
     let now = ws.now();
 
     // Fetch by pubkey hex — relay addresses mailbox by pubkey, not name (ADR 0015).
@@ -926,13 +926,8 @@ fn parse_pubkey_hex(hex: &str) -> Result<[u8; 32], String> {
     if hex.len() != 64 {
         return Err(format!("public key must be 64 hex chars (32 bytes), got {} chars", hex.len()));
     }
-    let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
-        out[i] = u8::from_str_radix(s, 16)
-            .map_err(|_| format!("invalid hex byte '{s}' in public key"))?;
-    }
-    Ok(out)
+    loot_core::hex::decode_array::<32>(hex)
+        .ok_or_else(|| format!("invalid hex in public key '{hex}'"))
 }
 
 fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
@@ -1013,12 +1008,9 @@ fn short_oid(oid: &Oid) -> String {
     short(oid)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
+/// A pubkey prefix for display: first 4 bytes as hex, plus an ellipsis.
 fn hex_short(bytes: &[u8]) -> String {
-    bytes[..4].iter().map(|b| format!("{b:02x}")).collect::<String>() + "…"
+    format!("{}…", loot_core::hex::short(bytes, 4))
 }
 
 #[cfg(test)]
