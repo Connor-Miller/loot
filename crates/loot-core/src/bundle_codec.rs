@@ -95,7 +95,7 @@ impl<'a> Cursor<'a> {
 
 pub fn encode(
     changes: &[&ChangeNode],
-    objs: &BTreeMap<Oid, &SealedObject>,
+    objs: &BTreeMap<Oid, SealedObject>,
     public_keys: &BTreeMap<Oid, ContentKey>,
     escrow_entries: &BTreeMap<Oid, (ContentKey, u64)>,
 ) -> Vec<u8> {
@@ -240,7 +240,9 @@ pub fn decode(
 #[derive(Clone)]
 pub struct BundleBody {
     pub changes: Vec<ChangeNode>,
-    pub objs: Vec<(Oid, SealedObject)>,
+    /// Keyed by content address so `encode_body` can borrow directly into
+    /// `encode()` without rebuilding a map.
+    pub objs: BTreeMap<Oid, SealedObject>,
     pub keys: BTreeMap<Oid, ContentKey>,
     pub escrow: BTreeMap<Oid, (ContentKey, u64)>,
 }
@@ -279,13 +281,12 @@ pub enum Frame {
 /// there is exactly one definition of the payload layout.
 fn encode_body(body: &BundleBody) -> Vec<u8> {
     let changes: Vec<&ChangeNode> = body.changes.iter().collect();
-    let objs: BTreeMap<Oid, &SealedObject> =
-        body.objs.iter().map(|(o, s)| (o.clone(), s)).collect();
-    encode(&changes, &objs, &body.keys, &body.escrow)
+    encode(&changes, &body.objs, &body.keys, &body.escrow)
 }
 
 fn decode_body(b: &[u8]) -> Result<BundleBody, RepoError> {
-    let (changes, objs, keys, escrow) = decode(b)?;
+    let (changes, objs_vec, keys, escrow) = decode(b)?;
+    let objs = objs_vec.into_iter().collect();
     Ok(BundleBody { changes, objs, keys, escrow })
 }
 
@@ -347,6 +348,9 @@ impl Frame {
                 let body = decode_body(&c.b[c.i..])?;
                 Ok(Frame::Grant { grantee, body })
             }
+            // tag 2: reserved — do not assign (the Visibility codec uses 2 for Embargoed
+            // in its own sub-stream; assigning it as a bundle tag would be ambiguous
+            // to any reader that sees both streams).
             3 => {
                 let mut c = Cursor { b: rest, i: 0 };
                 let grantee_pubkey = c.arr32()?;
@@ -366,7 +370,7 @@ mod tests {
     use super::*;
 
     fn empty_body() -> BundleBody {
-        BundleBody { changes: vec![], objs: vec![], keys: BTreeMap::new(), escrow: BTreeMap::new() }
+        BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), escrow: BTreeMap::new() }
     }
 
     #[test]

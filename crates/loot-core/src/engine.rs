@@ -134,9 +134,11 @@ impl DagRepo {
         let obj = self.object(oid)?.clone();
         let mut keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
         keys.insert(oid.clone(), key);
+        let mut objs: BTreeMap<Oid, SealedObject> = BTreeMap::new();
+        objs.insert(oid.clone(), obj);
         let body = BundleBody {
             changes: Vec::new(),
-            objs: vec![(oid.clone(), obj)],
+            objs,
             keys,
             escrow: BTreeMap::new(),
         };
@@ -175,9 +177,11 @@ impl DagRepo {
         // Object only — the key travels ECIES-wrapped in the frame's wrapped_key
         // field, never in the body.
         let obj = self.object(oid)?.clone();
+        let mut objs: BTreeMap<Oid, SealedObject> = BTreeMap::new();
+        objs.insert(oid.clone(), obj);
         let body = BundleBody {
             changes: Vec::new(),
-            objs: vec![(oid.clone(), obj)],
+            objs,
             keys: BTreeMap::new(),
             escrow: BTreeMap::new(),
         };
@@ -810,7 +814,8 @@ impl Repo for DagRepo {
         for c in &send {
             for (oid, vis) in c.tree.values() {
                 if let Ok(obj) = self.object(oid) {
-                    needed.insert(oid.clone(), obj.clone());
+                    // Clone only once per unique OID; BTreeMap deduplicates repeats.
+                    needed.entry(oid.clone()).or_insert_with(|| obj.clone());
                     if obj.grant_ids.iter().any(|g| g == ANYONE) {
                         if let Visibility::Embargoed { reveal_at } = vis {
                             // Embargoed: key rides as an escrow entry so the receiver
@@ -830,11 +835,9 @@ impl Repo for DagRepo {
             }
         }
 
-        // A Sync frame: the codec owns the tag byte and purge prefix. `objs` is
-        // sorted by address (BTreeMap -> Vec) so the wire stays byte-identical.
         let body = BundleBody {
             changes: send.into_iter().cloned().collect(),
-            objs: needed.into_iter().collect(),
+            objs: needed,
             keys: public_keys,
             escrow: escrow_entries,
         };
