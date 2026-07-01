@@ -34,10 +34,9 @@ fn map_io(e: std::io::Error) -> NetError {
     NetError::Io(e.to_string())
 }
 
-/// Hash `bytes` with blake3 and return the lowercase hex string.
+/// Content-address `bytes` with blake3 and return the lowercase hex string.
 fn hex_hash(bytes: &[u8]) -> String {
-    let h = blake3::hash(bytes);
-    h.to_hex().to_string()
+    loot_core::hex::encode(blake3::hash(bytes).as_bytes())
 }
 
 /// Load the index: `recipient -> [hash_hex]`.
