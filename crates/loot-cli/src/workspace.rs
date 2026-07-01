@@ -8,17 +8,17 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
-use loot_core::{DagRepo, Oid, Repo, Visibility};
+use loot_core::{DagRepo, Oid, RepoStore, Repo, Visibility};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOT: &str = ".loot";
 const ATTRS: &str = ".lootattributes";
-const CONFIG: &str = "config";
 
 pub struct Workspace {
     dot: PathBuf,
+    store: RepoStore,
     root: PathBuf,
     identity: String,
     repo: DagRepo,
@@ -38,23 +38,17 @@ impl Workspace {
     /// Load a repo rooted at an explicit directory (used by `clone`).
     pub fn open_at(dir: &Path) -> Result<Self, String> {
         let dot = dir.join(DOT);
-        if !dot.join("identity").exists() {
+        let store = RepoStore::new(&dot);
+        if !store.identity().exists() {
             return Err(format!(
                 "not a loot repo at {} (no .loot/). Run `loot init` first.",
                 dir.display()
             ));
         }
         let repo = DagRepo::load(&dot, dir.to_path_buf()).map_err(|e| e.to_string())?;
-        let identity = read_to_string(&dot.join("identity"))?;
-        let working = match std::fs::read(dot.join("working")) {
-            Ok(bytes) if bytes.len() == 32 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(&bytes);
-                Some(Oid(a))
-            }
-            _ => None,
-        };
-        Ok(Workspace { dot, root: dir.to_path_buf(), identity, repo, working, now: real_now() })
+        let identity = read_to_string(&store.identity())?;
+        let working = store.read_working();
+        Ok(Workspace { dot, store, root: dir.to_path_buf(), identity, repo, working, now: real_now() })
     }
 
     pub fn identity(&self) -> &str {
@@ -108,8 +102,7 @@ impl Workspace {
         // Hash the current working tree content + message. Skip the engine
         // snapshot if nothing changed — running `loot status` repeatedly is safe.
         let tree_hash = hash_tree(&entries, message);
-        let hash_path = self.dot.join("tree-hash");
-        let last_hash = std::fs::read(&hash_path).unwrap_or_default();
+        let last_hash = self.store.read_tree_hash();
         if last_hash == tree_hash {
             if let Some(id) = &self.working {
                 return Ok((id.clone(), reported));
@@ -122,7 +115,7 @@ impl Workspace {
             .map_err(|e| e.to_string())?;
         self.working = Some(id.clone());
         // Persist the new tree hash before persisting the rest of state.
-        let _ = std::fs::write(&hash_path, &tree_hash);
+        let _ = self.store.write_tree_hash(&tree_hash);
         self.persist()?;
         Ok((id, reported))
     }
@@ -132,7 +125,7 @@ impl Workspace {
     pub fn finalize_working(&mut self) -> Result<(), String> {
         self.working = None;
         // Clear the tree-hash so the next snapshot always runs the engine.
-        let _ = std::fs::remove_file(self.dot.join("tree-hash"));
+        self.store.clear_tree_hash();
         self.persist()
     }
 
@@ -178,12 +171,12 @@ impl Workspace {
     /// Read the URL for a named remote (e.g. "origin") from `.loot/config`.
     /// Returns `None` if the remote is not set.
     pub fn remote_url(&self, name: &str) -> Option<String> {
-        Config::load(&self.dot.join(CONFIG)).get(name)
+        Config::load(&self.store.config()).get(name)
     }
 
     /// Add or update a named remote in `.loot/config`.
     pub fn remote_add(&self, name: &str, url: &str) -> Result<(), String> {
-        let path = self.dot.join(CONFIG);
+        let path = self.store.config();
         let mut cfg = Config::load(&path);
         cfg.set(name, url);
         cfg.save(&path)
@@ -191,7 +184,7 @@ impl Workspace {
 
     /// Remove a named remote from `.loot/config`. No-ops if not present.
     pub fn remote_remove(&self, name: &str) -> Result<(), String> {
-        let path = self.dot.join(CONFIG);
+        let path = self.store.config();
         let mut cfg = Config::load(&path);
         cfg.remove(name);
         cfg.save(&path)
@@ -199,7 +192,7 @@ impl Workspace {
 
     /// List all named remotes from `.loot/config`.
     pub fn remote_list(&self) -> Vec<(String, String)> {
-        Config::load(&self.dot.join(CONFIG)).entries()
+        Config::load(&self.store.config()).entries()
     }
 
     /// Create a fresh repo inside `dir`, owned by `identity`. `dir` is created if
@@ -209,12 +202,14 @@ impl Workspace {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("create {}: {e}", dir.display()))?;
         let dot = dir.join(DOT);
-        if dot.join("identity").exists() {
+        if RepoStore::new(&dot).identity().exists() {
             return Err(format!("already a loot repo at {}", dir.display()));
         }
+        let store = RepoStore::new(&dot);
         let repo = DagRepo::init(dir.to_path_buf(), identity).map_err(|e| e.to_string())?;
         let ws = Workspace {
             dot,
+            store,
             root: dir.to_path_buf(),
             identity: identity.to_string(),
             repo,
@@ -227,14 +222,9 @@ impl Workspace {
 
     fn persist(&self) -> Result<(), String> {
         self.repo.save(&self.dot).map_err(|e| e.to_string())?;
-        match &self.working {
-            Some(oid) => std::fs::write(self.dot.join("working"), oid.0)
-                .map_err(|e| format!("write working: {e}"))?,
-            None => {
-                let _ = std::fs::remove_file(self.dot.join("working"));
-            }
-        }
-        Ok(())
+        self.store
+            .write_working(self.working.as_ref())
+            .map_err(|e| format!("write working: {e}"))
     }
 }
 
@@ -439,10 +429,28 @@ fn hash_tree(entries: &[(PathBuf, Vec<u8>, Visibility)], message: &str) -> Vec<u
     h.update(message.as_bytes());
     h.update(&[0]);
     // entries arrive pre-sorted from walk(); hash in that order for stability.
-    for (path, bytes, _vis) in entries {
+    // Visibility is included so a .lootattributes-only change (same content,
+    // different access policy) triggers a new snapshot rather than being skipped.
+    for (path, bytes, vis) in entries {
         h.update(path.to_string_lossy().as_bytes());
         h.update(&[0]);
         h.update(bytes);
+        h.update(&[0]);
+        // Stable encoding: Public=0, Restricted=1+names, Embargoed=2+timestamp.
+        match vis {
+            Visibility::Public => { h.update(&[0]); }
+            Visibility::Restricted(ids) => {
+                h.update(&[1]);
+                for id in ids {
+                    h.update(id.as_bytes());
+                    h.update(&[0]);
+                }
+            }
+            Visibility::Embargoed { reveal_at } => {
+                h.update(&[2]);
+                h.update(&reveal_at.to_le_bytes());
+            }
+        }
         h.update(&[0]);
     }
     h.finalize().as_bytes().to_vec()
@@ -515,7 +523,7 @@ mod tests {
     fn config_round_trips_remotes() {
         let dir = std::env::temp_dir().join(format!("loot-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join(CONFIG);
+        let p = dir.join("config");
 
         let mut cfg = Config::load(&p);
         assert!(cfg.get("origin").is_none());
@@ -542,7 +550,7 @@ mod tests {
     fn config_ignores_comments_and_blanks() {
         let dir = std::env::temp_dir().join(format!("loot-config2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join(CONFIG);
+        let p = dir.join("config");
         std::fs::write(&p, "# a comment\n\norigin = http://localhost:4000\n").unwrap();
         let cfg = Config::load(&p);
         assert_eq!(cfg.get("origin").as_deref(), Some("http://localhost:4000"));
