@@ -37,29 +37,6 @@ fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
     }
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
-    }
-    s
-}
-
-fn unhex32(s: &str) -> Option<[u8; 32]> {
-    let bytes = s.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        let hi = (bytes[2 * i] as char).to_digit(16)?;
-        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
-        out[i] = ((hi << 4) | lo) as u8;
-    }
-    Some(out)
-}
-
 fn encode_object(obj: &SealedObject) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&obj.nonce);
@@ -99,11 +76,11 @@ pub fn save_objects_loose(dir: &Path, objects: &ObjectStore) -> Result<(), RepoE
     let obj_dir = dir.join(OBJECTS_DIR);
     std::fs::create_dir_all(&obj_dir).map_err(io)?;
     for (addr, obj) in objects.iter() {
-        let dest = obj_dir.join(hex(&addr.0));
+        let dest = obj_dir.join(crate::hex::encode(&addr.0));
         if dest.exists() {
             continue;
         }
-        let tmp = obj_dir.join(format!("{}.tmp", hex(&addr.0)));
+        let tmp = obj_dir.join(format!("{}.tmp", crate::hex::encode(&addr.0)));
         std::fs::write(&tmp, encode_object(obj)).map_err(io)?;
         std::fs::rename(&tmp, &dest).map_err(io)?;
     }
@@ -124,7 +101,7 @@ pub fn load_objects_loose(dir: &Path) -> Result<ObjectStore, RepoError> {
         let entry = entry.map_err(|e| RepoError::Backend(e.to_string()))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(addr) = unhex32(&name) else {
+        let Some(addr) = crate::hex::decode_array::<32>(&name) else {
             continue; // skip *.tmp and anything not a content address
         };
         let bytes = std::fs::read(entry.path()).map_err(|e| RepoError::Backend(e.to_string()))?;

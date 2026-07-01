@@ -10,6 +10,7 @@ pub mod bundle_codec;   // sync bundle wire format (ADR 0003, 0004, 0007)
 pub mod converge;
 pub mod engine;
 pub mod escrow;
+pub mod hex;            // shared byte<->hex conversion (one home for all crates)
 pub mod manifest;
 pub mod sealed;
 
