@@ -13,7 +13,7 @@ pub mod escrow;
 pub mod manifest;
 pub mod sealed;
 
-pub use engine::{DagRepo, MaroonResult, MigrateResult};
+pub use engine::{DagRepo, GcReport, MaroonResult, MigrateResult};
 
 /// Content identity. A stable handle to a unit of content, independent of
 /// where (or whether) it is currently materialized on disk.

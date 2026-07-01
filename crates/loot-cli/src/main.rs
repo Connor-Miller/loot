@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         "new" => cmd_new(),
         "surface" => cmd_surface(),
         "log" => cmd_log(),
+        "gc" => cmd_gc(rest),
         "bundle" => cmd_bundle(rest),
         "apply" => cmd_apply(rest),
         "grant" => cmd_grant(rest),
@@ -70,6 +71,7 @@ usage:
   loot new                                  finalize the working change; start a fresh one
   loot surface                              materialize what the current identity may see
   loot log                                  show change history
+  loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file>                         merge a peer's bundle (idempotent)
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
@@ -202,6 +204,32 @@ fn cmd_log() -> Result<(), String> {
     }
     if let Some(working) = ws.working_id() {
         println!("{}  (working change)", short(&working));
+    }
+    Ok(())
+}
+
+fn cmd_gc(args: &[String]) -> Result<(), String> {
+    let dry_run = args.iter().any(|a| a == "--dry-run" || a == "-n");
+    let mut ws = Workspace::open()?;
+    let report = ws.gc(dry_run)?;
+
+    if report.pruned == 0 {
+        println!("nothing to prune — every stored object is referenced by a change");
+        return Ok(());
+    }
+
+    let human = human_bytes(report.bytes);
+    if dry_run {
+        println!(
+            "would prune {} object(s), freeing {human} ({} bytes)",
+            report.pruned, report.bytes
+        );
+        println!("  run `loot gc` (without --dry-run) to delete them");
+    } else {
+        println!(
+            "pruned {} object(s), freed {human} ({} bytes)",
+            report.pruned, report.bytes
+        );
     }
     Ok(())
 }
@@ -967,6 +995,22 @@ fn describe(o: &MergeOutcome) -> &'static str {
 
 fn short(oid: &Oid) -> String {
     oid.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Render a byte count as a compact human-readable size (B / KiB / MiB / GiB).
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 fn short_oid(oid: &Oid) -> String {

@@ -29,8 +29,18 @@ use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 pub(crate) use change_graph::ChangeNode;
 use change_graph::{compute_change_id, ChangeGraph};
 use object_store::{ObjectStore, Stored};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// Returned by `gc`: how many loose objects were (or, on a dry run, would be)
+/// pruned, and the total bytes they occupied on disk (ADR 0012).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Number of unreferenced object files pruned.
+    pub pruned: usize,
+    /// Total on-disk size of the pruned object files, in bytes.
+    pub bytes: u64,
+}
 
 /// Returned by `grant`, `maroon`, and `maroon_hard`: the new object address
 /// plus any targeted grant bundles the caller should forward to remaining
@@ -564,6 +574,38 @@ impl DagRepo {
         std::fs::write(dir.join("purges"), encode_purges(&self.purges)).map_err(io)?;
         std::fs::write(dir.join("conflicts"), encode_conflicts(&self.conflicts)).map_err(io)?;
         Ok(())
+    }
+
+    /// Every content address referenced by any change in the graph — across ALL
+    /// changes, not just the current heads. This is the live set for `gc`:
+    /// anything in the object store outside it is unreachable (ADR 0012).
+    pub fn referenced_oids(&self) -> BTreeSet<Oid> {
+        let mut live = BTreeSet::new();
+        for node in self.graph.in_order() {
+            for (oid, _vis) in node.tree.values() {
+                live.insert(oid.clone());
+            }
+        }
+        live
+    }
+
+    /// Prune loose objects not referenced by any change in the graph (ADR 0012).
+    /// Content-addressing makes this exact: an object whose address no ChangeNode
+    /// names can never be needed, so deleting it is loss-free. Walks the on-disk
+    /// object store under `dir` and removes every unreferenced file; with
+    /// `dry_run` it only reports what would be pruned. On a real run the in-memory
+    /// store is compacted to match, so a subsequent `save` stays consistent.
+    ///
+    /// Objects referenced by non-HEAD changes are retained — the whole reachable
+    /// history is preserved, only truly orphaned objects go. `dir` is the same
+    /// `.loot/` directory passed to [`save`]/[`load`].
+    pub fn gc(&mut self, dir: &Path, dry_run: bool) -> Result<GcReport, RepoError> {
+        let live = self.referenced_oids();
+        let (pruned, bytes) = persist_codec::prune_orphaned_objects_loose(dir, &live, dry_run)?;
+        if !dry_run {
+            self.objects.retain(&live);
+        }
+        Ok(GcReport { pruned, bytes })
     }
 
     /// Visibility-aware snapshot of a working tree into the working change
@@ -1266,6 +1308,128 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover_tmp, "atomic write should leave no .tmp files");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- gc: prune orphaned loose objects (ADR 0012, issue #17) ---
+
+    /// A dry run reports the orphan count and total size but deletes nothing —
+    /// neither the on-disk file nor the in-memory store entry.
+    #[test]
+    fn gc_dry_run_reports_orphans_without_deleting() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        // Referenced object: named by a change, so it is part of the live set.
+        let kept = repo.put(b"keep me\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("keep.txt"), (kept.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+        // Orphan: stored but never referenced by any change.
+        let orphan = repo.put(b"unreferenced orphan bytes\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = dir.join("objects");
+        let kept_path = obj_dir.join(super::persist_codec::hex(&kept.0));
+        let orphan_path = obj_dir.join(super::persist_codec::hex(&orphan.0));
+        assert!(kept_path.exists() && orphan_path.exists());
+
+        let report = repo.gc(&dir, true).unwrap();
+        assert_eq!(report.pruned, 1, "exactly one orphan would be pruned");
+        assert!(report.bytes > 0, "dry run reports the orphan's on-disk size");
+        // Dry run mutates nothing.
+        assert!(orphan_path.exists(), "dry run must not delete files");
+        assert!(kept_path.exists());
+        assert!(repo.object(&orphan).is_ok(), "in-memory store untouched by dry run");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real run deletes the orphan file, compacts the in-memory store, and
+    /// leaves referenced content intact and readable — including across reload.
+    /// A second pass is a no-op.
+    #[test]
+    fn gc_deletes_orphaned_objects_and_keeps_referenced() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let kept = repo.put(b"referenced\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (kept.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+        let orphan = repo.put(b"unreferenced\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = dir.join("objects");
+        let kept_path = obj_dir.join(super::persist_codec::hex(&kept.0));
+        let orphan_path = obj_dir.join(super::persist_codec::hex(&orphan.0));
+
+        let report = repo.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 1);
+        assert!(!orphan_path.exists(), "orphan file deleted");
+        assert!(kept_path.exists(), "referenced file retained");
+        // In-memory store compacted: orphan gone, referenced object still readable.
+        assert!(matches!(repo.object(&orphan), Err(RepoError::NotFound(_))));
+        assert_eq!(repo.get(&kept, "alice", 0).unwrap(), b"referenced\n");
+
+        // Idempotent: nothing left to prune.
+        let report2 = repo.gc(&dir, false).unwrap();
+        assert_eq!(report2.pruned, 0);
+
+        // Reload from disk: referenced content survives; orphan is gone.
+        let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        assert_eq!(loaded.get(&kept, "alice", 0).unwrap(), b"referenced\n");
+        assert!(matches!(loaded.get(&orphan, "alice", 0), Err(RepoError::NotFound(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Objects referenced by a NON-HEAD change (older history) must be retained —
+    /// gc walks the whole graph, not just the tips.
+    #[test]
+    fn gc_retains_objects_referenced_by_non_head_changes() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-nonhead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        // Parent change references old_oid.
+        let old_oid = repo.put(b"v1\n", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a.txt"), (old_oid.clone(), Visibility::Public));
+        let parent = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "v1".into(), tree: t1 })
+            .unwrap();
+        // Child change references new_oid on top of the parent.
+        let new_oid = repo.put(b"v2\n", Visibility::Public).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("a.txt"), (new_oid.clone(), Visibility::Public));
+        repo.record(Change {
+            id: Oid([0; 32]),
+            parents: vec![parent.clone()],
+            message: "v2".into(),
+            tree: t2,
+        })
+        .unwrap();
+        assert!(!repo.heads().contains(&parent), "parent is no longer a head");
+        // Orphan object.
+        let orphan = repo.put(b"orphan\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let report = repo.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 1, "only the orphan is pruned");
+
+        let obj_dir = dir.join("objects");
+        assert!(
+            obj_dir.join(super::persist_codec::hex(&old_oid.0)).exists(),
+            "object referenced only by a non-HEAD change must be retained"
+        );
+        assert!(obj_dir.join(super::persist_codec::hex(&new_oid.0)).exists(), "head object retained");
+        assert!(!obj_dir.join(super::persist_codec::hex(&orphan.0)).exists(), "orphan deleted");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,7 +14,7 @@ nails them) are a layer for later.
 The full loop from first init to relay-based collaboration is functional:
 
 ```text
-local:    init → status → describe → new → log → surface
+local:    init → status → describe → new → log → surface → gc
 file:     bundle → apply
 relay:    serve → push → pull
 grants:   grant → grant --relay → grants → pull-grants
