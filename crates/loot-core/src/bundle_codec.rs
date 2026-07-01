@@ -3,6 +3,8 @@
 //! consumed by `engine::DagRepo::bundle` and `engine::DagRepo::apply`.
 
 use crate::engine::ChangeNode;
+use crate::format;
+pub use crate::format::Cursor;
 use crate::sealed::{ContentKey, SealedObject};
 use crate::{Oid, RepoError, Visibility};
 use std::collections::BTreeMap;
@@ -32,48 +34,7 @@ pub fn put_vis(out: &mut Vec<u8>, vis: &Visibility) {
     }
 }
 
-pub struct Cursor<'a> {
-    pub b: &'a [u8],
-    pub i: usize,
-}
 impl<'a> Cursor<'a> {
-    pub fn take(&mut self, n: usize) -> Result<&'a [u8], RepoError> {
-        if self.i + n > self.b.len() {
-            return Err(RepoError::Backend("bundle truncated".into()));
-        }
-        let s = &self.b[self.i..self.i + n];
-        self.i += n;
-        Ok(s)
-    }
-    pub fn u32(&mut self) -> Result<usize, RepoError> {
-        let s = self.take(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
-    }
-    pub fn u64(&mut self) -> Result<u64, RepoError> {
-        let s = self.take(8)?;
-        let mut a = [0u8; 8];
-        a.copy_from_slice(s);
-        Ok(u64::from_le_bytes(a))
-    }
-    pub fn arr32(&mut self) -> Result<[u8; 32], RepoError> {
-        let s = self.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        Ok(a)
-    }
-    pub fn arr12(&mut self) -> Result<[u8; 12], RepoError> {
-        let s = self.take(12)?;
-        let mut a = [0u8; 12];
-        a.copy_from_slice(s);
-        Ok(a)
-    }
-    pub fn bytes(&mut self) -> Result<Vec<u8>, RepoError> {
-        let n = self.u32()?;
-        Ok(self.take(n)?.to_vec())
-    }
-    pub fn string(&mut self) -> Result<String, RepoError> {
-        String::from_utf8(self.bytes()?).map_err(|e| RepoError::Backend(e.to_string()))
-    }
     pub fn vis(&mut self) -> Result<Visibility, RepoError> {
         match self.take(1)?[0] {
             0 => Ok(Visibility::Public),
@@ -93,6 +54,10 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Encode the bundle body payload (objects, keys, escrow, changes).
+/// This is the raw body — no version marker or frame tag. Use `Frame::encode`
+/// for the complete on-wire format; call this directly only when re-encoding a
+/// decoded body for inspection (e.g. in test helpers).
 pub fn encode(
     changes: &[&ChangeNode],
     objs: &BTreeMap<Oid, SealedObject>,
@@ -150,6 +115,9 @@ pub fn encode(
     out
 }
 
+/// Decode the bundle body payload (no version marker or frame tag).
+/// Use `Frame::decode` for the complete on-wire format; call this directly only
+/// when parsing a body slice that was already extracted by `Frame::decode`.
 #[allow(clippy::type_complexity)]
 pub fn decode(
     b: &[u8],
@@ -291,44 +259,49 @@ fn decode_body(b: &[u8]) -> Result<BundleBody, RepoError> {
 }
 
 impl Frame {
-    /// Serialize to the exact bytes the old hand-rolled framing emitted —
-    /// byte-identical, so the ADR 0003/0004/0007 leak-guards still pass.
+    /// Serialize a bundle: a two-byte format marker (`[major][minor]`, ADR 0019)
+    /// followed by the tagged body. The body after the marker is byte-identical
+    /// to the old hand-rolled framing, so the ADR 0003/0004/0007 leak-guards
+    /// still pass.
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        format::put_version(&mut out);
         match self {
             Frame::Sync { purges, body } => {
-                let mut out = vec![0u8];
+                out.push(0);
                 put_u32(&mut out, purges.len());
                 for (oid, marooned) in purges {
                     out.extend_from_slice(&oid.0);
                     put_bytes(&mut out, marooned.as_bytes());
                 }
                 out.extend_from_slice(&encode_body(body));
-                out
             }
             Frame::Grant { grantee, body } => {
-                let mut out = vec![1u8];
+                out.push(1);
                 put_bytes(&mut out, grantee.as_bytes());
                 out.extend_from_slice(&encode_body(body));
-                out
             }
             Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body } => {
-                let mut out = vec![3u8];
+                out.push(3);
                 out.extend_from_slice(grantee_pubkey);
                 out.extend_from_slice(wrapped_key);
                 out.extend_from_slice(&oid.0);
                 out.extend_from_slice(&encode_body(body));
-                out
             }
         }
+        out
     }
 
     /// Decode a whole bundle. Pure and total: no keys, no I/O, no crypto — so it
-    /// serves both `apply` (keyholder) and `stow` (relay). Errors on empty input,
-    /// an unknown tag, or any truncation.
+    /// serves both `apply` (keyholder) and `stow` (relay). The format marker is
+    /// checked first, so a bundle from an incompatible future major is rejected
+    /// with a clear error (ADR 0019). Errors on empty input, an unsupported
+    /// version, an unknown tag, or any truncation.
     pub fn decode(bytes: &[u8]) -> Result<Frame, RepoError> {
-        let Some((&tag, rest)) = bytes.split_first() else {
-            return Err(RepoError::Backend("empty bundle".into()));
-        };
+        let mut head = Cursor { b: bytes, i: 0 };
+        format::read_version(&mut head)?;
+        let tag = head.take(1)?[0];
+        let rest = &bytes[head.i..];
         match tag {
             0 => {
                 let mut c = Cursor { b: rest, i: 0 };
@@ -373,6 +346,37 @@ mod tests {
         BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), escrow: BTreeMap::new() }
     }
 
+    // Golden v1 wire bytes for `Frame::Sync { purges: [], body: empty }`:
+    // [major=1][minor=0][tag=0][purge_count=0][objs=0][keys=0][escrow=0][changes=0].
+    // Locks the v1 layout — if the wire format drifts, this fails and the change
+    // must bump FORMAT_MAJOR (ADR 0019).
+    const GOLDEN_SYNC_V1: [u8; 23] =
+        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    #[test]
+    fn encoded_bundle_leads_with_version_marker() {
+        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
+        assert_eq!(&bytes[..2], &[format::FORMAT_MAJOR, format::FORMAT_MINOR]);
+    }
+
+    #[test]
+    fn golden_v1_sync_bundle_matches_and_round_trips() {
+        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
+        assert_eq!(bytes, GOLDEN_SYNC_V1, "v1 wire layout must not drift");
+        // A newer build still reads the committed v1 bytes (newer reads older).
+        assert!(matches!(Frame::decode(&GOLDEN_SYNC_V1).unwrap(), Frame::Sync { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_incompatible_future_major() {
+        let mut bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
+        bytes[0] = format::FORMAT_MAJOR + 1; // pretend a newer major wrote it
+        assert!(matches!(
+            Frame::decode(&bytes),
+            Err(RepoError::UnsupportedFormat { .. })
+        ));
+    }
+
     #[test]
     fn sync_frame_round_trips_with_purges() {
         let f = Frame::Sync {
@@ -380,7 +384,7 @@ mod tests {
             body: empty_body(),
         };
         let bytes = f.encode();
-        assert_eq!(bytes[0], 0, "sync tag");
+        assert_eq!(bytes[2], 0, "sync tag follows the 2-byte version marker");
         match Frame::decode(&bytes).unwrap() {
             Frame::Sync { purges, body } => {
                 assert_eq!(purges, vec![(Oid([7; 32]), "bob".to_string())]);
@@ -394,7 +398,7 @@ mod tests {
     fn grant_frame_round_trips_grantee() {
         let f = Frame::Grant { grantee: "alice".into(), body: empty_body() };
         let bytes = f.encode();
-        assert_eq!(bytes[0], 1, "grant tag");
+        assert_eq!(bytes[2], 1, "grant tag follows the 2-byte version marker");
         match Frame::decode(&bytes).unwrap() {
             Frame::Grant { grantee, .. } => assert_eq!(grantee, "alice"),
             _ => panic!("expected Grant"),
@@ -410,7 +414,7 @@ mod tests {
             body: empty_body(),
         };
         let bytes = f.encode();
-        assert_eq!(bytes[0], 3, "sealed-grant tag");
+        assert_eq!(bytes[2], 3, "sealed-grant tag follows the 2-byte version marker");
         match Frame::decode(&bytes).unwrap() {
             Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, .. } => {
                 assert_eq!(grantee_pubkey, [1; 32]);
@@ -424,6 +428,10 @@ mod tests {
     #[test]
     fn decode_rejects_empty_and_unknown_tag() {
         assert!(Frame::decode(&[]).is_err(), "empty input");
-        assert!(Frame::decode(&[9]).is_err(), "unknown tag");
+        // An unknown tag now sits after the 2-byte version marker.
+        assert!(
+            Frame::decode(&[format::FORMAT_MAJOR, format::FORMAT_MINOR, 9]).is_err(),
+            "unknown tag"
+        );
     }
 }

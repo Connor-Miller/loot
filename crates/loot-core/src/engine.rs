@@ -988,6 +988,7 @@ impl converge::KeyOracle for DagRepo {
 fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
     use crate::bundle_codec::{put_bytes, put_u32};
     let mut out = Vec::new();
+    crate::format::put_version(&mut out);
     let entries: Vec<_> = manifest.iter().collect();
     put_u32(&mut out, entries.len());
     for e in entries {
@@ -1001,8 +1002,9 @@ fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
 }
 
 fn decode_manifest(b: &[u8]) -> Result<Manifest, RepoError> {
-    use crate::bundle_codec::Cursor;
+    use crate::format::Cursor;
     let mut c = Cursor { b, i: 0 };
+    crate::format::read_version(&mut c)?;
     let mut m = Manifest::new();
     let n = c.u32()?;
     for _ in 0..n {
@@ -1019,6 +1021,7 @@ fn decode_manifest(b: &[u8]) -> Result<Manifest, RepoError> {
 fn encode_purges(purges: &[(Oid, String)]) -> Vec<u8> {
     use crate::bundle_codec::{put_bytes, put_u32};
     let mut out = Vec::new();
+    crate::format::put_version(&mut out);
     put_u32(&mut out, purges.len());
     for (oid, identity) in purges {
         out.extend_from_slice(&oid.0);
@@ -1028,8 +1031,9 @@ fn encode_purges(purges: &[(Oid, String)]) -> Vec<u8> {
 }
 
 fn decode_purges(b: &[u8]) -> Result<Vec<(Oid, String)>, RepoError> {
-    use crate::bundle_codec::Cursor;
+    use crate::format::Cursor;
     let mut c = Cursor { b, i: 0 };
+    crate::format::read_version(&mut c)?;
     let n = c.u32()?;
     let mut purges = Vec::with_capacity(n);
     for _ in 0..n {
@@ -1043,6 +1047,7 @@ fn decode_purges(b: &[u8]) -> Result<Vec<(Oid, String)>, RepoError> {
 fn encode_conflicts(conflicts: &BTreeMap<PathBuf, (Oid, Oid)>) -> Vec<u8> {
     use crate::bundle_codec::{put_bytes, put_u32};
     let mut out = Vec::new();
+    crate::format::put_version(&mut out);
     put_u32(&mut out, conflicts.len());
     for (path, (ours, theirs)) in conflicts {
         put_bytes(&mut out, path.to_string_lossy().as_bytes());
@@ -1053,8 +1058,9 @@ fn encode_conflicts(conflicts: &BTreeMap<PathBuf, (Oid, Oid)>) -> Vec<u8> {
 }
 
 fn decode_conflicts(b: &[u8]) -> Result<BTreeMap<PathBuf, (Oid, Oid)>, RepoError> {
-    use crate::bundle_codec::Cursor;
+    use crate::format::Cursor;
     let mut c = Cursor { b, i: 0 };
+    crate::format::read_version(&mut c)?;
     let n = c.u32()?;
     let mut conflicts = BTreeMap::new();
     for _ in 0..n {
@@ -1102,15 +1108,14 @@ mod tests {
         let public_key = alice.keyring.key_for(&pub_oid).expect("alice holds public key");
 
         let bundle = alice.bundle(&[]).unwrap();
-        // Extract the payload past the tag and purge prefix.
         let payload = extract_sync_payload(&bundle.0);
 
         assert!(
-            !contains_window(payload, &restricted_key),
+            !contains_window(&payload, &restricted_key),
             "restricted content key leaked into the sync bundle"
         );
         assert!(
-            contains_window(payload, &public_key),
+            contains_window(&payload, &public_key),
             "public content key should ride along for ANYONE-granted content"
         );
     }
@@ -1148,7 +1153,7 @@ mod tests {
 
     fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
         let payload = extract_sync_payload(bundle);
-        let (_changes, objs, _keys, _escrow) = bundle_codec::decode(payload).unwrap();
+        let (_changes, objs, _keys, _escrow) = bundle_codec::decode(&payload).unwrap();
         assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
         objs.into_iter().next().unwrap().1.ciphertext
     }
@@ -1157,19 +1162,17 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    /// Strip the tag byte and purge prefix from a sync bundle, returning the
-    /// raw bundle_codec payload for inspection in ADR leak-guard tests.
-    fn extract_sync_payload(bundle: &[u8]) -> &[u8] {
-        assert_eq!(bundle[0], 0, "expected sync bundle tag");
-        let rest = &bundle[1..];
-        let purge_count = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-        let mut pos = 4;
-        for _ in 0..purge_count {
-            pos += 32; // oid
-            let id_len = u32::from_le_bytes([rest[pos], rest[pos+1], rest[pos+2], rest[pos+3]]) as usize;
-            pos += 4 + id_len;
-        }
-        &rest[pos..]
+    /// Decode a sync bundle through `Frame::decode` and re-encode just the body
+    /// payload for ADR 0003/0004 leak-guard inspection. This approach is immune
+    /// to future Frame header changes (S2 compression flags, etc.) — the frame
+    /// decoder handles whatever is in front of the body.
+    fn extract_sync_payload(bundle: &[u8]) -> Vec<u8> {
+        let frame = bundle_codec::Frame::decode(bundle).expect("valid sync bundle");
+        let bundle_codec::Frame::Sync { body, .. } = frame else {
+            panic!("expected sync bundle (tag 0)");
+        };
+        let changes: Vec<&ChangeNode> = body.changes.iter().collect();
+        bundle_codec::encode(&changes, &body.objs, &body.keys, &body.escrow)
     }
 
     /// ADR 0005: a repo survives save -> load with identity, content, history,
@@ -1478,7 +1481,7 @@ mod tests {
 
         // The raw wire must have the key in the escrow section, not the keyring.
         let payload = extract_sync_payload(&bundle.0);
-        let (_changes, _objs, plain_keys, escrow_entries) = bundle_codec::decode(payload).unwrap();
+        let (_changes, _objs, plain_keys, escrow_entries) = bundle_codec::decode(&payload).unwrap();
         assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in keyring section");
         assert!(escrow_entries.contains_key(&oid), "embargoed key must be in escrow section");
 
@@ -2011,6 +2014,97 @@ mod tests {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
         let result = alice.resolve(Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
         assert!(matches!(result, Err(RepoError::Backend(_))), "unknown path must error");
+    }
+
+    // --- golden-byte fixtures + major-rejection for manifest, purges, conflicts (ADR 0019) ---
+
+    // manifest: one entry — oid=[1;32], grantee="bob", grantee_pubkey=[2;32],
+    //           grantor_pubkey=[3;32], granted_at=42.
+    // Layout: [major=1][minor=0][count=1 u32le][oid 32][put_bytes("bob")=7][grantee_pk 32][grantor_pk 32][granted_at u64le]
+    const GOLDEN_MANIFEST_V1: [u8; 117] = [
+        1, 0, 1, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // oid=[1;32]
+        3, 0, 0, 0, 98, 111, 98,  // put_bytes("bob")
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // grantee_pk=[2;32]
+        3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, // grantor_pk=[3;32]
+        42, 0, 0, 0, 0, 0, 0, 0, // granted_at=42
+    ];
+
+    // purges: one entry — oid=[6;32], identity="eve".
+    // Layout: [major=1][minor=0][count=1 u32le][oid 32][put_bytes("eve")=7]
+    const GOLDEN_PURGES_V1: [u8; 45] = [
+        1, 0, 1, 0, 0, 0,
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, // oid=[6;32]
+        3, 0, 0, 0, 101, 118, 101, // put_bytes("eve")
+    ];
+
+    // conflicts: one entry — path="f.txt", ours=[7;32], theirs=[8;32].
+    // Layout: [major=1][minor=0][count=1 u32le][put_bytes("f.txt")=9][ours 32][theirs 32]
+    const GOLDEN_CONFLICTS_V1: [u8; 79] = [
+        1, 0, 1, 0, 0, 0,
+        5, 0, 0, 0, 102, 46, 116, 120, 116, // put_bytes("f.txt")
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // ours=[7;32]
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // theirs=[8;32]
+    ];
+
+    fn sample_manifest() -> Manifest {
+        let mut m = Manifest::new();
+        m.record(Oid([1; 32]), "bob".to_string(), [2u8; 32], [3u8; 32], 42);
+        m
+    }
+
+    #[test]
+    fn golden_v1_manifest_matches_and_round_trips() {
+        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V1, "v1 manifest layout must not drift");
+        let back = decode_manifest(&GOLDEN_MANIFEST_V1).unwrap();
+        let entries = back.grants_for(&Oid([1; 32]));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].grantee, "bob");
+        assert_eq!(entries[0].granted_at, 42);
+    }
+
+    #[test]
+    fn golden_v1_purges_matches_and_round_trips() {
+        let purges = vec![(Oid([6; 32]), "eve".to_string())];
+        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V1, "v1 purges layout must not drift");
+        let back = decode_purges(&GOLDEN_PURGES_V1).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, Oid([6; 32]));
+        assert_eq!(back[0].1, "eve");
+    }
+
+    #[test]
+    fn golden_v1_conflicts_matches_and_round_trips() {
+        let mut conflicts = BTreeMap::new();
+        conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
+        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V1, "v1 conflicts layout must not drift");
+        let back = decode_conflicts(&GOLDEN_CONFLICTS_V1).unwrap();
+        let (ours, theirs) = &back[Path::new("f.txt")];
+        assert_eq!(*ours, Oid([7; 32]));
+        assert_eq!(*theirs, Oid([8; 32]));
+    }
+
+    #[test]
+    fn decode_manifest_rejects_incompatible_future_major() {
+        let mut bytes = encode_manifest(&sample_manifest());
+        bytes[0] = crate::format::FORMAT_MAJOR + 1;
+        assert!(matches!(decode_manifest(&bytes), Err(RepoError::UnsupportedFormat { .. })));
+    }
+
+    #[test]
+    fn decode_purges_rejects_incompatible_future_major() {
+        let mut bytes = encode_purges(&[(Oid([6; 32]), "eve".to_string())]);
+        bytes[0] = crate::format::FORMAT_MAJOR + 1;
+        assert!(matches!(decode_purges(&bytes), Err(RepoError::UnsupportedFormat { .. })));
+    }
+
+    #[test]
+    fn decode_conflicts_rejects_incompatible_future_major() {
+        let mut conflicts = BTreeMap::new();
+        conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
+        let mut bytes = encode_conflicts(&conflicts);
+        bytes[0] = crate::format::FORMAT_MAJOR + 1;
+        assert!(matches!(decode_conflicts(&bytes), Err(RepoError::UnsupportedFormat { .. })));
     }
 
     #[test]

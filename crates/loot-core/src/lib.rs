@@ -10,6 +10,7 @@ pub mod bundle_codec;   // sync bundle wire format (ADR 0003, 0004, 0007)
 pub mod converge;
 pub mod engine;
 pub mod escrow;
+pub mod format;         // format version markers + compatibility gate (S1, ADR 0019)
 pub mod hex;            // shared byte<->hex conversion (one home for all crates)
 pub mod manifest;
 pub mod sealed;
@@ -55,6 +56,8 @@ pub enum RepoError {
     Unauthorized(Oid),
     #[error("content still embargoed until {0}")]
     Embargoed(u64),
+    #[error("unsupported format version v{found} — upgrade loot (this build reads up to v{supported})")]
+    UnsupportedFormat { found: u8, supported: u8 },
     #[error("backend error: {0}")]
     Backend(String),
 }

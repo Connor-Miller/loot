@@ -138,6 +138,9 @@ crates/
 | 0014 | Identity keypairs: ed25519 OpenSSH, signed push envelopes |
 | 0015 | Grant authentication and trust (grantor signs, peer-registry gate) |
 | 0016 | Identity portability: export/import with passphrase wrapping |
+| 0017 | RepoStore: one home for the `.loot/` layout |
+| 0018 | Signed changes: author in id + validity enforcement |
+| 0019 | Format versioning + compatibility gate (newer reads older) |
 
 See [CONTEXT.md](CONTEXT.md) for the full domain glossary.
 
