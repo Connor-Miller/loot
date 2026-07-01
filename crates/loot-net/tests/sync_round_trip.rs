@@ -208,9 +208,8 @@ fn sealed_grant_relay_round_trip() {
     let bob_ed_pubkey = bob_id.public_key_bytes();
     let bob_x25519 = bob_id.x25519_pubkey_bytes();
 
-    // Bob's pubkey hex = mailbox address (relay learns no names, ADR 0015).
-    let bob_pubkey_hex: String = bob_ed_pubkey.iter().map(|b| format!("{b:02x}")).collect();
-
+    // Bob's pubkey is the mailbox address; loot-net hexes it (relay learns no
+    // names, ADR 0015). Callers pass raw key bytes, not a pre-hexed string.
     let now = 0u64;
 
     // Alice produces a sealed grant bundle (tag 3): grantee_pubkey + wrapped_key + oid + payload.
@@ -226,18 +225,18 @@ fn sealed_grant_relay_round_trip() {
     let envelope = alice_id.wrap_envelope(&sealed_bundle.0);
 
     // Alice delivers the envelope to bob's pubkey-addressed mailbox.
-    loot_net::deliver_grant(&base, &bob_pubkey_hex, &envelope).unwrap();
+    loot_net::deliver_grant(&base, &bob_ed_pubkey, &envelope).unwrap();
 
     // Bob peeks: should show 1 pending grant.
-    let count = loot_net::peek_grants(&base, &bob_pubkey_hex).unwrap();
+    let count = loot_net::peek_grants(&base, &bob_ed_pubkey).unwrap();
     assert_eq!(count, 1, "peek should show 1 pending grant before drain");
 
     // Bob fetches his grants (envelopes). The relay held opaque ciphertext.
-    let envelopes = loot_net::fetch_grants(&base, &bob_pubkey_hex).unwrap();
+    let envelopes = loot_net::fetch_grants(&base, &bob_ed_pubkey).unwrap();
     assert_eq!(envelopes.len(), 1, "bob should have exactly one pending grant");
 
     // Mailbox is now drained.
-    let after_drain = loot_net::fetch_grants(&base, &bob_pubkey_hex).unwrap();
+    let after_drain = loot_net::fetch_grants(&base, &bob_ed_pubkey).unwrap();
     assert!(after_drain.is_empty(), "grants must be deleted on delivery");
 
     // Unwrap the push envelope: get grantor pubkey + bundle bytes.
