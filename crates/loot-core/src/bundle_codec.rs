@@ -73,6 +73,7 @@ pub fn encode(
     for (addr, obj) in objs {
         out.extend_from_slice(&addr.0);
         out.extend_from_slice(&obj.nonce);
+        out.push(obj.compressed as u8); // v2: compression flag (ADR 0020)
         put_bytes(&mut out, &obj.ciphertext);
         put_vis(&mut out, &obj.vis);
         put_u32(&mut out, obj.grant_ids.len());
@@ -111,6 +112,8 @@ pub fn encode(
             out.extend_from_slice(&oid.0);
             put_vis(&mut out, vis);
         }
+        // v3: author pubkey + signature ride beside the change body (ADR 0018).
+        format::put_author_sig(&mut out, &c.author, &c.signature);
     }
     out
 }
@@ -118,9 +121,12 @@ pub fn encode(
 /// Decode the bundle body payload (no version marker or frame tag).
 /// Use `Frame::decode` for the complete on-wire format; call this directly only
 /// when parsing a body slice that was already extracted by `Frame::decode`.
+/// `major` is the format major from the frame's version marker: it selects
+/// whether inline objects carry the v2 `compressed` flag (ADR 0019/0020).
 #[allow(clippy::type_complexity)]
 pub fn decode(
     b: &[u8],
+    major: u8,
 ) -> Result<
     (
         Vec<ChangeNode>,
@@ -137,6 +143,8 @@ pub fn decode(
     for _ in 0..n_objs {
         let addr = Oid(c.arr32()?);
         let nonce = c.arr12()?;
+        // Compression flag exists from v2 on; v1 bundles predate it (uncompressed).
+        let compressed = if major >= 2 { c.take(1)?[0] != 0 } else { false };
         let ciphertext = c.bytes()?;
         let vis = c.vis()?;
         let n_grants = c.u32()?;
@@ -151,6 +159,7 @@ pub fn decode(
                 ciphertext,
                 vis,
                 grant_ids,
+                compressed,
             },
         ));
     }
@@ -190,11 +199,14 @@ pub fn decode(
             let vis = c.vis()?;
             tree.insert(path, (oid, vis));
         }
+        let (author, signature) = format::read_author_sig(&mut c, major)?;
         changes.push(ChangeNode {
             id,
             parents,
             message,
             tree,
+            author,
+            signature,
         });
     }
 
@@ -252,8 +264,8 @@ fn encode_body(body: &BundleBody) -> Vec<u8> {
     encode(&changes, &body.objs, &body.keys, &body.escrow)
 }
 
-fn decode_body(b: &[u8]) -> Result<BundleBody, RepoError> {
-    let (changes, objs_vec, keys, escrow) = decode(b)?;
+fn decode_body(b: &[u8], major: u8) -> Result<BundleBody, RepoError> {
+    let (changes, objs_vec, keys, escrow) = decode(b, major)?;
     let objs = objs_vec.into_iter().collect();
     Ok(BundleBody { changes, objs, keys, escrow })
 }
@@ -299,7 +311,7 @@ impl Frame {
     /// version, an unknown tag, or any truncation.
     pub fn decode(bytes: &[u8]) -> Result<Frame, RepoError> {
         let mut head = Cursor { b: bytes, i: 0 };
-        format::read_version(&mut head)?;
+        let (major, _minor) = format::read_version(&mut head)?;
         let tag = head.take(1)?[0];
         let rest = &bytes[head.i..];
         match tag {
@@ -312,13 +324,13 @@ impl Frame {
                     let marooned = c.string()?;
                     purges.push((oid, marooned));
                 }
-                let body = decode_body(&c.b[c.i..])?;
+                let body = decode_body(&c.b[c.i..], major)?;
                 Ok(Frame::Sync { purges, body })
             }
             1 => {
                 let mut c = Cursor { b: rest, i: 0 };
                 let grantee = c.string()?;
-                let body = decode_body(&c.b[c.i..])?;
+                let body = decode_body(&c.b[c.i..], major)?;
                 Ok(Frame::Grant { grantee, body })
             }
             // tag 2: reserved — do not assign (the Visibility codec uses 2 for Embargoed
@@ -330,7 +342,7 @@ impl Frame {
                 let mut wrapped_key = [0u8; 80];
                 wrapped_key.copy_from_slice(c.take(80)?);
                 let oid = Oid(c.arr32()?);
-                let body = decode_body(&c.b[c.i..])?;
+                let body = decode_body(&c.b[c.i..], major)?;
                 Ok(Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body })
             }
             t => Err(RepoError::Backend(format!("unknown bundle tag {t}"))),
@@ -346,12 +358,27 @@ mod tests {
         BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), escrow: BTreeMap::new() }
     }
 
-    // Golden v1 wire bytes for `Frame::Sync { purges: [], body: empty }`:
-    // [major=1][minor=0][tag=0][purge_count=0][objs=0][keys=0][escrow=0][changes=0].
-    // Locks the v1 layout — if the wire format drifts, this fails and the change
-    // must bump FORMAT_MAJOR (ADR 0019).
+    // Golden wire bytes for `Frame::Sync { purges: [], body: empty }`:
+    // [major][minor][tag=0][purge_count=0][objs=0][keys=0][escrow=0][changes=0].
+    // The empty bundle carries no inline objects, so v1 and v2 differ only in the
+    // marker byte. These lock the wire layout; a drift fails here and must bump
+    // FORMAT_MAJOR (ADR 0019/0020).
     const GOLDEN_SYNC_V1: [u8; 23] =
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const GOLDEN_SYNC_V2: [u8; 23] =
+        [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const GOLDEN_SYNC_V3: [u8; 23] =
+        [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    fn object(compressed: bool) -> SealedObject {
+        SealedObject {
+            nonce: [1; 12],
+            ciphertext: vec![9, 9, 9],
+            vis: Visibility::Public,
+            grant_ids: vec!["*".into()],
+            compressed,
+        }
+    }
 
     #[test]
     fn encoded_bundle_leads_with_version_marker() {
@@ -360,11 +387,66 @@ mod tests {
     }
 
     #[test]
-    fn golden_v1_sync_bundle_matches_and_round_trips() {
-        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
-        assert_eq!(bytes, GOLDEN_SYNC_V1, "v1 wire layout must not drift");
-        // A newer build still reads the committed v1 bytes (newer reads older).
+    fn v1_sync_bundle_still_decodes() {
+        // A v2 build still reads the committed v1 wire bytes (newer reads older).
         assert!(matches!(Frame::decode(&GOLDEN_SYNC_V1).unwrap(), Frame::Sync { .. }));
+    }
+
+    #[test]
+    fn v2_sync_bundle_still_decodes() {
+        // A v3 build still reads the committed v2 wire bytes (newer reads older).
+        assert!(matches!(Frame::decode(&GOLDEN_SYNC_V2).unwrap(), Frame::Sync { .. }));
+    }
+
+    #[test]
+    fn golden_v3_sync_bundle_matches_and_round_trips() {
+        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
+        assert_eq!(bytes, GOLDEN_SYNC_V3, "v3 wire layout must not drift");
+        assert!(matches!(Frame::decode(&GOLDEN_SYNC_V3).unwrap(), Frame::Sync { .. }));
+    }
+
+    #[test]
+    fn bundle_change_author_and_signature_round_trip() {
+        let node = ChangeNode {
+            id: Oid([5; 32]),
+            parents: vec![],
+            message: "authored".into(),
+            tree: BTreeMap::new(),
+            author: Some([7; 32]),
+            signature: Some([9; 64]),
+        };
+        let body = BundleBody {
+            changes: vec![node],
+            objs: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+        };
+        match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
+            Frame::Sync { body, .. } => {
+                let c = &body.changes[0];
+                assert_eq!(c.author, Some([7; 32]), "author must survive the bundle");
+                assert_eq!(c.signature, Some([9; 64]), "signature must survive the bundle");
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn bundle_inline_object_compressed_flag_round_trips() {
+        let obj = object(true);
+        let addr = obj.address();
+        let mut objs = BTreeMap::new();
+        objs.insert(addr.clone(), obj);
+        let body = BundleBody { changes: vec![], objs, keys: BTreeMap::new(), escrow: BTreeMap::new() };
+        match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert!(
+                    body.objs.get(&addr).expect("object present").compressed,
+                    "inline object compressed flag must round-trip through the bundle"
+                );
+            }
+            _ => panic!("expected Sync"),
+        }
     }
 
     #[test]

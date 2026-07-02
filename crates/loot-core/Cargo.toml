@@ -13,3 +13,10 @@ blake3.workspace = true
 # RustCrypto.
 aes-gcm = "0.10"
 getrandom = "0.2"
+# Zstd compression for public content (S2, ADR 0020). Compress-then-encrypt;
+# each object is its own context.
+zstd = "0.13"
+# Verify-only: authored-change signature checking on apply/stow (S3, ADR 0018).
+# loot-core VERIFIES (read-side DAG integrity); signing + key custody stay in
+# loot-identity. Same version as the rest of the workspace.
+ed25519-dalek.workspace = true

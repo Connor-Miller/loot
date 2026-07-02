@@ -77,6 +77,10 @@ pub struct MigrateResult {
 pub struct DagRepo {
     root: PathBuf,
     identity: String,
+    /// This identity's ed25519 public key, folded into new change ids to attribute
+    /// authored history (S3, ADR 0018). `None` until the workspace sets it from the
+    /// loaded keypair; unauthored changes then keep their legacy (pre-0018) ids.
+    author: Option<[u8; 32]>,
     /// This identity's private key custody for non-embargoed content.
     keyring: Keyring,
     /// Embargoed content keys awaiting their reveal time. `flush_escrow` promotes
@@ -241,6 +245,14 @@ impl DagRepo {
 
         // Cryptographic gate: unseal fails if this grant wasn't addressed to us.
         let key = unseal(&wrapped_key)?;
+
+        // SealedGrant bodies carry objects only (the grant is a key handoff, not
+        // a history sync), so `changes` is always empty today. Guard it anyway so
+        // a future format extension can't sneak unsigned authored changes in via
+        // the grant path (ADR 0018 — verify-always, not a toggle).
+        for node in &body.changes {
+            verify_authored_change(node)?;
+        }
 
         for (addr, obj) in body.objs {
             self.store(addr, obj, None);
@@ -462,6 +474,12 @@ impl DagRepo {
         };
         let BundleBody { changes, objs, keys, escrow } = body;
 
+        // Reject any change with a missing/invalid author signature before we
+        // store anything — a keyless relay still enforces authorship (ADR 0018).
+        for node in &changes {
+            verify_authored_change(node)?;
+        }
+
         // Store ciphertext, retaining any keys that rode along so they keep
         // forwarding downstream. Only ANYONE-granted (public) keys and embargoed
         // escrow entries ever travel in a sync bundle — RESTRICTED keys never do
@@ -505,6 +523,12 @@ impl DagRepo {
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
         let BundleBody { changes, objs, keys, escrow } = body;
+
+        // Reject any change with a missing/invalid author signature before we
+        // mutate state (ADR 0018 — validity is always enforced, not a toggle).
+        for node in &changes {
+            verify_authored_change(node)?;
+        }
 
         // Honor purge events: if we are the marooned identity, remove the old key.
         for (purge_oid, marooned) in &purges {
@@ -643,6 +667,39 @@ impl DagRepo {
             tree,
         };
         self.record(change)
+    }
+
+    /// Set this repo's author pubkey (S3, ADR 0018): the workspace calls this
+    /// after loading the identity keypair, so new changes fold the author into
+    /// their id and can be signed at finalization. Left unset, changes stay
+    /// unauthored (legacy ids) — keyless and pre-0018 repos keep working.
+    pub fn set_author(&mut self, author: [u8; 32]) {
+        self.author = Some(author);
+    }
+
+    /// This repo's author pubkey, if set.
+    pub fn author(&self) -> Option<[u8; 32]> {
+        self.author
+    }
+
+    /// Attach the author's signature to a finalized change (`loot new`). The
+    /// signature covers the change id and is stored beside the node, so identity
+    /// stays a pure function of authored content (ADR 0018). Errors if `id` is
+    /// unknown to this repo.
+    pub fn attach_signature(&mut self, id: &Oid, signature: [u8; 64]) -> Result<(), RepoError> {
+        self.graph.set_signature(id, signature).ok_or_else(|| {
+            RepoError::Backend(format!(
+                "cannot sign unknown change {}",
+                crate::hex::short(&id.0, 8)
+            ))
+        })
+    }
+
+    /// The author pubkey recorded on a change, if any (S3, ADR 0018). `None` for
+    /// a legacy/unauthored change or an unknown id. Used by `loot log` to show
+    /// authorship, reverse-resolved to a peer name.
+    pub fn change_author(&self, id: &Oid) -> Option<[u8; 32]> {
+        self.graph.get(id).and_then(|n| n.author)
     }
 
     /// Change history in topo order (parents before children), as
@@ -797,6 +854,7 @@ impl DagRepo {
         Ok(DagRepo {
             root,
             identity,
+            author: None,
             keyring,
             escrow,
             manifest,
@@ -813,6 +871,7 @@ impl Repo for DagRepo {
         Ok(DagRepo {
             root: path,
             identity: identity.to_string(),
+            author: None,
             keyring: Keyring::new(),
             escrow: Escrow::new(),
             manifest: Manifest::new(),
@@ -836,12 +895,17 @@ impl Repo for DagRepo {
 
     /// Record a change over the current set of put() objects.
     fn record(&mut self, change: Change) -> Result<Oid, RepoError> {
-        let id = compute_change_id(&change);
+        // Fold this repo's author pubkey (if set) into the id, so authorship is
+        // intrinsic (ADR 0018). The signature is attached later, at finalization
+        // (`attach_signature`), not on every working-change rewrite.
+        let id = compute_change_id(self.author.as_ref(), &change);
         let node = ChangeNode {
             id: id.clone(),
             parents: change.parents,
             message: change.message,
             tree: change.tree,
+            author: self.author,
+            signature: None,
         };
         self.graph.insert(node);
         Ok(id)
@@ -881,7 +945,10 @@ impl Repo for DagRepo {
             .graph
             .in_order()
             .into_iter()
-            .filter(|c| !have_set.contains(&c.id))
+            // Skip changes the recipient has, and any authored-but-unsigned
+            // working change: only finalized, signed history travels (ADR 0018).
+            // Legacy unauthored changes still travel, so keyless repos are unaffected.
+            .filter(|c| !have_set.contains(&c.id) && !(c.author.is_some() && c.signature.is_none()))
             .collect();
 
         // Ship SealedObjects (ciphertext, no keys) plus:
@@ -984,6 +1051,25 @@ impl converge::KeyOracle for DagRepo {
 
 // --- local persistence helpers for manifest, purges, conflicts ---
 // These use the same hand-rolled length-prefixed format as the other codecs.
+
+/// Reject an authored change whose signature is missing or does not verify over
+/// its id (S3, ADR 0018). Legacy/unauthored changes (`author == None`) predate
+/// signing and are accepted. Called inside `apply`/`stow` so validity is
+/// enforced structurally — never a toggle a caller can skip. loot-core is
+/// verify-only here; signing and key custody live in loot-identity.
+fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Some(author) = node.author else {
+        return Ok(());
+    };
+    let Some(sig) = node.signature else {
+        return Err(RepoError::BadChangeSignature(node.id.clone()));
+    };
+    let vk = VerifyingKey::from_bytes(&author)
+        .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))?;
+    vk.verify(&node.id.0, &Signature::from_bytes(&sig))
+        .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))
+}
 
 fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
     use crate::bundle_codec::{put_bytes, put_u32};
@@ -2181,6 +2267,29 @@ mod tests {
         8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     ];
 
+    // v3 goldens (current format, FORMAT_MAJOR = 3, ADR 0018). None of these
+    // artifacts contain changes, so their layouts are unchanged from v2 — only
+    // the marker byte differs.
+    const GOLDEN_MANIFEST_V3: [u8; 117] = [
+        3, 0, 1, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        3, 0, 0, 0, 98, 111, 98,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+        42, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const GOLDEN_PURGES_V3: [u8; 45] = [
+        3, 0, 1, 0, 0, 0,
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+        3, 0, 0, 0, 101, 118, 101,
+    ];
+    const GOLDEN_CONFLICTS_V3: [u8; 79] = [
+        3, 0, 1, 0, 0, 0,
+        5, 0, 0, 0, 102, 46, 116, 120, 116,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    ];
+
     fn sample_manifest() -> Manifest {
         let mut m = Manifest::new();
         m.record(Oid([1; 32]), "bob".to_string(), [2u8; 32], [3u8; 32], 42);
@@ -2198,9 +2307,14 @@ mod tests {
     }
 
     #[test]
-    fn golden_v2_manifest_matches_and_round_trips() {
-        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V2, "v2 manifest layout must not drift");
+    fn v2_manifest_still_decodes() {
         assert_eq!(decode_manifest(&GOLDEN_MANIFEST_V2).unwrap().grants_for(&Oid([1; 32])).len(), 1);
+    }
+
+    #[test]
+    fn golden_v3_manifest_matches_and_round_trips() {
+        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V3, "v3 manifest layout must not drift");
+        assert_eq!(decode_manifest(&GOLDEN_MANIFEST_V3).unwrap().grants_for(&Oid([1; 32])).len(), 1);
     }
 
     #[test]
@@ -2212,10 +2326,15 @@ mod tests {
     }
 
     #[test]
-    fn golden_v2_purges_matches_and_round_trips() {
-        let purges = vec![(Oid([6; 32]), "eve".to_string())];
-        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V2, "v2 purges layout must not drift");
+    fn v2_purges_still_decodes() {
         assert_eq!(decode_purges(&GOLDEN_PURGES_V2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn golden_v3_purges_matches_and_round_trips() {
+        let purges = vec![(Oid([6; 32]), "eve".to_string())];
+        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V3, "v3 purges layout must not drift");
+        assert_eq!(decode_purges(&GOLDEN_PURGES_V3).unwrap().len(), 1);
     }
 
     #[test]
@@ -2227,11 +2346,146 @@ mod tests {
     }
 
     #[test]
-    fn golden_v2_conflicts_matches_and_round_trips() {
+    fn v2_conflicts_still_decodes() {
+        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V2).unwrap().contains_key(Path::new("f.txt")));
+    }
+
+    #[test]
+    fn golden_v3_conflicts_matches_and_round_trips() {
         let mut conflicts = BTreeMap::new();
         conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
-        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V2, "v2 conflicts layout must not drift");
-        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V2).unwrap().contains_key(Path::new("f.txt")));
+        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V3, "v3 conflicts layout must not drift");
+        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V3).unwrap().contains_key(Path::new("f.txt")));
+    }
+
+    // ---- S3: authored, signed history (ADR 0018) ----
+
+    /// A deterministic ed25519 test keypair (seeded, no RNG needed).
+    fn test_signer(seed: u8) -> (ed25519_dalek::SigningKey, [u8; 32]) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        (sk, pk)
+    }
+
+    fn authored_change(id: Oid, author: [u8; 32], signature: Option<[u8; 64]>) -> ChangeNode {
+        ChangeNode {
+            id,
+            parents: vec![],
+            message: "m".into(),
+            tree: BTreeMap::new(),
+            author: Some(author),
+            signature,
+        }
+    }
+
+    fn bundle_of(node: ChangeNode) -> SyncBundle {
+        let body = BundleBody {
+            changes: vec![node],
+            objs: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+        };
+        SyncBundle(Frame::Sync { purges: vec![], body }.encode())
+    }
+
+    #[test]
+    fn author_is_part_of_change_id() {
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("f"), (Oid([9; 32]), Visibility::Public));
+        let change = Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree };
+        let (_s1, pk1) = test_signer(1);
+        let (_s2, pk2) = test_signer(2);
+        let id_legacy = compute_change_id(None, &change);
+        let id1 = compute_change_id(Some(&pk1), &change);
+        let id2 = compute_change_id(Some(&pk2), &change);
+        assert_ne!(id1, id2, "same edit by two authors must yield different ids");
+        assert_ne!(id1, id_legacy, "authored id must differ from the legacy (unauthored) id");
+    }
+
+    #[test]
+    fn signed_change_verifies_through_apply() {
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(7);
+        let id = Oid([5; 32]);
+        let node = authored_change(id.clone(), pk, Some(sk.sign(&id.0).to_bytes()));
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        assert!(bob.apply(&bundle_of(node), 0).is_ok(), "a validly signed change must apply");
+    }
+
+    #[test]
+    fn apply_rejects_missing_forged_and_tampered_signatures() {
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(7);
+        let id = Oid([5; 32]);
+
+        // Names an author but carries no signature — a stripped signature.
+        let missing = authored_change(id.clone(), pk, None);
+        assert!(matches!(
+            DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(missing), 0),
+            Err(RepoError::BadChangeSignature(_))
+        ));
+
+        // Signature is valid ed25519 but over a different message (forged/tampered).
+        let forged = authored_change(id.clone(), pk, Some(sk.sign(b"not the id").to_bytes()));
+        assert!(matches!(
+            DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(forged), 0),
+            Err(RepoError::BadChangeSignature(_))
+        ));
+
+        // Signature by the wrong key (author claims pk but a different key signed).
+        let (other, _) = test_signer(8);
+        let wrong_key = authored_change(id.clone(), pk, Some(other.sign(&id.0).to_bytes()));
+        assert!(matches!(
+            DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(wrong_key), 0),
+            Err(RepoError::BadChangeSignature(_))
+        ));
+    }
+
+    #[test]
+    fn relay_stow_preserves_author_and_signature() {
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(7);
+        let id = Oid([5; 32]);
+        let node = authored_change(id.clone(), pk, Some(sk.sign(&id.0).to_bytes()));
+
+        // A keyless relay verifies then stows, and re-bundles downstream with the
+        // author + signature intact — authorship survives the relay hop (ADR 0018).
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&bundle_of(node)).unwrap();
+        let out = relay.bundle(&[]).unwrap();
+        match Frame::decode(&out.0).unwrap() {
+            Frame::Sync { body, .. } => {
+                let c = body.changes.iter().find(|c| c.id == id).expect("change survived the relay");
+                assert_eq!(c.author, Some(pk), "author must survive the relay hop");
+                assert!(c.signature.is_some(), "signature must survive the relay hop");
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn stow_rejects_authored_change_with_missing_or_bad_signature() {
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(7);
+        let id = Oid([5; 32]);
+
+        let missing_sig = authored_change(id.clone(), pk, None);
+        assert!(
+            matches!(
+                DagRepo::init(tmp(), "relay").unwrap().stow(&bundle_of(missing_sig)),
+                Err(RepoError::BadChangeSignature(_))
+            ),
+            "stow must reject authored change with no signature"
+        );
+
+        let forged = authored_change(id.clone(), pk, Some(sk.sign(b"wrong").to_bytes()));
+        assert!(
+            matches!(
+                DagRepo::init(tmp(), "relay").unwrap().stow(&bundle_of(forged)),
+                Err(RepoError::BadChangeSignature(_))
+            ),
+            "stow must reject authored change with a forged signature"
+        );
     }
 
     #[test]

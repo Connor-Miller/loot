@@ -9,6 +9,7 @@
 //! the engine reconciles, and persists state after a mutation.
 
 use loot_core::{DagRepo, Oid, RepoStore, Repo, Visibility};
+use loot_identity::Identity;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +26,10 @@ pub struct Workspace {
     /// The working change being rewritten in place, if one is in progress.
     /// `None` right after `init` or `apply` (finalized history, no WIP change).
     working: Option<Oid>,
+    /// The loaded signing keypair, if this repo has one. Stamps the author on new
+    /// changes and signs at finalization (S3, ADR 0018). `None` for a keyless
+    /// repo, which then produces unauthored (legacy) changes.
+    signer: Option<Identity>,
     /// Injected clock — a value, not a call, so tests can drive embargo timing.
     now: u64,
 }
@@ -45,10 +50,20 @@ impl Workspace {
                 dir.display()
             ));
         }
-        let repo = DagRepo::load(&dot, dir.to_path_buf()).map_err(|e| e.to_string())?;
+        let mut repo = DagRepo::load(&dot, dir.to_path_buf()).map_err(|e| e.to_string())?;
         let identity = read_to_string(&store.identity())?;
         let working = store.read_working();
-        Ok(Workspace { dot, store, root: dir.to_path_buf(), identity, repo, working, now: real_now() })
+        // Load the signing keypair if present and stamp its pubkey as the author,
+        // so new changes are attributable and signable (S3, ADR 0018). A keyless
+        // repo stays unauthored (legacy ids), which keeps older repos working.
+        let signer = if loot_identity::keypair_exists(&dot) {
+            let id = loot_identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
+            repo.set_author(id.public_key_bytes());
+            Some(id)
+        } else {
+            None
+        };
+        Ok(Workspace { dot, store, root: dir.to_path_buf(), identity, repo, working, signer, now: real_now() })
     }
 
     pub fn identity(&self) -> &str {
@@ -123,6 +138,15 @@ impl Workspace {
     /// Finalize the working change and start fresh: the next snapshot appends a
     /// new change rather than rewriting this one.
     pub fn finalize_working(&mut self) -> Result<(), String> {
+        // Sign the finalized change id with our identity key (S3, ADR 0018). The
+        // working change is ephemeral until now (rewritten on each `status`), so
+        // we sign exactly once, here. A keyless repo finalizes unsigned (legacy).
+        if let (Some(signer), Some(working)) = (&self.signer, self.working.clone()) {
+            let sig = signer.sign(&working.0);
+            self.repo
+                .attach_signature(&working, sig)
+                .map_err(|e| e.to_string())?;
+        }
         self.working = None;
         // Clear the tree-hash so the next snapshot always runs the engine.
         self.store.clear_tree_hash();
@@ -214,6 +238,9 @@ impl Workspace {
             identity: identity.to_string(),
             repo,
             working: None,
+            // A freshly-initialized repo has no keypair yet (`loot keygen` adds one);
+            // its early changes are unauthored until then (S3, ADR 0018).
+            signer: None,
             now: real_now(),
         };
         ws.persist()?;

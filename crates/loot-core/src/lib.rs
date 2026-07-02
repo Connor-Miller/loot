@@ -58,6 +58,8 @@ pub enum RepoError {
     Embargoed(u64),
     #[error("unsupported format version v{found} — upgrade loot (this build reads up to v{supported})")]
     UnsupportedFormat { found: u8, supported: u8 },
+    #[error("change {0:?} has a missing or invalid author signature")]
+    BadChangeSignature(Oid),
     #[error("backend error: {0}")]
     Backend(String),
 }

@@ -192,11 +192,20 @@ fn cmd_log() -> Result<(), String> {
         return Ok(());
     }
 
+    // Resolve each change's author pubkey to a peer name (short-hex fallback),
+    // reusing the peer registry (S3, ADR 0018). Author trust stays advisory —
+    // this is display only.
+    let reg = identity::PeerRegistry::load(ws.dot());
+    let author_of = |id: &loot_core::Oid| match ws.repo().change_author(id) {
+        Some(pk) => format!("  [logged by {}]", resolve_pubkey_name(&reg, &pk)),
+        None => String::new(),
+    };
+
     // A single head keeps the flat, newest-first listing (unchanged). Only a
     // diverged graph (2+ heads, e.g. after a pull) switches to a branch view.
     if ws.repo().heads().len() <= 1 {
         for (id, message, total, restricted, embargoed) in detailed.into_iter().rev() {
-            println!("{}  {}{}", short(&id), message, seal_hint(total, restricted, embargoed));
+            println!("{}  {}{}{}", short(&id), message, seal_hint(total, restricted, embargoed), author_of(&id));
         }
         if let Some(working) = ws.working_id() {
             println!("{}  (working change)", short(&working));
@@ -220,7 +229,7 @@ fn cmd_log() -> Result<(), String> {
         println!();
         println!("head {} — {}", hi + 1, short(head));
         for node in g.changes.iter().filter(|n| n.reachable_from == [hi]) {
-            println!("  {}  {}{}", short(&node.id), node.message, hint_for(&node.id));
+            println!("  {}  {}{}{}", short(&node.id), node.message, hint_for(&node.id), author_of(&node.id));
         }
     }
 
@@ -230,7 +239,7 @@ fn cmd_log() -> Result<(), String> {
         println!();
         println!("shared history");
         for node in shared {
-            println!("  {}  {}{}", short(&node.id), node.message, hint_for(&node.id));
+            println!("  {}  {}{}{}", short(&node.id), node.message, hint_for(&node.id), author_of(&node.id));
         }
     }
     Ok(())

@@ -75,7 +75,17 @@ impl<'a> Cursor<'a> {
 }
 
 /// The newest breaking format version this build writes and can read.
-pub const FORMAT_MAJOR: u8 = 1;
+///
+/// - v2 (S2, ADR 0020) added the per-object `compressed` flag to the sealed-object
+///   layout.
+/// - v3 (S3, ADR 0018) added the per-change `author` pubkey + `signature` to the
+///   change layout (bundle and durable graph).
+///
+/// Each was a change an older reader cannot parse, so each bumped the major. A
+/// v3 reader still reads v1/v2 artifacts (missing fields default to absent —
+/// uncompressed, unauthored); an older reader cleanly rejects a newer major
+/// rather than mis-parsing.
+pub const FORMAT_MAJOR: u8 = 3;
 /// The compatible revision this build writes.
 pub const FORMAT_MINOR: u8 = 0;
 /// Bytes the version marker occupies at the front of an artifact.
@@ -105,6 +115,60 @@ pub fn read_version(c: &mut Cursor) -> Result<(u8, u8), RepoError> {
         });
     }
     Ok((major, minor))
+}
+
+// --- authored-change fields (S3, ADR 0018), shared by the bundle and durable
+// graph codecs so the on-wire and on-disk change layouts stay identical. ---
+
+/// Write a change's optional author pubkey then optional signature, each as a
+/// presence byte followed by its bytes (32 for the author, 64 for the sig).
+pub fn put_author_sig(out: &mut Vec<u8>, author: &Option<[u8; 32]>, signature: &Option<[u8; 64]>) {
+    match author {
+        Some(a) => {
+            out.push(1);
+            out.extend_from_slice(a);
+        }
+        None => out.push(0),
+    }
+    match signature {
+        Some(s) => {
+            out.push(1);
+            out.extend_from_slice(s);
+        }
+        None => out.push(0),
+    }
+}
+
+/// Read a change's optional author pubkey + signature. From v3 on these follow
+/// the change body; an older `major` predates them, so both are `None`
+/// (unauthored) — this is the "newer reads older" path (ADR 0019/0018).
+#[allow(clippy::type_complexity)]
+pub fn read_author_sig(
+    c: &mut Cursor,
+    major: u8,
+) -> Result<(Option<[u8; 32]>, Option<[u8; 64]>), RepoError> {
+    if major < 3 {
+        return Ok((None, None));
+    }
+    let author = if c.take(1)?[0] != 0 { Some(c.arr32()?) } else { None };
+    // Only read the signature bytes when an author is present. If author is
+    // absent the sig field has no meaning; skip its presence byte (and any
+    // following bytes) so an anomalous author=0/sig=1 payload can't produce a
+    // (None, Some(_)) pair that verify_authored_change silently accepts.
+    let signature = if author.is_some() {
+        if c.take(1)?[0] != 0 {
+            let mut s = [0u8; 64];
+            s.copy_from_slice(c.take(64)?);
+            Some(s)
+        } else {
+            None
+        }
+    } else {
+        // Consume the sig presence byte to keep the cursor in sync; ignore value.
+        let _ = c.take(1)?;
+        None
+    };
+    Ok((author, signature))
 }
 
 #[cfg(test)]

@@ -124,3 +124,23 @@ re-signing does not gratuitously change identity.
   policy reusing the peer registry, later.
 - **The attestation lane implementation** (co-sign / review sign-off) — a
   follow-on slice; the format reserves room now.
+
+## Implementation note (S3)
+
+Signature **validity is enforced inside the engine's ingest paths** (`apply` and
+`stow`), so no caller can skip it — matching "always enforced, not a toggle"
+above. This gives loot-core a **verify-only** `ed25519-dalek` dependency;
+*signing* and all key custody stay in loot-identity. The split is deliberate:
+loot-core **verifies** (read-side DAG integrity, next to the blake3 addressing
+and AES-GCM sealing it already owns), while loot-identity **signs** and manages
+keys. It does not weaken ADR 0014/0015's separation, which was about identity
+*custody*, not stateless signature checks.
+
+Mechanics: the author pubkey is folded into `compute_change_id`, and the
+`author` + `signature` ride beside the change node as an additive field in both
+the sync bundle and the durable graph, gated by the format version (v3, ADR
+0019). A v1/v2 change decodes as unauthored (`author = None`) and is accepted as
+legacy. The engine stores the author on `DagRepo` (set by the workspace from the
+loaded keypair); an unsigned working change is kept **local** — `bundle` never
+ships an authored-but-unsigned change — until `loot new` signs it once at
+finalization. Keyless repos stay unauthored and keep working.

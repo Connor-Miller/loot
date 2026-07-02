@@ -37,6 +37,8 @@ fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
         out.extend_from_slice(&oid.0);
         put_vis(out, vis);
     }
+    // v3: author pubkey + signature ride beside the change body (ADR 0018).
+    format::put_author_sig(out, &c.author, &c.signature);
 }
 
 fn encode_object(obj: &SealedObject) -> Vec<u8> {
@@ -46,6 +48,7 @@ fn encode_object(obj: &SealedObject) -> Vec<u8> {
     let mut out = Vec::new();
     format::put_version(&mut out);
     out.extend_from_slice(&obj.nonce);
+    out.push(obj.compressed as u8); // v2: compression flag (ADR 0020)
     put_bytes(&mut out, &obj.ciphertext);
     put_vis(&mut out, &obj.vis);
     put_u32(&mut out, obj.grant_ids.len());
@@ -57,8 +60,11 @@ fn encode_object(obj: &SealedObject) -> Vec<u8> {
 
 fn decode_object(b: &[u8]) -> Result<SealedObject, RepoError> {
     let mut c = Cursor { b, i: 0 };
-    format::read_version(&mut c)?;
+    let (major, _minor) = format::read_version(&mut c)?;
     let nonce = c.arr12()?;
+    // The compression flag exists from v2 on; a v1 object predates it and is
+    // uncompressed (newer reads older, ADR 0019/0020).
+    let compressed = if major >= 2 { c.take(1)?[0] != 0 } else { false };
     let ciphertext = c.bytes()?;
     let vis = c.vis()?;
     let n_grants = c.u32()?;
@@ -71,6 +77,7 @@ fn decode_object(b: &[u8]) -> Result<SealedObject, RepoError> {
         ciphertext,
         vis,
         grant_ids,
+        compressed,
     })
 }
 
@@ -131,7 +138,7 @@ pub fn encode_graph(graph: &ChangeGraph) -> Vec<u8> {
 
 pub fn decode_graph(b: &[u8]) -> Result<ChangeGraph, RepoError> {
     let mut c = Cursor { b, i: 0 };
-    format::read_version(&mut c)?;
+    let (major, _minor) = format::read_version(&mut c)?;
     let mut graph = ChangeGraph::new();
     let n_changes = c.u32()?;
     for _ in 0..n_changes {
@@ -150,11 +157,14 @@ pub fn decode_graph(b: &[u8]) -> Result<ChangeGraph, RepoError> {
             let vis = c.vis()?;
             tree.insert(path, (oid, vis));
         }
+        let (author, signature) = format::read_author_sig(&mut c, major)?;
         graph.insert(ChangeNode {
             id,
             parents,
             message,
             tree,
+            author,
+            signature,
         });
     }
     Ok(graph)
@@ -263,6 +273,86 @@ mod tests {
         b
     };
 
+    // ---- v2 goldens (current format, FORMAT_MAJOR = 2, ADR 0020) ----
+    // Graph/keyring/escrow layouts are unchanged from v1; only the marker byte
+    // differs. The sealed object gains a one-byte `compressed` flag after the
+    // nonce, so its v2 golden is one byte longer than v1.
+
+    // graph: identical body to GOLDEN_GRAPH_V1, marker [2,0].
+    const GOLDEN_GRAPH_V2: [u8; 97] = [
+        2, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 5, 0, 0, 0, 102, 105, 114, 115, 116, 1, 0, 0, 0, 5, 0,
+        0, 0, 97, 46, 116, 120, 116, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0,
+    ];
+
+    // sealed object: nonce=[9;12], compressed=0, ciphertext=[0xAB,0xCD], Public,
+    // grant_ids=["*"]. The compressed flag sits right after the nonce.
+    const GOLDEN_OBJECT_V2: [u8; 31] = [
+        2, 0, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 2, 0, 0, 0, 171, 205, 0, 1, 0, 0, 0, 1, 0, 0,
+        0, 42,
+    ];
+
+    // keyring: same body as GOLDEN_KEYRING_V1, marker [2,0].
+    const GOLDEN_KEYRING_V2: [u8; 70] = {
+        let mut b = [0u8; 70];
+        b[0] = 2; b[1] = 0;
+        b[2] = 1;
+        let mut i = 6;
+        while i < 6 + 32 { b[i] = 4; i += 1; }
+        while i < 6 + 64 { b[i] = 7; i += 1; }
+        b
+    };
+
+    // escrow: same body as GOLDEN_ESCROW_V1, marker [2,0].
+    const GOLDEN_ESCROW_V2: [u8; 78] = {
+        let mut b = [0u8; 78];
+        b[0] = 2; b[1] = 0;
+        b[2] = 1;
+        let mut i = 6;
+        while i < 6 + 32 { b[i] = 5; i += 1; }
+        while i < 6 + 64 { b[i] = 8; i += 1; }
+        b[70] = 0; b[71] = 210; b[72] = 73; b[73] = 107;
+        b[74] = 0; b[75] = 0;   b[76] = 0; b[77] = 0;
+        b
+    };
+
+    // ---- v3 goldens (current format, FORMAT_MAJOR = 3, ADR 0018) ----
+    // S3 changed only the *change* layout (per-change author + signature), so the
+    // graph golden grows by 2 bytes (author-absent, sig-absent for this sample
+    // unauthored change). Object/keyring/escrow layouts are unchanged; only the
+    // marker byte differs.
+    const GOLDEN_GRAPH_V3: [u8; 99] = [
+        3, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 5, 0, 0, 0, 102, 105, 114, 115, 116, 1, 0, 0, 0, 5, 0,
+        0, 0, 97, 46, 116, 120, 116, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0,
+    ];
+    const GOLDEN_OBJECT_V3: [u8; 31] = [
+        3, 0, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 2, 0, 0, 0, 171, 205, 0, 1, 0, 0, 0, 1, 0, 0,
+        0, 42,
+    ];
+    const GOLDEN_KEYRING_V3: [u8; 70] = {
+        let mut b = [0u8; 70];
+        b[0] = 3; b[1] = 0;
+        b[2] = 1;
+        let mut i = 6;
+        while i < 6 + 32 { b[i] = 4; i += 1; }
+        while i < 6 + 64 { b[i] = 7; i += 1; }
+        b
+    };
+    const GOLDEN_ESCROW_V3: [u8; 78] = {
+        let mut b = [0u8; 78];
+        b[0] = 3; b[1] = 0;
+        b[2] = 1;
+        let mut i = 6;
+        while i < 6 + 32 { b[i] = 5; i += 1; }
+        while i < 6 + 64 { b[i] = 8; i += 1; }
+        b[70] = 0; b[71] = 210; b[72] = 73; b[73] = 107;
+        b[74] = 0; b[75] = 0;   b[76] = 0; b[77] = 0;
+        b
+    };
+
     fn one_change_graph() -> ChangeGraph {
         let mut g = ChangeGraph::new();
         let mut tree = BTreeMap::new();
@@ -275,16 +365,22 @@ mod tests {
             parents: vec![],
             message: "first".into(),
             tree,
+            author: None,
+            signature: None,
         });
         g
     }
 
+    // A hand-built fixture object. `compressed: false` keeps its bytes
+    // deterministic (the codec round-trips the flag verbatim; actual zstd lives
+    // in seal/open, tested in the sealed module).
     fn sample_object() -> SealedObject {
         SealedObject {
             nonce: [9; 12],
             ciphertext: vec![0xAB, 0xCD],
             vis: Visibility::Public,
             grant_ids: vec!["*".into()],
+            compressed: false,
         }
     }
 
@@ -298,14 +394,27 @@ mod tests {
     }
 
     #[test]
-    fn golden_v1_graph_matches_and_round_trips() {
-        assert_eq!(encode_graph(&one_change_graph()), GOLDEN_GRAPH_V1, "v1 graph layout must not drift");
-        // A newer build still reads the committed v1 bytes (newer reads older).
+    fn v1_graph_still_decodes() {
+        // A v2 build still reads a committed v1 graph (newer reads older).
         let g = decode_graph(&GOLDEN_GRAPH_V1).unwrap();
         let changes = g.in_order();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].message, "first");
         assert_eq!(changes[0].id, Oid([1; 32]));
+    }
+
+    #[test]
+    fn v2_graph_still_decodes() {
+        // A v3 build still reads a v2 graph; its change predates authorship.
+        let g = decode_graph(&GOLDEN_GRAPH_V2).unwrap();
+        assert_eq!(g.in_order().len(), 1);
+        assert!(g.in_order()[0].author.is_none(), "v2 change is unauthored");
+    }
+
+    #[test]
+    fn golden_v3_graph_matches_and_round_trips() {
+        assert_eq!(encode_graph(&one_change_graph()), GOLDEN_GRAPH_V3, "v3 graph layout must not drift");
+        assert_eq!(decode_graph(&GOLDEN_GRAPH_V3).unwrap().in_order().len(), 1);
     }
 
     #[test]
@@ -322,9 +431,32 @@ mod tests {
     }
 
     #[test]
-    fn golden_v1_object_matches_and_round_trips() {
-        assert_eq!(encode_object(&sample_object()), GOLDEN_OBJECT_V1, "v1 object layout must not drift");
-        assert_eq!(decode_object(&GOLDEN_OBJECT_V1).unwrap(), sample_object());
+    fn v1_object_still_decodes_as_uncompressed() {
+        // A v1 object predates the compressed flag; a v2 build reads it and
+        // defaults compressed=false (newer reads older, ADR 0020).
+        let obj = decode_object(&GOLDEN_OBJECT_V1).unwrap();
+        assert_eq!(obj, sample_object());
+        assert!(!obj.compressed);
+    }
+
+    #[test]
+    fn v2_object_still_decodes() {
+        // The object layout is unchanged in v3; a v3 build still reads a v2 object.
+        assert_eq!(decode_object(&GOLDEN_OBJECT_V2).unwrap(), sample_object());
+    }
+
+    #[test]
+    fn golden_v3_object_matches_and_round_trips() {
+        assert_eq!(encode_object(&sample_object()), GOLDEN_OBJECT_V3, "v3 object layout must not drift");
+        assert_eq!(decode_object(&GOLDEN_OBJECT_V3).unwrap(), sample_object());
+    }
+
+    #[test]
+    fn object_compressed_flag_round_trips() {
+        let mut obj = sample_object();
+        obj.compressed = true;
+        let back = decode_object(&encode_object(&obj)).unwrap();
+        assert!(back.compressed, "compressed flag must survive encode/decode");
     }
 
     #[test]
@@ -360,15 +492,37 @@ mod tests {
     }
 
     #[test]
-    fn golden_v1_keyring_matches_and_round_trips() {
-        assert_eq!(encode_keyring(&sample_keyring()), GOLDEN_KEYRING_V1, "v1 keyring layout must not drift");
+    fn v1_keyring_still_decodes() {
+        // Layout unchanged since v1; a v2 build still reads a v1 keyring.
         assert!(decode_keyring(&GOLDEN_KEYRING_V1).unwrap().holds(&Oid([4; 32])));
     }
 
     #[test]
-    fn golden_v1_escrow_matches_and_round_trips() {
-        assert_eq!(encode_escrow(&sample_escrow()), GOLDEN_ESCROW_V1, "v1 escrow layout must not drift");
+    fn v2_keyring_still_decodes() {
+        assert!(decode_keyring(&GOLDEN_KEYRING_V2).unwrap().holds(&Oid([4; 32])));
+    }
+
+    #[test]
+    fn golden_v3_keyring_matches_and_round_trips() {
+        assert_eq!(encode_keyring(&sample_keyring()), GOLDEN_KEYRING_V3, "v3 keyring layout must not drift");
+        assert!(decode_keyring(&GOLDEN_KEYRING_V3).unwrap().holds(&Oid([4; 32])));
+    }
+
+    #[test]
+    fn v1_escrow_still_decodes() {
+        // Layout unchanged since v1; a v2 build still reads a v1 escrow.
         assert!(decode_escrow(&GOLDEN_ESCROW_V1).unwrap().holds(&Oid([5; 32])));
+    }
+
+    #[test]
+    fn v2_escrow_still_decodes() {
+        assert!(decode_escrow(&GOLDEN_ESCROW_V2).unwrap().holds(&Oid([5; 32])));
+    }
+
+    #[test]
+    fn golden_v3_escrow_matches_and_round_trips() {
+        assert_eq!(encode_escrow(&sample_escrow()), GOLDEN_ESCROW_V3, "v3 escrow layout must not drift");
+        assert!(decode_escrow(&GOLDEN_ESCROW_V3).unwrap().holds(&Oid([5; 32])));
     }
 
     #[test]

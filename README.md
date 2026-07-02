@@ -110,7 +110,7 @@ crates/
 
 | Module | What it owns |
 | --- | --- |
-| `loot-core::sealed` | Per-content encryption, key custody, embargo (ADR 0003, 0007) |
+| `loot-core::sealed` | Per-content encryption, key custody, embargo, public-content compression (ADR 0003, 0007, 0020) |
 | `loot-core::converge` | Merger/relay convergence rule — decrypt-then-merge (ADR 0001) |
 | `loot-core::engine` | Encrypted content-addressed DAG: put/get/record/surface/bundle/apply |
 | `loot-core::manifest` | Grant audit trail: grantee, grantor pubkeys, timestamps |
@@ -141,6 +141,7 @@ crates/
 | 0017 | RepoStore: one home for the `.loot/` layout |
 | 0018 | Signed changes: author in id + validity enforcement |
 | 0019 | Format versioning + compatibility gate (newer reads older) |
+| 0020 | Compress public content (Zstd); format major → 2 |
 
 See [CONTEXT.md](CONTEXT.md) for the full domain glossary.
 

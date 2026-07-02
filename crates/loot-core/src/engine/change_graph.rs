@@ -17,12 +17,28 @@ pub struct ChangeNode {
     pub parents: Vec<Oid>,
     pub message: String,
     pub tree: BTreeMap<PathBuf, (Oid, Visibility)>,
+    /// The author's ed25519 public key (S3, ADR 0018). `Some` for authored
+    /// changes — the pubkey is folded into `id`, so authorship is intrinsic.
+    /// `None` for legacy/unauthored changes read under an older format version.
+    pub author: Option<[u8; 32]>,
+    /// The author's signature over `id`, attached at finalization (`loot new`).
+    /// `None` for an in-progress working change, or a legacy/unauthored change.
+    pub signature: Option<[u8; 64]>,
 }
 
-/// Content-derived change id: hash of message, parents, and the path/address
-/// tree. Pure; identical changes get identical ids (idempotent commit/apply).
-pub fn compute_change_id(change: &Change) -> Oid {
+/// Content-and-author-derived change id: hash of the author pubkey (when
+/// present), message, parents, and the path/address tree. Pure; identical
+/// changes get identical ids (idempotent commit/apply).
+///
+/// Folding the author in first makes authorship intrinsic (ADR 0018): the same
+/// edit by two identities yields distinct ids. `author = None` reproduces the
+/// pre-authorship id exactly, so legacy/unauthored changes are unchanged and
+/// "newer reads older" holds.
+pub fn compute_change_id(author: Option<&[u8; 32]>, change: &Change) -> Oid {
     let mut h = blake3::Hasher::new();
+    if let Some(a) = author {
+        h.update(a);
+    }
     h.update(change.message.as_bytes());
     for p in &change.parents {
         h.update(&p.0);
@@ -93,6 +109,13 @@ impl ChangeGraph {
         self.changes.get(id)
     }
 
+    /// Attach a signature to a node's `signature` field (finalization, ADR 0018).
+    /// Returns `None` if the change id is unknown.
+    pub fn set_signature(&mut self, id: &Oid, signature: [u8; 64]) -> Option<()> {
+        self.changes.get_mut(id)?.signature = Some(signature);
+        Some(())
+    }
+
     /// Latest content address per path, applying changes in topo order so a
     /// child's write wins over its parent's.
     pub fn current_tree(&self) -> Tree {
@@ -148,6 +171,8 @@ mod tests {
             parents: parents.iter().map(|&p| Oid([p; 32])).collect(),
             message: format!("c{id}"),
             tree,
+            author: None,
+            signature: None,
         }
     }
 
