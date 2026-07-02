@@ -27,6 +27,9 @@ pub type ContentKey = [u8; 32];
 /// `Public` and `Embargoed` content.
 pub const ANYONE: &str = "*";
 
+/// Zstd compression level for public content (matches lore's choice).
+const ZSTD_LEVEL: i32 = 6;
+
 /// Encrypted content with its access policy — but no key.
 ///
 /// Carries everything needed to *store* and *relay* content, and everything
@@ -41,6 +44,10 @@ pub struct SealedObject {
     /// Identities permitted to hold this content's key (names, never keys).
     /// `[ANYONE]` for Public/Embargoed; the listed identities for Restricted.
     pub grant_ids: Vec<String>,
+    /// Whether the plaintext was Zstd-compressed before encryption (S2, ADR 0020).
+    /// Only `Public` content is compressed; `open` decompresses when set. The
+    /// flag is metadata about the payload, not part of the content address.
+    pub compressed: bool,
 }
 
 impl SealedObject {
@@ -126,9 +133,24 @@ pub fn grant_ids(vis: &Visibility) -> Vec<String> {
 pub fn seal(bytes: &[u8], vis: &Visibility) -> Result<(Oid, SealedObject, ContentKey), RepoError> {
     let key: ContentKey = random_bytes()?;
     let nonce: [u8; 12] = random_bytes()?;
+
+    // Compress-then-encrypt, public content only. Each object is its own zstd
+    // context (no shared dictionary), so CRIME/BREACH-style cross-context leaks
+    // don't apply. Restricted/embargoed payloads are never compressed, so no
+    // compressibility/length side-channel appears on sensitive data — keying
+    // this off visibility (already in the clear on the object) reveals nothing
+    // new (S2, ADR 0020).
+    let compressed = matches!(vis, Visibility::Public);
+    let payload = if compressed {
+        zstd::encode_all(bytes, ZSTD_LEVEL)
+            .map_err(|e| RepoError::Backend(format!("zstd compress: {e}")))?
+    } else {
+        bytes.to_vec()
+    };
+
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), bytes)
+        .encrypt(Nonce::from_slice(&nonce), payload.as_ref())
         .map_err(|e| RepoError::Backend(format!("encrypt: {e}")))?;
 
     let sealed = SealedObject {
@@ -136,6 +158,7 @@ pub fn seal(bytes: &[u8], vis: &Visibility) -> Result<(Oid, SealedObject, Conten
         ciphertext,
         vis: vis.clone(),
         grant_ids: grant_ids(vis),
+        compressed,
     };
     Ok((sealed.address(), sealed, key))
 }
@@ -176,9 +199,17 @@ pub fn open(
     //    key simply hasn't arrived yet.
     if let Some(key) = keyring.get(oid) {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-        return cipher
+        let plain = cipher
             .decrypt(Nonce::from_slice(&sealed.nonce), sealed.ciphertext.as_ref())
-            .map_err(|e| RepoError::Backend(format!("decrypt: {e}")));
+            .map_err(|e| RepoError::Backend(format!("decrypt: {e}")))?;
+        // Transparent decompression: undo the compress-then-encrypt from `seal`.
+        return if sealed.compressed {
+            // 64 MiB cap: generous for typical content, prevents adversarial zip-bomb.
+            zstd::bulk::decompress(&plain, 64 * 1024 * 1024)
+                .map_err(|e| RepoError::Backend(format!("zstd decompress: {e}")))
+        } else {
+            Ok(plain)
+        };
     }
 
     // 3. Visibility gate — no key held; check if reader is authorized to
@@ -282,5 +313,49 @@ mod tests {
         let plaintext_hash = *blake3::hash(b"same secret").as_bytes();
         assert_ne!(oid1.0, plaintext_hash);
         assert_ne!(oid2.0, plaintext_hash);
+    }
+
+    #[test]
+    fn public_content_is_compressed_and_round_trips() {
+        let data = b"the quick brown fox jumps over the lazy dog\n".repeat(50);
+        let (oid, sealed, key) = seal(&data, &Visibility::Public).unwrap();
+        assert!(sealed.compressed, "public content must be compressed");
+        let kr = keyring_with(oid.clone(), key);
+        assert_eq!(open(&sealed, &oid, "anyone", &kr, 0).unwrap(), data);
+    }
+
+    #[test]
+    fn restricted_content_is_not_compressed_and_round_trips() {
+        let (oid, sealed, key) =
+            seal(b"secret", &Visibility::Restricted(vec!["alice".into()])).unwrap();
+        assert!(!sealed.compressed, "restricted content must not be compressed");
+        let kr = keyring_with(oid.clone(), key);
+        assert_eq!(open(&sealed, &oid, "alice", &kr, 0).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn embargoed_content_is_not_compressed() {
+        let (_oid, sealed, _key) = seal(b"cve", &Visibility::Embargoed { reveal_at: 0 }).unwrap();
+        assert!(!sealed.compressed, "embargoed content must not be compressed");
+    }
+
+    #[test]
+    fn public_object_shrinks_on_compressible_corpus() {
+        // A repetitive text/code corpus compresses well: the sealed public
+        // payload (compressed) must be materially smaller than the same bytes
+        // sealed uncompressed (restricted). AES-GCM adds only a fixed 16-byte tag,
+        // so the difference is the compression win (S2 AC).
+        let corpus = "fn main() { println!(\"hello, world\"); }\n".repeat(200);
+        let bytes = corpus.as_bytes();
+        let (_o1, public, _k1) = seal(bytes, &Visibility::Public).unwrap();
+        let (_o2, restricted, _k2) =
+            seal(bytes, &Visibility::Restricted(vec!["alice".into()])).unwrap();
+        assert!(public.compressed && !restricted.compressed);
+        assert!(
+            public.ciphertext.len() < restricted.ciphertext.len() / 2,
+            "public payload should shrink on a compressible corpus: {} vs {}",
+            public.ciphertext.len(),
+            restricted.ciphertext.len()
+        );
     }
 }

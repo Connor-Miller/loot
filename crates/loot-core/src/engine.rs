@@ -1153,7 +1153,8 @@ mod tests {
 
     fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
         let payload = extract_sync_payload(bundle);
-        let (_changes, objs, _keys, _escrow) = bundle_codec::decode(&payload).unwrap();
+        let (_changes, objs, _keys, _escrow) =
+            bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
         assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
         objs.into_iter().next().unwrap().1.ciphertext
     }
@@ -1173,6 +1174,116 @@ mod tests {
         };
         let changes: Vec<&ChangeNode> = body.changes.iter().collect();
         bundle_codec::encode(&changes, &body.objs, &body.keys, &body.escrow)
+    }
+
+    /// S1/S2 compatibility: a v1-format sync bundle (marker `[1,0]`, no
+    /// `compressed` flag in inline objects) applies cleanly through the full
+    /// engine stack. Exercises `Frame::decode -> decode_body(major=1)` on `apply`.
+    ///
+    /// We hand-serialize the v1 wire layout using the public body-codec helpers
+    /// so the test is coupled to the same field encoding as the real codec, not
+    /// to internal byte offsets.
+    #[test]
+    fn v1_bundle_applies_through_engine() {
+        use crate::bundle_codec::{put_bytes, put_u32, put_vis};
+
+        // Produce a real bundle so we have live object/key/change data to work with.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let oid = alice.put(b"public\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("f.txt"), (oid.clone(), Visibility::Public));
+        let change_id = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+
+        let v2_bundle = alice.bundle(&[]).unwrap();
+        let frame = bundle_codec::Frame::decode(&v2_bundle.0).expect("valid v2 bundle");
+        let bundle_codec::Frame::Sync { body, .. } = frame else { panic!("expected sync frame") };
+
+        // Hand-serialize the v1 wire layout:
+        //   [major=1][minor=0][tag=0][purge_count=0 u32le]
+        //   [obj_count u32le]
+        //     per object: [addr 32][nonce 12][ciphertext len+bytes][vis][grant_ids]
+        //     note: v1 has NO `compressed` flag byte between nonce and ciphertext
+        //   [key_count u32le][addr 32][key 32] ...
+        //   [escrow_count u32le] ...
+        //   [change_count u32le][change ...] ...
+        let mut wire = Vec::new();
+        wire.push(1u8); // major = 1
+        wire.push(0u8); // minor = 0
+        wire.push(0u8); // tag = Sync
+        put_u32(&mut wire, 0); // no purges
+
+        put_u32(&mut wire, body.objs.len());
+        for (addr, obj) in &body.objs {
+            wire.extend_from_slice(&addr.0);
+            wire.extend_from_slice(&obj.nonce);
+            // v1: no compressed flag byte here
+            put_bytes(&mut wire, &obj.ciphertext);
+            put_vis(&mut wire, &obj.vis);
+            put_u32(&mut wire, obj.grant_ids.len());
+            for id in &obj.grant_ids {
+                put_bytes(&mut wire, id.as_bytes());
+            }
+        }
+        put_u32(&mut wire, body.keys.len());
+        for (addr, key) in &body.keys {
+            wire.extend_from_slice(&addr.0);
+            wire.extend_from_slice(key);
+        }
+        put_u32(&mut wire, body.escrow.len());
+        for (addr, (key, reveal_at)) in &body.escrow {
+            wire.extend_from_slice(&addr.0);
+            wire.extend_from_slice(key);
+            wire.extend_from_slice(&reveal_at.to_le_bytes());
+        }
+        put_u32(&mut wire, body.changes.len());
+        for c in &body.changes {
+            wire.extend_from_slice(&c.id.0);
+            put_u32(&mut wire, c.parents.len());
+            for p in &c.parents {
+                wire.extend_from_slice(&p.0);
+            }
+            put_bytes(&mut wire, c.message.as_bytes());
+            put_u32(&mut wire, c.tree.len());
+            for (path, (o, vis)) in &c.tree {
+                put_bytes(&mut wire, path.to_string_lossy().as_bytes());
+                wire.extend_from_slice(&o.0);
+                put_vis(&mut wire, vis);
+            }
+        }
+
+        // apply() must succeed: the v1 major is accepted, the body parses without
+        // the compressed flag, and the change is integrated.
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&SyncBundle(wire), 0).expect("v1 bundle must apply through engine");
+        assert!(bob.heads().contains(&change_id), "change must be tracked after v1 apply");
+    }
+
+    /// S2 (ADR 0020): a public file compresses on seal and round-trips
+    /// byte-identical through bundle -> apply -> read on a peer that receives the
+    /// public key. Exercises compress-then-encrypt over the full sync path.
+    #[test]
+    fn public_content_round_trips_compressed_through_bundle_apply() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let doc = b"fn main() { println!(\"hi\"); }\n".repeat(64);
+        let oid = alice.put(&doc, Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("main.rs"), (oid.clone(), Visibility::Public));
+        alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "add main".into(), tree })
+            .unwrap();
+        // Reads back verbatim locally (decompress-on-open).
+        assert_eq!(alice.get(&oid, "alice", 0).unwrap(), doc);
+        // A peer receives the bundle (public key rides along) and reads identical bytes.
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+        assert_eq!(
+            bob.get(&oid, "bob", 0).unwrap(),
+            doc,
+            "public content must round-trip byte-identical through bundle/apply"
+        );
     }
 
     /// ADR 0005: a repo survives save -> load with identity, content, history,
@@ -1481,7 +1592,8 @@ mod tests {
 
         // The raw wire must have the key in the escrow section, not the keyring.
         let payload = extract_sync_payload(&bundle.0);
-        let (_changes, _objs, plain_keys, escrow_entries) = bundle_codec::decode(&payload).unwrap();
+        let (_changes, _objs, plain_keys, escrow_entries) =
+            bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
         assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in keyring section");
         assert!(escrow_entries.contains_key(&oid), "embargoed key must be in escrow section");
 
@@ -2047,6 +2159,28 @@ mod tests {
         8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // theirs=[8;32]
     ];
 
+    // v2 goldens (current format, FORMAT_MAJOR = 2, ADR 0020). These layouts are
+    // unchanged from v1; only the marker byte differs.
+    const GOLDEN_MANIFEST_V2: [u8; 117] = [
+        2, 0, 1, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        3, 0, 0, 0, 98, 111, 98,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+        42, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const GOLDEN_PURGES_V2: [u8; 45] = [
+        2, 0, 1, 0, 0, 0,
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+        3, 0, 0, 0, 101, 118, 101,
+    ];
+    const GOLDEN_CONFLICTS_V2: [u8; 79] = [
+        2, 0, 1, 0, 0, 0,
+        5, 0, 0, 0, 102, 46, 116, 120, 116,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    ];
+
     fn sample_manifest() -> Manifest {
         let mut m = Manifest::new();
         m.record(Oid([1; 32]), "bob".to_string(), [2u8; 32], [3u8; 32], 42);
@@ -2054,8 +2188,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_v1_manifest_matches_and_round_trips() {
-        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V1, "v1 manifest layout must not drift");
+    fn v1_manifest_still_decodes() {
+        // Layout unchanged since v1; a v2 build still reads a v1 manifest.
         let back = decode_manifest(&GOLDEN_MANIFEST_V1).unwrap();
         let entries = back.grants_for(&Oid([1; 32]));
         assert_eq!(entries.len(), 1);
@@ -2064,9 +2198,13 @@ mod tests {
     }
 
     #[test]
-    fn golden_v1_purges_matches_and_round_trips() {
-        let purges = vec![(Oid([6; 32]), "eve".to_string())];
-        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V1, "v1 purges layout must not drift");
+    fn golden_v2_manifest_matches_and_round_trips() {
+        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V2, "v2 manifest layout must not drift");
+        assert_eq!(decode_manifest(&GOLDEN_MANIFEST_V2).unwrap().grants_for(&Oid([1; 32])).len(), 1);
+    }
+
+    #[test]
+    fn v1_purges_still_decodes() {
         let back = decode_purges(&GOLDEN_PURGES_V1).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, Oid([6; 32]));
@@ -2074,14 +2212,26 @@ mod tests {
     }
 
     #[test]
-    fn golden_v1_conflicts_matches_and_round_trips() {
-        let mut conflicts = BTreeMap::new();
-        conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
-        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V1, "v1 conflicts layout must not drift");
+    fn golden_v2_purges_matches_and_round_trips() {
+        let purges = vec![(Oid([6; 32]), "eve".to_string())];
+        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V2, "v2 purges layout must not drift");
+        assert_eq!(decode_purges(&GOLDEN_PURGES_V2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v1_conflicts_still_decodes() {
         let back = decode_conflicts(&GOLDEN_CONFLICTS_V1).unwrap();
         let (ours, theirs) = &back[Path::new("f.txt")];
         assert_eq!(*ours, Oid([7; 32]));
         assert_eq!(*theirs, Oid([8; 32]));
+    }
+
+    #[test]
+    fn golden_v2_conflicts_matches_and_round_trips() {
+        let mut conflicts = BTreeMap::new();
+        conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
+        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V2, "v2 conflicts layout must not drift");
+        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V2).unwrap().contains_key(Path::new("f.txt")));
     }
 
     #[test]
