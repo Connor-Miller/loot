@@ -142,6 +142,9 @@ crates/
 | 0018 | Signed changes: author in id + validity enforcement |
 | 0019 | Format versioning + compatibility gate (newer reads older) |
 | 0020 | Compress public content (Zstd); format major → 2 |
+| 0021 | Object-level "wants" negotiation on push/pull |
+| 0022 | Concurrent-agent model: docks, harbor, optimistic convergence |
+| 0023 | Agent-facing machine output: porcelain-first, reconciliation verbs |
 
 See [CONTEXT.md](CONTEXT.md) for the full domain glossary.
 

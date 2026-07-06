@@ -31,6 +31,42 @@ discovers `.loot/`, supplies the current identity and the clock, and persists on
 mutation. Commands are thin verbs over it; the snapshot invariant and clock
 injection live here. See ADR 0006.
 
+**Dock** *(proposed — concurrent-agents design, 2026-07-06)* — an isolated
+working tree plus its own [[Working change]] tip, materialized cheaply over the
+*shared* `.loot/` object store and change graph. loot's answer to a git
+worktree, and the isolation unit for concurrent agents: each agent (or human)
+*docks* into the repo to get its own tree and tip without a second clone or any
+re-fetch of ciphertext. Docks fork the DAG exactly as concurrent pushes already
+do (engine.rs, ADR 0011), so reconciliation reuses the existing converge path —
+a dock is a local fork instead of a remote one. _Avoid_: worktree, checkout,
+berth, slip.
+
+**Buoy** *(proposed — concurrent-agents design, 2026-07-06)* — a change that
+carries a navigational-role [[Attestation]] (e.g. `reviewed`, `base`), used as a
+fixed landmark to build from. Not a new primitive: `attest` stays the only
+write-verb, and a buoy is the *derived, read-side* concept — "the newest change
+attested with role X by a trusted peer." Because attestations are append-only
+and signed (ADR 0018), each buoy pins one change immutably and the "current"
+buoy is computed, never a mutable ref — so it carries none of the
+concurrent-writer race a git tag or branch pointer would. A moored fixed marker,
+in contrast to the moving [[Dock]]. _Avoid_: tag, bookmark, branch.
+
+**Harbor** *(proposed — concurrent-agents design, 2026-07-06)* — the conventional
+integrator [[Dock]] that agents converge into and re-base from: a dock with a
+well-known name and *no* permissions attached, so it is a coordination
+convention, not a gated branch (branches stay a permanent non-goal). Merging is
+direct and local — `loot dock merge <name>` applies one dock's tip onto
+another's working change in-process, reusing the `apply`/converge path with no
+relay hop, because docks share one object store. The relay remains the path for
+*remote* agents only. _Avoid_: main, master, trunk.
+
+**Attestation** — a detachable, signed, advisory marker over a change id:
+`sign(change_id || attester || role)` (ADR 0018 / S4). Verified drop-not-fatal
+on `apply`/`stow`, never folded into the change id, never affects convergence.
+Stored in `.loot/attestations` and carried in the sync bundle. The mechanism
+underneath co-author/reviewer sign-offs and [[Buoy]] landmarks. CLI: `loot
+attest <change> [role]`.
+
 **Visibility** — the access policy on a unit of content. One of:
 
 - *Public* — readable by anyone who can read the repo.
@@ -271,3 +307,12 @@ tree so the decision is reproducible (`cargo test --release`).
 - **Embargoed merges across repos.** Accepting a change from a peer but keeping
   the diff embargoed until a scheduled reveal. Requires a multi-remote model
   (not yet defined). Deferred until the network layer exists.
+
+- **Soft advisory claims (concurrent agents).** A later-phase mitigation for
+  agents thrashing on the same paths: an append-only "working-on `<paths>`"
+  record other agents read and voluntarily avoid — advisory, no enforcement, the
+  same grain as attestations. Explicitly **not** a lock (file locking is a
+  dropped, binary-first concern). Deferred: the concurrent-agent model is
+  optimistic by default (docks fork, the harbor serializes, conflicts surface as
+  porcelain verdicts), and work-assignment is the orchestrator's job, not loot's.
+  Add only if real thrashing shows up. See the concurrent-agents design, 2026-07-06.
