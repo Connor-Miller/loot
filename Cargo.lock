@@ -1039,6 +1039,7 @@ version = "0.0.0"
 dependencies = [
  "aes-gcm",
  "blake3",
+ "ed25519-dalek",
  "getrandom 0.2.17",
  "thiserror 2.0.18",
  "zstd",

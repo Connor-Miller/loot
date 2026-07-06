@@ -20,6 +20,7 @@ mod change_graph;
 mod object_store;
 mod persist_codec;
 
+use crate::attestation::{Attestation, AttestationLog};
 use crate::bundle_codec::{BundleBody, Frame};
 use crate::converge;
 use crate::escrow::Escrow;
@@ -97,6 +98,9 @@ pub struct DagRepo {
     /// value is (our oid, their oid). Populated from `MergeOutcome::Conflict`
     /// during `apply`; cleared entry-by-entry as `resolve` is called (ADR 0001).
     conflicts: BTreeMap<PathBuf, (Oid, Oid)>,
+    /// Detachable, advisory attestations over changes (S4, ADR 0018). Travels in
+    /// bundles; verified-and-dropped on ingest; never affects a change id.
+    attestations: AttestationLog,
 }
 
 impl DagRepo {
@@ -170,6 +174,7 @@ impl DagRepo {
             objs,
             keys,
             escrow: BTreeMap::new(),
+            attestations: Vec::new(),
         };
 
         // Record in the local manifest (file-based grant: no pubkeys known here).
@@ -213,6 +218,7 @@ impl DagRepo {
             objs,
             keys: BTreeMap::new(),
             escrow: BTreeMap::new(),
+            attestations: Vec::new(),
         };
 
         self.manifest.record(oid.clone(), grantee_name.to_string(), grantee_pubkey, grantor_pubkey, now);
@@ -472,12 +478,20 @@ impl DagRepo {
                 "a relay can only stow sync bundles (tag 0), not grant bundles".into(),
             ));
         };
-        let BundleBody { changes, objs, keys, escrow } = body;
+        let BundleBody { changes, objs, keys, escrow, attestations } = body;
 
         // Reject any change with a missing/invalid author signature before we
         // store anything — a keyless relay still enforces authorship (ADR 0018).
         for node in &changes {
             verify_authored_change(node)?;
+        }
+
+        // Ingest attestations: verify each, drop invalid (advisory, never fatal),
+        // keep the rest so they keep forwarding downstream (S4, ADR 0018).
+        for att in attestations {
+            if att.verify() {
+                self.attestations.insert(att);
+            }
         }
 
         // Store ciphertext, retaining any keys that rode along so they keep
@@ -522,12 +536,20 @@ impl DagRepo {
         body: BundleBody,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
-        let BundleBody { changes, objs, keys, escrow } = body;
+        let BundleBody { changes, objs, keys, escrow, attestations } = body;
 
         // Reject any change with a missing/invalid author signature before we
         // mutate state (ADR 0018 — validity is always enforced, not a toggle).
         for node in &changes {
             verify_authored_change(node)?;
+        }
+
+        // Ingest attestations: verify each, drop invalid (advisory, never fatal),
+        // and merge the rest (S4, ADR 0018).
+        for att in attestations {
+            if att.verify() {
+                self.attestations.insert(att);
+            }
         }
 
         // Honor purge events: if we are the marooned identity, remove the old key.
@@ -597,6 +619,7 @@ impl DagRepo {
         std::fs::write(store.manifest(), encode_manifest(&self.manifest)).map_err(io)?;
         std::fs::write(store.purges(), encode_purges(&self.purges)).map_err(io)?;
         std::fs::write(store.conflicts(), encode_conflicts(&self.conflicts)).map_err(io)?;
+        std::fs::write(store.attestations(), encode_attestations(&self.attestations)).map_err(io)?;
         Ok(())
     }
 
@@ -700,6 +723,28 @@ impl DagRepo {
     /// authorship, reverse-resolved to a peer name.
     pub fn change_author(&self, id: &Oid) -> Option<[u8; 32]> {
         self.graph.get(id).and_then(|n| n.author)
+    }
+
+    /// Verify and record an attestation over a change (S4, ADR 0018). Returns
+    /// `true` if it verified and was stored, `false` if the signature was invalid
+    /// (dropped — an attestation is advisory and never fatal). Attestations never
+    /// affect a change id or convergence.
+    pub fn add_attestation(&mut self, att: Attestation) -> bool {
+        let ok = att.verify();
+        if ok {
+            self.attestations.insert(att);
+        }
+        ok
+    }
+
+    /// Attestations recorded over a change, for display (`loot log`/`manifest`).
+    pub fn attestations_for(&self, change_id: &Oid) -> Vec<&Attestation> {
+        self.attestations.for_change(change_id)
+    }
+
+    /// Every recorded attestation, for `loot manifest` display.
+    pub fn all_attestations(&self) -> Vec<&Attestation> {
+        self.attestations.iter().collect()
     }
 
     /// Change history in topo order (parents before children), as
@@ -851,6 +896,11 @@ impl DagRepo {
             Ok(b) => decode_conflicts(&b)?,
             Err(_) => BTreeMap::new(),
         };
+        // Attestations file may not exist in repos created before S4 — default empty.
+        let attestations = match std::fs::read(store.attestations()) {
+            Ok(b) => decode_attestations(&b)?,
+            Err(_) => AttestationLog::new(),
+        };
         Ok(DagRepo {
             root,
             identity,
@@ -862,6 +912,7 @@ impl DagRepo {
             objects,
             graph,
             conflicts,
+            attestations,
         })
     }
 }
@@ -879,6 +930,7 @@ impl Repo for DagRepo {
             objects: ObjectStore::new(),
             graph: ChangeGraph::new(),
             conflicts: BTreeMap::new(),
+            attestations: AttestationLog::new(),
         })
     }
 
@@ -982,11 +1034,25 @@ impl Repo for DagRepo {
             }
         }
 
+        // Only ship attestations for changes actually in this bundle's send set
+        // (#42/#48). An attestation for a change the recipient is not receiving
+        // would leak that change's existence and its reviewers, so attestations
+        // ride strictly with their change. The send set is the delta
+        // (reachable-not-`have`), so this is also the delta filter.
+        let sent_ids: std::collections::BTreeSet<&Oid> = send.iter().map(|c| &c.id).collect();
+        let attestations: Vec<Attestation> = self
+            .attestations
+            .iter()
+            .filter(|a| sent_ids.contains(&a.change_id))
+            .cloned()
+            .collect();
+
         let body = BundleBody {
             changes: send.into_iter().cloned().collect(),
             objs: needed,
             keys: public_keys,
             escrow: escrow_entries,
+            attestations,
         };
         Ok(SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode()))
     }
@@ -1069,6 +1135,37 @@ fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
         .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))?;
     vk.verify(&node.id.0, &Signature::from_bytes(&sig))
         .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))
+}
+
+fn encode_attestations(log: &AttestationLog) -> Vec<u8> {
+    use crate::bundle_codec::{put_attestation, put_u32};
+    let mut out = Vec::new();
+    crate::format::put_version(&mut out);
+    let entries: Vec<_> = log.iter().collect();
+    put_u32(&mut out, entries.len());
+    for a in entries {
+        put_attestation(&mut out, a);
+    }
+    out
+}
+
+fn decode_attestations(b: &[u8]) -> Result<AttestationLog, RepoError> {
+    use crate::bundle_codec::Cursor;
+    let mut c = Cursor { b, i: 0 };
+    crate::format::read_version(&mut c)?;
+    let mut log = AttestationLog::new();
+    let n = c.u32()?;
+    for _ in 0..n {
+        let att = c.attestation()?;
+        // Re-verify on load: the on-disk log is untrusted (it can be edited or
+        // corrupted between runs), so we hold it to the same verify-and-drop bar
+        // as bundle ingest — an invalid attestation is silently discarded rather
+        // than trusted just because it was on disk (S4, ADR 0018).
+        if att.verify() {
+            log.insert(att);
+        }
+    }
+    Ok(log)
 }
 
 fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
@@ -1239,7 +1336,7 @@ mod tests {
 
     fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
         let payload = extract_sync_payload(bundle);
-        let (_changes, objs, _keys, _escrow) =
+        let (_changes, objs, _keys, _escrow, _attestations) =
             bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
         assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
         objs.into_iter().next().unwrap().1.ciphertext
@@ -1259,7 +1356,7 @@ mod tests {
             panic!("expected sync bundle (tag 0)");
         };
         let changes: Vec<&ChangeNode> = body.changes.iter().collect();
-        bundle_codec::encode(&changes, &body.objs, &body.keys, &body.escrow)
+        bundle_codec::encode(&changes, &body.objs, &body.keys, &body.escrow, &body.attestations)
     }
 
     /// S1/S2 compatibility: a v1-format sync bundle (marker `[1,0]`, no
@@ -1678,7 +1775,7 @@ mod tests {
 
         // The raw wire must have the key in the escrow section, not the keyring.
         let payload = extract_sync_payload(&bundle.0);
-        let (_changes, _objs, plain_keys, escrow_entries) =
+        let (_changes, _objs, plain_keys, escrow_entries, _attestations) =
             bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
         assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in keyring section");
         assert!(escrow_entries.contains_key(&oid), "embargoed key must be in escrow section");
@@ -2290,6 +2387,37 @@ mod tests {
         8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     ];
 
+    // v4 goldens (FORMAT_MAJOR = 4). manifest/purges/conflicts layouts unchanged
+    // in S4 — only the marker. The attestation log is new in v4.
+    const GOLDEN_MANIFEST_V4: [u8; 117] = [
+        4, 0, 1, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        3, 0, 0, 0, 98, 111, 98,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+        42, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const GOLDEN_PURGES_V4: [u8; 45] = [
+        4, 0, 1, 0, 0, 0,
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+        3, 0, 0, 0, 101, 118, 101,
+    ];
+    const GOLDEN_CONFLICTS_V4: [u8; 79] = [
+        4, 0, 1, 0, 0, 0,
+        5, 0, 0, 0, 102, 46, 116, 120, 116,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    ];
+    // attestation log: 1 entry — change_id=[1;32], attester=[7;32], role="reviewed", sig=[9;64].
+    const GOLDEN_ATTEST_V4: [u8; 146] = [
+        4, 0, 1, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 0, 0, 0, 114, 101, 118, 105, 101, 119, 101, 100,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    ];
+
     fn sample_manifest() -> Manifest {
         let mut m = Manifest::new();
         m.record(Oid([1; 32]), "bob".to_string(), [2u8; 32], [3u8; 32], 42);
@@ -2312,9 +2440,14 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_manifest_matches_and_round_trips() {
-        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V3, "v3 manifest layout must not drift");
+    fn v3_manifest_still_decodes() {
         assert_eq!(decode_manifest(&GOLDEN_MANIFEST_V3).unwrap().grants_for(&Oid([1; 32])).len(), 1);
+    }
+
+    #[test]
+    fn golden_v4_manifest_matches_and_round_trips() {
+        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V4, "v4 manifest layout must not drift");
+        assert_eq!(decode_manifest(&GOLDEN_MANIFEST_V4).unwrap().grants_for(&Oid([1; 32])).len(), 1);
     }
 
     #[test]
@@ -2331,10 +2464,15 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_purges_matches_and_round_trips() {
-        let purges = vec![(Oid([6; 32]), "eve".to_string())];
-        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V3, "v3 purges layout must not drift");
+    fn v3_purges_still_decodes() {
         assert_eq!(decode_purges(&GOLDEN_PURGES_V3).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn golden_v4_purges_matches_and_round_trips() {
+        let purges = vec![(Oid([6; 32]), "eve".to_string())];
+        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V4, "v4 purges layout must not drift");
+        assert_eq!(decode_purges(&GOLDEN_PURGES_V4).unwrap().len(), 1);
     }
 
     #[test]
@@ -2351,11 +2489,53 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_conflicts_matches_and_round_trips() {
+    fn v3_conflicts_still_decodes() {
+        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V3).unwrap().contains_key(Path::new("f.txt")));
+    }
+
+    #[test]
+    fn golden_v4_conflicts_matches_and_round_trips() {
         let mut conflicts = BTreeMap::new();
         conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
-        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V3, "v3 conflicts layout must not drift");
-        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V3).unwrap().contains_key(Path::new("f.txt")));
+        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V4, "v4 conflicts layout must not drift");
+        assert!(decode_conflicts(&GOLDEN_CONFLICTS_V4).unwrap().contains_key(Path::new("f.txt")));
+    }
+
+    #[test]
+    fn golden_v4_attestations_layout_matches() {
+        // Encode-direction golden: fixed bytes (with a placeholder signature)
+        // lock the durable *layout* so it cannot drift. Decode is not exercised
+        // here — `decode_attestations` now re-verifies and would drop this
+        // placeholder signature; disk decode is covered by the round-trip tests.
+        let mut log = AttestationLog::new();
+        log.insert(Attestation {
+            change_id: Oid([1; 32]),
+            attester: [7; 32],
+            role: "reviewed".into(),
+            signature: [9; 64],
+        });
+        assert_eq!(encode_attestations(&log), GOLDEN_ATTEST_V4, "v4 attestation layout must not drift");
+    }
+
+    #[test]
+    fn valid_attestations_survive_disk_round_trip() {
+        let (sk, pk) = test_signer(9);
+        let mut log = AttestationLog::new();
+        log.insert(make_attestation(&sk, pk, Oid([1; 32]), "reviewed"));
+        let back = decode_attestations(&encode_attestations(&log)).unwrap();
+        assert_eq!(back.for_change(&Oid([1; 32])).len(), 1, "valid attestation survives disk load");
+    }
+
+    #[test]
+    fn invalid_attestation_dropped_on_disk_load() {
+        // A tampered on-disk log must not be trusted just because it was on disk.
+        let (sk, pk) = test_signer(9);
+        let mut att = make_attestation(&sk, pk, Oid([1; 32]), "reviewed");
+        att.signature[0] ^= 0xff; // corrupt after signing
+        let mut log = AttestationLog::new();
+        log.insert(att);
+        let back = decode_attestations(&encode_attestations(&log)).unwrap();
+        assert!(back.is_empty(), "invalid on-disk attestation is dropped on load");
     }
 
     // ---- S3: authored, signed history (ADR 0018) ----
@@ -2384,6 +2564,7 @@ mod tests {
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
             escrow: BTreeMap::new(),
+            attestations: vec![],
         };
         SyncBundle(Frame::Sync { purges: vec![], body }.encode())
     }
@@ -2458,6 +2639,122 @@ mod tests {
                 let c = body.changes.iter().find(|c| c.id == id).expect("change survived the relay");
                 assert_eq!(c.author, Some(pk), "author must survive the relay hop");
                 assert!(c.signature.is_some(), "signature must survive the relay hop");
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    // ---- S4: attestation lane (ADR 0018) ----
+
+    fn make_attestation(sk: &ed25519_dalek::SigningKey, pk: [u8; 32], change: Oid, role: &str) -> Attestation {
+        use ed25519_dalek::Signer;
+        let signature = sk.sign(&crate::attestation::signing_bytes(&change, &pk, role)).to_bytes();
+        Attestation { change_id: change, attester: pk, role: role.into(), signature }
+    }
+
+    fn attestation_bundle(atts: Vec<Attestation>) -> SyncBundle {
+        let body = BundleBody {
+            changes: vec![],
+            objs: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+            attestations: atts,
+        };
+        SyncBundle(Frame::Sync { purges: vec![], body }.encode())
+    }
+
+    #[test]
+    fn attestation_round_trips_through_apply() {
+        let (sk, pk) = test_signer(9);
+        let att = make_attestation(&sk, pk, Oid([5; 32]), "reviewed");
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&attestation_bundle(vec![att]), 0).unwrap();
+        let got = bob.attestations_for(&Oid([5; 32]));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].role, "reviewed");
+        assert_eq!(got[0].attester, pk);
+    }
+
+    #[test]
+    fn invalid_attestation_is_dropped_not_fatal() {
+        let (sk, pk) = test_signer(9);
+        let good = make_attestation(&sk, pk, Oid([6; 32]), "kept");
+        let mut bad = make_attestation(&sk, pk, Oid([5; 32]), "reviewed");
+        bad.signature[0] ^= 0xff; // corrupt the signature
+
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        // apply must NOT fail on a bad attestation (advisory, unlike change sigs).
+        bob.apply(&attestation_bundle(vec![bad, good]), 0).unwrap();
+        assert!(bob.attestations_for(&Oid([5; 32])).is_empty(), "invalid attestation dropped");
+        assert_eq!(bob.attestations_for(&Oid([6; 32])).len(), 1, "valid attestation kept");
+    }
+
+    #[test]
+    fn attestation_does_not_change_change_id() {
+        let (sk, pk) = test_signer(9);
+        let mut repo = DagRepo::init(tmp(), "alice").unwrap();
+        repo.set_author(pk);
+        let oid = repo.put(b"x", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("f"), (oid, Visibility::Public));
+        let id = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "m".into(), tree })
+            .unwrap();
+        let heads_before = repo.heads();
+        assert!(repo.add_attestation(make_attestation(&sk, pk, id.clone(), "reviewed")));
+        assert_eq!(repo.heads(), heads_before, "attesting must not touch the graph or ids");
+        assert_eq!(repo.attestations_for(&id).len(), 1);
+    }
+
+    /// A legacy (unauthored) change with an arbitrary id — travels through a
+    /// relay, so an attestation over it can ride along.
+    fn carried_change(id: Oid) -> ChangeNode {
+        ChangeNode {
+            id,
+            parents: vec![],
+            message: "m".into(),
+            tree: BTreeMap::new(),
+            author: None,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn relay_preserves_attestations_for_changes_it_carries() {
+        // Strict send-set filtering (#42/#48): an attestation rides only with its
+        // change. A relay that carries the change also forwards its attestation.
+        let (sk, pk) = test_signer(9);
+        let att = make_attestation(&sk, pk, Oid([5; 32]), "reviewed");
+        let body = BundleBody {
+            changes: vec![carried_change(Oid([5; 32]))],
+            objs: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+            attestations: vec![att],
+        };
+        let bundle = SyncBundle(Frame::Sync { purges: vec![], body }.encode());
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&bundle).unwrap();
+        match Frame::decode(&relay.bundle(&[]).unwrap().0).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert_eq!(body.attestations.len(), 1, "attestation rides with its carried change");
+                assert_eq!(body.attestations[0].attester, pk);
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn bundle_omits_attestations_for_changes_not_sent() {
+        // The change is NOT in the send set, so its attestation must not ship —
+        // shipping it would leak the change's existence and reviewers (#42).
+        let (sk, pk) = test_signer(9);
+        let att = make_attestation(&sk, pk, Oid([5; 32]), "reviewed");
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&attestation_bundle(vec![att])).unwrap(); // attestation only, no change
+        match Frame::decode(&relay.bundle(&[]).unwrap().0).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert!(body.attestations.is_empty(), "orphan attestation must not be shipped");
             }
             _ => panic!("expected Sync"),
         }

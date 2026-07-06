@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub mod attestation;    // detachable advisory signatures over changes (S4, ADR 0018)
 pub mod bundle_codec;   // sync bundle wire format (ADR 0003, 0004, 0007)
 pub mod converge;
 pub mod engine;
@@ -16,6 +17,7 @@ pub mod manifest;
 pub mod sealed;
 pub mod store;          // the .loot/ on-disk layout (single source of truth)
 
+pub use attestation::{Attestation, AttestationLog};
 pub use engine::{DagRepo, LogGraph, LogNode, MaroonResult, MigrateResult};
 pub use store::RepoStore;
 

@@ -45,6 +45,7 @@ const ESCROW: &str = "escrow";
 const MANIFEST: &str = "manifest";
 const PURGES: &str = "purges";
 const CONFLICTS: &str = "conflicts";
+const ATTESTATIONS: &str = "attestations";
 const WORKING: &str = "working";
 const TREE_HASH: &str = "tree-hash";
 const CONFIG: &str = "config";
@@ -81,6 +82,7 @@ impl RepoStore {
     pub fn manifest(&self) -> PathBuf { self.dot.join(MANIFEST) }
     pub fn purges(&self) -> PathBuf { self.dot.join(PURGES) }
     pub fn conflicts(&self) -> PathBuf { self.dot.join(CONFLICTS) }
+    pub fn attestations(&self) -> PathBuf { self.dot.join(ATTESTATIONS) }
 
     // --- Workspace-owned process artifacts ---
     pub fn working(&self) -> PathBuf { self.dot.join(WORKING) }

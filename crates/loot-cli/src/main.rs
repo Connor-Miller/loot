@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         "maroon" => cmd_maroon(rest),
         "migrate" => cmd_migrate(rest),
         "manifest" => cmd_manifest(),
+        "attest" => cmd_attest(rest),
         "conflicts" => cmd_conflicts(),
         "resolve" => cmd_resolve(rest),
         "remote" => cmd_remote(rest),
@@ -78,7 +79,8 @@ usage:
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
-  loot manifest                             show the grant audit trail
+  loot manifest                             show the grant audit trail (and attestations)
+  loot attest <change-id> [role]            attest a change (advisory sign-off, ADR 0018)
   loot conflicts                            list paths that need human resolution
   loot resolve <path> <file>                resolve a conflict at <path> using the content of <file>
   loot remote add <name> <url>              register a relay URL under a name
@@ -200,12 +202,18 @@ fn cmd_log() -> Result<(), String> {
         Some(pk) => format!("  [logged by {}]", resolve_pubkey_name(&reg, &pk)),
         None => String::new(),
     };
+    let print_attestations = |id: &loot_core::Oid| {
+        for a in ws.repo().attestations_for(id) {
+            println!("      + attested by {} ({})", resolve_pubkey_name(&reg, &a.attester), a.role);
+        }
+    };
 
     // A single head keeps the flat, newest-first listing (unchanged). Only a
     // diverged graph (2+ heads, e.g. after a pull) switches to a branch view.
     if ws.repo().heads().len() <= 1 {
         for (id, message, total, restricted, embargoed) in detailed.into_iter().rev() {
             println!("{}  {}{}{}", short(&id), message, seal_hint(total, restricted, embargoed), author_of(&id));
+            print_attestations(&id);
         }
         if let Some(working) = ws.working_id() {
             println!("{}  (working change)", short(&working));
@@ -230,6 +238,7 @@ fn cmd_log() -> Result<(), String> {
         println!("head {} — {}", hi + 1, short(head));
         for node in g.changes.iter().filter(|n| n.reachable_from == [hi]) {
             println!("  {}  {}{}{}", short(&node.id), node.message, hint_for(&node.id), author_of(&node.id));
+            print_attestations(&node.id);
         }
     }
 
@@ -240,6 +249,7 @@ fn cmd_log() -> Result<(), String> {
         println!("shared history");
         for node in shared {
             println!("  {}  {}{}{}", short(&node.id), node.message, hint_for(&node.id), author_of(&node.id));
+            print_attestations(&node.id);
         }
     }
     Ok(())
@@ -595,6 +605,62 @@ fn cmd_manifest() -> Result<(), String> {
         };
         println!("{:<12} {:<16} {:<16} {}", e.granted_at, e.grantee, grantor, short_oid(&e.oid));
     }
+
+    // Attestations (S4, ADR 0018): advisory sign-offs over changes, by pubkey.
+    let attestations = ws.repo().all_attestations();
+    if !attestations.is_empty() {
+        println!();
+        println!("attestations:");
+        for a in attestations {
+            println!(
+                "  {}  {} ({})",
+                short_oid(&a.change_id),
+                resolve_pubkey_name(&reg, &a.attester),
+                a.role
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a change-id hex prefix (as shown by `loot log`) to a full change id.
+/// The ephemeral working change is excluded: its id is rewritten on every
+/// snapshot, so an attestation over it would be orphaned the next time the tree
+/// changes — finalize it with `loot new` first (S4, ADR 0018).
+fn resolve_change(ws: &Workspace, prefix: &str) -> Result<loot_core::Oid, String> {
+    let working = ws.working_id().cloned();
+    if let Some(w) = &working {
+        if loot_core::hex::encode(&w.0).starts_with(prefix) {
+            return Err(
+                "cannot attest the working change — its id is still changing; finalize it with `loot new` first"
+                    .into(),
+            );
+        }
+    }
+    let matches: Vec<loot_core::Oid> = ws
+        .repo()
+        .log()
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| Some(id) != working.as_ref())
+        .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no change matching '{prefix}'")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => Err(format!("ambiguous change prefix '{prefix}' — matches {n} changes")),
+    }
+}
+
+fn cmd_attest(args: &[String]) -> Result<(), String> {
+    let change_ref = args
+        .first()
+        .ok_or("usage: loot attest <change-id> [role]")?;
+    let role = args.get(1).map(String::as_str).unwrap_or("reviewed");
+    let mut ws = Workspace::open()?;
+    let change_id = resolve_change(&ws, change_ref)?;
+    ws.attest(&change_id, role)?;
+    println!("attested {} as \"{}\"", short(&change_id), role);
     Ok(())
 }
 

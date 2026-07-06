@@ -144,3 +144,17 @@ legacy. The engine stores the author on `DagRepo` (set by the workspace from the
 loaded keypair); an unsigned working change is kept **local** — `bundle` never
 ships an authored-but-unsigned change — until `loot new` signs it once at
 finalization. Keyless repos stay unauthored and keep working.
+
+## Implementation note (S4 — attestation lane)
+
+The "attestation lane" above is now implemented. An [[Attestation]] is a
+detachable signature over `change_id || attester || role`, carried in a new
+`AttestationLog` that travels in the sync bundle (a v4 body section) and
+persists beside the graph (`.loot/attestations`). It is **advisory**, so unlike
+a change signature its verification is *drop-not-fatal*: `apply`/`stow` verify
+each incoming attestation and silently discard invalid ones rather than
+rejecting the bundle. Attestations never enter a change id and never affect
+convergence — `add_attestation` only touches the log, never the graph. `loot
+attest <change> [role]` signs one with the local identity; `loot log` and `loot
+manifest` display them, reverse-resolved to peer names. Author-trust enforcement
+(quarantining unknown authors/attesters) remains deferred and advisory.

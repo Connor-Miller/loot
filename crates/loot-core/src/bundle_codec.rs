@@ -2,6 +2,7 @@
 //! Owns the shared low-level binary primitives and the `SyncBundle` wire format
 //! consumed by `engine::DagRepo::bundle` and `engine::DagRepo::apply`.
 
+use crate::attestation::Attestation;
 use crate::engine::ChangeNode;
 use crate::format;
 pub use crate::format::Cursor;
@@ -11,11 +12,24 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub fn put_u32(out: &mut Vec<u8>, n: usize) {
-    out.extend_from_slice(&(n as u32).to_le_bytes());
+    // Every length/count prefix in the format is 32-bit. Truncating a larger
+    // usize would silently corrupt the stream (a huge count wrapping to a small
+    // one); fail loudly instead — no real artifact carries >4B of anything.
+    let n = u32::try_from(n).expect("count exceeds u32::MAX — loot wire format uses 32-bit length prefixes");
+    out.extend_from_slice(&n.to_le_bytes());
 }
 pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u32(out, b.len());
     out.extend_from_slice(b);
+}
+/// Write a single attestation record: `change_id ‖ attester ‖ role ‖ signature`.
+/// The one definition of the attestation byte layout — shared by the bundle body
+/// (`encode`) and the durable `.loot/attestations` log (S4, ADR 0018).
+pub fn put_attestation(out: &mut Vec<u8>, a: &Attestation) {
+    out.extend_from_slice(&a.change_id.0);
+    out.extend_from_slice(&a.attester);
+    put_bytes(out, a.role.as_bytes());
+    out.extend_from_slice(&a.signature);
 }
 pub fn put_vis(out: &mut Vec<u8>, vis: &Visibility) {
     match vis {
@@ -52,6 +66,17 @@ impl<'a> Cursor<'a> {
             t => Err(RepoError::Backend(format!("bad vis tag {t}"))),
         }
     }
+    /// Read a single attestation record written by [`put_attestation`]. The one
+    /// reader for the attestation byte layout — shared by the bundle body and the
+    /// durable `.loot/attestations` log (S4, ADR 0018).
+    pub fn attestation(&mut self) -> Result<Attestation, RepoError> {
+        let change_id = Oid(self.arr32()?);
+        let attester = self.arr32()?;
+        let role = self.string()?;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(self.take(64)?);
+        Ok(Attestation { change_id, attester, role, signature })
+    }
 }
 
 /// Encode the bundle body payload (objects, keys, escrow, changes).
@@ -63,6 +88,7 @@ pub fn encode(
     objs: &BTreeMap<Oid, SealedObject>,
     public_keys: &BTreeMap<Oid, ContentKey>,
     escrow_entries: &BTreeMap<Oid, (ContentKey, u64)>,
+    attestations: &[Attestation],
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -115,6 +141,12 @@ pub fn encode(
         // v3: author pubkey + signature ride beside the change body (ADR 0018).
         format::put_author_sig(&mut out, &c.author, &c.signature);
     }
+
+    // v4: detachable attestations ride after the changes (S4, ADR 0018).
+    put_u32(&mut out, attestations.len());
+    for a in attestations {
+        put_attestation(&mut out, a);
+    }
     out
 }
 
@@ -133,6 +165,7 @@ pub fn decode(
         Vec<(Oid, SealedObject)>,
         BTreeMap<Oid, ContentKey>,
         BTreeMap<Oid, (ContentKey, u64)>,
+        Vec<Attestation>,
     ),
     RepoError,
 > {
@@ -210,7 +243,20 @@ pub fn decode(
         });
     }
 
-    Ok((changes, objs, public_keys, escrow_entries))
+    // v4: detachable attestations after the changes (S4, ADR 0018). Older
+    // bundles predate them, so a pre-v4 reader/body yields none.
+    let attestations = if major >= 4 {
+        let n = c.u32()?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(c.attestation()?);
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
+    Ok((changes, objs, public_keys, escrow_entries, attestations))
 }
 
 /// The decoded payload every bundle carries: changes plus the sealed objects,
@@ -225,6 +271,9 @@ pub struct BundleBody {
     pub objs: BTreeMap<Oid, SealedObject>,
     pub keys: BTreeMap<Oid, ContentKey>,
     pub escrow: BTreeMap<Oid, (ContentKey, u64)>,
+    /// Detachable, advisory attestations over changes (S4, ADR 0018). Carried
+    /// with the bundle; verified and dropped-if-invalid on ingest.
+    pub attestations: Vec<Attestation>,
 }
 
 /// A whole bundle on the wire, tag already resolved: the one value callers match
@@ -261,13 +310,13 @@ pub enum Frame {
 /// there is exactly one definition of the payload layout.
 fn encode_body(body: &BundleBody) -> Vec<u8> {
     let changes: Vec<&ChangeNode> = body.changes.iter().collect();
-    encode(&changes, &body.objs, &body.keys, &body.escrow)
+    encode(&changes, &body.objs, &body.keys, &body.escrow, &body.attestations)
 }
 
 fn decode_body(b: &[u8], major: u8) -> Result<BundleBody, RepoError> {
-    let (changes, objs_vec, keys, escrow) = decode(b, major)?;
+    let (changes, objs_vec, keys, escrow, attestations) = decode(b, major)?;
     let objs = objs_vec.into_iter().collect();
-    Ok(BundleBody { changes, objs, keys, escrow })
+    Ok(BundleBody { changes, objs, keys, escrow, attestations })
 }
 
 impl Frame {
@@ -355,7 +404,7 @@ mod tests {
     use super::*;
 
     fn empty_body() -> BundleBody {
-        BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), escrow: BTreeMap::new() }
+        BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), escrow: BTreeMap::new(), attestations: vec![] }
     }
 
     // Golden wire bytes for `Frame::Sync { purges: [], body: empty }`:
@@ -369,6 +418,25 @@ mod tests {
         [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     const GOLDEN_SYNC_V3: [u8; 23] =
         [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // v4 grew by the attestation-count section (S4): empty bundle is 27 bytes.
+    const GOLDEN_SYNC_V4: [u8; 27] =
+        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // v4 bundle with one authored+signed change (no tree, no objects, no attestations).
+    // Pins the put_author_sig layout: presence-byte + 32-byte pubkey, presence-byte + 64-byte sig.
+    const GOLDEN_SYNC_V4_AUTHORED: [u8; 177] = [
+        4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 1, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 8, 0, 0, 0, 97,
+        117, 116, 104, 111, 114, 101, 100, 0, 0, 0, 0, 1, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0,
+        0,
+    ];
 
     fn object(compressed: bool) -> SealedObject {
         SealedObject {
@@ -399,10 +467,72 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_sync_bundle_matches_and_round_trips() {
-        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
-        assert_eq!(bytes, GOLDEN_SYNC_V3, "v3 wire layout must not drift");
+    fn v3_sync_bundle_still_decodes() {
+        // A v4 build still reads the committed v3 wire bytes (newer reads older).
         assert!(matches!(Frame::decode(&GOLDEN_SYNC_V3).unwrap(), Frame::Sync { .. }));
+    }
+
+    #[test]
+    fn golden_v4_sync_bundle_matches_and_round_trips() {
+        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
+        assert_eq!(bytes, GOLDEN_SYNC_V4, "v4 wire layout must not drift");
+        assert!(matches!(Frame::decode(&GOLDEN_SYNC_V4).unwrap(), Frame::Sync { .. }));
+    }
+
+    #[test]
+    fn golden_v4_authored_change_layout_matches_and_round_trips() {
+        // Pins the put_author_sig wire layout (presence-byte + 32-byte pubkey,
+        // presence-byte + 64-byte sig). A field-ordering regression in that path
+        // must break this test before it breaks interop with peers.
+        let node = ChangeNode {
+            id: Oid([5; 32]),
+            parents: vec![],
+            message: "authored".into(),
+            tree: BTreeMap::new(),
+            author: Some([7; 32]),
+            signature: Some([9; 64]),
+        };
+        let body = BundleBody {
+            changes: vec![node],
+            objs: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+            attestations: vec![],
+        };
+        let bytes = Frame::Sync { purges: vec![], body }.encode();
+        assert_eq!(bytes, GOLDEN_SYNC_V4_AUTHORED, "v4 authored-change wire layout must not drift");
+        match Frame::decode(&GOLDEN_SYNC_V4_AUTHORED).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert_eq!(body.changes.len(), 1);
+                assert_eq!(body.changes[0].author, Some([7; 32]));
+                assert_eq!(body.changes[0].signature, Some([9; 64]));
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn bundle_attestation_round_trips() {
+        let att = Attestation {
+            change_id: Oid([5; 32]),
+            attester: [7; 32],
+            role: "reviewed".into(),
+            signature: [9; 64],
+        };
+        let body = BundleBody {
+            changes: vec![],
+            objs: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+            attestations: vec![att.clone()],
+        };
+        match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert_eq!(body.attestations.len(), 1, "attestation must survive the bundle");
+                assert_eq!(body.attestations[0], att);
+            }
+            _ => panic!("expected Sync"),
+        }
     }
 
     #[test]
@@ -420,6 +550,7 @@ mod tests {
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
             escrow: BTreeMap::new(),
+            attestations: vec![],
         };
         match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
             Frame::Sync { body, .. } => {
@@ -437,7 +568,7 @@ mod tests {
         let addr = obj.address();
         let mut objs = BTreeMap::new();
         objs.insert(addr.clone(), obj);
-        let body = BundleBody { changes: vec![], objs, keys: BTreeMap::new(), escrow: BTreeMap::new() };
+        let body = BundleBody { changes: vec![], objs, keys: BTreeMap::new(), escrow: BTreeMap::new(), attestations: vec![] };
         match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
             Frame::Sync { body, .. } => {
                 assert!(

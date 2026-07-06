@@ -80,12 +80,14 @@ impl<'a> Cursor<'a> {
 ///   layout.
 /// - v3 (S3, ADR 0018) added the per-change `author` pubkey + `signature` to the
 ///   change layout (bundle and durable graph).
+/// - v4 (S4, ADR 0018) added the detachable attestation section to the bundle
+///   body and a durable attestation log.
 ///
 /// Each was a change an older reader cannot parse, so each bumped the major. A
-/// v3 reader still reads v1/v2 artifacts (missing fields default to absent —
-/// uncompressed, unauthored); an older reader cleanly rejects a newer major
-/// rather than mis-parsing.
-pub const FORMAT_MAJOR: u8 = 3;
+/// v4 reader still reads v1/v2/v3 artifacts (missing fields default to absent —
+/// uncompressed, unauthored, no attestations); an older reader cleanly rejects a
+/// newer major rather than mis-parsing.
+pub const FORMAT_MAJOR: u8 = 4;
 /// The compatible revision this build writes.
 pub const FORMAT_MINOR: u8 = 0;
 /// Bytes the version marker occupies at the front of an artifact.

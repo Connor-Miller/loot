@@ -153,6 +153,31 @@ impl Workspace {
         self.persist()
     }
 
+    /// Attest an existing change with this repo's identity (S4, ADR 0018): sign
+    /// `change_id || attester || role` and record the attestation. Advisory — it
+    /// never changes the change id. Errors if the repo has no keypair.
+    pub fn attest(&mut self, change_id: &Oid, role: &str) -> Result<(), String> {
+        let att = {
+            let signer = self
+                .signer
+                .as_ref()
+                .ok_or("no identity keypair — run `loot keygen` to generate one")?;
+            let attester = signer.public_key_bytes();
+            let signature =
+                signer.sign(&loot_core::attestation::signing_bytes(change_id, &attester, role));
+            loot_core::Attestation {
+                change_id: change_id.clone(),
+                attester,
+                role: role.to_string(),
+                signature,
+            }
+        };
+        if !self.repo.add_attestation(att) {
+            return Err("internal error: freshly-signed attestation failed to verify".into());
+        }
+        self.persist()
+    }
+
     /// Materialize what the current identity may see from the tip change.
     pub fn surface(&mut self) -> Result<Oid, String> {
         let (head, _, _) = self.surface_with_report()?;

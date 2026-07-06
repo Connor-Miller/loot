@@ -353,6 +353,39 @@ mod tests {
         b
     };
 
+    // ---- v4 goldens (current format, FORMAT_MAJOR = 4, ADR 0018). None of these
+    // artifacts changed layout in S4 (attestations are separate); only the marker.
+    const GOLDEN_GRAPH_V4: [u8; 99] = [
+        4, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 5, 0, 0, 0, 102, 105, 114, 115, 116, 1, 0, 0, 0, 5, 0,
+        0, 0, 97, 46, 116, 120, 116, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0,
+    ];
+    const GOLDEN_OBJECT_V4: [u8; 31] = [
+        4, 0, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 2, 0, 0, 0, 171, 205, 0, 1, 0, 0, 0, 1, 0, 0,
+        0, 42,
+    ];
+    const GOLDEN_KEYRING_V4: [u8; 70] = {
+        let mut b = [0u8; 70];
+        b[0] = 4; b[1] = 0;
+        b[2] = 1;
+        let mut i = 6;
+        while i < 6 + 32 { b[i] = 4; i += 1; }
+        while i < 6 + 64 { b[i] = 7; i += 1; }
+        b
+    };
+    const GOLDEN_ESCROW_V4: [u8; 78] = {
+        let mut b = [0u8; 78];
+        b[0] = 4; b[1] = 0;
+        b[2] = 1;
+        let mut i = 6;
+        while i < 6 + 32 { b[i] = 5; i += 1; }
+        while i < 6 + 64 { b[i] = 8; i += 1; }
+        b[70] = 0; b[71] = 210; b[72] = 73; b[73] = 107;
+        b[74] = 0; b[75] = 0;   b[76] = 0; b[77] = 0;
+        b
+    };
+
     fn one_change_graph() -> ChangeGraph {
         let mut g = ChangeGraph::new();
         let mut tree = BTreeMap::new();
@@ -412,9 +445,14 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_graph_matches_and_round_trips() {
-        assert_eq!(encode_graph(&one_change_graph()), GOLDEN_GRAPH_V3, "v3 graph layout must not drift");
+    fn v3_graph_still_decodes() {
         assert_eq!(decode_graph(&GOLDEN_GRAPH_V3).unwrap().in_order().len(), 1);
+    }
+
+    #[test]
+    fn golden_v4_graph_matches_and_round_trips() {
+        assert_eq!(encode_graph(&one_change_graph()), GOLDEN_GRAPH_V4, "v4 graph layout must not drift");
+        assert_eq!(decode_graph(&GOLDEN_GRAPH_V4).unwrap().in_order().len(), 1);
     }
 
     #[test]
@@ -446,9 +484,14 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_object_matches_and_round_trips() {
-        assert_eq!(encode_object(&sample_object()), GOLDEN_OBJECT_V3, "v3 object layout must not drift");
+    fn v3_object_still_decodes() {
         assert_eq!(decode_object(&GOLDEN_OBJECT_V3).unwrap(), sample_object());
+    }
+
+    #[test]
+    fn golden_v4_object_matches_and_round_trips() {
+        assert_eq!(encode_object(&sample_object()), GOLDEN_OBJECT_V4, "v4 object layout must not drift");
+        assert_eq!(decode_object(&GOLDEN_OBJECT_V4).unwrap(), sample_object());
     }
 
     #[test]
@@ -503,9 +546,14 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_keyring_matches_and_round_trips() {
-        assert_eq!(encode_keyring(&sample_keyring()), GOLDEN_KEYRING_V3, "v3 keyring layout must not drift");
+    fn v3_keyring_still_decodes() {
         assert!(decode_keyring(&GOLDEN_KEYRING_V3).unwrap().holds(&Oid([4; 32])));
+    }
+
+    #[test]
+    fn golden_v4_keyring_matches_and_round_trips() {
+        assert_eq!(encode_keyring(&sample_keyring()), GOLDEN_KEYRING_V4, "v4 keyring layout must not drift");
+        assert!(decode_keyring(&GOLDEN_KEYRING_V4).unwrap().holds(&Oid([4; 32])));
     }
 
     #[test]
@@ -520,9 +568,14 @@ mod tests {
     }
 
     #[test]
-    fn golden_v3_escrow_matches_and_round_trips() {
-        assert_eq!(encode_escrow(&sample_escrow()), GOLDEN_ESCROW_V3, "v3 escrow layout must not drift");
+    fn v3_escrow_still_decodes() {
         assert!(decode_escrow(&GOLDEN_ESCROW_V3).unwrap().holds(&Oid([5; 32])));
+    }
+
+    #[test]
+    fn golden_v4_escrow_matches_and_round_trips() {
+        assert_eq!(encode_escrow(&sample_escrow()), GOLDEN_ESCROW_V4, "v4 escrow layout must not drift");
+        assert!(decode_escrow(&GOLDEN_ESCROW_V4).unwrap().holds(&Oid([5; 32])));
     }
 
     #[test]
