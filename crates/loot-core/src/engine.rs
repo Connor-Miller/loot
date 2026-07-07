@@ -1141,9 +1141,8 @@ fn encode_attestations(log: &AttestationLog) -> Vec<u8> {
     use crate::bundle_codec::{put_attestation, put_u32};
     let mut out = Vec::new();
     crate::format::put_version(&mut out);
-    let entries: Vec<_> = log.iter().collect();
-    put_u32(&mut out, entries.len());
-    for a in entries {
+    put_u32(&mut out, log.len());
+    for a in log.iter() {
         put_attestation(&mut out, a);
     }
     out
@@ -2755,6 +2754,42 @@ mod tests {
         match Frame::decode(&relay.bundle(&[]).unwrap().0).unwrap() {
             Frame::Sync { body, .. } => {
                 assert!(body.attestations.is_empty(), "orphan attestation must not be shipped");
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn bundle_omits_attestations_for_changes_the_recipient_already_holds() {
+        // Delta filter (#48): the change IS carried in the graph, but the
+        // recipient's `have` set already includes it, so it falls out of the
+        // send set — and its attestation must not be re-sent. Incremental sync
+        // grows with new changes, not with total attestation history.
+        let (sk, pk) = test_signer(9);
+        let att = make_attestation(&sk, pk, Oid([5; 32]), "reviewed");
+        let body = BundleBody {
+            changes: vec![carried_change(Oid([5; 32]))],
+            objs: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            escrow: BTreeMap::new(),
+            attestations: vec![att],
+        };
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&SyncBundle(Frame::Sync { purges: vec![], body }.encode())).unwrap();
+
+        // Sanity: a full bundle (have = []) still carries the attestation...
+        match Frame::decode(&relay.bundle(&[]).unwrap().0).unwrap() {
+            Frame::Sync { body, .. } => assert_eq!(body.attestations.len(), 1, "full bundle carries it"),
+            _ => panic!("expected Sync"),
+        }
+        // ...but an incremental bundle whose recipient already holds change 5 omits it.
+        match Frame::decode(&relay.bundle(&[Oid([5; 32])]).unwrap().0).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert!(body.changes.is_empty(), "held change is not re-sent");
+                assert!(
+                    body.attestations.is_empty(),
+                    "attestation for an already-held change must not be re-sent"
+                );
             }
             _ => panic!("expected Sync"),
         }
