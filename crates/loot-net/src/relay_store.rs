@@ -72,4 +72,21 @@ impl RelayStore {
             .bundle(have)
             .map_err(|e| super::NetError::Engine(e.to_string()))
     }
+
+    /// Object addresses the relay would offer for `have` (S5 negotiation).
+    pub fn offered_objects(&self, have: &[Oid]) -> Vec<Oid> {
+        self.repo.offered_objects(have)
+    }
+
+    /// The subset of `offered` addresses the relay does not hold (S5 push round).
+    pub fn missing_objects(&self, offered: &[Oid]) -> Vec<Oid> {
+        self.repo.missing_objects(offered)
+    }
+
+    /// A bundle for `have` whose object bytes are limited to `wants` (S5 fetch).
+    pub fn bundle_wanted(&self, have: &[Oid], wants: &[Oid]) -> Result<SyncBundle, super::NetError> {
+        self.repo
+            .bundle_wanted(have, wants)
+            .map_err(|e| super::NetError::Engine(e.to_string()))
+    }
 }

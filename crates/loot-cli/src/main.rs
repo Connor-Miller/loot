@@ -1017,10 +1017,28 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
     let ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
-    let bundle = ws.repo().bundle(&[]).map_err(|e| e.to_string())?;
+    // S5: offer our object addresses; the relay replies with the subset it is
+    // missing, so we ship only new object bytes (re-push transfers ~0 objects).
+    // Pass heads() as have so bundle_wanted ships only the change delta, not the
+    // full history on every push.
+    let have = ws.repo().heads();
+    let offered = ws.repo().offered_objects(&have);
+    if offered.is_empty() && ws.repo().has_unsigned_tip() {
+        return Err(
+            "nothing to push: your working change has not been signed yet.\n\
+             Run `loot new` (or sign the current change) before pushing."
+                .into(),
+        );
+    }
+    let wants = loot_net::wants(&url, &offered).map_err(|e| e.to_string())?;
+    let bundle = ws.repo().bundle_wanted(&have, &wants).map_err(|e| e.to_string())?;
     let n = bundle.0.len();
     loot_net::push(&url, bundle.0, &id).map_err(|e| e.to_string())?;
-    println!("pushed {n} bytes to {url}");
+    println!(
+        "pushed {n} bytes to {url} ({} of {} objects were new)",
+        wants.len(),
+        offered.len()
+    );
     println!("  this published your sealed content to the relay (it still cannot read it)");
     Ok(())
 }
@@ -1031,11 +1049,17 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     let now = ws.now();
     let identity = ws.identity().to_string();
     let have = ws.repo().heads();
-    let bytes = loot_net::pull(&url, &have).map_err(|e| e.to_string())?;
-    if bytes.is_empty() {
+    // S5: negotiate object addresses before any object bytes move. The relay
+    // offers the closure it would send; we reply with only the addresses we
+    // lack; fetch returns a bundle limited to those. A re-pull with nothing new
+    // transfers ~0 object bytes.
+    let offered = loot_net::offer(&url, &have).map_err(|e| e.to_string())?;
+    let wants = ws.repo().missing_objects(&offered);
+    if wants.is_empty() {
         println!("pulled from {url}: nothing new (already up to date)");
         return Ok(());
     }
+    let bytes = loot_net::fetch(&url, &have, &wants).map_err(|e| e.to_string())?;
     let outcomes = ws.with_repo(|repo| {
         repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
     })?;

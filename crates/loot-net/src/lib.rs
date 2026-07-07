@@ -75,6 +75,79 @@ fn decode_have(body: &[u8]) -> Result<Vec<Oid>, NetError> {
     Ok(have)
 }
 
+// --- S5: object-level "wants" negotiation wire messages ---
+//
+// The negotiation exchanges content addresses (already relay-visible), never
+// keys or plaintext — the zero-knowledge posture is preserved. Each message
+// leads with the S1 format marker so the wire protocol is version-gated (a peer
+// on an incompatible future major is rejected, not mis-parsed).
+
+/// Encode a version-marked list of content addresses (the `/offer` and `/wants`
+/// message shape).
+pub fn encode_addrs(oids: &[Oid]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + oids.len() * 32);
+    loot_core::format::put_version(&mut out);
+    for oid in oids {
+        out.extend_from_slice(&oid.0);
+    }
+    out
+}
+
+fn decode_addrs(body: &[u8]) -> Result<Vec<Oid>, NetError> {
+    let mut c = loot_core::format::Cursor { b: body, i: 0 };
+    loot_core::format::read_version(&mut c).map_err(|e| NetError::Http(e.to_string()))?;
+    let rest = &body[c.i..];
+    if !rest.len().is_multiple_of(32) {
+        return Err(NetError::Http(format!(
+            "address list must be a multiple of 32 bytes after the marker, got {}",
+            rest.len()
+        )));
+    }
+    let mut oids = Vec::with_capacity(rest.len() / 32);
+    for chunk in rest.chunks_exact(32) {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(chunk);
+        oids.push(Oid(a));
+    }
+    Ok(oids)
+}
+
+/// Encode the `/fetch` request: version marker, the caller's `have` change-ids,
+/// then the `wants` object addresses (each a length-prefixed list).
+pub fn encode_have_wants(have: &[Oid], wants: &[Oid]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loot_core::format::put_version(&mut out);
+    out.extend_from_slice(&(have.len() as u32).to_le_bytes());
+    for o in have {
+        out.extend_from_slice(&o.0);
+    }
+    out.extend_from_slice(&(wants.len() as u32).to_le_bytes());
+    for o in wants {
+        out.extend_from_slice(&o.0);
+    }
+    out
+}
+
+fn decode_have_wants(body: &[u8]) -> Result<(Vec<Oid>, Vec<Oid>), NetError> {
+    let mut c = loot_core::format::Cursor { b: body, i: 0 };
+    loot_core::format::read_version(&mut c).map_err(|e| NetError::Http(e.to_string()))?;
+    // Cap capacity by remaining body bytes so an attacker-controlled count cannot
+    // trigger a multi-GB Vec::with_capacity before the loop's arr32() fires.
+    let hn = c.u32().map_err(|e| NetError::Http(e.to_string()))?;
+    let max_oids = (body.len() - c.i) / 32;
+    let mut have = Vec::with_capacity(hn.min(max_oids));
+    for _ in 0..hn {
+        have.push(Oid(c.arr32().map_err(|e| NetError::Http(e.to_string()))?));
+    }
+    let wn = c.u32().map_err(|e| NetError::Http(e.to_string()))?;
+    let max_oids = (body.len() - c.i) / 32;
+    let mut wants = Vec::with_capacity(wn.min(max_oids));
+    for _ in 0..wn {
+        wants.push(Oid(c.arr32().map_err(|e| NetError::Http(e.to_string()))?));
+    }
+    Ok((have, wants))
+}
+
 // --- server (`loot serve`) ---
 
 #[derive(Clone)]
@@ -113,6 +186,9 @@ async fn serve_async(store: RelayStore, dir: PathBuf, addr: &str, allowed_keys: 
     let app = Router::new()
         .route("/stow", post(handle_stow))
         .route("/negotiate", post(handle_negotiate))
+        .route("/offer", post(handle_offer))
+        .route("/fetch", post(handle_fetch))
+        .route("/wants", post(handle_wants))
         .route("/grant", post(handle_deposit_grant))
         .route("/pull-grants", post(handle_pull_grants))
         .route("/grants/peek", post(handle_peek_grants))
@@ -151,6 +227,44 @@ async fn handle_negotiate(
         .bundle(&have)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(bundle.0)
+}
+
+// S5 pull round 1: caller sends its `have` change-ids; relay offers the object
+// addresses in the closure of what it would send.
+async fn handle_offer(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    body: axum::body::Bytes,
+) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
+    let have = decode_addrs(&body).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    let relay = state.relay.lock().await;
+    Ok(encode_addrs(&relay.offered_objects(&have)))
+}
+
+// S5 pull round 2: caller sends `have` + the `wants` subset it is missing; relay
+// returns a bundle whose object bytes are limited to `wants`.
+async fn handle_fetch(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    body: axum::body::Bytes,
+) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
+    let (have, wants) =
+        decode_have_wants(&body).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    let relay = state.relay.lock().await;
+    let bundle = relay
+        .bundle_wanted(&have, &wants)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(bundle.0)
+}
+
+// S5 push round 1: caller offers the object addresses it would push; relay
+// replies with the subset it is missing (so only those bytes are stowed).
+async fn handle_wants(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    body: axum::body::Bytes,
+) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
+    let offered =
+        decode_addrs(&body).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    let relay = state.relay.lock().await;
+    Ok(encode_addrs(&relay.missing_objects(&offered)))
 }
 
 async fn handle_deposit_grant(
@@ -251,6 +365,63 @@ pub fn pull(base_url: &str, have: &[Oid]) -> Result<Vec<u8>, NetError> {
     Ok(bytes.to_vec())
 }
 
+/// S5 pull round 1: ask the relay which object addresses it would offer for our
+/// `have` change-ids. Returns the offered content addresses.
+pub fn offer(base_url: &str, have: &[Oid]) -> Result<Vec<Oid>, NetError> {
+    let url = format!("{}/offer", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(&url)
+        .body(encode_addrs(have))
+        .send()
+        .map_err(|e| NetError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let msg = resp.text().unwrap_or_default();
+        return Err(NetError::Http(format!("relay rejected offer ({code}): {msg}")));
+    }
+    let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
+    decode_addrs(&bytes)
+}
+
+/// S5 pull round 2: fetch a bundle whose object bytes are limited to the
+/// addresses we `want`. Returns the raw bundle bytes for the caller to `apply`.
+pub fn fetch(base_url: &str, have: &[Oid], wants: &[Oid]) -> Result<Vec<u8>, NetError> {
+    let url = format!("{}/fetch", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(&url)
+        .body(encode_have_wants(have, wants))
+        .send()
+        .map_err(|e| NetError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let msg = resp.text().unwrap_or_default();
+        return Err(NetError::Http(format!("relay rejected fetch ({code}): {msg}")));
+    }
+    let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
+    Ok(bytes.to_vec())
+}
+
+/// S5 push round 1: offer the relay our object addresses; it replies with the
+/// subset it is missing — the only object bytes we then need to stow.
+pub fn wants(base_url: &str, offered: &[Oid]) -> Result<Vec<Oid>, NetError> {
+    let url = format!("{}/wants", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(&url)
+        .body(encode_addrs(offered))
+        .send()
+        .map_err(|e| NetError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let msg = resp.text().unwrap_or_default();
+        return Err(NetError::Http(format!("relay rejected wants ({code}): {msg}")));
+    }
+    let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
+    decode_addrs(&bytes)
+}
+
 /// Helper: load a working repo's heads for the pull `have` list, given its
 /// `.loot/` dir and working root.
 pub fn heads_of(dot: &Path, root: PathBuf) -> Result<Vec<Oid>, NetError> {
@@ -326,4 +497,61 @@ pub fn fetch_grants(base_url: &str, recipient_pubkey: &[u8; 32]) -> Result<Vec<V
     }
     let bytes = resp.bytes().map_err(|e| NetError::Http(e.to_string()))?;
     mailbox::decode_blobs(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(b: u8) -> Oid {
+        Oid([b; 32])
+    }
+
+    #[test]
+    fn addrs_round_trip_and_carry_version_marker() {
+        let list = vec![oid(1), oid(2), oid(3)];
+        let enc = encode_addrs(&list);
+        assert_eq!(
+            &enc[..2],
+            &[loot_core::format::FORMAT_MAJOR, loot_core::format::FORMAT_MINOR],
+            "negotiation messages are versioned under S1"
+        );
+        assert_eq!(decode_addrs(&enc).unwrap(), list);
+    }
+
+    #[test]
+    fn empty_addrs_round_trip() {
+        assert!(decode_addrs(&encode_addrs(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn have_wants_round_trip() {
+        let have = vec![oid(1), oid(2)];
+        let wants = vec![oid(9)];
+        let (h, w) = decode_have_wants(&encode_have_wants(&have, &wants)).unwrap();
+        assert_eq!(h, have);
+        assert_eq!(w, wants);
+    }
+
+    #[test]
+    fn decode_rejects_incompatible_version() {
+        let mut enc = encode_addrs(&[oid(1)]);
+        enc[0] = loot_core::format::FORMAT_MAJOR + 1; // pretend a newer major wrote it
+        assert!(decode_addrs(&enc).is_err(), "an unknown future major is rejected");
+    }
+
+    #[test]
+    fn decode_have_wants_rejects_count_larger_than_body() {
+        // Craft a body with version marker + hn=1000 but zero actual Oid bytes.
+        // The capacity guard must clamp to 0; the first arr32() in the loop must
+        // then return an error rather than a panic or a silent over-allocation.
+        let mut body = Vec::new();
+        loot_core::format::put_version(&mut body);
+        body.extend_from_slice(&1000u32.to_le_bytes()); // hn = 1000
+        // no oid bytes follow
+        assert!(
+            decode_have_wants(&body).is_err(),
+            "truncated body with oversized count must be rejected"
+        );
+    }
 }

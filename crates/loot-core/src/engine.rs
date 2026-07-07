@@ -990,71 +990,8 @@ impl Repo for DagRepo {
     }
 
     fn bundle(&self, have: &[Oid]) -> Result<SyncBundle, RepoError> {
-        // Changes reachable here but not already known to the recipient. For
-        // now, "reachable-not-have" = every change id not in `have`.
-        let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
-        let send: Vec<&ChangeNode> = self
-            .graph
-            .in_order()
-            .into_iter()
-            // Skip changes the recipient has, and any authored-but-unsigned
-            // working change: only finalized, signed history travels (ADR 0018).
-            // Legacy unauthored changes still travel, so keyless repos are unaffected.
-            .filter(|c| !have_set.contains(&c.id) && !(c.author.is_some() && c.signature.is_none()))
-            .collect();
-
-        // Ship SealedObjects (ciphertext, no keys) plus:
-        //   - Public content keys -> plain keyring section (ANYONE-granted, not embargoed)
-        //   - Embargoed content keys -> escrow section (ANYONE-granted, time-gated)
-        //   - Restricted keys NEVER travel (ADR 0003)
-        let mut needed: BTreeMap<Oid, SealedObject> = BTreeMap::new();
-        let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
-        let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
-        for c in &send {
-            for (oid, vis) in c.tree.values() {
-                if let Ok(obj) = self.object(oid) {
-                    // Clone only once per unique OID; BTreeMap deduplicates repeats.
-                    needed.entry(oid.clone()).or_insert_with(|| obj.clone());
-                    if obj.grant_ids.iter().any(|g| g == ANYONE) {
-                        if let Visibility::Embargoed { reveal_at } = vis {
-                            // Embargoed: key rides as an escrow entry so the receiver
-                            // files it into their Escrow, not their Keyring (ADR 0007).
-                            if let Some(k) = self.escrow.iter()
-                                .find(|(o, _)| *o == oid)
-                                .map(|(_, e)| e.key)
-                                .or_else(|| self.keyring.key_for(oid))
-                            {
-                                escrow_entries.insert(oid.clone(), (k, *reveal_at));
-                            }
-                        } else if let Some(k) = self.keyring.key_for(oid) {
-                            public_keys.insert(oid.clone(), k);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Only ship attestations for changes actually in this bundle's send set
-        // (#42/#48). An attestation for a change the recipient is not receiving
-        // would leak that change's existence and its reviewers, so attestations
-        // ride strictly with their change. The send set is the delta
-        // (reachable-not-`have`), so this is also the delta filter.
-        let sent_ids: std::collections::BTreeSet<&Oid> = send.iter().map(|c| &c.id).collect();
-        let attestations: Vec<Attestation> = self
-            .attestations
-            .iter()
-            .filter(|a| sent_ids.contains(&a.change_id))
-            .cloned()
-            .collect();
-
-        let body = BundleBody {
-            changes: send.into_iter().cloned().collect(),
-            objs: needed,
-            keys: public_keys,
-            escrow: escrow_entries,
-            attestations,
-        };
-        Ok(SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode()))
+        // Full bundle: ship every object referenced by the sent changes.
+        self.bundle_impl(have, None)
     }
 
     fn apply(
@@ -1103,6 +1040,134 @@ impl Repo for DagRepo {
 
     fn flush_embargo(&mut self, now: u64) {
         self.flush_escrow(now);
+    }
+}
+
+impl DagRepo {
+    /// Returns `true` if the repo has any authored-but-unsigned change (a working
+    /// change the author has not yet signed). Such changes are excluded from
+    /// bundles (ADR 0018), so a push while one exists silently transfers nothing.
+    pub fn has_unsigned_tip(&self) -> bool {
+        self.graph
+            .in_order()
+            .into_iter()
+            .any(|c| c.author.is_some() && c.signature.is_none())
+    }
+
+    /// Object addresses in the closure of the changes this repo would send for
+    /// `have` — the objects a recipient may be missing (S5). Only addresses of
+    /// objects we actually hold are offered. Zero-knowledge: addresses only,
+    /// never keys or plaintext (the relay already sees content addresses).
+    pub fn offered_objects(&self, have: &[Oid]) -> Vec<Oid> {
+        let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
+        let mut addrs: std::collections::BTreeSet<Oid> = std::collections::BTreeSet::new();
+        for c in self.graph.in_order() {
+            if have_set.contains(&c.id) || (c.author.is_some() && c.signature.is_none()) {
+                continue;
+            }
+            for (oid, _vis) in c.tree.values() {
+                if self.object(oid).is_ok() {
+                    addrs.insert(oid.clone());
+                }
+            }
+        }
+        addrs.into_iter().collect()
+    }
+
+    /// The subset of `offered` addresses this repo does NOT already hold — the
+    /// "wants" a receiver replies with (S5).
+    pub fn missing_objects(&self, offered: &[Oid]) -> Vec<Oid> {
+        offered
+            .iter()
+            .filter(|oid| self.object(oid).is_err())
+            .cloned()
+            .collect()
+    }
+
+    /// A sync bundle for `have` whose object *bytes* are limited to `wants` (S5).
+    /// Changes, keys, escrow, and attestations ride as in a normal bundle (they
+    /// are tiny); only the negotiated object ciphertext is filtered, so a peer
+    /// never re-downloads objects it already holds.
+    pub fn bundle_wanted(&self, have: &[Oid], wants: &[Oid]) -> Result<SyncBundle, RepoError> {
+        let wants_set: std::collections::BTreeSet<Oid> = wants.iter().cloned().collect();
+        self.bundle_impl(have, Some(&wants_set))
+    }
+
+    /// Shared bundle builder. `wants = None` ships every referenced object;
+    /// `wants = Some(set)` ships only those object *bytes* (S5 negotiation).
+    fn bundle_impl(
+        &self,
+        have: &[Oid],
+        wants: Option<&std::collections::BTreeSet<Oid>>,
+    ) -> Result<SyncBundle, RepoError> {
+        // Changes reachable here but not already known to the recipient. For
+        // now, "reachable-not-have" = every change id not in `have`.
+        let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
+        let send: Vec<&ChangeNode> = self
+            .graph
+            .in_order()
+            .into_iter()
+            // Skip changes the recipient has, and any authored-but-unsigned
+            // working change: only finalized, signed history travels (ADR 0018).
+            // Legacy unauthored changes still travel, so keyless repos are unaffected.
+            .filter(|c| !have_set.contains(&c.id) && !(c.author.is_some() && c.signature.is_none()))
+            .collect();
+
+        // Ship SealedObjects (ciphertext, no keys) plus:
+        //   - Public content keys -> plain keyring section (ANYONE-granted, not embargoed)
+        //   - Embargoed content keys -> escrow section (ANYONE-granted, time-gated)
+        //   - Restricted keys NEVER travel (ADR 0003)
+        let mut needed: BTreeMap<Oid, SealedObject> = BTreeMap::new();
+        let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
+        let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
+        for c in &send {
+            for (oid, vis) in c.tree.values() {
+                if let Ok(obj) = self.object(oid) {
+                    // Object bytes: when negotiating (S5), ship only wanted addrs;
+                    // keys/escrow below always ride (tiny, and a peer may hold the
+                    // ciphertext but not the key).
+                    if wants.map_or(true, |w| w.contains(oid)) {
+                        needed.entry(oid.clone()).or_insert_with(|| obj.clone());
+                    }
+                    if obj.grant_ids.iter().any(|g| g == ANYONE) {
+                        if let Visibility::Embargoed { reveal_at } = vis {
+                            // Embargoed: key rides as an escrow entry so the receiver
+                            // files it into their Escrow, not their Keyring (ADR 0007).
+                            if let Some(k) = self.escrow.iter()
+                                .find(|(o, _)| *o == oid)
+                                .map(|(_, e)| e.key)
+                                .or_else(|| self.keyring.key_for(oid))
+                            {
+                                escrow_entries.insert(oid.clone(), (k, *reveal_at));
+                            }
+                        } else if let Some(k) = self.keyring.key_for(oid) {
+                            public_keys.insert(oid.clone(), k);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only ship attestations for changes actually in this bundle's send set
+        // (#42/#48). An attestation for a change the recipient is not receiving
+        // would leak that change's existence and its reviewers, so attestations
+        // ride strictly with their change.
+        let sent_ids: std::collections::BTreeSet<&Oid> = send.iter().map(|c| &c.id).collect();
+        let attestations: Vec<Attestation> = self
+            .attestations
+            .iter()
+            .filter(|a| sent_ids.contains(&a.change_id))
+            .cloned()
+            .collect();
+
+        let body = BundleBody {
+            changes: send.into_iter().cloned().collect(),
+            objs: needed,
+            keys: public_keys,
+            escrow: escrow_entries,
+            attestations,
+        };
+        Ok(SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode()))
     }
 }
 
@@ -2783,6 +2848,75 @@ mod tests {
             ),
             "stow must reject authored change with a forged signature"
         );
+    }
+
+    // ---- S5: object-level "wants" negotiation ----
+
+    fn objs_in(bundle: &SyncBundle) -> BTreeMap<Oid, SealedObject> {
+        match Frame::decode(&bundle.0).unwrap() {
+            Frame::Sync { body, .. } => body.objs,
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn negotiation_transfers_only_missing_objects() {
+        // Alice: two changes, each adding one public object (A then B).
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let a = alice.put(b"aaaa", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a"), (a.clone(), Visibility::Public));
+        let c1 = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
+            .unwrap();
+        let b = alice.put(b"bbbb", Visibility::Public).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("b"), (b.clone(), Visibility::Public));
+        let c2 = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "c2".into(), tree: t2 })
+            .unwrap();
+
+        // Bob receives only change1 (+ object A) via a partial bundle (have=[c2]).
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&alice.bundle(&[c2]).unwrap(), 0).unwrap();
+        assert!(bob.object(&a).is_ok(), "bob has A");
+        assert!(bob.object(&b).is_err(), "bob lacks B");
+
+        // Negotiate: alice offers the closure, bob replies with the subset it lacks.
+        let have = bob.heads();
+        let offered = alice.offered_objects(&have);
+        let wants = bob.missing_objects(&offered);
+        assert_eq!(wants, vec![b.clone()], "bob wants only the object it is missing");
+
+        // Alice ships only the wanted object bytes; the already-held one is not re-sent.
+        let bundle = alice.bundle_wanted(&have, &wants).unwrap();
+        let objs = objs_in(&bundle);
+        assert_eq!(objs.len(), 1);
+        assert!(objs.contains_key(&b) && !objs.contains_key(&a));
+        bob.apply(&bundle, 0).unwrap();
+        assert!(bob.object(&b).is_ok(), "bob now holds B");
+    }
+
+    #[test]
+    fn re_pull_with_nothing_new_transfers_zero_objects() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let a = alice.put(b"data", Visibility::Public).unwrap();
+        let mut t = BTreeMap::new();
+        t.insert(PathBuf::from("f"), (a, Visibility::Public));
+        alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree: t })
+            .unwrap();
+
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        bob.apply(&alice.bundle(&[]).unwrap(), 0).unwrap();
+
+        // Re-pull: bob already holds everything, so wants is empty and no object
+        // bytes move (AC: a re-pull with nothing new transfers ~0 object bytes).
+        let have = bob.heads();
+        let offered = alice.offered_objects(&have);
+        let wants = bob.missing_objects(&offered);
+        assert!(wants.is_empty(), "nothing new to want");
+        assert!(objs_in(&alice.bundle_wanted(&have, &wants).unwrap()).is_empty());
     }
 
     #[test]
