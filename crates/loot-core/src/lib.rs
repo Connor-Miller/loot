@@ -19,7 +19,7 @@ pub mod store;          // the .loot/ on-disk layout (single source of truth)
 
 pub use attestation::{Attestation, AttestationLog};
 pub use engine::{DagRepo, LogGraph, LogNode, MaroonResult, MigrateResult};
-pub use store::RepoStore;
+pub use store::{valid_dock_name, RepoStore, HOME_DOCK};
 
 /// Content identity. A stable handle to a unit of content, independent of
 /// where (or whether) it is currently materialized on disk.

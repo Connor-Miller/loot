@@ -128,31 +128,59 @@ impl ChangeGraph {
         tree
     }
 
-    /// Changes ordered so parents precede children (DFS topo sort).
-    pub fn in_order(&self) -> Vec<&ChangeNode> {
-        fn visit<'a>(
-            id: &Oid,
-            changes: &'a BTreeMap<Oid, ChangeNode>,
-            visited: &mut BTreeMap<Oid, bool>,
-            out: &mut Vec<&'a ChangeNode>,
-        ) {
-            if visited.get(id).copied().unwrap_or(false) {
-                return;
-            }
-            visited.insert(id.clone(), true);
-            if let Some(node) = changes.get(id) {
-                for p in &node.parents {
-                    visit(p, changes, visited, out);
-                }
-                out.push(node);
+    /// Latest content address per path along a *single* head's ancestry, applying
+    /// changes in topo order so a child's write wins. Unlike [`current_tree`],
+    /// which merges every head, this scopes the tree to one line — the basis for
+    /// per-dock isolation, where each dock forks from its own tip (ADR 0022). An
+    /// unknown head yields an empty tree.
+    ///
+    /// [`current_tree`]: ChangeGraph::current_tree
+    pub fn tree_at(&self, head: &Oid) -> Tree {
+        let mut tree: Tree = BTreeMap::new();
+        for node in self.ancestry_in_order(head) {
+            for (path, entry) in &node.tree {
+                tree.insert(path.clone(), entry.clone());
             }
         }
+        tree
+    }
+
+    /// Changes ordered so parents precede children (DFS topo sort).
+    pub fn in_order(&self) -> Vec<&ChangeNode> {
         let mut ordered = Vec::with_capacity(self.changes.len());
         let mut visited: BTreeMap<Oid, bool> = BTreeMap::new();
         for id in self.changes.keys() {
             visit(id, &self.changes, &mut visited, &mut ordered);
         }
         ordered
+    }
+
+    /// The ancestor-closure of `head` (head included) in parents-before-children
+    /// order. Empty if `head` is unknown.
+    fn ancestry_in_order(&self, head: &Oid) -> Vec<&ChangeNode> {
+        let mut ordered = Vec::new();
+        let mut visited: BTreeMap<Oid, bool> = BTreeMap::new();
+        visit(head, &self.changes, &mut visited, &mut ordered);
+        ordered
+    }
+}
+
+/// Shared DFS: emit `id` and its ancestors with parents before children.
+fn visit<'a>(
+    id: &Oid,
+    changes: &'a BTreeMap<Oid, ChangeNode>,
+    visited: &mut BTreeMap<Oid, bool>,
+    out: &mut Vec<&'a ChangeNode>,
+) {
+    if visited.get(id).copied().unwrap_or(false) {
+        return;
+    }
+    visited.insert(id.clone(), true);
+    if let Some(node) = changes.get(id) {
+        for p in &node.parents {
+            visit(p, changes, visited, out);
+        }
+        out.push(node);
     }
 }
 
@@ -216,5 +244,38 @@ mod tests {
         let mut heads = g.heads();
         heads.sort_by_key(|o| o.0[0]);
         assert_eq!(heads, vec![Oid([1; 32]), Oid([2; 32])]);
+    }
+
+    #[test]
+    fn tree_at_scopes_to_one_line_unlike_current_tree() {
+        // A common base (1), then two forks: 2 writes b, 3 writes c. Both are
+        // heads. current_tree() merges everything; tree_at() sees one line only.
+        let mut g = ChangeGraph::new();
+        g.insert(node(1, &[], "a", 10));
+        g.insert(node(2, &[1], "b", 20)); // fork A
+        g.insert(node(3, &[1], "c", 30)); // fork B
+
+        let merged = g.current_tree();
+        assert!(merged.contains_key(&PathBuf::from("a")));
+        assert!(merged.contains_key(&PathBuf::from("b")));
+        assert!(merged.contains_key(&PathBuf::from("c")), "current_tree merges all heads");
+
+        let fork_a = g.tree_at(&Oid([2; 32]));
+        assert!(fork_a.contains_key(&PathBuf::from("a")), "sees the shared base");
+        assert!(fork_a.contains_key(&PathBuf::from("b")), "sees its own write");
+        assert!(!fork_a.contains_key(&PathBuf::from("c")), "must NOT see the sibling fork");
+
+        let fork_b = g.tree_at(&Oid([3; 32]));
+        assert!(fork_b.contains_key(&PathBuf::from("c")));
+        assert!(!fork_b.contains_key(&PathBuf::from("b")), "isolation is symmetric");
+    }
+
+    #[test]
+    fn tree_at_child_write_wins_and_unknown_head_is_empty() {
+        let mut g = ChangeGraph::new();
+        g.insert(node(1, &[], "a", 10));
+        g.insert(node(2, &[1], "a", 11)); // child overwrites a
+        assert_eq!(g.tree_at(&Oid([2; 32]))[&PathBuf::from("a")].0, Oid([11; 32]));
+        assert!(g.tree_at(&Oid([99; 32])).is_empty(), "unknown head => empty tree");
     }
 }

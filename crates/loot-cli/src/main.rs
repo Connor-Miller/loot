@@ -10,7 +10,7 @@ mod workspace;
 use loot_core::{MaroonResult, MergeOutcome, MigrateResult, Oid, Repo, SyncBundle, Visibility};
 use loot_identity as identity;
 use std::process::ExitCode;
-use workspace::{GlobalConfig, Workspace};
+use workspace::{DockAction, GlobalConfig, Workspace};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -23,6 +23,8 @@ fn main() -> ExitCode {
         "describe" => cmd_describe(rest),
         "new" => cmd_new(),
         "surface" => cmd_surface(),
+        "dock" => cmd_dock(rest),
+        "docks" => cmd_docks(),
         "log" => cmd_log(),
         "bundle" => cmd_bundle(rest),
         "apply" => cmd_apply(rest),
@@ -70,6 +72,8 @@ usage:
   loot describe -m <message>                name the working change
   loot new                                  finalize the working change; start a fresh one
   loot surface                              materialize what the current identity may see
+  loot dock <name>                          create a dock (isolated working tree + tip), or switch to one
+  loot docks                                list docks with their tip and visibility
   loot log                                  show change history
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file>                         merge a peer's bundle (idempotent)
@@ -183,6 +187,38 @@ fn cmd_surface() -> Result<(), String> {
         println!("  ({skipped} sealed path(s) skipped — request a grant to access them)");
     }
     println!("surfaced {} as {}", short(&head), ws.identity());
+    Ok(())
+}
+
+fn cmd_dock(args: &[String]) -> Result<(), String> {
+    let name = args
+        .first()
+        .ok_or("dock requires <name>\n  loot dock <name>   create a dock, or switch to an existing one")?;
+    let mut ws = Workspace::open()?;
+    let from = ws.current_dock().to_string();
+    match ws.dock_goto(name)? {
+        DockAction::Already => println!("already on dock '{name}'"),
+        DockAction::Switched => {
+            println!("switched to dock '{name}' — working tree re-materialized (run `loot docks`)");
+        }
+        DockAction::Created => {
+            println!("created dock '{name}' off '{from}' and switched to it");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_docks() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    for d in ws.dock_list() {
+        let marker = if d.current { "*" } else { " " };
+        let head = d.head.as_ref().map(short).unwrap_or_else(|| "(empty)".to_string());
+        let vis = match d.visibility {
+            Some((total, restricted, embargoed)) => seal_hint(total, restricted, embargoed),
+            None => String::new(),
+        };
+        println!("{marker} {:<20} {}{}", d.name, head, vis);
+    }
     Ok(())
 }
 

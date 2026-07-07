@@ -641,6 +641,7 @@ impl DagRepo {
     /// Returns the new working-change id. Idempotent on an unchanged tree.
     pub fn snapshot(
         &mut self,
+        base: Option<&Oid>,
         working: Option<&Oid>,
         entries: &[(PathBuf, Vec<u8>, Visibility)],
         message: &str,
@@ -652,7 +653,14 @@ impl DagRepo {
             self.graph.remove_head(w);
         }
 
-        let base = self.graph.current_tree();
+        // `base` is the dock tip this snapshot forks from (ADR 0022): the new
+        // change parents on it and reconciles against *its* line only. `None`
+        // preserves the pre-dock behavior exactly — fork from every head and
+        // merge their trees — so existing single-line repos are unaffected.
+        let (base, parents) = match base {
+            Some(tip) => (self.graph.tree_at(tip), vec![tip.clone()]),
+            None => (self.graph.current_tree(), self.graph.heads()),
+        };
         let by_path: BTreeMap<&PathBuf, &(PathBuf, Vec<u8>, Visibility)> =
             entries.iter().map(|e| (&e.0, e)).collect();
 
@@ -685,7 +693,7 @@ impl DagRepo {
 
         let change = Change {
             id: Oid([0; 32]),
-            parents: self.graph.heads(),
+            parents,
             message: message.to_string(),
             tree,
         };
@@ -723,6 +731,36 @@ impl DagRepo {
     /// authorship, reverse-resolved to a peer name.
     pub fn change_author(&self, id: &Oid) -> Option<[u8; 32]> {
         self.graph.get(id).and_then(|n| n.author)
+    }
+
+    /// The parents of a change, or empty if the id is unknown. Lets a caller find
+    /// the finalized change a working change forks from — the anchor a dock sits
+    /// on when its working change is finalized away (ADR 0022).
+    pub fn parents_of(&self, id: &Oid) -> Vec<Oid> {
+        self.graph.get(id).map(|n| n.parents.clone()).unwrap_or_default()
+    }
+
+    /// A change's message, or `None` if unknown. Lets an auto-snapshot preserve
+    /// the working change's description instead of overwriting it (ADR 0022).
+    pub fn change_message(&self, id: &Oid) -> Option<String> {
+        self.graph.get(id).map(|n| n.message.clone())
+    }
+
+    /// Count `(total, restricted, embargoed)` paths in a tip's tree — the
+    /// visibility summary `loot docks` shows per dock (ADR 0022).
+    pub fn visibility_summary_at(&self, tip: &Oid) -> (usize, usize, usize) {
+        let tree = self.graph.tree_at(tip);
+        let total = tree.len();
+        let mut restricted = 0;
+        let mut embargoed = 0;
+        for (_, vis) in tree.values() {
+            match vis {
+                Visibility::Restricted(_) => restricted += 1,
+                Visibility::Embargoed { .. } => embargoed += 1,
+                Visibility::Public => {}
+            }
+        }
+        (total, restricted, embargoed)
     }
 
     /// Verify and record an attestation over a change (S4, ADR 0018). Returns
@@ -865,6 +903,61 @@ impl DagRepo {
             written.push((path.clone(), vis.clone()));
         }
 
+        Ok((written, skipped))
+    }
+
+    /// Paths at `tip` whose content `reader` can open now — the change's own tree
+    /// (exactly what [`surface`] would write) minus anything sealed or embargoed
+    /// against this reader. This is the set a dock switch may prune from disk, so
+    /// it must match what `surface` put there (ADR 0022). Unknown tip => empty.
+    ///
+    /// [`surface`]: DagRepo::surface_with_report
+    pub fn visible_paths_at(&self, tip: &Oid, reader: &str, now: u64) -> Vec<PathBuf> {
+        let Some(node) = self.graph.get(tip) else {
+            return Vec::new();
+        };
+        node.tree
+            .iter()
+            .filter(|(_, (oid, _))| self.get(oid, reader, now).is_ok())
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Reconcile the working tree from one dock tip to another (dock switch, ADR
+    /// 0022): write `to`'s visible content, then remove files that were visible
+    /// under `from` but are gone in `to`. Content the reader cannot see is never
+    /// touched — sealed data lives in `.loot/` as ciphertext, not as a plaintext
+    /// file — so pruning is scoped to loot-managed, visible paths only. Callers
+    /// must auto-snapshot the outgoing dock first, which makes every pruned file
+    /// recoverable by switching back.
+    pub fn materialize(
+        &self,
+        from: Option<&Oid>,
+        to: &Oid,
+        reader: &str,
+        now: u64,
+    ) -> Result<(Vec<(PathBuf, Visibility)>, usize), RepoError> {
+        let (written, skipped) = self.surface_with_report(to, reader, now)?;
+        let keep: std::collections::BTreeSet<&PathBuf> = written.iter().map(|(p, _)| p).collect();
+        if let Some(from) = from {
+            for path in self.visible_paths_at(from, reader, now) {
+                if keep.contains(&path) {
+                    continue;
+                }
+                let dest = self.root.join(&path);
+                let _ = std::fs::remove_file(&dest);
+                // Best-effort: drop parent dirs that this removal left empty, up to
+                // (never including) the repo root. `remove_dir` only deletes empty
+                // dirs, so a still-populated dir is a harmless error we ignore.
+                let mut dir = dest.parent().map(Path::to_path_buf);
+                while let Some(d) = dir {
+                    if d == self.root || std::fs::remove_dir(&d).is_err() {
+                        break;
+                    }
+                    dir = d.parent().map(Path::to_path_buf);
+                }
+            }
+        }
         Ok((written, skipped))
     }
 
@@ -1621,11 +1714,11 @@ mod tests {
     fn snapshot_rewrites_working_change_in_place() {
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let w1 = repo
-            .snapshot(None, &[entry("a.txt", b"one", Visibility::Public)], "wip", 0)
+            .snapshot(None, None, &[entry("a.txt", b"one", Visibility::Public)], "wip", 0)
             .unwrap();
         // Re-snapshot with new content -> same working slot, not a second change.
         let w2 = repo
-            .snapshot(Some(&w1), &[entry("a.txt", b"two", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w1), &[entry("a.txt", b"two", Visibility::Public)], "wip", 0)
             .unwrap();
         assert_eq!(repo.log().len(), 1, "working change rewritten, not appended");
         assert!(repo.heads().contains(&w2));
@@ -1636,10 +1729,88 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_with_base_forks_isolated_lines_over_one_store() {
+        // The dock primitive (ADR 0022, CA1): two snapshots forked from a common
+        // base tip produce independent heads that do NOT see each other's writes,
+        // while sharing the object store for the base content.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let base = repo
+            .snapshot(None, None, &[entry("shared.txt", b"base", Visibility::Public)], "base", 0)
+            .unwrap();
+
+        // Fork A adds a.txt on top of base; fork B adds b.txt on top of base.
+        let a = repo
+            .snapshot(Some(&base), None, &[entry("a.txt", b"A", Visibility::Public)], "fork a", 0)
+            .unwrap();
+        let b = repo
+            .snapshot(Some(&base), None, &[entry("b.txt", b"B", Visibility::Public)], "fork b", 0)
+            .unwrap();
+
+        // Both are live heads — a local fork of the DAG, same shape as a remote push.
+        assert!(repo.heads().contains(&a) && repo.heads().contains(&b), "two independent tips");
+
+        let ta = repo.graph.tree_at(&a);
+        let tb = repo.graph.tree_at(&b);
+        assert!(ta.contains_key(&PathBuf::from("a.txt")) && !ta.contains_key(&PathBuf::from("b.txt")));
+        assert!(tb.contains_key(&PathBuf::from("b.txt")) && !tb.contains_key(&PathBuf::from("a.txt")));
+
+        // Shared base content is one object in the store, referenced by both.
+        assert_eq!(
+            ta[&PathBuf::from("shared.txt")].0, tb[&PathBuf::from("shared.txt")].0,
+            "base content is shared, not duplicated"
+        );
+    }
+
+    #[test]
+    fn materialize_writes_target_and_prunes_stale_visible_files() {
+        // Dock switch (ADR 0022): moving from fork A to fork B writes B's tree and
+        // removes A-only files, without touching shared content.
+        let root = tmp().join(format!("loot-materialize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut repo = DagRepo::init(root.clone(), "alice").unwrap();
+
+        let base = repo
+            .snapshot(None, None, &[entry("shared.txt", b"s", Visibility::Public)], "base", 0)
+            .unwrap();
+        // Real snapshots carry the full working tree, so shared.txt rides along.
+        let a = repo
+            .snapshot(
+                Some(&base),
+                None,
+                &[entry("shared.txt", b"s", Visibility::Public), entry("a.txt", b"A", Visibility::Public)],
+                "a",
+                0,
+            )
+            .unwrap();
+        let b = repo
+            .snapshot(
+                Some(&base),
+                None,
+                &[entry("shared.txt", b"s", Visibility::Public), entry("b.txt", b"B", Visibility::Public)],
+                "b",
+                0,
+            )
+            .unwrap();
+
+        // Materialize A first (fresh working tree), then switch to B.
+        repo.materialize(None, &a, "alice", 0).unwrap();
+        assert!(root.join("a.txt").exists() && root.join("shared.txt").exists());
+
+        repo.materialize(Some(&a), &b, "alice", 0).unwrap();
+        assert!(root.join("b.txt").exists(), "target file written");
+        assert!(root.join("shared.txt").exists(), "content in both trees is kept");
+        assert!(!root.join("a.txt").exists(), "A-only file pruned on switch to B");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn snapshot_deletes_a_visible_path_absent_from_the_tree() {
         let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let w = repo
             .snapshot(
+                None,
                 None,
                 &[
                     entry("keep.txt", b"k", Visibility::Public),
@@ -1651,7 +1822,7 @@ mod tests {
             .unwrap();
         // Re-snapshot with gone.txt removed from the tree -> it's deleted.
         let w2 = repo
-            .snapshot(Some(&w), &[entry("keep.txt", b"k", Visibility::Public)], "wip", 0)
+            .snapshot(None, Some(&w), &[entry("keep.txt", b"k", Visibility::Public)], "wip", 0)
             .unwrap();
         let tree = repo.graph.current_tree();
         assert!(tree.contains_key(&PathBuf::from("keep.txt")));
@@ -1667,6 +1838,7 @@ mod tests {
         let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let _ = alice
             .snapshot(
+                None,
                 None,
                 &[
                     entry(".env", b"SECRET", Visibility::Restricted(vec!["alice".into()])),
@@ -1686,6 +1858,7 @@ mod tests {
         // his snapshot appends on alice's change, carrying .env forward.
         let sealed_env_oid = bob.graph.current_tree()[&PathBuf::from(".env")].0.clone();
         bob.snapshot(
+            None,
             None,
             &[entry("README", b"hi edited by bob", Visibility::Public)],
             "bob edits readme",
@@ -1712,6 +1885,7 @@ mod tests {
         let _ = alice
             .snapshot(
                 None,
+                None,
                 &[entry(".env", b"ALICE", Visibility::Restricted(vec!["alice".into()]))],
                 "init",
                 0,
@@ -1722,6 +1896,7 @@ mod tests {
         bob.apply(&bundle, 0).unwrap();
 
         let result = bob.snapshot(
+            None,
             None,
             &[entry(".env", b"BOB", Visibility::Restricted(vec!["bob".into()]))],
             "bob writes own env",

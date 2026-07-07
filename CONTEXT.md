@@ -31,15 +31,22 @@ discovers `.loot/`, supplies the current identity and the clock, and persists on
 mutation. Commands are thin verbs over it; the snapshot invariant and clock
 injection live here. See ADR 0006.
 
-**Dock** *(proposed — concurrent-agents design, 2026-07-06)* — an isolated
-working tree plus its own [[Working change]] tip, materialized cheaply over the
-*shared* `.loot/` object store and change graph. loot's answer to a git
-worktree, and the isolation unit for concurrent agents: each agent (or human)
-*docks* into the repo to get its own tree and tip without a second clone or any
-re-fetch of ciphertext. Docks fork the DAG exactly as concurrent pushes already
-do (engine.rs, ADR 0011), so reconciliation reuses the existing converge path —
-a dock is a local fork instead of a remote one. _Avoid_: worktree, checkout,
-berth, slip.
+**Dock** *(CA1 shipped, 2026-07-06)* — an isolated working tree plus its own
+[[Working change]] tip, materialized cheaply over the *shared* `.loot/` object
+store and change graph. loot's answer to a git worktree, and the isolation unit
+for concurrent agents: each agent (or human) *docks* into the repo to get its
+own tree and tip without a second clone or any re-fetch of ciphertext. Docks
+fork the DAG exactly as concurrent pushes already do (engine.rs, ADR 0011), so
+reconciliation reuses the existing converge path — a dock is a local fork
+instead of a remote one. CLI: `loot dock <name>` (create-or-switch), `loot
+docks` (list). The default dock is `home`, whose process files are the root
+`.loot/working`/`tip`/`tree-hash`, so a repo that never docks is unchanged on
+disk; named docks live under `.loot/docks/<name>/`. CA1 is the *checkout* model
+— one physical working tree a switch re-materializes (auto-snapshotting the
+outgoing dock first, so nothing uncommitted is lost); per-dock *physical*
+directories for truly simultaneous editing are a later, additive step (the
+on-disk format is already dock-agnostic). _Avoid_: worktree, checkout, berth,
+slip.
 
 **Buoy** *(proposed — concurrent-agents design, 2026-07-06)* — a change that
 carries a navigational-role [[Attestation]] (e.g. `reviewed`, `base`), used as a
