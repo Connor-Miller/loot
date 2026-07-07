@@ -145,6 +145,7 @@ crates/
 | 0021 | Object-level "wants" negotiation on push/pull |
 | 0022 | Concurrent-agent model: docks, harbor, optimistic convergence |
 | 0023 | Agent-facing machine output: porcelain-first, reconciliation verbs |
+| 0024 | Resumable transfer via batched, negotiated sync |
 
 See [CONTEXT.md](CONTEXT.md) for the full domain glossary.
 

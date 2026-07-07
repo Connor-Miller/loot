@@ -1093,6 +1093,122 @@ impl DagRepo {
         self.bundle_impl(have, Some(&wants_set))
     }
 
+    /// Split `wants` into batches and produce one `SyncBundle` per batch (S6).
+    ///
+    /// The change delta, keys, escrow, and attestations are computed once and
+    /// cloned into each bundle; only the object ciphertext subset differs per
+    /// batch. This is O(graph_size + N*batch_payload) rather than the
+    /// O(N*graph_size) cost of calling `bundle_wanted` N times in a loop.
+    ///
+    /// When `wants` is empty one bundle is returned (carrying the change delta
+    /// and attestations with no object bytes) so the caller always makes at
+    /// least one network round-trip to propagate metadata.
+    pub fn bundle_wanted_batched(
+        &self,
+        have: &[Oid],
+        wants: &[Oid],
+        batch_size: usize,
+    ) -> Result<Vec<SyncBundle>, RepoError> {
+        // Compute the shared payload (send-set, keys, escrow, attestations) once.
+        let (shared_changes, shared_keys, shared_escrow, shared_attestations, all_objects) =
+            self.bundle_shared(have)?;
+
+        let make_bundle = |batch_wants: Option<&[Oid]>| -> SyncBundle {
+            let needed: BTreeMap<Oid, SealedObject> = match batch_wants {
+                None => all_objects.clone(),
+                Some(batch) => {
+                    let batch_set: std::collections::BTreeSet<&Oid> = batch.iter().collect();
+                    all_objects
+                        .iter()
+                        .filter(|(oid, _)| batch_set.contains(oid))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                }
+            };
+            let body = BundleBody {
+                changes: shared_changes.clone(),
+                objs: needed,
+                keys: shared_keys.clone(),
+                escrow: shared_escrow.clone(),
+                attestations: shared_attestations.clone(),
+            };
+            SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode())
+        };
+
+        if wants.is_empty() {
+            return Ok(vec![make_bundle(Some(&[]))]);
+        }
+        let bundles = wants
+            .chunks(batch_size)
+            .map(|batch| make_bundle(Some(batch)))
+            .collect();
+        Ok(bundles)
+    }
+
+    /// Compute the shared (non-object) payload for a send relative to `have`:
+    /// returns (changes, keys, escrow, attestations, all_objects).
+    fn bundle_shared(
+        &self,
+        have: &[Oid],
+    ) -> Result<
+        (
+            Vec<ChangeNode>,
+            BTreeMap<Oid, ContentKey>,
+            BTreeMap<Oid, (ContentKey, u64)>,
+            Vec<Attestation>,
+            BTreeMap<Oid, SealedObject>,
+        ),
+        RepoError,
+    > {
+        let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
+        let send: Vec<&ChangeNode> = self
+            .graph
+            .in_order()
+            .into_iter()
+            .filter(|c| !have_set.contains(&c.id) && !(c.author.is_some() && c.signature.is_none()))
+            .collect();
+
+        let mut all_objects: BTreeMap<Oid, SealedObject> = BTreeMap::new();
+        let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
+        let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
+        for c in &send {
+            for (oid, vis) in c.tree.values() {
+                if let Ok(obj) = self.object(oid) {
+                    all_objects.entry(oid.clone()).or_insert_with(|| obj.clone());
+                    if obj.grant_ids.iter().any(|g| g == ANYONE) {
+                        if let Visibility::Embargoed { reveal_at } = vis {
+                            if let Some(k) = self.escrow.iter()
+                                .find(|(o, _)| *o == oid)
+                                .map(|(_, e)| e.key)
+                                .or_else(|| self.keyring.key_for(oid))
+                            {
+                                escrow_entries.insert(oid.clone(), (k, *reveal_at));
+                            }
+                        } else if let Some(k) = self.keyring.key_for(oid) {
+                            public_keys.insert(oid.clone(), k);
+                        }
+                    }
+                }
+            }
+        }
+
+        let sent_ids: std::collections::BTreeSet<&Oid> = send.iter().map(|c| &c.id).collect();
+        let attestations: Vec<Attestation> = self
+            .attestations
+            .iter()
+            .filter(|a| sent_ids.contains(&a.change_id))
+            .cloned()
+            .collect();
+
+        Ok((
+            send.into_iter().cloned().collect(),
+            public_keys,
+            escrow_entries,
+            attestations,
+            all_objects,
+        ))
+    }
+
     /// Shared bundle builder. `wants = None` ships every referenced object;
     /// `wants = Some(set)` ships only those object *bytes* (S5 negotiation).
     fn bundle_impl(
@@ -2917,6 +3033,62 @@ mod tests {
         let wants = bob.missing_objects(&offered);
         assert!(wants.is_empty(), "nothing new to want");
         assert!(objs_in(&alice.bundle_wanted(&have, &wants).unwrap()).is_empty());
+    }
+
+    // ---- S6: resumable transfer ----
+
+    #[test]
+    fn interrupted_push_resumes_transferring_only_remaining() {
+        // Alice: two changes, objects A then B.
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let a = alice.put(b"aaaa", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a"), (a.clone(), Visibility::Public));
+        let c1 = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c1".into(), tree: t1 })
+            .unwrap();
+        let b = alice.put(b"bbbb", Visibility::Public).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("b"), (b.clone(), Visibility::Public));
+        alice
+            .record(Change { id: Oid([0; 32]), parents: vec![c1], message: "c2".into(), tree: t2 })
+            .unwrap();
+
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+
+        // "Interrupted" push: only the first batch (object A) reaches the relay and
+        // is stowed. `stow` is append-only + idempotent, so this partial progress
+        // is durable.
+        relay.stow(&alice.bundle_wanted(&[], &[a.clone()]).unwrap()).unwrap();
+        assert!(relay.object(&a).is_ok(), "A delivered");
+        assert!(relay.object(&b).is_err(), "B not yet delivered");
+
+        // Resume: re-negotiate. The relay already holds A, so only B is wanted.
+        let wants = relay.missing_objects(&alice.offered_objects(&[]));
+        assert_eq!(wants, vec![b.clone()], "resume sends only the remaining object");
+        relay.stow(&alice.bundle_wanted(&[], &wants).unwrap()).unwrap();
+        assert!(relay.object(&b).is_ok(), "B delivered on resume");
+
+        // Re-run a completed push: nothing left to want (idempotent no-op).
+        assert!(relay.missing_objects(&alice.offered_objects(&[])).is_empty());
+    }
+
+    #[test]
+    fn re_stowing_a_delivered_bundle_is_idempotent() {
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        let a = alice.put(b"data", Visibility::Public).unwrap();
+        let mut t = BTreeMap::new();
+        t.insert(PathBuf::from("f"), (a.clone(), Visibility::Public));
+        alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree: t })
+            .unwrap();
+        let bundle = alice.bundle(&[]).unwrap();
+
+        let mut relay = DagRepo::init(tmp(), "relay").unwrap();
+        relay.stow(&bundle).unwrap();
+        relay.stow(&bundle).unwrap(); // re-run of a completed transfer
+        assert!(relay.object(&a).is_ok());
+        assert_eq!(relay.offered_objects(&[]).len(), 1, "no duplication on re-stow");
     }
 
     #[test]
