@@ -1049,14 +1049,48 @@ fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
         .ok_or_else(|| format!("no remote '{name}' configured — use `loot remote add {name} <url>` or pass a URL directly"))
 }
 
+// 32 objects per batch: coarse enough for low round-trip count on typical
+// pushes, fine enough that an interrupted transfer loses at most ~32 objects
+// before the next re-negotiate checkpoint (ADR 0024).
+const OBJECTS_PER_BATCH: usize = 32;
+
 fn cmd_push(args: &[String]) -> Result<(), String> {
     let ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
-    let bundle = ws.repo().bundle(&[]).map_err(|e| e.to_string())?;
-    let n = bundle.0.len();
-    loot_net::push(&url, bundle.0, &id).map_err(|e| e.to_string())?;
-    println!("pushed {n} bytes to {url}");
+    // S5: offer our object addresses; the relay replies with the subset it is
+    // missing, so we ship only new object bytes (re-push transfers ~0 objects).
+    // Pass heads() as have so bundle_wanted ships only the change delta, not the
+    // full history on every push.
+    let have = ws.repo().heads();
+    let offered = ws.repo().offered_objects(&have);
+    if offered.is_empty() && ws.repo().has_unsigned_tip() {
+        return Err(
+            "nothing to push: your working change has not been signed yet.\n\
+             Run `loot new` (or sign the current change) before pushing."
+                .into(),
+        );
+    }
+    let wants = loot_net::wants(&url, &offered).map_err(|e| e.to_string())?;
+    // S6: bundle_wanted_batched computes the shared change delta / keys /
+    // attestations once and produces one SyncBundle per object batch. Each
+    // bundle is stowed independently on the relay (stow is append-only +
+    // idempotent), so an interrupted push resumes by re-negotiating and sending
+    // only the objects not yet stowed. The empty-wants case always produces one
+    // bundle so the change delta and attestations propagate even when no new
+    // objects are needed.
+    let bundles = ws
+        .repo()
+        .bundle_wanted_batched(&have, &wants, OBJECTS_PER_BATCH)
+        .map_err(|e| e.to_string())?;
+    let batch_count = bundles.len();
+    for bundle in bundles {
+        loot_net::push(&url, bundle.0, &id).map_err(|e| e.to_string())?;
+    }
+    println!(
+        "pushed {} new object(s) to {url} in {batch_count} batch(es) — resumable (re-run to continue if interrupted)",
+        wants.len(),
+    );
     println!("  this published your sealed content to the relay (it still cannot read it)");
     Ok(())
 }
@@ -1067,14 +1101,48 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
     let now = ws.now();
     let identity = ws.identity().to_string();
     let have = ws.repo().heads();
-    let bytes = loot_net::pull(&url, &have).map_err(|e| e.to_string())?;
-    if bytes.is_empty() {
+    // S5: negotiate object addresses before any object bytes move. The relay
+    // offers the closure it would send; we reply with only the addresses we
+    // lack; fetch returns a bundle limited to those. A re-pull with nothing new
+    // transfers ~0 object bytes.
+    let offered = loot_net::offer(&url, &have).map_err(|e| e.to_string())?;
+    let wants = ws.repo().missing_objects(&offered);
+    if wants.is_empty() {
         println!("pulled from {url}: nothing new (already up to date)");
         return Ok(());
     }
-    let outcomes = ws.with_repo(|repo| {
-        repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
-    })?;
+    // S6: fetch objects in batches. Each applied batch is persisted (with_repo
+    // saves), so an interrupted pull resumes by re-negotiating and fetching
+    // only what's left.
+    //
+    // Two correctness points:
+    //   - `have` is re-read after each batch so the relay's change-delta
+    //     computation stays relative to our current heads, not the pre-pull
+    //     snapshot. This keeps bandwidth proportional to actual progress.
+    //   - outcomes are merged with converge::worst so a Conflict from one
+    //     batch cannot be silently overwritten by a later Converged for the
+    //     same path (apply_sync uses worst internally per call; we must honour
+    //     the same rule across calls).
+    //
+    // Atomicity note (ADR 0024): if a batch fetch fails mid-pull the repo holds
+    // change nodes referencing objects that have not yet arrived. Re-pulling
+    // resolves this, but loot surface / loot log may error on those nodes until
+    // the pull completes.
+    let mut outcomes: std::collections::BTreeMap<std::path::PathBuf, MergeOutcome> =
+        std::collections::BTreeMap::new();
+    for batch in wants.chunks(OBJECTS_PER_BATCH) {
+        let current_have = ws.repo().heads();
+        let bytes = loot_net::fetch(&url, &current_have, batch).map_err(|e| e.to_string())?;
+        let batch_outcomes = ws.with_repo(|repo| {
+            repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
+        })?;
+        for (path, outcome) in batch_outcomes {
+            let slot = outcomes
+                .entry(path)
+                .or_insert(MergeOutcome::Converged);
+            *slot = loot_core::converge::worst(slot.clone(), outcome);
+        }
+    }
     if outcomes.is_empty() {
         println!("pulled from {url}: nothing new (already up to date)");
     } else {
