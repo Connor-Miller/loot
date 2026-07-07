@@ -48,7 +48,15 @@ const CONFLICTS: &str = "conflicts";
 const ATTESTATIONS: &str = "attestations";
 const WORKING: &str = "working";
 const TREE_HASH: &str = "tree-hash";
+const TIP: &str = "tip";
+const DOCK: &str = "dock";
+const DOCKS: &str = "docks";
 const CONFIG: &str = "config";
+
+/// The default dock every repo starts on. Its process files are the root
+/// `.loot/working`/`tree-hash`/`tip`, so a repo that never touches docks is
+/// byte-for-byte unchanged on disk. Named docks live under `.loot/docks/<name>/`.
+pub const HOME_DOCK: &str = "home";
 const OBJECTS: &str = "objects";
 const ID: &str = "id";
 const ID_PUB: &str = "id.pub";
@@ -84,54 +92,163 @@ impl RepoStore {
     pub fn conflicts(&self) -> PathBuf { self.dot.join(CONFLICTS) }
     pub fn attestations(&self) -> PathBuf { self.dot.join(ATTESTATIONS) }
 
-    // --- Workspace-owned process artifacts ---
-    pub fn working(&self) -> PathBuf { self.dot.join(WORKING) }
-    pub fn tree_hash(&self) -> PathBuf { self.dot.join(TREE_HASH) }
+    // --- Workspace-owned process artifacts (per-dock, ADR 0022) ---
+    //
+    // `dock: None` selects the home dock (root files, unchanged on disk); `Some`
+    // selects a named dock under `.loot/docks/<name>/`. The no-arg `config` and
+    // the ambient-dock pointer are repo-wide, not per-dock.
     pub fn config(&self) -> PathBuf { self.dot.join(CONFIG) }
+
+    /// Directory a dock's process files live in: the repo root for home, else
+    /// `.loot/docks/<name>/`.
+    fn dock_dir(&self, dock: Option<&str>) -> PathBuf {
+        match dock {
+            None => self.dot.clone(),
+            Some(name) => self.dot.join(DOCKS).join(name),
+        }
+    }
+
+    pub fn working(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(WORKING) }
+    pub fn tree_hash(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(TREE_HASH) }
+    pub fn tip(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(TIP) }
+
+    /// The ambient-dock pointer: names the dock this workspace is currently on.
+    /// Absent (or `home`) means the home dock — so pre-dock repos read as home.
+    pub fn dock_pointer(&self) -> PathBuf { self.dot.join(DOCK) }
+    pub fn docks_dir(&self) -> PathBuf { self.dot.join(DOCKS) }
 
     // --- loot-identity-owned artifacts (named here; written there) ---
     pub fn id(&self) -> PathBuf { self.dot.join(ID) }
     pub fn id_pub(&self) -> PathBuf { self.dot.join(ID_PUB) }
     pub fn peers(&self) -> PathBuf { self.dot.join(PEERS) }
 
-    /// Read the working-change id (32 raw bytes) if one is in progress. An
-    /// absent or malformed file means finalized history (no working change).
-    pub fn read_working(&self) -> Option<Oid> {
-        match std::fs::read(self.working()) {
-            Ok(b) if b.len() == 32 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(&b);
-                Some(Oid(a))
-            }
-            _ => None,
-        }
+    /// Read the working-change id (32 raw bytes) for `dock` if one is in
+    /// progress. An absent or malformed file means finalized history.
+    pub fn read_working(&self, dock: Option<&str>) -> Option<Oid> {
+        read_oid_file(&self.working(dock))
     }
 
-    /// Persist the working-change id, or remove the file when there is none.
-    /// Removal failure is ignored (best-effort, matches the prior inline logic).
-    pub fn write_working(&self, working: Option<&Oid>) -> std::io::Result<()> {
-        match working {
-            Some(oid) => std::fs::write(self.working(), oid.0),
-            None => {
-                let _ = std::fs::remove_file(self.working());
-                Ok(())
-            }
-        }
+    /// Persist the working-change id for `dock`, or remove the file when there is
+    /// none. Removal failure is ignored (best-effort).
+    pub fn write_working(&self, dock: Option<&str>, working: Option<&Oid>) -> std::io::Result<()> {
+        write_oid_file(&self.working(dock), working)
     }
 
-    /// The last snapshot's tree+message hash, or empty if never written.
-    pub fn read_tree_hash(&self) -> Vec<u8> {
-        std::fs::read(self.tree_hash()).unwrap_or_default()
+    /// The finalized tip `dock` sits on — the change new snapshots fork from
+    /// (ADR 0022). Absent means "derive from the graph" (the home dock before any
+    /// dock exists, where the single head is unambiguous).
+    pub fn read_tip(&self, dock: Option<&str>) -> Option<Oid> {
+        read_oid_file(&self.tip(dock))
+    }
+
+    /// Record (or clear) the finalized tip for `dock`.
+    pub fn write_tip(&self, dock: Option<&str>, tip: Option<&Oid>) -> std::io::Result<()> {
+        write_oid_file(&self.tip(dock), tip)
+    }
+
+    /// The last snapshot's tree+message hash for `dock`, or empty if never written.
+    pub fn read_tree_hash(&self, dock: Option<&str>) -> Vec<u8> {
+        std::fs::read(self.tree_hash(dock)).unwrap_or_default()
     }
 
     /// Record the snapshot hash used for idempotent re-`status`.
-    pub fn write_tree_hash(&self, hash: &[u8]) -> std::io::Result<()> {
-        std::fs::write(self.tree_hash(), hash)
+    pub fn write_tree_hash(&self, dock: Option<&str>, hash: &[u8]) -> std::io::Result<()> {
+        std::fs::write(self.tree_hash(dock), hash)
     }
 
     /// Forget the snapshot hash so the next snapshot always runs the engine.
-    pub fn clear_tree_hash(&self) {
-        let _ = std::fs::remove_file(self.tree_hash());
+    pub fn clear_tree_hash(&self, dock: Option<&str>) {
+        let _ = std::fs::remove_file(self.tree_hash(dock));
+    }
+
+    /// The name of the ambient dock, or [`HOME_DOCK`] when the pointer is absent
+    /// or empty (pre-dock repos, and repos switched back home).
+    pub fn read_dock(&self) -> String {
+        match std::fs::read_to_string(self.dock_pointer()) {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => HOME_DOCK.to_string(),
+        }
+    }
+
+    /// Point the workspace at `name`. Writing [`HOME_DOCK`] removes the pointer so
+    /// the repo returns to its pristine, pre-dock on-disk shape.
+    pub fn write_dock(&self, name: &str) -> std::io::Result<()> {
+        if name == HOME_DOCK {
+            let _ = std::fs::remove_file(self.dock_pointer());
+            Ok(())
+        } else {
+            std::fs::write(self.dock_pointer(), name)
+        }
+    }
+
+    /// Create a named dock's directory (idempotent). Home needs none.
+    pub fn ensure_dock_dir(&self, name: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(self.docks_dir().join(name))
+    }
+
+    /// True if `name` is the home dock or an existing named dock.
+    pub fn dock_exists(&self, name: &str) -> bool {
+        name == HOME_DOCK || self.docks_dir().join(name).is_dir()
+    }
+
+    /// Every dock in the repo: home first, then named docks sorted. Home is
+    /// always present even before `.loot/docks/` exists.
+    pub fn list_docks(&self) -> Vec<String> {
+        let mut named: Vec<String> = std::fs::read_dir(self.docks_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        named.sort();
+        let mut out = vec![HOME_DOCK.to_string()];
+        out.extend(named);
+        out
+    }
+}
+
+/// Validate a name for a *new* named dock. The charset (ASCII alphanumerics plus
+/// `-`/`_`) is deliberately narrow so a name can never traverse or escape the
+/// `.loot/docks/` directory. Home is reserved — it always exists.
+pub fn valid_dock_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("dock name cannot be empty".into());
+    }
+    if name == HOME_DOCK {
+        return Err(format!("'{HOME_DOCK}' is the default dock — it always exists"));
+    }
+    if name.len() > 64 {
+        return Err("dock name is too long (max 64 characters)".into());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!(
+            "invalid dock name '{name}' — use only letters, digits, '-' and '_'"
+        ));
+    }
+    Ok(())
+}
+
+/// Read a 32-byte Oid file, or `None` if absent/malformed.
+fn read_oid_file(path: &Path) -> Option<Oid> {
+    match std::fs::read(path) {
+        Ok(b) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            Some(Oid(a))
+        }
+        _ => None,
+    }
+}
+
+/// Write a 32-byte Oid, or remove the file when `None` (best-effort removal).
+fn write_oid_file(path: &Path, oid: Option<&Oid>) -> std::io::Result<()> {
+    match oid {
+        Some(oid) => std::fs::write(path, oid.0),
+        None => {
+            let _ = std::fs::remove_file(path);
+            Ok(())
+        }
     }
 }
 
@@ -143,9 +260,20 @@ mod tests {
     fn paths_are_under_dot() {
         let s = RepoStore::new("/tmp/repo/.loot");
         assert!(s.graph().ends_with(".loot/graph"));
-        assert!(s.working().ends_with(".loot/working"));
+        assert!(s.working(None).ends_with(".loot/working"));
         assert!(s.objects_dir().ends_with(".loot/objects"));
         assert!(s.peers().ends_with(".loot/peers"));
+    }
+
+    #[test]
+    fn home_dock_uses_root_files_named_docks_are_nested() {
+        // The compat guarantee: home's process files are the root files, so a
+        // repo that never docks looks exactly as before.
+        let s = RepoStore::new("/tmp/repo/.loot");
+        assert!(s.working(None).ends_with(".loot/working"));
+        assert!(s.tip(None).ends_with(".loot/tip"));
+        assert!(s.working(Some("feat")).ends_with(".loot/docks/feat/working"));
+        assert!(s.tip(Some("feat")).ends_with(".loot/docks/feat/tip"));
     }
 
     #[test]
@@ -155,11 +283,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let s = RepoStore::new(&dir);
 
-        assert_eq!(s.read_working(), None, "no working file yet");
-        s.write_working(Some(&Oid([5; 32]))).unwrap();
-        assert_eq!(s.read_working(), Some(Oid([5; 32])));
-        s.write_working(None).unwrap();
-        assert_eq!(s.read_working(), None, "None removes the file");
+        assert_eq!(s.read_working(None), None, "no working file yet");
+        s.write_working(None, Some(&Oid([5; 32]))).unwrap();
+        assert_eq!(s.read_working(None), Some(Oid([5; 32])));
+        s.write_working(None, None).unwrap();
+        assert_eq!(s.read_working(None), None, "None removes the file");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -171,12 +299,55 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let s = RepoStore::new(&dir);
 
-        assert!(s.read_tree_hash().is_empty());
-        s.write_tree_hash(b"hash-bytes").unwrap();
-        assert_eq!(s.read_tree_hash(), b"hash-bytes");
-        s.clear_tree_hash();
-        assert!(s.read_tree_hash().is_empty());
+        assert!(s.read_tree_hash(None).is_empty());
+        s.write_tree_hash(None, b"hash-bytes").unwrap();
+        assert_eq!(s.read_tree_hash(None), b"hash-bytes");
+        s.clear_tree_hash(None);
+        assert!(s.read_tree_hash(None).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn docks_are_isolated_and_listed_home_first() {
+        let dir = std::env::temp_dir().join(format!("loot-store-docks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = RepoStore::new(&dir);
+
+        // Ambient defaults to home with no pointer on disk.
+        assert_eq!(s.read_dock(), HOME_DOCK);
+        assert_eq!(s.list_docks(), vec![HOME_DOCK.to_string()], "home always present");
+
+        // A named dock's tip is independent of home's.
+        s.ensure_dock_dir("feat").unwrap();
+        s.write_tip(None, Some(&Oid([1; 32]))).unwrap();
+        s.write_tip(Some("feat"), Some(&Oid([2; 32]))).unwrap();
+        assert_eq!(s.read_tip(None), Some(Oid([1; 32])));
+        assert_eq!(s.read_tip(Some("feat")), Some(Oid([2; 32])), "per-dock tips don't collide");
+
+        // Ambient pointer round-trips; writing home clears it back to pristine.
+        s.write_dock("feat").unwrap();
+        assert_eq!(s.read_dock(), "feat");
+        assert!(s.dock_pointer().exists());
+        s.write_dock(HOME_DOCK).unwrap();
+        assert_eq!(s.read_dock(), HOME_DOCK);
+        assert!(!s.dock_pointer().exists(), "home removes the pointer (compat shape)");
+
+        assert_eq!(s.list_docks(), vec!["home".to_string(), "feat".to_string()]);
+        assert!(s.dock_exists("feat") && s.dock_exists(HOME_DOCK) && !s.dock_exists("nope"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_name_validation_blocks_traversal_and_reserved() {
+        assert!(valid_dock_name("feature-1").is_ok());
+        assert!(valid_dock_name("feat_2").is_ok());
+        assert!(valid_dock_name("").is_err(), "empty rejected");
+        assert!(valid_dock_name(HOME_DOCK).is_err(), "home reserved");
+        assert!(valid_dock_name("../evil").is_err(), "path traversal rejected");
+        assert!(valid_dock_name("a/b").is_err(), "separators rejected");
+        assert!(valid_dock_name("has space").is_err(), "whitespace rejected");
     }
 }

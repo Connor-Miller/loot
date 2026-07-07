@@ -7,10 +7,13 @@
 
 mod workspace;
 
-use loot_core::{MaroonResult, MergeOutcome, MigrateResult, Oid, Repo, SyncBundle, Visibility};
+use loot_core::{
+    verdict, MaroonResult, MergeOutcome, MigrateResult, Oid, PathVerdict, Repo, SyncBundle,
+    Visibility,
+};
 use loot_identity as identity;
 use std::process::ExitCode;
-use workspace::{GlobalConfig, Workspace};
+use workspace::{DockAction, GlobalConfig, Workspace};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -23,6 +26,8 @@ fn main() -> ExitCode {
         "describe" => cmd_describe(rest),
         "new" => cmd_new(),
         "surface" => cmd_surface(),
+        "dock" => cmd_dock(rest),
+        "docks" => cmd_docks(),
         "log" => cmd_log(),
         "bundle" => cmd_bundle(rest),
         "apply" => cmd_apply(rest),
@@ -31,7 +36,7 @@ fn main() -> ExitCode {
         "migrate" => cmd_migrate(rest),
         "manifest" => cmd_manifest(),
         "attest" => cmd_attest(rest),
-        "conflicts" => cmd_conflicts(),
+        "conflicts" => cmd_conflicts(rest),
         "resolve" => cmd_resolve(rest),
         "remote" => cmd_remote(rest),
         "keygen" => cmd_keygen(),
@@ -66,13 +71,15 @@ usage:
   loot init [--identity <name>]             initialize a repo here (identity from global config if omitted)
   loot clone <url> <dir> [--identity <name>]  clone a relay into <dir>
   loot config [set <key> <val>] [unset <key>] [list]  manage global config (~/.config/loot/config)
-  loot status [-m <message>]                snapshot the working tree into the working change
+  loot status [-m <message>] [--porcelain|--json]  snapshot the working tree into the working change
   loot describe -m <message>                name the working change
   loot new                                  finalize the working change; start a fresh one
   loot surface                              materialize what the current identity may see
+  loot dock <name>                          create a dock (isolated working tree + tip), or switch to one
+  loot docks                                list docks with their tip and visibility
   loot log                                  show change history
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
-  loot apply <file>                         merge a peer's bundle (idempotent)
+  loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
   loot grant <path> <identity> <file>       write a targeted grant bundle for <identity> (file delivery)
   loot grant --relay <name> <path> <identity>  seal and deliver a grant via relay mailbox
   loot grants [<url>] [--remote <name>]     peek pending grant count (no download)
@@ -81,7 +88,7 @@ usage:
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
   loot manifest                             show the grant audit trail (and attestations)
   loot attest <change-id> [role]            attest a change (advisory sign-off, ADR 0018)
-  loot conflicts                            list paths that need human resolution
+  loot conflicts [--porcelain|--json]       list paths that need human resolution
   loot resolve <path> <file>                resolve a conflict at <path> using the content of <file>
   loot remote add <name> <url>              register a relay URL under a name
   loot remote remove <name>                 forget a named relay
@@ -112,6 +119,63 @@ fn message_flag(args: &[String]) -> Option<&str> {
     flag(args, "-m").or_else(|| flag(args, "--message"))
 }
 
+/// Machine-output selector for the reconciliation verbs (CA3, ADR 0023).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutFmt {
+    Human,
+    Porcelain,
+    Json,
+}
+
+/// True if `name` appears as a bare flag anywhere in `args`.
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+/// Which output format the verb should emit. `--json` wins over `--porcelain`;
+/// with neither flag the default is human text (unchanged for existing callers).
+fn out_fmt(args: &[String]) -> OutFmt {
+    if has_flag(args, "--json") {
+        OutFmt::Json
+    } else if has_flag(args, "--porcelain") {
+        OutFmt::Porcelain
+    } else {
+        OutFmt::Human
+    }
+}
+
+/// First positional (non-`-`) argument. Lets `--porcelain`/`--json` sit on
+/// either side of the filename for the reconciliation verbs, which take at
+/// most one positional.
+fn first_positional(args: &[String]) -> Option<&str> {
+    args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
+}
+
+/// Lift an apply/pull outcome map into the serializable verdict rows.
+fn verdicts_of(
+    outcomes: &std::collections::BTreeMap<std::path::PathBuf, MergeOutcome>,
+) -> Vec<PathVerdict> {
+    outcomes
+        .iter()
+        .map(|(p, o)| PathVerdict::new(p.clone(), o.clone()))
+        .collect()
+}
+
+/// Lift the recorded conflict set (path -> ours/theirs) into verdict rows.
+fn conflict_verdicts(
+    conflicts: &std::collections::BTreeMap<std::path::PathBuf, (Oid, Oid)>,
+) -> Vec<PathVerdict> {
+    conflicts
+        .iter()
+        .map(|(p, (ours, theirs))| {
+            PathVerdict::new(
+                p.clone(),
+                MergeOutcome::Conflict { ours: ours.clone(), theirs: theirs.clone() },
+            )
+        })
+        .collect()
+}
+
 // --- commands ---
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
@@ -139,17 +203,25 @@ fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
 }
 
 fn cmd_status(args: &[String]) -> Result<(), String> {
+    let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
     // Snapshot first (JJ: the tree IS the change), then report it.
     let message = message_flag(args).unwrap_or("(working change)");
     let (id, entries) = ws.snapshot(message)?;
-    if entries.is_empty() {
-        println!("working change {} is empty", short(&id));
-        return Ok(());
-    }
-    println!("working change {} — \"{message}\"", short(&id));
-    for (path, vis) in &entries {
-        println!("  {:<24} {}", path.display(), mark(vis));
+    match fmt {
+        OutFmt::Human => {
+            if entries.is_empty() {
+                println!("working change {} is empty", short(&id));
+                return Ok(());
+            }
+            println!("working change {} — \"{message}\"", short(&id));
+            for (path, vis) in &entries {
+                println!("  {:<24} {}", path.display(), mark(vis));
+            }
+        }
+        // status is not a merge: its own working-change shape (ADR 0023).
+        OutFmt::Porcelain => print!("{}", verdict::status_porcelain(&entries)),
+        OutFmt::Json => println!("{}", verdict::status_json(&entries)),
     }
     Ok(())
 }
@@ -183,6 +255,38 @@ fn cmd_surface() -> Result<(), String> {
         println!("  ({skipped} sealed path(s) skipped — request a grant to access them)");
     }
     println!("surfaced {} as {}", short(&head), ws.identity());
+    Ok(())
+}
+
+fn cmd_dock(args: &[String]) -> Result<(), String> {
+    let name = args
+        .first()
+        .ok_or("dock requires <name>\n  loot dock <name>   create a dock, or switch to an existing one")?;
+    let mut ws = Workspace::open()?;
+    let from = ws.current_dock().to_string();
+    match ws.dock_goto(name)? {
+        DockAction::Already => println!("already on dock '{name}'"),
+        DockAction::Switched => {
+            println!("switched to dock '{name}' — working tree re-materialized (run `loot docks`)");
+        }
+        DockAction::Created => {
+            println!("created dock '{name}' off '{from}' and switched to it");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_docks() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    for d in ws.dock_list() {
+        let marker = if d.current { "*" } else { " " };
+        let head = d.head.as_ref().map(short).unwrap_or_else(|| "(empty)".to_string());
+        let vis = match d.visibility {
+            Some((total, restricted, embargoed)) => seal_hint(total, restricted, embargoed),
+            None => String::new(),
+        };
+        println!("{marker} {:<20} {}{}", d.name, head, vis);
+    }
     Ok(())
 }
 
@@ -277,7 +381,8 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_apply(args: &[String]) -> Result<(), String> {
-    let infile = args.first().ok_or("apply requires <file>")?;
+    let fmt = out_fmt(args);
+    let infile = first_positional(args).ok_or("apply requires <file>")?;
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
     let mut ws = Workspace::open()?;
     let now = ws.now();
@@ -286,14 +391,21 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
         repo.apply(&SyncBundle(bytes), now).map_err(|e| e.to_string())
     })?;
 
-    if outcomes.is_empty() {
-        println!("applied {infile}: nothing new (already up to date)");
-    } else {
-        println!("applied {infile} as {identity}:");
-        for (path, outcome) in &outcomes {
-            println!("  {:<24} {}", path.display(), describe(outcome));
+    match fmt {
+        OutFmt::Human => {
+            if outcomes.is_empty() {
+                println!("applied {infile}: nothing new (already up to date)");
+            } else {
+                println!("applied {infile} as {identity}:");
+                for (path, outcome) in &outcomes {
+                    println!("  {:<24} {}", path.display(), describe(outcome));
+                }
+                println!("run `loot surface` to materialize what you may see");
+            }
         }
-        println!("run `loot surface` to materialize what you may see");
+        // Machine output: just the verdict rows, no prose (empty -> no lines).
+        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
+        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
     }
     Ok(())
 }
@@ -551,11 +663,7 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
         repo.migrate(path, new_vis.clone(), now).map_err(|e| e.to_string())
     })?;
 
-    let vis_label = match &new_vis {
-        Visibility::Public => "public".to_string(),
-        Visibility::Restricted(ids) => format!("restricted={}", ids.join(",")),
-        Visibility::Embargoed { reveal_at } => format!("embargoed@{reveal_at}"),
-    };
+    let vis_label = verdict::visibility_token(&new_vis);
     println!(
         "migrated {} -> {} (new oid: {})",
         path.display(),
@@ -675,17 +783,25 @@ fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> Strin
     hex_short(pubkey)
 }
 
-fn cmd_conflicts() -> Result<(), String> {
+fn cmd_conflicts(args: &[String]) -> Result<(), String> {
+    let fmt = out_fmt(args);
     let ws = Workspace::open()?;
     let conflicts = ws.repo().conflicts();
-    if conflicts.is_empty() {
-        println!("no conflicts");
-        return Ok(());
-    }
-    for (path, (our_oid, their_oid)) in conflicts {
-        println!("conflict at {}", path.display());
-        println!("  ours:   {}", short(our_oid));
-        println!("  theirs: {}", short(their_oid));
+    match fmt {
+        OutFmt::Human => {
+            if conflicts.is_empty() {
+                println!("no conflicts");
+                return Ok(());
+            }
+            for (path, (our_oid, their_oid)) in conflicts {
+                println!("conflict at {}", path.display());
+                println!("  ours:   {}", short(our_oid));
+                println!("  theirs: {}", short(their_oid));
+            }
+        }
+        // Every recorded conflict is a `C` row (ADR 0023); empty -> no lines.
+        OutFmt::Porcelain => print!("{}", verdict::porcelain(&conflict_verdicts(conflicts))),
+        OutFmt::Json => println!("{}", verdict::json(&conflict_verdicts(conflicts))),
     }
     Ok(())
 }
@@ -1122,12 +1238,10 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
 // --- formatting ---
 
 fn mark(vis: &loot_core::Visibility) -> String {
-    use loot_core::Visibility::*;
-    match vis {
-        Public => "public".to_string(),
-        Restricted(ids) => format!("restricted={}", ids.join(",")),
-        Embargoed { reveal_at } => format!("embargoed@{reveal_at}"),
-    }
+    // One home for the visibility token, shared with the machine `status`
+    // output (CA3). Human phrasing is unchanged: public / restricted=a,b /
+    // embargoed@<ts>.
+    verdict::visibility_token(vis)
 }
 
 /// Human phrasing for a merge outcome, naming the relay role explicitly.
@@ -1171,5 +1285,48 @@ mod tests {
         assert_eq!(mark(&Visibility::Public), "public");
         assert_eq!(mark(&Visibility::Restricted(vec!["a".into(), "b".into()])), "restricted=a,b");
         assert_eq!(mark(&Visibility::Embargoed { reveal_at: 5 }), "embargoed@5");
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn out_fmt_selects_format_json_wins() {
+        assert_eq!(out_fmt(&args(&["file"])), OutFmt::Human);
+        assert_eq!(out_fmt(&args(&["file", "--porcelain"])), OutFmt::Porcelain);
+        assert_eq!(out_fmt(&args(&["file", "--json"])), OutFmt::Json);
+        // Explicit precedence: --json wins over --porcelain if both appear.
+        assert_eq!(out_fmt(&args(&["--porcelain", "--json"])), OutFmt::Json);
+    }
+
+    #[test]
+    fn first_positional_skips_flags_either_side() {
+        assert_eq!(first_positional(&args(&["--porcelain", "b.bundle"])), Some("b.bundle"));
+        assert_eq!(first_positional(&args(&["b.bundle", "--json"])), Some("b.bundle"));
+        assert_eq!(first_positional(&args(&["--json"])), None);
+    }
+
+    #[test]
+    fn verdicts_of_preserves_outcomes_in_path_order() {
+        let mut m: std::collections::BTreeMap<std::path::PathBuf, MergeOutcome> =
+            std::collections::BTreeMap::new();
+        m.insert("b.rs".into(), MergeOutcome::Merged);
+        m.insert("a.rs".into(), MergeOutcome::Converged);
+        let v = verdicts_of(&m);
+        // BTreeMap iteration is sorted, so rows are deterministic.
+        assert_eq!(v[0].path, std::path::PathBuf::from("a.rs"));
+        assert_eq!(v[0].outcome, MergeOutcome::Converged);
+        assert_eq!(v[1].outcome, MergeOutcome::Merged);
+    }
+
+    #[test]
+    fn conflict_verdicts_builds_conflict_rows() {
+        let mut c: std::collections::BTreeMap<std::path::PathBuf, (Oid, Oid)> =
+            std::collections::BTreeMap::new();
+        c.insert("x".into(), (Oid([7; 32]), Oid([9; 32])));
+        let v = conflict_verdicts(&c);
+        assert_eq!(v[0].status_char(), 'C');
+        assert_eq!(v[0].addrs(), (Some(Oid([7; 32])), Some(Oid([9; 32]))));
     }
 }

@@ -31,15 +31,22 @@ discovers `.loot/`, supplies the current identity and the clock, and persists on
 mutation. Commands are thin verbs over it; the snapshot invariant and clock
 injection live here. See ADR 0006.
 
-**Dock** *(proposed — concurrent-agents design, 2026-07-06)* — an isolated
-working tree plus its own [[Working change]] tip, materialized cheaply over the
-*shared* `.loot/` object store and change graph. loot's answer to a git
-worktree, and the isolation unit for concurrent agents: each agent (or human)
-*docks* into the repo to get its own tree and tip without a second clone or any
-re-fetch of ciphertext. Docks fork the DAG exactly as concurrent pushes already
-do (engine.rs, ADR 0011), so reconciliation reuses the existing converge path —
-a dock is a local fork instead of a remote one. _Avoid_: worktree, checkout,
-berth, slip.
+**Dock** *(CA1 shipped, 2026-07-06)* — an isolated working tree plus its own
+[[Working change]] tip, materialized cheaply over the *shared* `.loot/` object
+store and change graph. loot's answer to a git worktree, and the isolation unit
+for concurrent agents: each agent (or human) *docks* into the repo to get its
+own tree and tip without a second clone or any re-fetch of ciphertext. Docks
+fork the DAG exactly as concurrent pushes already do (engine.rs, ADR 0011), so
+reconciliation reuses the existing converge path — a dock is a local fork
+instead of a remote one. CLI: `loot dock <name>` (create-or-switch), `loot
+docks` (list). The default dock is `home`, whose process files are the root
+`.loot/working`/`tip`/`tree-hash`, so a repo that never docks is unchanged on
+disk; named docks live under `.loot/docks/<name>/`. CA1 is the *checkout* model
+— one physical working tree a switch re-materializes (auto-snapshotting the
+outgoing dock first, so nothing uncommitted is lost); per-dock *physical*
+directories for truly simultaneous editing are a later, additive step (the
+on-disk format is already dock-agnostic). _Avoid_: worktree, checkout, berth,
+slip.
 
 **Buoy** *(proposed — concurrent-agents design, 2026-07-06)* — a change that
 carries a navigational-role [[Attestation]] (e.g. `reviewed`, `base`), used as a
@@ -59,6 +66,24 @@ direct and local — `loot dock merge <name>` applies one dock's tip onto
 another's working change in-process, reusing the `apply`/converge path with no
 relay hop, because docks share one object store. The relay remains the path for
 *remote* agents only. _Avoid_: main, master, trunk.
+
+**Verdict** *(CA3 shipped, 2026-07-07)* — the machine-readable form of a
+reconciliation outcome. The [[Convergence classifier]] already computes a
+per-path merge outcome; the reconciliation verbs (`apply`, `conflicts`, `status`, and
+`dock merge` once CA2 lands) can now emit it as data instead of prose. Default
+machine format is **porcelain**: one path per line, a leading status char (`=`
+converged, `M` merged, `C` conflict, `R` relayed), tab-separated columns
+`status<TAB>path<TAB>base<TAB>incoming`; `--json` is the opt-in fallback for
+paths whose bytes (tab/newline) would corrupt columns. Default (no flag) output
+is unchanged human text. Scope note (CA3): `base`/`incoming` content addresses
+are populated only for a `C` row (the outcome's `ours`/`theirs`); other rows
+carry `-`. Widening them to every row means threading both trees through
+`apply` and is, per ADR 0023, a *breaking* contract change. `status` is not a
+merge, so it has its own shape — `~<TAB>path<TAB>visibility`. The column order
+and status chars are a **frozen contract** once agents parse them, versioned
+with the format gate (`format::FORMAT_MAJOR`, ADR 0019). CLI: `loot apply --porcelain`,
+`loot conflicts --json`, etc. (ADR 0023). _Avoid_: adding machine output to the
+~25 non-reconciliation verbs — deliberately out of scope.
 
 **Attestation** — a detachable, signed, advisory marker over a change id:
 `sign(change_id || attester || role)` (ADR 0018 / S4). Verified drop-not-fatal

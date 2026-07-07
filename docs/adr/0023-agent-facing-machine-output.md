@@ -86,3 +86,36 @@ captures most of the token win while staying trivially parseable by both.
   global renderer is explicitly deferred.
 - The verdict record should be versioned alongside the format-versioning gate
   (ADR 0019 / S1) so the contract can evolve safely.
+
+## Shipped (CA3, 2026-07-07)
+
+The lift landed as `loot_core::verdict` — one `PathVerdict { path, outcome }`
+value with two encoders (`porcelain`, `json`) over it, wired into `apply`,
+`conflicts`, and `status` behind `--porcelain` / `--json`. Default (no flag)
+output is byte-unchanged. `dock merge` (CA2) will emit through the same
+`verdict::porcelain`/`json` once it lands.
+
+**Frozen contract as shipped:**
+
+- Reconciliation porcelain row: `status<TAB>path<TAB>base<TAB>incoming\n`.
+- Status chars: `=` converged, `M` merged, `C` conflict, `R` relayed.
+- `base`/`incoming` are full-hex content addresses **only on a `C` row** (the
+  outcome's `ours`/`theirs`); every other row renders `-` in both columns. This
+  is the deliberate CA3 scope: `MergeOutcome` only carries OIDs for `Conflict`,
+  and surfacing them for every row would mean widening `Repo::apply`'s return
+  past the outcome map. Filling those columns later is a **breaking** change —
+  bump the contract version.
+- `status` is not a merge (it never runs the classifier), so it gets its own
+  per-verb shape: `~<TAB>path<TAB>visibility` (porcelain) and a
+  `{contract, working:[{path, visibility}]}` JSON object. The leading `~` marks
+  a working-change line and is intentionally distinct from the merge chars.
+- The machine record carries a contract version: `verdict::VERDICT_CONTRACT`,
+  defined as `format::FORMAT_MAJOR` so it moves in lockstep with the format gate
+  (ADR 0019). JSON emits it as `"contract"`; porcelain's version is that same
+  gate (documented, not per-line, to keep rows header-free per this ADR's
+  example).
+
+**Judgment call for review:** the version is surfaced explicitly only in JSON;
+porcelain stays pure rows (no `#` header line) to match the example above. If we
+want porcelain self-describing, add a single leading `# loot-verdict <n>` header
+and teach parsers to skip `#` — deferred unless needed.

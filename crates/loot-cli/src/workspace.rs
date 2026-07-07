@@ -8,7 +8,7 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
-use loot_core::{DagRepo, Oid, RepoStore, Repo, Visibility};
+use loot_core::{valid_dock_name, DagRepo, Oid, Repo, RepoStore, Visibility, HOME_DOCK};
 use loot_identity::Identity;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -23,9 +23,18 @@ pub struct Workspace {
     root: PathBuf,
     identity: String,
     repo: DagRepo,
+    /// The ambient dock this workspace is on (ADR 0022). `HOME_DOCK` uses the
+    /// root `.loot/` process files, so a repo that never docks is unchanged on
+    /// disk; named docks live under `.loot/docks/<name>/`.
+    dock: String,
     /// The working change being rewritten in place, if one is in progress.
     /// `None` right after `init` or `apply` (finalized history, no WIP change).
     working: Option<Oid>,
+    /// The finalized change the ambient dock forks from — new snapshots parent on
+    /// it (ADR 0022). `None` on the home dock until a dock is created, which
+    /// selects the pre-dock behavior (fork from all heads) and keeps existing
+    /// repos byte-for-byte unchanged.
+    tip: Option<Oid>,
     /// The loaded signing keypair, if this repo has one. Stamps the author on new
     /// changes and signs at finalization (S3, ADR 0018). `None` for a keyless
     /// repo, which then produces unauthored (legacy) changes.
@@ -52,7 +61,10 @@ impl Workspace {
         }
         let mut repo = DagRepo::load(&dot, dir.to_path_buf()).map_err(|e| e.to_string())?;
         let identity = read_to_string(&store.identity())?;
-        let working = store.read_working();
+        let dock = store.read_dock();
+        let dock_opt = opt(&dock);
+        let working = store.read_working(dock_opt);
+        let tip = store.read_tip(dock_opt);
         // Load the signing keypair if present and stamp its pubkey as the author,
         // so new changes are attributable and signable (S3, ADR 0018). A keyless
         // repo stays unauthored (legacy ids), which keeps older repos working.
@@ -63,7 +75,7 @@ impl Workspace {
         } else {
             None
         };
-        Ok(Workspace { dot, store, root: dir.to_path_buf(), identity, repo, working, signer, now: real_now() })
+        Ok(Workspace { dot, store, root: dir.to_path_buf(), identity, repo, dock, working, tip, signer, now: real_now() })
     }
 
     pub fn identity(&self) -> &str {
@@ -117,20 +129,23 @@ impl Workspace {
         // Hash the current working tree content + message. Skip the engine
         // snapshot if nothing changed — running `loot status` repeatedly is safe.
         let tree_hash = hash_tree(&entries, message);
-        let last_hash = self.store.read_tree_hash();
+        let last_hash = self.store.read_tree_hash(self.dock_opt());
         if last_hash == tree_hash {
             if let Some(id) = &self.working {
                 return Ok((id.clone(), reported));
             }
         }
 
+        // Fork the working change from the ambient dock's tip (ADR 0022). `tip`
+        // is `None` on the pre-dock home dock, which preserves the original
+        // fork-from-all-heads behavior exactly.
         let id = self
             .repo
-            .snapshot(self.working.as_ref(), &entries, message, self.now)
+            .snapshot(self.tip.as_ref(), self.working.as_ref(), &entries, message, self.now)
             .map_err(|e| e.to_string())?;
         self.working = Some(id.clone());
         // Persist the new tree hash before persisting the rest of state.
-        let _ = self.store.write_tree_hash(&tree_hash);
+        let _ = self.store.write_tree_hash(self.dock_opt(), &tree_hash);
         self.persist()?;
         Ok((id, reported))
     }
@@ -147,9 +162,18 @@ impl Workspace {
                 .attach_signature(&working, sig)
                 .map_err(|e| e.to_string())?;
         }
-        self.working = None;
+        // The finalized change becomes this dock's tip — the anchor the next
+        // change forks from. Persist it only once docks are in play; the pristine
+        // home dock keeps `tip` absent so its on-disk shape (and its
+        // fork-from-all-heads behavior) is unchanged (ADR 0022).
+        if self.docks_active() {
+            self.tip = self.working.take();
+            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        } else {
+            self.working = None;
+        }
         // Clear the tree-hash so the next snapshot always runs the engine.
-        self.store.clear_tree_hash();
+        self.store.clear_tree_hash(self.dock_opt());
         self.persist()
     }
 
@@ -188,11 +212,15 @@ impl Workspace {
     /// count of skipped (sealed) paths for richer CLI output.
     pub fn surface_with_report(&mut self) -> Result<(Oid, Vec<(PathBuf, loot_core::Visibility)>, usize), String> {
         self.repo.flush_escrow(self.now);
+        // Surface the ambient dock's own tip — its in-progress working change, or
+        // its finalized tip, falling back to the graph head for the pre-dock home
+        // dock. In a multi-dock (multi-head) graph `heads().next()` is arbitrary,
+        // so a dock must name its own head (ADR 0022).
         let head = self
-            .repo
-            .heads()
-            .into_iter()
-            .next()
+            .working
+            .clone()
+            .or_else(|| self.tip.clone())
+            .or_else(|| self.repo.heads().into_iter().next())
             .ok_or("nothing to surface yet (no changes recorded)")?;
         let (written, skipped) = self.repo
             .surface_with_report(&head, &self.identity, self.now)
@@ -262,7 +290,10 @@ impl Workspace {
             root: dir.to_path_buf(),
             identity: identity.to_string(),
             repo,
+            // A fresh repo starts on the home dock with pre-dock semantics.
+            dock: HOME_DOCK.to_string(),
             working: None,
+            tip: None,
             // A freshly-initialized repo has no keypair yet (`loot keygen` adds one);
             // its early changes are unauthored until then (S3, ADR 0018).
             signer: None,
@@ -272,12 +303,158 @@ impl Workspace {
         Ok(ws)
     }
 
+    // --- docks (ADR 0022) ---
+
+    /// The ambient dock name (`home` for the default dock).
+    pub fn current_dock(&self) -> &str {
+        &self.dock
+    }
+
+    /// The store selector for the ambient dock: `None` for home (root files),
+    /// `Some(name)` for a named dock under `.loot/docks/`.
+    fn dock_opt(&self) -> Option<&str> {
+        opt(&self.dock)
+    }
+
+    /// Whether docks are in play — either we're on a named dock, or named docks
+    /// exist alongside home. Gates whether home persists an explicit tip, so a
+    /// repo that never docks stays pristine on disk.
+    fn docks_active(&self) -> bool {
+        self.dock != HOME_DOCK || self.store.list_docks().len() > 1
+    }
+
+    /// The finalized change the ambient dock currently sits on — a new dock forks
+    /// from here. Uses the pinned tip when present, else derives it from the
+    /// graph (the pre-dock home case): the working change's parent, or the head.
+    fn anchor(&self) -> Option<Oid> {
+        if let Some(t) = &self.tip {
+            return Some(t.clone());
+        }
+        match &self.working {
+            Some(w) => self.repo.parents_of(w).into_iter().next(),
+            None => self.repo.heads().into_iter().next(),
+        }
+    }
+
+    /// `loot dock <name>`: switch to an existing dock, or create it (forking from
+    /// the ambient dock's finalized tip) and switch to it. A no-op if already on
+    /// `name`. The outgoing dock is auto-snapshotted first so no uncommitted work
+    /// is lost — every pruned file is recoverable by switching back (ADR 0022).
+    pub fn dock_goto(&mut self, name: &str) -> Result<DockAction, String> {
+        if name == self.dock {
+            return Ok(DockAction::Already);
+        }
+        let creating = !self.store.dock_exists(name);
+        if creating {
+            valid_dock_name(name)?;
+        }
+
+        // 1. Capture the outgoing dock's working tree, preserving its message.
+        let msg = self
+            .working
+            .as_ref()
+            .and_then(|w| self.repo.change_message(w))
+            .unwrap_or_else(|| "(working change)".to_string());
+        self.snapshot(&msg)?;
+        let from = self.working.clone().or_else(|| self.tip.clone());
+
+        // 2. Pin the outgoing home dock's tip before it stops being the lone dock,
+        //    so a later `status` on home never merges the new fork.
+        let anchor = self.anchor();
+        if self.dock == HOME_DOCK && self.tip.is_none() {
+            if let Some(a) = &anchor {
+                let _ = self.store.write_tip(None, Some(a));
+            }
+        }
+
+        // 3. Resolve the incoming dock's target head + working/tip state.
+        let (target, incoming_working, incoming_tip) = if creating {
+            let a = anchor
+                .clone()
+                .ok_or("nothing to fork yet — record a change first (`loot new`)")?;
+            self.store.ensure_dock_dir(name).map_err(|e| e.to_string())?;
+            self.store.write_tip(Some(name), Some(&a)).map_err(|e| e.to_string())?;
+            (a.clone(), None, Some(a))
+        } else {
+            let o = opt(name);
+            let w = self.store.read_working(o);
+            let t = self.store.read_tip(o);
+            let target = w
+                .clone()
+                .or_else(|| t.clone())
+                .ok_or_else(|| format!("dock '{name}' has no content to materialize"))?;
+            (target, w, t)
+        };
+
+        // 4. Switch the ambient pointer, then reconcile the working tree.
+        self.store.write_dock(name).map_err(|e| e.to_string())?;
+        self.repo
+            .materialize(from.as_ref(), &target, &self.identity, self.now)
+            .map_err(|e| e.to_string())?;
+        self.dock = name.to_string();
+        self.working = incoming_working;
+        self.tip = incoming_tip;
+        // The incoming dock re-derives its snapshot hash on the next `status`.
+        self.store.clear_tree_hash(self.dock_opt());
+        self.persist()?;
+        Ok(if creating { DockAction::Created } else { DockAction::Switched })
+    }
+
+    /// Every dock with its head and visibility summary, for `loot docks`.
+    pub fn dock_list(&self) -> Vec<DockInfo> {
+        self.store
+            .list_docks()
+            .into_iter()
+            .map(|name| {
+                let current = name == self.dock;
+                // For the ambient dock, in-memory state is authoritative and may
+                // be ahead of disk; for others, read the persisted head.
+                let head = if current {
+                    self.working
+                        .clone()
+                        .or_else(|| self.tip.clone())
+                        .or_else(|| self.repo.heads().into_iter().next())
+                } else {
+                    let o = opt(&name);
+                    self.store.read_working(o).or_else(|| self.store.read_tip(o))
+                };
+                let visibility = head.as_ref().map(|h| self.repo.visibility_summary_at(h));
+                DockInfo { name, head, current, visibility }
+            })
+            .collect()
+    }
+
     fn persist(&self) -> Result<(), String> {
         self.repo.save(&self.dot).map_err(|e| e.to_string())?;
         self.store
-            .write_working(self.working.as_ref())
+            .write_working(self.dock_opt(), self.working.as_ref())
             .map_err(|e| format!("write working: {e}"))
     }
+}
+
+/// Store selector for a dock name: `home` maps to the root files (`None`).
+fn opt(name: &str) -> Option<&str> {
+    if name == HOME_DOCK {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// What `dock_goto` did, for CLI reporting.
+pub enum DockAction {
+    Already,
+    Switched,
+    Created,
+}
+
+/// A dock's summary for `loot docks`: its head change, visibility counts
+/// `(total, restricted, embargoed)`, and whether it's the ambient dock.
+pub struct DockInfo {
+    pub name: String,
+    pub head: Option<Oid>,
+    pub visibility: Option<(usize, usize, usize)>,
+    pub current: bool,
 }
 
 fn real_now() -> u64 {
@@ -707,6 +884,84 @@ mod tests {
         let (id3, _) = ws.snapshot("new message").unwrap();
         assert_ne!(id1, id3);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fresh unique repo dir for a dock test.
+    fn dock_repo(tag: &str) -> (PathBuf, Workspace) {
+        let dir = std::env::temp_dir().join(format!("loot-dock-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::init_at(&dir, "alice").unwrap();
+        (dir, ws)
+    }
+
+    #[test]
+    fn a_repo_that_never_docks_writes_no_dock_files() {
+        // The CA1 compatibility guarantee (ADR 0022): docks are opt-in, so a repo
+        // that never runs a dock command is byte-for-byte its pre-dock self.
+        let (dir, mut ws) = dock_repo("compat");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        ws.snapshot("work").unwrap();
+        ws.finalize_working().unwrap();
+        ws.snapshot("more").unwrap();
+
+        let dot = dir.join(".loot");
+        assert!(!dot.join("dock").exists(), "no ambient-dock pointer");
+        assert!(!dot.join("docks").exists(), "no docks directory");
+        assert!(!dot.join("tip").exists(), "home persists no explicit tip pre-dock");
+        assert_eq!(ws.current_dock(), "home");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_docks_hold_independent_tips_and_isolated_trees() {
+        // Acceptance: two docks editing disjoint paths reach independent tips over
+        // one store, and switching re-materializes each dock's own tree.
+        let (dir, mut ws) = dock_repo("iso");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        // Fork a dock and give it a file the home dock never sees.
+        ws.dock_goto("feature").unwrap();
+        assert_eq!(ws.current_dock(), "feature");
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        let (feat_tip, _) = ws.snapshot("feature work").unwrap();
+
+        // Back on home: feature.txt is pruned from disk, base.txt remains.
+        ws.dock_goto("home").unwrap();
+        assert!(dir.join("base.txt").exists(), "shared base kept");
+        assert!(!dir.join("feature.txt").exists(), "feature-only file pruned on switch home");
+        std::fs::write(dir.join("home.txt"), b"H").unwrap();
+        let (home_tip, _) = ws.snapshot("home work").unwrap();
+
+        assert_ne!(feat_tip, home_tip, "docks advance to independent tips");
+
+        // Switching back restores the feature tree in full — nothing was lost.
+        ws.dock_goto("feature").unwrap();
+        assert!(dir.join("feature.txt").exists(), "feature file restored on switch back");
+        assert!(!dir.join("home.txt").exists(), "home-only file absent on feature");
+
+        // Both docks are listed, home first, with the ambient one marked.
+        let docks = ws.dock_list();
+        assert_eq!(docks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["home", "feature"]);
+        assert!(docks.iter().find(|d| d.name == "feature").unwrap().current);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_goto_is_idempotent_and_rejects_bad_names() {
+        let (dir, mut ws) = dock_repo("names");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        assert!(matches!(ws.dock_goto("home"), Ok(DockAction::Already)), "self-switch is a no-op");
+        assert!(ws.dock_goto("../escape").is_err(), "path traversal rejected");
+        assert!(matches!(ws.dock_goto("feat").unwrap(), DockAction::Created));
+        assert!(matches!(ws.dock_goto("feat"), Ok(DockAction::Already)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

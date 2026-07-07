@@ -15,6 +15,7 @@ The full loop from first init to relay-based collaboration is functional:
 
 ```text
 local:    init → status → describe → new → log → surface
+docks:    dock → docks (isolated working trees over one store, ADR 0022)
 file:     bundle → apply
 relay:    serve → push → pull
 grants:   grant → grant --relay → grants → pull-grants
@@ -167,6 +168,8 @@ loot status [-m <message>]               snapshot the working tree into the work
 loot describe -m <message>               name the working change
 loot new                                 finalize the working change; start a fresh one
 loot surface                             materialize what the current identity may see
+loot dock <name>                         create a dock (isolated tree + tip), or switch to an existing one
+loot docks                               list docks with their tip and visibility
 loot log                                 show change history with visibility hints
 loot bundle <file>                       write a sync bundle (ciphertext, no keys)
 loot apply <file>                        merge a peer's bundle (idempotent)
