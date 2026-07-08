@@ -165,22 +165,41 @@ pub fn prune_orphaned_objects_loose(
 }
 
 pub fn encode_graph(graph: &ChangeGraph) -> Vec<u8> {
+    // A graph file is just a versioned, topo-ordered node array — the same wire
+    // shape `encode_nodes` produces, so the two share one encoder.
+    encode_nodes(&graph.in_order())
+}
+
+/// Encode an explicit node list (versioned, in the given order). Used both by
+/// `encode_graph` (over the whole graph) and to persist a dock's working-change
+/// node separately from the shared finalized graph (CA1.5, ADR 0022). Callers
+/// pass nodes parents-first so `decode` can replay them in order.
+pub fn encode_nodes(nodes: &[&ChangeNode]) -> Vec<u8> {
     let mut out = Vec::new();
     format::put_version(&mut out);
-    // Changes in topo order so decode can replay them parents-first.
-    let changes = graph.in_order();
-    put_u32(&mut out, changes.len());
-    for c in changes {
+    put_u32(&mut out, nodes.len());
+    for c in nodes {
         put_change(&mut out, c);
     }
     out
 }
 
 pub fn decode_graph(b: &[u8]) -> Result<ChangeGraph, RepoError> {
+    let mut graph = ChangeGraph::new();
+    for node in decode_nodes(b)? {
+        graph.insert(node);
+    }
+    Ok(graph)
+}
+
+/// Decode a versioned node array back into `ChangeNode`s in stored order
+/// (parents-first). The inverse of `encode_nodes`; `decode_graph` layers head
+/// tracking on top by inserting the result.
+pub fn decode_nodes(b: &[u8]) -> Result<Vec<ChangeNode>, RepoError> {
     let mut c = Cursor { b, i: 0 };
     let (major, _minor) = format::read_version(&mut c)?;
-    let mut graph = ChangeGraph::new();
     let n_changes = c.u32()?;
+    let mut nodes = Vec::with_capacity(n_changes);
     for _ in 0..n_changes {
         let id = Oid(c.arr32()?);
         let n_parents = c.u32()?;
@@ -198,7 +217,7 @@ pub fn decode_graph(b: &[u8]) -> Result<ChangeGraph, RepoError> {
             tree.insert(path, (oid, vis));
         }
         let (author, signature) = format::read_author_sig(&mut c, major)?;
-        graph.insert(ChangeNode {
+        nodes.push(ChangeNode {
             id,
             parents,
             message,
@@ -207,7 +226,7 @@ pub fn decode_graph(b: &[u8]) -> Result<ChangeGraph, RepoError> {
             signature,
         });
     }
-    Ok(graph)
+    Ok(nodes)
 }
 
 pub fn encode_keyring(keyring: &Keyring) -> Vec<u8> {

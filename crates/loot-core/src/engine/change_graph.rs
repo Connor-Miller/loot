@@ -109,6 +109,69 @@ impl ChangeGraph {
         self.changes.get(id)
     }
 
+    /// Build a graph containing only the subgraph reachable from `heads` over a
+    /// `pool` of candidate nodes (CA1.5, ADR 0022). This is the per-dock load:
+    /// the shared store holds every dock's finalized nodes, but a dock only wants
+    /// *its own lineage*, so it materializes exactly the ancestry of its heads.
+    ///
+    /// Because only reachable nodes are inserted (parents before children), the
+    /// derived heads come out equal to `heads` (every non-tip is some node's
+    /// parent), so `current_tree`/`surface`/`snapshot` see the dock's lineage
+    /// with no change to their logic. Heads absent from `pool` are skipped.
+    pub fn reachable_from(pool: &BTreeMap<Oid, ChangeNode>, heads: &[Oid]) -> Self {
+        // Collect the reachable id set by walking parent edges from each head.
+        let mut reachable: std::collections::BTreeSet<Oid> = std::collections::BTreeSet::new();
+        let mut stack: Vec<Oid> = heads.to_vec();
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            if let Some(node) = pool.get(&id) {
+                for p in &node.parents {
+                    stack.push(p.clone());
+                }
+            }
+        }
+        // Topo-insert (parents first) so head tracking stays correct.
+        fn visit(
+            id: &Oid,
+            pool: &BTreeMap<Oid, ChangeNode>,
+            reachable: &std::collections::BTreeSet<Oid>,
+            visited: &mut std::collections::BTreeSet<Oid>,
+            out: &mut ChangeGraph,
+        ) {
+            if !reachable.contains(id) || !visited.insert(id.clone()) {
+                return;
+            }
+            if let Some(node) = pool.get(id) {
+                for p in &node.parents {
+                    visit(p, pool, reachable, visited, out);
+                }
+                out.insert(node.clone());
+            }
+        }
+        let mut graph = ChangeGraph::new();
+        let mut visited = std::collections::BTreeSet::new();
+        for h in heads {
+            visit(h, pool, &reachable, &mut visited, &mut graph);
+        }
+        graph
+    }
+
+    /// The ids in `pool` that no node in `pool` names as a parent — the tips of
+    /// the whole pool. Used for back-compat load of a repo that predates per-dock
+    /// heads (no heads file): treat the entire graph as the (default) dock's
+    /// lineage, exactly as before CA1.5.
+    pub fn derive_all_heads(pool: &BTreeMap<Oid, ChangeNode>) -> Vec<Oid> {
+        let mut parented: std::collections::BTreeSet<&Oid> = std::collections::BTreeSet::new();
+        for node in pool.values() {
+            for p in &node.parents {
+                parented.insert(p);
+            }
+        }
+        pool.keys().filter(|id| !parented.contains(id)).cloned().collect()
+    }
+
     /// Attach a signature to a node's `signature` field (finalization, ADR 0018).
     /// Returns `None` if the change id is unknown.
     pub fn set_signature(&mut self, id: &Oid, signature: [u8; 64]) -> Option<()> {
