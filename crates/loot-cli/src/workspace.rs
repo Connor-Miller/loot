@@ -8,7 +8,7 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
-use loot_core::{valid_dock_name, DagRepo, Oid, Repo, RepoStore, Visibility, HOME_DOCK};
+use loot_core::{valid_dock_name, DagRepo, MergeOutcome, Oid, Repo, RepoStore, Visibility, HOME_DOCK};
 use loot_identity::Identity;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,17 +51,54 @@ impl Workspace {
 
     /// Load a repo rooted at an explicit directory (used by `clone`).
     pub fn open_at(dir: &Path) -> Result<Self, String> {
-        let dot = dir.join(DOT);
-        let store = RepoStore::new(&dot);
+        let loot = dir.join(DOT);
+        // A `--at` worktree dock has a `.loot` *pointer file* (not a directory)
+        // naming the shared store and its dock (ADR 0022 physical model).
+        if loot.is_file() {
+            return Self::open_worktree(dir, &loot);
+        }
+        let store = RepoStore::new(&loot);
         if !store.identity().exists() {
             return Err(format!(
                 "not a loot repo at {} (no .loot/). Run `loot init` first.",
                 dir.display()
             ));
         }
-        let mut repo = DagRepo::load(&dot, dir.to_path_buf()).map_err(|e| e.to_string())?;
-        let identity = read_to_string(&store.identity())?;
         let dock = store.read_dock();
+        Self::assemble(loot, store, dir.to_path_buf(), dock)
+    }
+
+    /// Load a worktree dock: its `.loot` pointer file names the shared store (where
+    /// the graph/objects/dock state live) and this dock; files materialize here.
+    fn open_worktree(dir: &Path, pointer: &Path) -> Result<Self, String> {
+        let text = read_to_string(pointer)?;
+        let mut shared: Option<PathBuf> = None;
+        let mut dock: Option<String> = None;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("store =") {
+                shared = Some(PathBuf::from(v.trim()));
+            } else if let Some(v) = line.strip_prefix("dock =") {
+                dock = Some(v.trim().to_string());
+            }
+        }
+        let shared = shared.ok_or("malformed .loot pointer: missing `store`")?;
+        let dock = dock.ok_or("malformed .loot pointer: missing `dock`")?;
+        let store = RepoStore::new(&shared);
+        if !store.identity().exists() {
+            return Err(format!(
+                "worktree at {} points at a missing store {}",
+                dir.display(),
+                shared.display()
+            ));
+        }
+        Self::assemble(shared, store, dir.to_path_buf(), dock)
+    }
+
+    /// Finish loading once the store `dot`, working `root`, and ambient `dock` are
+    /// known (shared by the primary and worktree open paths).
+    fn assemble(dot: PathBuf, store: RepoStore, root: PathBuf, dock: String) -> Result<Self, String> {
+        let mut repo = DagRepo::load(&dot, root.clone()).map_err(|e| e.to_string())?;
+        let identity = read_to_string(&store.identity())?;
         let dock_opt = opt(&dock);
         let working = store.read_working(dock_opt);
         let tip = store.read_tip(dock_opt);
@@ -75,7 +112,7 @@ impl Workspace {
         } else {
             None
         };
-        Ok(Workspace { dot, store, root: dir.to_path_buf(), identity, repo, dock, working, tip, signer, now: real_now() })
+        Ok(Workspace { dot, store, root, identity, repo, dock, working, tip, signer, now: real_now() })
     }
 
     pub fn identity(&self) -> &str {
@@ -118,7 +155,14 @@ impl Workspace {
         let mut entries: Vec<(PathBuf, Vec<u8>, Visibility)> = Vec::new();
         let mut reported: Vec<(PathBuf, Visibility)> = Vec::new();
         for path in walk(&self.root)? {
-            let rel = path.strip_prefix("./").unwrap_or(&path).to_path_buf();
+            // Store paths relative to the repo root so tree keys are stable
+            // regardless of whether the root is "." (the CLI) or an absolute dir
+            // (tests, `clone` into a path). Fall back to stripping a leading "./".
+            let rel = path
+                .strip_prefix(&self.root)
+                .or_else(|_| path.strip_prefix("./"))
+                .unwrap_or(&path)
+                .to_path_buf();
             let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
             let vis = attrs.visibility_for(&rel.to_string_lossy());
             reported.push((rel.clone(), vis.clone()));
@@ -165,10 +209,14 @@ impl Workspace {
         // The finalized change becomes this dock's tip — the anchor the next
         // change forks from. Persist it only once docks are in play; the pristine
         // home dock keeps `tip` absent so its on-disk shape (and its
-        // fork-from-all-heads behavior) is unchanged (ADR 0022).
+        // fork-from-all-heads behavior) is unchanged (ADR 0022). With no working
+        // change (e.g. `loot new` right after a clean dock merge already sealed the
+        // tip) there is nothing to finalize — leave the dock's tip intact.
         if self.docks_active() {
-            self.tip = self.working.take();
-            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            if self.working.is_some() {
+                self.tip = self.working.take();
+                let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            }
         } else {
             self.working = None;
         }
@@ -232,13 +280,6 @@ impl Workspace {
     /// The id of the current working change, if one is in progress.
     pub fn working_id(&self) -> Option<&Oid> {
         self.working.as_ref()
-    }
-
-    /// Prune orphaned loose objects from `.loot/objects/` (ADR 0012). Delegates
-    /// to the engine, which owns the object store and the reachability walk over
-    /// the change graph. `dry_run` reports what would be pruned without deleting.
-    pub fn gc(&mut self, dry_run: bool) -> Result<loot_core::GcReport, String> {
-        self.repo.gc(&self.dot, dry_run).map_err(|e| e.to_string())
     }
 
     /// Run a closure that mutates the repo, then persist. The single path for
@@ -312,9 +353,14 @@ impl Workspace {
 
     // --- docks (ADR 0022) ---
 
-    /// The ambient dock name (`home` for the default dock).
-    pub fn current_dock(&self) -> &str {
-        &self.dock
+    /// The ambient dock name, or `None` on the primary/default dock (which the
+    /// CLI displays as `main`). `Some(name)` for a named or `--at` dock.
+    pub fn current_dock(&self) -> Option<&str> {
+        if self.dock == HOME_DOCK {
+            None
+        } else {
+            Some(&self.dock)
+        }
     }
 
     /// The store selector for the ambient dock: `None` for home (root files),
@@ -405,6 +451,170 @@ impl Workspace {
         self.store.clear_tree_hash(self.dock_opt());
         self.persist()?;
         Ok(if creating { DockAction::Created } else { DockAction::Switched })
+    }
+
+    /// `loot dock <name> [--at <dir>]` — the physical-model dock verb (ADR 0022).
+    /// Without `at`, create-or-switch the ambient dock in place and re-materialize
+    /// (the single-dir checkout flow, [`dock_goto`]). With `at`, bind a *separate*
+    /// working directory to this repo's shared store via a `.loot` pointer file
+    /// and materialize the dock's tree there, so concurrent agents edit physically
+    /// separate trees over one object store.
+    ///
+    /// [`dock_goto`]: Workspace::dock_goto
+    pub fn create_dock(&mut self, name: &str, at: Option<&Path>) -> Result<(), String> {
+        match at {
+            None => {
+                self.dock_goto(name)?;
+                Ok(())
+            }
+            Some(dir) => self.bind_dock_dir(name, dir),
+        }
+    }
+
+    /// Bind a new named dock to a separate working directory `dir` (a git-worktree
+    /// analogue). The dock's process state lives in the shared store under
+    /// `.loot/docks/<name>/`; `dir` gets a `.loot` *pointer file* naming the shared
+    /// store + dock, and the dock's tree is materialized into it. Does not disturb
+    /// the ambient dock or the primary working tree.
+    fn bind_dock_dir(&mut self, name: &str, dir: &Path) -> Result<(), String> {
+        valid_dock_name(name)?;
+        if self.store.dock_exists(name) {
+            return Err(format!("dock '{name}' already exists — pick a fresh name"));
+        }
+        // Capture the current dock's work so the new dock forks from a real tip.
+        if self.working.is_some() {
+            let msg = self
+                .working
+                .as_ref()
+                .and_then(|w| self.repo.change_message(w))
+                .unwrap_or_else(|| "(working change)".to_string());
+            self.snapshot(&msg)?;
+        }
+        let anchor = self
+            .anchor()
+            .ok_or("nothing to fork yet — record a change first (`loot new`)")?;
+        // Pin the primary's tip if it's about to gain a sibling (see dock_goto).
+        if self.dock == HOME_DOCK && self.tip.is_none() {
+            let _ = self.store.write_tip(None, Some(&anchor));
+        }
+        self.store.ensure_dock_dir(name).map_err(|e| e.to_string())?;
+        self.store
+            .write_tip(Some(name), Some(&anchor))
+            .map_err(|e| e.to_string())?;
+        self.persist()?;
+
+        // Write the worktree dir + its `.loot` pointer at the shared store.
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let shared = std::fs::canonicalize(&self.dot)
+            .map_err(|e| format!("resolve store path: {e}"))?;
+        let pointer = format!("store = {}\ndock = {}\n", shared.display(), name);
+        std::fs::write(dir.join(DOT), pointer)
+            .map_err(|e| format!("write {} pointer: {e}", dir.join(DOT).display()))?;
+
+        // Materialize the dock's tree into the new worktree by opening it.
+        Workspace::open_at(dir)?.surface()?;
+        Ok(())
+    }
+
+    /// Merge dock `name`'s finalized tip into the current dock, in process (CA2,
+    /// ADR 0022). Docks share one object store and graph, so this is a local fork
+    /// collapse — no relay, no bundle file. Reuses the ADR 0001 convergence rule
+    /// via [`DagRepo::merge_tips`]; adds none.
+    ///
+    /// Only *finalized* (signed) history merges (ADR 0018): the source contributes
+    /// its `tip`, and our own in-progress work is captured and finalized first, so
+    /// both parents of the merge change are signed and can travel in a later
+    /// bundle. The merge change is then signed and becomes this dock's tip; its
+    /// tree is materialized. Conflicts flow through the existing
+    /// `conflicts`/`resolve` path — no side is dropped. Returns
+    /// `(source dock, per-path outcomes)`.
+    pub fn merge_dock(&mut self, name: &str) -> Result<(String, BTreeMap<PathBuf, MergeOutcome>), String> {
+        if name == self.dock {
+            return Err(format!("'{name}' is the current dock — nothing to merge"));
+        }
+        if !self.store.dock_exists(name) {
+            return Err(format!("no such dock '{name}' (see `loot docks`)"));
+        }
+        // The source dock's finalized tip — only signed history merges.
+        let their = self.store.read_tip(opt(name)).ok_or_else(|| {
+            format!("dock '{name}' has no finalized change to merge — run `loot new` in it first")
+        })?;
+
+        // Short-circuit BEFORE touching our work: if their tip is already our
+        // finalized tip, there is nothing to merge. `anchor()` reads the finalized
+        // tip without disturbing any in-progress change, so an up-to-date no-op
+        // never seals our pending work into a spurious tip.
+        if self.anchor() == Some(their.clone()) {
+            return Ok((name.to_string(), BTreeMap::new()));
+        }
+
+        // Capture and finalize any in-progress work so our side of the merge is a
+        // signed tip (a merge parent must be finalized to travel in a bundle).
+        if self.working.is_some() {
+            let msg = self
+                .working
+                .as_ref()
+                .and_then(|w| self.repo.change_message(w))
+                .unwrap_or_else(|| "(working change)".to_string());
+            self.snapshot(&msg)?;
+            self.finalize_working()?;
+        }
+        let ours = self
+            .anchor()
+            .ok_or("nothing to merge into yet — record a change first (`loot new`)")?;
+        if ours == their {
+            return Ok((name.to_string(), BTreeMap::new()));
+        }
+
+        // Reconcile the two lines into a merge change (reuses converge), then sign
+        // it and make it this dock's tip.
+        let msg = format!("merge dock '{name}' into '{}'", self.dock);
+        let (merge_id, outcomes) = self
+            .repo
+            .merge_tips(&ours, &their, &msg, self.now)
+            .map_err(|e| e.to_string())?;
+        self.working = Some(merge_id.clone());
+        self.finalize_working()?;
+        // Reflect the merged tree in the working directory.
+        self.repo
+            .materialize(Some(&ours), &merge_id, &self.identity, self.now)
+            .map_err(|e| e.to_string())?;
+        Ok((name.to_string(), outcomes))
+    }
+
+    /// Resolve a conflict at `path` with `resolution` bytes. On a dock the
+    /// resolution is built on — and becomes — the dock's tip (its conflicted merge
+    /// change), then is signed like any finalized change, so a later `status`
+    /// forks from the resolved line rather than the pre-resolution merge (CA2, ADR
+    /// 0022). On the pre-dock home dock it keeps the original behavior (resolve
+    /// against all heads; finalize with `loot new`). Returns the resolution
+    /// content oid, for display.
+    pub fn resolve_conflict(&mut self, path: &Path, resolution: &[u8], vis: Visibility) -> Result<Oid, String> {
+        let base = self.tip.clone();
+        let (change_id, content) = self
+            .repo
+            .resolve(base.as_ref(), path, resolution, vis, self.now)
+            .map_err(|e| e.to_string())?;
+        // On a dock, the resolution advances (and is signed as) the dock's tip so
+        // it isn't orphaned and the next snapshot builds on it.
+        if self.docks_active() {
+            if let Some(signer) = &self.signer {
+                let sig = signer.sign(&change_id.0);
+                self.repo
+                    .attach_signature(&change_id, sig)
+                    .map_err(|e| e.to_string())?;
+            }
+            // Reflect the resolved tree on disk (writing the resolution over the
+            // still-conflicted working copy) so a later `status` captures the
+            // resolution, not the pre-resolution content.
+            self.repo
+                .materialize(base.as_ref(), &change_id, &self.identity, self.now)
+                .map_err(|e| e.to_string())?;
+            self.tip = Some(change_id);
+            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        }
+        self.persist()?;
+        Ok(content)
     }
 
     /// Every dock with its head and visibility summary, for `loot docks`.
@@ -917,7 +1127,7 @@ mod tests {
         assert!(!dot.join("dock").exists(), "no ambient-dock pointer");
         assert!(!dot.join("docks").exists(), "no docks directory");
         assert!(!dot.join("tip").exists(), "home persists no explicit tip pre-dock");
-        assert_eq!(ws.current_dock(), "home");
+        assert_eq!(ws.current_dock(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -932,12 +1142,12 @@ mod tests {
 
         // Fork a dock and give it a file the home dock never sees.
         ws.dock_goto("feature").unwrap();
-        assert_eq!(ws.current_dock(), "feature");
+        assert_eq!(ws.current_dock(), Some("feature"));
         std::fs::write(dir.join("feature.txt"), b"F").unwrap();
         let (feat_tip, _) = ws.snapshot("feature work").unwrap();
 
         // Back on home: feature.txt is pruned from disk, base.txt remains.
-        ws.dock_goto("home").unwrap();
+        ws.dock_goto("main").unwrap();
         assert!(dir.join("base.txt").exists(), "shared base kept");
         assert!(!dir.join("feature.txt").exists(), "feature-only file pruned on switch home");
         std::fs::write(dir.join("home.txt"), b"H").unwrap();
@@ -952,7 +1162,7 @@ mod tests {
 
         // Both docks are listed, home first, with the ambient one marked.
         let docks = ws.dock_list();
-        assert_eq!(docks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["home", "feature"]);
+        assert_eq!(docks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["main", "feature"]);
         assert!(docks.iter().find(|d| d.name == "feature").unwrap().current);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -965,10 +1175,176 @@ mod tests {
         ws.snapshot("base").unwrap();
         ws.finalize_working().unwrap();
 
-        assert!(matches!(ws.dock_goto("home"), Ok(DockAction::Already)), "self-switch is a no-op");
+        assert!(matches!(ws.dock_goto("main"), Ok(DockAction::Already)), "self-switch is a no-op");
         assert!(ws.dock_goto("../escape").is_err(), "path traversal rejected");
         assert!(matches!(ws.dock_goto("feat").unwrap(), DockAction::Created));
         assert!(matches!(ws.dock_goto("feat"), Ok(DockAction::Already)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- CA2: local dock merge ---
+
+    #[test]
+    fn dock_merge_converges_disjoint_edits() {
+        // Acceptance: two docks editing disjoint paths merge cleanly with no
+        // conflict, and the merged tree carries both lines' files.
+        let (dir, mut ws) = dock_repo("merge-disjoint");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("feature work").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("home.txt"), b"H").unwrap();
+        ws.snapshot("home work").unwrap();
+        ws.finalize_working().unwrap();
+
+        let (src, outcomes) = ws.merge_dock("feature").unwrap();
+        assert_eq!(src, "feature");
+        assert!(ws.repo().conflicts().is_empty(), "disjoint edits: no conflicts");
+        assert_eq!(outcomes[&PathBuf::from("feature.txt")], MergeOutcome::Converged);
+        // Merge materialized both lines onto the home working tree.
+        assert!(dir.join("base.txt").exists());
+        assert!(dir.join("home.txt").exists());
+        assert!(dir.join("feature.txt").exists(), "feature work present after merge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_merge_same_path_conflicts_and_keeps_both_sides() {
+        // Acceptance: a genuine same-path divergence surfaces as a Conflict via the
+        // existing conflicts/resolve flow, with neither side dropped.
+        let (dir, mut ws) = dock_repo("merge-conflict");
+        std::fs::write(dir.join("a.txt"), b"base\n").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("a.txt"), b"feature side\n").unwrap();
+        ws.snapshot("feat").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("a.txt"), b"home side\n").unwrap();
+        ws.snapshot("home").unwrap();
+        ws.finalize_working().unwrap();
+
+        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
+        assert!(
+            ws.repo().conflicts().contains_key(&PathBuf::from("a.txt")),
+            "conflict recorded for `loot resolve`"
+        );
+        // Ours is kept on disk; theirs is preserved in the recorded conflict and
+        // via the merge change's second parent — no side dropped.
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"home side\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_merge_conflict_resolution_advances_the_dock_tip() {
+        // Regression (CA2 review): after a conflicted dock merge, `resolve` must
+        // build on and advance the dock's tip — not orphan the resolution onto a
+        // stray head — so later work on the dock sees the resolved content.
+        let (dir, mut ws) = dock_repo("merge-resolve");
+        std::fs::write(dir.join("a.txt"), b"base\n").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("a.txt"), b"feature side\n").unwrap();
+        ws.snapshot("feat").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("a.txt"), b"home side\n").unwrap();
+        ws.snapshot("home").unwrap();
+        ws.finalize_working().unwrap();
+
+        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
+
+        // Resolve — the resolution becomes the dock tip and lands on disk.
+        ws.resolve_conflict(Path::new("a.txt"), b"resolved\n", Visibility::Public).unwrap();
+        assert!(ws.repo().conflicts().is_empty(), "conflict cleared");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"resolved\n", "resolution written to disk");
+
+        // Later work forks from the resolution, not the pre-resolution merge:
+        // a fresh snapshot keeps the resolved a.txt and surfacing re-materializes it.
+        std::fs::write(dir.join("b.txt"), b"more\n").unwrap();
+        ws.snapshot("after resolve").unwrap();
+        ws.finalize_working().unwrap();
+        ws.surface_with_report().unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"resolved\n",
+            "dock line carries the resolution, not the conflicted merge"
+        );
+        assert!(dir.join("b.txt").exists(), "new work sits on the resolved tip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harbor_is_an_ordinary_dock_that_round_trips() {
+        // Acceptance: `harbor` is a plain dock by convention; merging into it and
+        // re-basing from it round-trips through the same machinery.
+        let (dir, mut ws) = dock_repo("harbor");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("feat.txt"), b"F").unwrap();
+        ws.snapshot("feat").unwrap();
+        ws.finalize_working().unwrap();
+
+        // Create harbor from a neutral base (home), then integrate feature into
+        // it — an ordinary dock playing the integrator role by convention.
+        ws.dock_goto("main").unwrap();
+        ws.dock_goto("harbor").unwrap();
+        assert!(!dir.join("feat.txt").exists(), "harbor forks from home, without feature's work");
+        let (_s, o1) = ws.merge_dock("feature").unwrap();
+        assert!(o1.contains_key(&PathBuf::from("feat.txt")));
+        assert!(dir.join("feat.txt").exists(), "harbor integrated feature work");
+
+        // Re-base home from harbor: the work flows back cleanly.
+        ws.dock_goto("main").unwrap();
+        assert!(!dir.join("feat.txt").exists(), "home has not merged yet");
+        ws.merge_dock("harbor").unwrap();
+        assert!(dir.join("feat.txt").exists(), "home re-based from harbor");
+        assert!(ws.repo().conflicts().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_at_binds_a_separate_worktree_over_the_shared_store() {
+        // Physical model (ADR 0022): `--at` creates a separate working directory
+        // with a `.loot` pointer file at the shared store, materialized with the
+        // dock's tree, without disturbing the primary.
+        let (dir, mut ws) = dock_repo("worktree");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        let wt = std::env::temp_dir().join(format!("loot-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        ws.create_dock("feature", Some(&wt)).unwrap();
+
+        // A worktree has a `.loot` pointer *file* (not a dir) and the dock's tree.
+        assert!(wt.join(".loot").is_file(), "worktree has a .loot pointer file");
+        assert!(wt.join("base.txt").exists(), "dock tree materialized into worktree");
+
+        // Opening the worktree loads the shared store on dock `feature`; the
+        // primary is untouched (still the default `main` dock).
+        let wtws = Workspace::open_at(&wt).unwrap();
+        assert_eq!(wtws.current_dock(), Some("feature"));
+        assert_eq!(ws.current_dock(), None, "primary stays on the default dock");
+
+        let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
