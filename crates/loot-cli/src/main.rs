@@ -122,7 +122,7 @@ fn message_flag(args: &[String]) -> Option<&str> {
 }
 
 /// Machine-output selector for the reconciliation verbs (CA3, ADR 0023).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutFmt {
     Human,
     Porcelain,
@@ -150,7 +150,14 @@ fn out_fmt(args: &[String]) -> OutFmt {
 /// either side of the filename for the reconciliation verbs, which take at
 /// most one positional.
 fn first_positional(args: &[String]) -> Option<&str> {
-    args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
+    nth_positional(args, 0)
+}
+
+/// The `n`th positional argument (0-indexed), skipping `--flags` on either side.
+/// One home for the flag-skipping rule, shared by verbs that take more than one
+/// positional (e.g. `dock merge <name>`).
+fn nth_positional(args: &[String], n: usize) -> Option<&str> {
+    args.iter().map(String::as_str).filter(|a| !a.starts_with('-')).nth(n)
 }
 
 /// Lift an apply/pull outcome map into the serializable verdict rows.
@@ -286,11 +293,7 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
 fn cmd_dock_merge(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     // positionals are ["merge", "<name>"]; take the second.
-    let name = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
-        .nth(1)
+    let name = nth_positional(args, 1)
         .ok_or("usage: loot dock merge <name> [--porcelain|--json]")?;
     let mut ws = Workspace::open()?;
     let (source, outcomes) = ws.merge_dock(name)?;
@@ -310,7 +313,7 @@ fn cmd_dock_merge(args: &[String]) -> Result<(), String> {
                     .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
                     .count();
                 if conflicts > 0 {
-                    println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>`, then `loot new`");
+                    println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances this dock's tip");
                 } else {
                     println!("merge committed as this dock's tip; run `loot log` to see it");
                 }
@@ -863,21 +866,23 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
 
     let mut ws = Workspace::open()?;
-    let now = ws.now();
 
     // Determine the visibility for this path from .lootattributes (same logic
     // snapshot uses). Unrecognized paths default to Public.
     let vis = ws.visibility_for(&path.to_string_lossy());
 
-    let new_oid = ws.with_repo(|repo| {
-        repo.resolve(path, &bytes, vis, now).map_err(|e| e.to_string())
-    })?;
+    let new_oid = ws.resolve_conflict(path, &bytes, vis)?;
 
     println!("resolved {} (new oid: {})", path.display(), short(&new_oid));
 
-    // Check if all conflicts are now clear.
+    // Check if all conflicts are now clear. On a dock the resolution has already
+    // advanced the tip; on the pre-dock home dock, `loot new` finalizes.
     if ws.repo().conflicts().is_empty() {
-        println!("all conflicts resolved — run `loot new` to finalize");
+        if ws.current_dock() == loot_core::HOME_DOCK {
+            println!("all conflicts resolved — run `loot new` to finalize");
+        } else {
+            println!("all conflicts resolved — dock tip advanced");
+        }
     }
     Ok(())
 }

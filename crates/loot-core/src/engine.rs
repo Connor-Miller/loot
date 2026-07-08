@@ -429,10 +429,24 @@ impl DagRepo {
         &self.conflicts
     }
 
-    /// Resolve a conflict at `path` by providing the resolution bytes.
-    /// Seals the resolution under `vis`, records a change, and removes the
-    /// path from the conflict set.
-    pub fn resolve(&mut self, path: &Path, resolution: &[u8], vis: Visibility, now: u64) -> Result<Oid, RepoError> {
+    /// Resolve a conflict at `path` by providing the resolution bytes. Seals the
+    /// resolution under `vis`, records a resolution change, and removes the path
+    /// from the conflict set. Returns `(resolution change id, resolution content
+    /// oid)`.
+    ///
+    /// `base` is the tip the resolution builds on. `Some(tip)` parents the
+    /// resolution on that single tip and bases its tree on that line — a dock
+    /// resolves onto its own conflicted merge change and advances it (ADR 0022),
+    /// rather than folding in every head. `None` keeps the pre-dock behavior
+    /// (parent on all heads, base on the merged `current_tree`).
+    pub fn resolve(
+        &mut self,
+        base: Option<&Oid>,
+        path: &Path,
+        resolution: &[u8],
+        vis: Visibility,
+        now: u64,
+    ) -> Result<(Oid, Oid), RepoError> {
         if !self.conflicts.contains_key(path) {
             return Err(RepoError::Backend(format!(
                 "no conflict recorded at {}",
@@ -442,22 +456,26 @@ impl DagRepo {
 
         let new_oid = self.put(resolution, vis.clone())?;
 
-        // Update the tree with the resolution.
-        let mut new_tree = self.graph.current_tree();
+        // Build the resolution on `base`'s line (the dock's conflicted merge tip)
+        // so it lands there and advances it; `None` reconciles against all heads.
+        let (mut new_tree, parents) = match base {
+            Some(tip) => (self.graph.tree_at(tip), vec![tip.clone()]),
+            None => (self.graph.current_tree(), self.graph.heads()),
+        };
         new_tree.insert(path.to_path_buf(), (new_oid.clone(), vis));
         let change = Change {
             id: Oid([0; 32]),
-            parents: self.graph.heads(),
+            parents,
             message: format!("resolve conflict at {}", path.display()),
             tree: new_tree,
         };
-        self.record(change)?;
+        let change_id = self.record(change)?;
 
         // Clear the resolved conflict.
         self.conflicts.remove(path);
 
         let _ = now;
-        Ok(new_oid)
+        Ok((change_id, new_oid))
     }
 
     /// Stow a bundle append-only: store its sealed objects and add its
@@ -2686,7 +2704,7 @@ mod tests {
 
         // Resolve.
         let resolution = b"resolved content\n";
-        let new_oid = bob.resolve(Path::new("f.txt"), resolution, Visibility::Public, 0).unwrap();
+        let (_change, new_oid) = bob.resolve(None, Path::new("f.txt"), resolution, Visibility::Public, 0).unwrap();
 
         // Conflict cleared.
         assert!(!bob.conflicts.contains_key(Path::new("f.txt")), "conflict must be cleared after resolve");
@@ -2699,7 +2717,7 @@ mod tests {
     #[test]
     fn resolve_unknown_path_errors() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let result = alice.resolve(Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
+        let result = alice.resolve(None, Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
         assert!(matches!(result, Err(RepoError::Backend(_))), "unknown path must error");
     }
 

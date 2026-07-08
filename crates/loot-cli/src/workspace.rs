@@ -118,7 +118,14 @@ impl Workspace {
         let mut entries: Vec<(PathBuf, Vec<u8>, Visibility)> = Vec::new();
         let mut reported: Vec<(PathBuf, Visibility)> = Vec::new();
         for path in walk(&self.root)? {
-            let rel = path.strip_prefix("./").unwrap_or(&path).to_path_buf();
+            // Store paths relative to the repo root so tree keys are stable
+            // regardless of whether the root is "." (the CLI) or an absolute dir
+            // (tests, `clone` into a path). Fall back to stripping a leading "./".
+            let rel = path
+                .strip_prefix(&self.root)
+                .or_else(|_| path.strip_prefix("./"))
+                .unwrap_or(&path)
+                .to_path_buf();
             let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
             let vis = attrs.visibility_for(&rel.to_string_lossy());
             reported.push((rel.clone(), vis.clone()));
@@ -165,10 +172,14 @@ impl Workspace {
         // The finalized change becomes this dock's tip — the anchor the next
         // change forks from. Persist it only once docks are in play; the pristine
         // home dock keeps `tip` absent so its on-disk shape (and its
-        // fork-from-all-heads behavior) is unchanged (ADR 0022).
+        // fork-from-all-heads behavior) is unchanged (ADR 0022). With no working
+        // change (e.g. `loot new` right after a clean dock merge already sealed the
+        // tip) there is nothing to finalize — leave the dock's tip intact.
         if self.docks_active() {
-            self.tip = self.working.take();
-            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            if self.working.is_some() {
+                self.tip = self.working.take();
+                let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+            }
         } else {
             self.working = None;
         }
@@ -424,6 +435,14 @@ impl Workspace {
             format!("dock '{name}' has no finalized change to merge — run `loot new` in it first")
         })?;
 
+        // Short-circuit BEFORE touching our work: if their tip is already our
+        // finalized tip, there is nothing to merge. `anchor()` reads the finalized
+        // tip without disturbing any in-progress change, so an up-to-date no-op
+        // never seals our pending work into a spurious tip.
+        if self.anchor() == Some(their.clone()) {
+            return Ok((name.to_string(), BTreeMap::new()));
+        }
+
         // Capture and finalize any in-progress work so our side of the merge is a
         // signed tip (a merge parent must be finalized to travel in a bundle).
         if self.working.is_some() {
@@ -456,6 +475,41 @@ impl Workspace {
             .materialize(Some(&ours), &merge_id, &self.identity, self.now)
             .map_err(|e| e.to_string())?;
         Ok((name.to_string(), outcomes))
+    }
+
+    /// Resolve a conflict at `path` with `resolution` bytes. On a dock the
+    /// resolution is built on — and becomes — the dock's tip (its conflicted merge
+    /// change), then is signed like any finalized change, so a later `status`
+    /// forks from the resolved line rather than the pre-resolution merge (CA2, ADR
+    /// 0022). On the pre-dock home dock it keeps the original behavior (resolve
+    /// against all heads; finalize with `loot new`). Returns the resolution
+    /// content oid, for display.
+    pub fn resolve_conflict(&mut self, path: &Path, resolution: &[u8], vis: Visibility) -> Result<Oid, String> {
+        let base = self.tip.clone();
+        let (change_id, content) = self
+            .repo
+            .resolve(base.as_ref(), path, resolution, vis, self.now)
+            .map_err(|e| e.to_string())?;
+        // On a dock, the resolution advances (and is signed as) the dock's tip so
+        // it isn't orphaned and the next snapshot builds on it.
+        if self.docks_active() {
+            if let Some(signer) = &self.signer {
+                let sig = signer.sign(&change_id.0);
+                self.repo
+                    .attach_signature(&change_id, sig)
+                    .map_err(|e| e.to_string())?;
+            }
+            // Reflect the resolved tree on disk (writing the resolution over the
+            // still-conflicted working copy) so a later `status` captures the
+            // resolution, not the pre-resolution content.
+            self.repo
+                .materialize(base.as_ref(), &change_id, &self.identity, self.now)
+                .map_err(|e| e.to_string())?;
+            self.tip = Some(change_id);
+            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        }
+        self.persist()?;
+        Ok(content)
     }
 
     /// Every dock with its head and visibility summary, for `loot docks`.
@@ -1087,6 +1141,49 @@ mod tests {
     }
 
     #[test]
+    fn dock_merge_conflict_resolution_advances_the_dock_tip() {
+        // Regression (CA2 review): after a conflicted dock merge, `resolve` must
+        // build on and advance the dock's tip — not orphan the resolution onto a
+        // stray head — so later work on the dock sees the resolved content.
+        let (dir, mut ws) = dock_repo("merge-resolve");
+        std::fs::write(dir.join("a.txt"), b"base\n").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("a.txt"), b"feature side\n").unwrap();
+        ws.snapshot("feat").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("home").unwrap();
+        std::fs::write(dir.join("a.txt"), b"home side\n").unwrap();
+        ws.snapshot("home").unwrap();
+        ws.finalize_working().unwrap();
+
+        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
+
+        // Resolve — the resolution becomes the dock tip and lands on disk.
+        ws.resolve_conflict(Path::new("a.txt"), b"resolved\n", Visibility::Public).unwrap();
+        assert!(ws.repo().conflicts().is_empty(), "conflict cleared");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"resolved\n", "resolution written to disk");
+
+        // Later work forks from the resolution, not the pre-resolution merge:
+        // a fresh snapshot keeps the resolved a.txt and surfacing re-materializes it.
+        std::fs::write(dir.join("b.txt"), b"more\n").unwrap();
+        ws.snapshot("after resolve").unwrap();
+        ws.finalize_working().unwrap();
+        ws.surface_with_report().unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"resolved\n",
+            "dock line carries the resolution, not the conflicted merge"
+        );
+        assert!(dir.join("b.txt").exists(), "new work sits on the resolved tip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn harbor_is_an_ordinary_dock_that_round_trips() {
         // Acceptance: `harbor` is a plain dock by convention; merging into it and
         // re-basing from it round-trips through the same machinery.
@@ -1100,8 +1197,11 @@ mod tests {
         ws.snapshot("feat").unwrap();
         ws.finalize_working().unwrap();
 
-        // Integrate feature into harbor (an ordinary dock).
+        // Create harbor from a neutral base (home), then integrate feature into
+        // it — an ordinary dock playing the integrator role by convention.
+        ws.dock_goto("home").unwrap();
         ws.dock_goto("harbor").unwrap();
+        assert!(!dir.join("feat.txt").exists(), "harbor forks from home, without feature's work");
         let (_s, o1) = ws.merge_dock("feature").unwrap();
         assert!(o1.contains_key(&PathBuf::from("feat.txt")));
         assert!(dir.join("feat.txt").exists(), "harbor integrated feature work");

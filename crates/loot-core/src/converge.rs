@@ -42,55 +42,75 @@ pub fn classify(
 ) -> BTreeMap<PathBuf, MergeOutcome> {
     let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
     for (path, (their_oid, _vis)) in incoming {
-        let outcome = match local.get(path) {
-            None => MergeOutcome::Converged,
-            Some((our_oid, _)) if our_oid == their_oid => MergeOutcome::Converged,
-            Some((our_oid, _)) => merge_pair(our_oid, their_oid, oracle, now).outcome(our_oid, their_oid),
-        };
+        // The same per-path rule `merge_trees` builds on — here we keep only the
+        // label and discard the tree action.
+        let outcome = reconcile_path(local.get(path), their_oid, oracle, now).outcome();
         let slot = outcomes.entry(path.clone()).or_insert(MergeOutcome::Converged);
         *slot = worst(slot.clone(), outcome);
     }
     outcomes
 }
 
-/// The result of reconciling one concurrent same-path edit, richer than
-/// [`MergeOutcome`]: a clean line-set merge also reports *which side won* (the
-/// superset), which a merge that assembles a tree ([`merge_trees`]) needs but a
-/// classify-only caller ([`classify`]) can discard via [`MergeResult::outcome`].
-enum MergeResult {
-    /// Same content on both sides (identical bytes).
+/// One path's reconciliation under the ADR 0001 rule — the single decision both
+/// [`classify`] (which only labels paths) and [`merge_trees`] (which also builds
+/// the merged tree) act on, so the label and the tree action can never drift.
+/// [`MergeDecision::outcome`] projects it to the public [`MergeOutcome`].
+enum MergeDecision {
+    /// Same content address on both sides — keep ours, nothing to do.
     Converged,
+    /// A path only `theirs` has — adopt it wholesale. Reported as `Converged`:
+    /// there is no divergence to resolve.
+    AdoptTheirs,
     /// One side's line set subsumes the other; `winner` is that superset side's
-    /// content address (what a merge should adopt).
+    /// content address, which a tree-building merge adopts. Reported as `Merged`.
     Merged { winner: Oid },
-    /// Genuinely divergent line sets — needs human resolution.
-    Conflict,
-    /// At least one side is sealed to us — defer to a keyholder (relay role).
+    /// Genuinely divergent line sets — keep ours, record the conflict for human
+    /// resolution (the `theirs` side is never dropped: it stays reachable through
+    /// the merge change's second parent).
+    Conflict { ours: Oid, theirs: Oid },
+    /// At least one side is sealed to us — keep ours, defer to a keyholder (relay
+    /// role).
     Relayed,
 }
 
-impl MergeResult {
-    /// Project down to the public [`MergeOutcome`] for classify-only callers.
-    fn outcome(self, ours: &Oid, theirs: &Oid) -> MergeOutcome {
+impl MergeDecision {
+    /// Project down to the public per-path [`MergeOutcome`] label.
+    fn outcome(&self) -> MergeOutcome {
         match self {
-            MergeResult::Converged => MergeOutcome::Converged,
-            MergeResult::Merged { .. } => MergeOutcome::Merged,
-            MergeResult::Conflict => MergeOutcome::Conflict {
+            MergeDecision::Converged | MergeDecision::AdoptTheirs => MergeOutcome::Converged,
+            MergeDecision::Merged { .. } => MergeOutcome::Merged,
+            MergeDecision::Conflict { ours, theirs } => MergeOutcome::Conflict {
                 ours: ours.clone(),
                 theirs: theirs.clone(),
             },
-            MergeResult::Relayed => MergeOutcome::RelayedUnmerged,
+            MergeDecision::Relayed => MergeOutcome::RelayedUnmerged,
         }
     }
 }
 
-/// Decide a single concurrent same-path edit. Opening both sides is the
-/// merger role; failing to open either is the relay role.
-fn merge_pair(ours: &Oid, theirs: &Oid, oracle: &dyn KeyOracle, now: u64) -> MergeResult {
+/// The ADR 0001 rule for one path: reconcile what `ours` holds (if anything)
+/// against `their_oid`. The single source of truth both `classify` and
+/// `merge_trees` consume.
+fn reconcile_path(
+    ours: Option<&(Oid, Visibility)>,
+    their_oid: &Oid,
+    oracle: &dyn KeyOracle,
+    now: u64,
+) -> MergeDecision {
+    match ours {
+        None => MergeDecision::AdoptTheirs,
+        Some((our_oid, _)) if our_oid == their_oid => MergeDecision::Converged,
+        Some((our_oid, _)) => merge_pair(our_oid, their_oid, oracle, now),
+    }
+}
+
+/// Decide a concurrent same-path edit where the two sides differ. Opening both
+/// is the merger role; failing to open either is the relay role.
+fn merge_pair(ours: &Oid, theirs: &Oid, oracle: &dyn KeyOracle, now: u64) -> MergeDecision {
     match (oracle.open(ours, now), oracle.open(theirs, now)) {
         (Some(a), Some(b)) => line_set_merge(ours, theirs, &a, &b),
         // Can't open at least one side -> relay, defer to a keyholder.
-        _ => MergeResult::Relayed,
+        _ => MergeDecision::Relayed,
     }
 }
 
@@ -99,19 +119,19 @@ fn merge_pair(ours: &Oid, theirs: &Oid, oracle: &dyn KeyOracle, now: u64) -> Mer
 /// subsumes the other it merges cleanly toward the superset; otherwise it's a
 /// genuine `Conflict`. Crude on purpose — the point is that merging *requires
 /// plaintext access*, the thesis tension. A real 3-way merge is a later seam.
-fn line_set_merge(ours: &Oid, theirs: &Oid, a: &[u8], b: &[u8]) -> MergeResult {
+fn line_set_merge(ours: &Oid, theirs: &Oid, a: &[u8], b: &[u8]) -> MergeDecision {
     if a == b {
         // Identical content (distinct addresses only via nonce) — adopt theirs.
-        return MergeResult::Merged { winner: theirs.clone() };
+        return MergeDecision::Merged { winner: theirs.clone() };
     }
     let al: std::collections::BTreeSet<&[u8]> = a.split(|&c| c == b'\n').collect();
     let bl: std::collections::BTreeSet<&[u8]> = b.split(|&c| c == b'\n').collect();
     if al.is_subset(&bl) {
-        MergeResult::Merged { winner: theirs.clone() } // theirs is the superset
+        MergeDecision::Merged { winner: theirs.clone() } // theirs is the superset
     } else if bl.is_subset(&al) {
-        MergeResult::Merged { winner: ours.clone() } // ours is the superset
+        MergeDecision::Merged { winner: ours.clone() } // ours is the superset
     } else {
-        MergeResult::Conflict
+        MergeDecision::Conflict { ours: ours.clone(), theirs: theirs.clone() }
     }
 }
 
@@ -141,31 +161,26 @@ pub fn merge_trees(ours: &Tree, theirs: &Tree, oracle: &dyn KeyOracle, now: u64)
     let mut conflicts: BTreeMap<PathBuf, (Oid, Oid)> = BTreeMap::new();
     let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
     for (path, their_entry) in theirs {
-        let (their_oid, _their_vis) = their_entry;
-        let outcome = match ours.get(path) {
-            None => {
-                // A path only theirs has — adopt it wholesale.
+        // `tree` starts as ours, so "keep ours" cases need no write — only the
+        // adopt/conflict actions touch the tree.
+        let decision = reconcile_path(ours.get(path), &their_entry.0, oracle, now);
+        match &decision {
+            MergeDecision::Converged | MergeDecision::Relayed => {} // keep ours untouched
+            MergeDecision::AdoptTheirs => {
                 tree.insert(path.clone(), their_entry.clone());
-                MergeOutcome::Converged
             }
-            Some(our_entry) if &our_entry.0 == their_oid => MergeOutcome::Converged,
-            Some(our_entry) => match merge_pair(&our_entry.0, their_oid, oracle, now) {
-                MergeResult::Converged => MergeOutcome::Converged,
-                MergeResult::Merged { winner } => {
-                    // Adopt the superset side's entry (keep its visibility).
-                    let entry = if winner == *their_oid { their_entry.clone() } else { our_entry.clone() };
-                    tree.insert(path.clone(), entry);
-                    MergeOutcome::Merged
+            MergeDecision::Merged { winner } => {
+                // Adopt only when theirs is the superset; ours is already in `tree`.
+                if *winner == their_entry.0 {
+                    tree.insert(path.clone(), their_entry.clone());
                 }
-                MergeResult::Conflict => {
-                    conflicts.insert(path.clone(), (our_entry.0.clone(), their_oid.clone()));
-                    // Keep ours in the tree; theirs survives via the merge parent.
-                    MergeOutcome::Conflict { ours: our_entry.0.clone(), theirs: their_oid.clone() }
-                }
-                MergeResult::Relayed => MergeOutcome::RelayedUnmerged, // keep ours untouched
-            },
-        };
-        outcomes.insert(path.clone(), outcome);
+            }
+            MergeDecision::Conflict { ours: o, theirs: t } => {
+                // Keep ours in the tree; theirs survives via the merge's 2nd parent.
+                conflicts.insert(path.clone(), (o.clone(), t.clone()));
+            }
+        }
+        outcomes.insert(path.clone(), decision.outcome());
     }
     Merge { tree, conflicts, outcomes }
 }
