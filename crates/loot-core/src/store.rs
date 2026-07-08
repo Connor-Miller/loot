@@ -47,16 +47,19 @@ const PURGES: &str = "purges";
 const CONFLICTS: &str = "conflicts";
 const ATTESTATIONS: &str = "attestations";
 const WORKING: &str = "working";
+const WORKING_CHANGE: &str = "working-change";
+const HEADS: &str = "heads";
 const TREE_HASH: &str = "tree-hash";
 const TIP: &str = "tip";
 const DOCK: &str = "dock";
 const DOCKS: &str = "docks";
 const CONFIG: &str = "config";
 
-/// The default dock every repo starts on. Its process files are the root
-/// `.loot/working`/`tree-hash`/`tip`, so a repo that never touches docks is
-/// byte-for-byte unchanged on disk. Named docks live under `.loot/docks/<name>/`.
-pub const HOME_DOCK: &str = "home";
+/// The default dock every repo starts on — the primary directory (ADR 0022
+/// physical model). Its process files are the root `.loot/working`/`tree-hash`/
+/// `tip`, so a repo that never touches docks is byte-for-byte unchanged on disk.
+/// Named docks live under `.loot/docks/<name>/`.
+pub const HOME_DOCK: &str = "main";
 const OBJECTS: &str = "objects";
 const ID: &str = "id";
 const ID_PUB: &str = "id.pub";
@@ -206,6 +209,62 @@ impl RepoStore {
         out.extend(named);
         out
     }
+
+    // --- lineage persistence (ADR 0022 physical model) ---
+    //
+    // A dock's lineage *tips* (`heads`) and its out-of-graph *working change*
+    // (`working-change`) persist beside the shared graph, like git's per-worktree
+    // HEAD. The engine writes both on `save` and reads them on `load`; a repo with
+    // no `heads` file predates this and derives its tips from the whole graph.
+
+    pub fn heads(&self) -> PathBuf { self.dot.join(HEADS) }
+    pub fn working_change(&self) -> PathBuf { self.dot.join(WORKING_CHANGE) }
+
+    /// This dock's lineage tips, or `None` for a legacy repo with no `heads` file
+    /// (the loader then derives them from the whole graph). An empty or malformed
+    /// file is treated the same as absent.
+    pub fn read_heads(&self) -> Option<Vec<Oid>> {
+        let bytes = std::fs::read(self.heads()).ok()?;
+        if bytes.is_empty() || bytes.len() % 32 != 0 {
+            return None;
+        }
+        Some(
+            bytes
+                .chunks_exact(32)
+                .map(|c| {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(c);
+                    Oid(a)
+                })
+                .collect(),
+        )
+    }
+
+    /// Persist this dock's lineage tips as concatenated 32-byte ids.
+    pub fn write_heads(&self, heads: &[Oid]) -> std::io::Result<()> {
+        let mut bytes = Vec::with_capacity(heads.len() * 32);
+        for h in heads {
+            bytes.extend_from_slice(&h.0);
+        }
+        std::fs::write(self.heads(), bytes)
+    }
+
+    /// The encoded working-change node blob if one is in progress, else `None`.
+    pub fn read_working_change(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.working_change()).ok()
+    }
+
+    /// Persist the encoded working-change node blob, or remove the file when there
+    /// is none (best-effort removal).
+    pub fn write_working_change(&self, blob: Option<&[u8]>) -> std::io::Result<()> {
+        match blob {
+            Some(b) => std::fs::write(self.working_change(), b),
+            None => {
+                let _ = std::fs::remove_file(self.working_change());
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Validate a name for a *new* named dock. The charset (ASCII alphanumerics plus
@@ -334,7 +393,7 @@ mod tests {
         assert_eq!(s.read_dock(), HOME_DOCK);
         assert!(!s.dock_pointer().exists(), "home removes the pointer (compat shape)");
 
-        assert_eq!(s.list_docks(), vec!["home".to_string(), "feat".to_string()]);
+        assert_eq!(s.list_docks(), vec![HOME_DOCK.to_string(), "feat".to_string()]);
         assert!(s.dock_exists("feat") && s.dock_exists(HOME_DOCK) && !s.dock_exists("nope"));
 
         let _ = std::fs::remove_dir_all(&dir);

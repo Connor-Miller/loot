@@ -13,7 +13,7 @@ use loot_core::{
 };
 use loot_identity as identity;
 use std::process::ExitCode;
-use workspace::{DockAction, GlobalConfig, Workspace};
+use workspace::{GlobalConfig, Workspace};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,8 +29,6 @@ fn main() -> ExitCode {
         "dock" => cmd_dock(rest),
         "docks" => cmd_docks(),
         "log" => cmd_log(),
-        "dock" => cmd_dock(rest),
-        "docks" => cmd_docks(),
         "bundle" => cmd_bundle(rest),
         "apply" => cmd_apply(rest),
         "grant" => cmd_grant(rest),
@@ -126,7 +124,7 @@ fn message_flag(args: &[String]) -> Option<&str> {
 }
 
 /// Machine-output selector for the reconciliation verbs (CA3, ADR 0023).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutFmt {
     Human,
     Porcelain,
@@ -261,24 +259,6 @@ fn cmd_surface() -> Result<(), String> {
         println!("  ({skipped} sealed path(s) skipped — request a grant to access them)");
     }
     println!("surfaced {} as {}", short(&head), ws.identity());
-    Ok(())
-}
-
-fn cmd_dock(args: &[String]) -> Result<(), String> {
-    let name = args
-        .first()
-        .ok_or("dock requires <name>\n  loot dock <name>   create a dock, or switch to an existing one")?;
-    let mut ws = Workspace::open()?;
-    let from = ws.current_dock().to_string();
-    match ws.dock_goto(name)? {
-        DockAction::Already => println!("already on dock '{name}'"),
-        DockAction::Switched => {
-            println!("switched to dock '{name}' — working tree re-materialized (run `loot docks`)");
-        }
-        DockAction::Created => {
-            println!("created dock '{name}' off '{from}' and switched to it");
-        }
-    }
     Ok(())
 }
 
@@ -727,37 +707,23 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
 fn cmd_dock_merge(name: &str) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let current = ws.current_dock().unwrap_or("main").to_string();
-    let outcomes = ws.merge_dock(name)?;
+    let (_source, outcomes) = ws.merge_dock(name)?;
     if outcomes.is_empty() {
-        println!(
-            "merge '{name}' → '{current}': nothing to merge (already up to date, or '{name}' has no finalized changes — run `loot new` in it first)"
-        );
+        println!("merge '{name}' → '{current}': already up to date");
         return Ok(());
     }
     println!("merged dock '{name}' into '{current}':");
     for (path, outcome) in &outcomes {
         println!("  {:<24} {}", path.display(), describe(outcome));
     }
-    println!("run `loot surface` to materialize, then resolve any conflicts and `loot new` to finalize the merge");
-    Ok(())
-}
-
-fn cmd_docks() -> Result<(), String> {
-    let ws = Workspace::open()?;
-    let current = ws.current_dock();
-    println!("docks (* = current):");
-    // The default dock is implicit ("main"); list it first, then the named docks.
-    let mut rows: Vec<Option<String>> = vec![None];
-    rows.extend(ws.docks().into_iter().map(Some));
-    for n in &rows {
-        let mark = if n.as_deref() == current { "*" } else { " " };
-        let label = n.as_deref().unwrap_or("main");
-        let tip = loot_core::RepoStore::on_dock(ws.dot(), n.clone()).read_working();
-        let tip_str = match tip {
-            Some(oid) => format!("working {}", short(&oid)),
-            None => "clean (at head)".to_string(),
-        };
-        println!("  {mark} {label:<16} {tip_str}");
+    let conflicts = outcomes
+        .values()
+        .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
+        .count();
+    if conflicts > 0 {
+        println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances this dock's tip");
+    } else {
+        println!("merge committed as this dock's tip; run `loot log` to see it");
     }
     Ok(())
 }
@@ -886,21 +852,23 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
 
     let mut ws = Workspace::open()?;
-    let now = ws.now();
 
     // Determine the visibility for this path from .lootattributes (same logic
     // snapshot uses). Unrecognized paths default to Public.
     let vis = ws.visibility_for(&path.to_string_lossy());
 
-    let new_oid = ws.with_repo(|repo| {
-        repo.resolve(path, &bytes, vis, now).map_err(|e| e.to_string())
-    })?;
+    let new_oid = ws.resolve_conflict(path, &bytes, vis)?;
 
     println!("resolved {} (new oid: {})", path.display(), short(&new_oid));
 
-    // Check if all conflicts are now clear.
+    // Check if all conflicts are now clear. On a dock the resolution has already
+    // advanced the tip; on the primary dock, `loot new` finalizes.
     if ws.repo().conflicts().is_empty() {
-        println!("all conflicts resolved — run `loot new` to finalize");
+        if ws.current_dock().is_none() {
+            println!("all conflicts resolved — run `loot new` to finalize");
+        } else {
+            println!("all conflicts resolved — dock tip advanced");
+        }
     }
     Ok(())
 }

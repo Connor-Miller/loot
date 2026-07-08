@@ -429,10 +429,24 @@ impl DagRepo {
         &self.conflicts
     }
 
-    /// Resolve a conflict at `path` by providing the resolution bytes.
-    /// Seals the resolution under `vis`, records a change, and removes the
-    /// path from the conflict set.
-    pub fn resolve(&mut self, path: &Path, resolution: &[u8], vis: Visibility, now: u64) -> Result<Oid, RepoError> {
+    /// Resolve a conflict at `path` by providing the resolution bytes. Seals the
+    /// resolution under `vis`, records a resolution change, and removes the path
+    /// from the conflict set. Returns `(resolution change id, resolution content
+    /// oid)`.
+    ///
+    /// `base` is the tip the resolution builds on. `Some(tip)` parents the
+    /// resolution on that single tip and bases its tree on that line — a dock
+    /// resolves onto its own conflicted merge change and advances it (ADR 0022),
+    /// rather than folding in every head. `None` keeps the pre-dock behavior
+    /// (parent on all heads, base on the merged `current_tree`).
+    pub fn resolve(
+        &mut self,
+        base: Option<&Oid>,
+        path: &Path,
+        resolution: &[u8],
+        vis: Visibility,
+        now: u64,
+    ) -> Result<(Oid, Oid), RepoError> {
         if !self.conflicts.contains_key(path) {
             return Err(RepoError::Backend(format!(
                 "no conflict recorded at {}",
@@ -442,22 +456,26 @@ impl DagRepo {
 
         let new_oid = self.put(resolution, vis.clone())?;
 
-        // Update the tree with the resolution.
-        let mut new_tree = self.graph.current_tree();
+        // Build the resolution on `base`'s line (the dock's conflicted merge tip)
+        // so it lands there and advances it; `None` reconciles against all heads.
+        let (mut new_tree, parents) = match base {
+            Some(tip) => (self.graph.tree_at(tip), vec![tip.clone()]),
+            None => (self.graph.current_tree(), self.graph.heads()),
+        };
         new_tree.insert(path.to_path_buf(), (new_oid.clone(), vis));
         let change = Change {
             id: Oid([0; 32]),
-            parents: self.graph.heads(),
+            parents,
             message: format!("resolve conflict at {}", path.display()),
             tree: new_tree,
         };
-        self.record(change)?;
+        let change_id = self.record(change)?;
 
         // Clear the resolved conflict.
         self.conflicts.remove(path);
 
         let _ = now;
-        Ok(new_oid)
+        Ok((change_id, new_oid))
     }
 
     /// Stow a bundle append-only: store its sealed objects and add its
@@ -813,6 +831,43 @@ impl DagRepo {
             }
         }
         (total, restricted, embargoed)
+    }
+
+    /// Merge finalized tip `theirs` into finalized tip `ours`, producing a merge
+    /// change parented on both (CA2, ADR 0022/0001). Docks share one object store
+    /// and graph, so this is a local fork collapse — no relay, no bundle. The new
+    /// change's tree is the ADR 0001 reconciliation of the two lines
+    /// ([`converge::merge_trees`]): converged/cleanly-merged paths take the other
+    /// (or superset) side, genuine same-path divergences keep *ours* and are
+    /// recorded as conflicts (theirs stays reachable via the second parent, for
+    /// `loot resolve`), and sealed paths we cannot open are carried forward.
+    ///
+    /// Reuses the shared convergence rule; adds none. The change is returned
+    /// unsigned — the caller finalizes (signs) it, as loot-core stays verify-only
+    /// for signatures (ADR 0018). Returns `(merge change id, per-path outcomes)`.
+    pub fn merge_tips(
+        &mut self,
+        ours: &Oid,
+        theirs: &Oid,
+        message: &str,
+        now: u64,
+    ) -> Result<(Oid, BTreeMap<PathBuf, MergeOutcome>), RepoError> {
+        let our_tree = self.graph.tree_at(ours);
+        let their_tree = self.graph.tree_at(theirs);
+        let merged = converge::merge_trees(&our_tree, &their_tree, self, now);
+        // Record conflicts so `loot conflicts`/`loot resolve` see them, exactly
+        // as the apply path does.
+        for (path, (o, t)) in &merged.conflicts {
+            self.conflicts.insert(path.clone(), (o.clone(), t.clone()));
+        }
+        let change = Change {
+            id: Oid([0; 32]),
+            parents: vec![ours.clone(), theirs.clone()],
+            message: message.to_string(),
+            tree: merged.tree,
+        };
+        let id = self.record(change)?;
+        Ok((id, merged.outcomes))
     }
 
     /// Verify and record an attestation over a change (S4, ADR 0018). Returns
@@ -2653,7 +2708,7 @@ mod tests {
 
         // Resolve.
         let resolution = b"resolved content\n";
-        let new_oid = bob.resolve(Path::new("f.txt"), resolution, Visibility::Public, 0).unwrap();
+        let (_change, new_oid) = bob.resolve(None, Path::new("f.txt"), resolution, Visibility::Public, 0).unwrap();
 
         // Conflict cleared.
         assert!(!bob.conflicts.contains_key(Path::new("f.txt")), "conflict must be cleared after resolve");
@@ -2666,7 +2721,7 @@ mod tests {
     #[test]
     fn resolve_unknown_path_errors() {
         let mut alice = DagRepo::init(tmp(), "alice").unwrap();
-        let result = alice.resolve(Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
+        let result = alice.resolve(None, Path::new("no-conflict.txt"), b"resolution", Visibility::Public, 0);
         assert!(matches!(result, Err(RepoError::Backend(_))), "unknown path must error");
     }
 

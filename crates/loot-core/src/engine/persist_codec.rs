@@ -148,7 +148,7 @@ pub fn prune_orphaned_objects_loose(
         let entry = entry.map_err(io)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(addr) = unhex32(&name) else {
+        let Some(addr) = crate::hex::decode_array::<32>(&name) else {
             continue; // skip *.tmp and anything not a content address
         };
         if keep.contains(&Oid(addr)) {
