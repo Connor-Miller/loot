@@ -234,6 +234,13 @@ impl Workspace {
         self.working.as_ref()
     }
 
+    /// Prune orphaned loose objects from `.loot/objects/` (ADR 0012). Delegates
+    /// to the engine, which owns the object store and the reachability walk over
+    /// the change graph. `dry_run` reports what would be pruned without deleting.
+    pub fn gc(&mut self, dry_run: bool) -> Result<loot_core::GcReport, String> {
+        self.repo.gc(&self.dot, dry_run).map_err(|e| e.to_string())
+    }
+
     /// Run a closure that mutates the repo, then persist. The single path for
     /// "mutation ⇒ save" — callers can't forget to persist (e.g. `apply`).
     pub fn with_repo<T>(

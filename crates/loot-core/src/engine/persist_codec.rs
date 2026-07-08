@@ -16,7 +16,7 @@ use crate::escrow::Escrow;
 use crate::format;
 use crate::sealed::{Keyring, SealedObject};
 use crate::{Oid, RepoError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::change_graph::{ChangeGraph, ChangeNode};
@@ -122,6 +122,46 @@ pub fn load_objects_loose(dir: &Path) -> Result<ObjectStore, RepoError> {
         objects.put(Oid(addr), decode_object(&bytes)?);
     }
     Ok(objects)
+}
+
+/// Delete loose object files under `dir/objects/` whose address is not in
+/// `keep`, returning `(count, total_bytes)` of the files pruned. With `dry_run`,
+/// the files are only counted and sized — nothing is deleted. Files whose name
+/// is not a 64-char hex address (e.g. a leftover `*.tmp` from an interrupted
+/// write) are ignored, never counted, and never removed. A missing objects
+/// directory yields `(0, 0)`. This is the on-disk half of `gc` (ADR 0012); the
+/// caller supplies the referenced set from the change graph.
+pub fn prune_orphaned_objects_loose(
+    dir: &Path,
+    keep: &BTreeSet<Oid>,
+    dry_run: bool,
+) -> Result<(usize, u64), RepoError> {
+    let io = |e: std::io::Error| RepoError::Backend(e.to_string());
+    let obj_dir = dir.join(OBJECTS_DIR);
+    let entries = match std::fs::read_dir(&obj_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok((0, 0)),
+    };
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(io)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(addr) = unhex32(&name) else {
+            continue; // skip *.tmp and anything not a content address
+        };
+        if keep.contains(&Oid(addr)) {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        count += 1;
+        bytes += size;
+        if !dry_run {
+            std::fs::remove_file(entry.path()).map_err(io)?;
+        }
+    }
+    Ok((count, bytes))
 }
 
 pub fn encode_graph(graph: &ChangeGraph) -> Vec<u8> {

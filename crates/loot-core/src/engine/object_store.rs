@@ -10,7 +10,7 @@
 
 use crate::sealed::SealedObject;
 use crate::{Oid, RepoError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What `put` did. The caller (which owns key custody) files a freshly-minted
 /// key only on [`Stored::New`]; on a [`Stored::Deduped`] the ciphertext already
@@ -69,6 +69,30 @@ impl ObjectStore {
         self.by_addr
             .iter()
             .map(move |(addr, &pos)| (addr.clone(), &self.log[pos]))
+    }
+
+    /// Drop every object whose address is not in `keep`, returning the removed
+    /// addresses. Used by `gc` (ADR 0012): an object no ChangeNode references is
+    /// unreachable and safe to delete — content-addressing makes this exact, with
+    /// no false positives. Compacts the backing log so pruned ciphertext does not
+    /// linger in memory.
+    pub fn retain(&mut self, keep: &BTreeSet<Oid>) -> Vec<Oid> {
+        let mut removed = Vec::new();
+        let mut new_log: Vec<SealedObject> = Vec::with_capacity(keep.len().min(self.log.len()));
+        let mut new_index: BTreeMap<Oid, usize> = BTreeMap::new();
+        // by_addr is sorted; iterate it so the surviving log is stable and deduped.
+        for (addr, &pos) in &self.by_addr {
+            if keep.contains(addr) {
+                let new_pos = new_log.len();
+                new_log.push(self.log[pos].clone());
+                new_index.insert(addr.clone(), new_pos);
+            } else {
+                removed.push(addr.clone());
+            }
+        }
+        self.log = new_log;
+        self.by_addr = new_index;
+        removed
     }
 }
 
