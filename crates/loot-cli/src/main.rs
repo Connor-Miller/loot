@@ -29,6 +29,8 @@ fn main() -> ExitCode {
         "dock" => cmd_dock(rest),
         "docks" => cmd_docks(),
         "log" => cmd_log(),
+        "dock" => cmd_dock(rest),
+        "docks" => cmd_docks(),
         "bundle" => cmd_bundle(rest),
         "apply" => cmd_apply(rest),
         "grant" => cmd_grant(rest),
@@ -86,6 +88,10 @@ usage:
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
+  loot dock <name> [--at <dir>]             create/switch a dock (isolated tree over the shared store, ADR 0022)
+  loot dock merge <name>                    merge another dock's finalized tip into the current dock (local, CA2)
+  loot docks                                list docks with their working tip
+                                            (convention: a dock named `harbor` is the shared integration dock)
   loot manifest                             show the grant audit trail (and attestations)
   loot attest <change-id> [role]            attest a change (advisory sign-off, ADR 0018)
   loot conflicts [--porcelain|--json]       list paths that need human resolution
@@ -688,6 +694,70 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
             );
         }
         println!("  run `loot bundle` to ship the re-sealed object to all peers");
+    }
+    Ok(())
+}
+
+fn cmd_dock(args: &[String]) -> Result<(), String> {
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    // Subcommand form: `loot dock merge <name>` collapses another dock's tip
+    // into this one locally (CA2). Everything else is create/switch.
+    if positional.first().map(|s| s.as_str()) == Some("merge") {
+        let name = positional
+            .get(1)
+            .ok_or("usage: loot dock merge <name>")?;
+        return cmd_dock_merge(name);
+    }
+    let name = positional
+        .first()
+        .ok_or("usage: loot dock <name> [--at <dir>]  |  loot dock merge <name>")?;
+    let at = flag(args, "--at").map(std::path::PathBuf::from);
+    let mut ws = Workspace::open()?;
+    ws.create_dock(name, at.as_deref())?;
+    match &at {
+        Some(dir) => println!(
+            "created dock '{name}' at {} — a separate working tree over this repo's shared store",
+            dir.display()
+        ),
+        None => println!("on dock '{name}' — re-materialized its working tree here"),
+    }
+    Ok(())
+}
+
+fn cmd_dock_merge(name: &str) -> Result<(), String> {
+    let mut ws = Workspace::open()?;
+    let current = ws.current_dock().unwrap_or("main").to_string();
+    let outcomes = ws.merge_dock(name)?;
+    if outcomes.is_empty() {
+        println!(
+            "merge '{name}' → '{current}': nothing to merge (already up to date, or '{name}' has no finalized changes — run `loot new` in it first)"
+        );
+        return Ok(());
+    }
+    println!("merged dock '{name}' into '{current}':");
+    for (path, outcome) in &outcomes {
+        println!("  {:<24} {}", path.display(), describe(outcome));
+    }
+    println!("run `loot surface` to materialize, then resolve any conflicts and `loot new` to finalize the merge");
+    Ok(())
+}
+
+fn cmd_docks() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let current = ws.current_dock();
+    println!("docks (* = current):");
+    // The default dock is implicit ("main"); list it first, then the named docks.
+    let mut rows: Vec<Option<String>> = vec![None];
+    rows.extend(ws.docks().into_iter().map(Some));
+    for n in &rows {
+        let mark = if n.as_deref() == current { "*" } else { " " };
+        let label = n.as_deref().unwrap_or("main");
+        let tip = loot_core::RepoStore::on_dock(ws.dot(), n.clone()).read_working();
+        let tip_str = match tip {
+            Some(oid) => format!("working {}", short(&oid)),
+            None => "clean (at head)".to_string(),
+        };
+        println!("  {mark} {label:<16} {tip_str}");
     }
     Ok(())
 }

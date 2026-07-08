@@ -71,6 +71,29 @@ responsibility ends at safe convergence; deciding *who works on what* belongs to
 the orchestrator that fans out the agents. **File locking stays dropped** (a
 binary-first concern; loot is code-first).
 
+### Physical model (resolved in CA1)
+
+Share the store; separate only the working trees. The costly data —
+`.loot/objects` (ciphertext) and the change graph — lives once in the primary
+repo and is never duplicated; a dock isolates only the *materialized working
+tree* (the current visible snapshot, not history), which is small. So N docks
+cost ~N working-sets, not ~N clones.
+
+- **Named docks are worktree-style separate directories.** A dock directory
+  holds a small `.loot` *pointer file* naming the shared store and the dock
+  (mirroring a git worktree's `.git` file). Its files materialize in that dir, so
+  concurrent agents edit physically separate trees with no on-disk clobber.
+- **The primary directory is the default dock**, using the existing top-level
+  `.loot/working` + `.loot/tree-hash`, so existing single-dir repos load
+  byte-unchanged.
+- **Per-dock process state** (`working` tip, `tree-hash`) for a named dock lives
+  under `.loot/docks/<name>/`, routed through `RepoStore` (ADR 0017).
+- **One noun, two ergonomics.** `loot dock <name>` switches the ambient dock in
+  place and re-materializes (checkout-style: the single-dir human flow); with
+  `--at <dir>` it binds a separate working directory (the concurrent-agent flow).
+- **Deferred:** reflink/copy-on-write materialization (APFS/btrfs) to make even
+  large working sets near-free to fork; CA1 materializes by plain `surface`.
+
 ## Considered alternatives
 
 **Separate clone per agent.** Works today with zero new code (each agent = own

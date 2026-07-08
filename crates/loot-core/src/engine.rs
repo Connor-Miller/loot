@@ -606,14 +606,66 @@ impl DagRepo {
     /// is written to its own LOCAL-ONLY file — it is custody, not repo content,
     /// and never travels in a bundle (ADR 0003, 0005).
     pub fn save(&self, dir: &std::path::Path) -> Result<(), RepoError> {
+        self.save_to(&RepoStore::new(dir))
+    }
+
+    /// Dock-aware persist (CA1.5, ADR 0022). The shared artifacts (objects, the
+    /// finalized change graph, keyring, escrow, manifest, purges, conflicts,
+    /// attestations) live top-level regardless of dock; only this dock's
+    /// *lineage state* — its heads and its in-progress working-change node — is
+    /// per-dock, so concurrent docks over one store never see each other's
+    /// uncommitted work nor entangle their tips.
+    ///
+    /// The shared graph is an **immutable node store**: we union our lineage's
+    /// finalized nodes into whatever is already on disk (other docks' finalized
+    /// nodes are preserved, never dropped), excluding any working change. The
+    /// working change (authored-but-unsigned) is written to the dock's own
+    /// `change` file and promoted into the shared graph only when it is signed
+    /// at `loot new` (finalization), matching git's "commit publishes" model.
+    pub fn save_to(&self, store: &RepoStore) -> Result<(), RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-        let store = RepoStore::new(dir);
+        let dir = store.dot();
         std::fs::create_dir_all(dir).map_err(io)?;
         std::fs::write(store.identity(), self.identity.as_bytes()).map_err(io)?;
         // Objects: loose, content-addressed, incremental (ADR 0012).
         persist_codec::save_objects_loose(dir, &self.objects)?;
-        // Change graph + custody metadata: small, whole-file. RepoStore names them.
-        std::fs::write(store.graph(), persist_codec::encode_graph(&self.graph)).map_err(io)?;
+
+        // Shared finalized graph: union of what is already on disk (other docks'
+        // lineages) with our finalized nodes; working changes are excluded and
+        // stored per-dock instead. Immutable nodes make the union safe (a node
+        // present under the same id is byte-identical).
+        let mut finalized = ChangeGraph::new();
+        if let Ok(bytes) = std::fs::read(store.graph()) {
+            for node in persist_codec::decode_nodes(&bytes)? {
+                if !is_working_change(&node) {
+                    finalized.insert(node);
+                }
+            }
+        }
+        for node in self.graph.in_order() {
+            if !is_working_change(node) {
+                finalized.insert(node.clone());
+            }
+        }
+        std::fs::write(store.graph(), persist_codec::encode_graph(&finalized)).map_err(io)?;
+
+        // Per-dock working change (at most one in practice — this dock's tip).
+        let working: Vec<&ChangeNode> = self
+            .graph
+            .in_order()
+            .into_iter()
+            .filter(|n| is_working_change(n))
+            .collect();
+        let working_blob =
+            (!working.is_empty()).then(|| persist_codec::encode_nodes(&working));
+        store
+            .write_working_change(working_blob.as_deref())
+            .map_err(io)?;
+
+        // Per-dock heads: this dock's lineage tips (git's per-worktree ref).
+        store.write_heads(&self.graph.heads()).map_err(io)?;
+
+        // Custody + advisory metadata: shared, whole-file. RepoStore names them.
         std::fs::write(store.keyring(), persist_codec::encode_keyring(&self.keyring)).map_err(io)?;
         std::fs::write(store.escrow(), persist_codec::encode_escrow(&self.escrow)).map_err(io)?;
         std::fs::write(store.manifest(), encode_manifest(&self.manifest)).map_err(io)?;
@@ -965,12 +1017,40 @@ impl DagRepo {
     /// working directory `surface` will materialize into (kept separate from
     /// `dir` so the store can live in `.loot/` while files land in the repo).
     pub fn load(dir: &std::path::Path, root: PathBuf) -> Result<Self, RepoError> {
+        Self::load_from(&RepoStore::new(dir), root)
+    }
+
+    /// Dock-aware load (CA1.5, ADR 0022). Reads the shared node store and this
+    /// dock's per-dock lineage state, then materializes only the subgraph
+    /// reachable from *this dock's heads* — so `current_tree`/`surface`/
+    /// `snapshot` see the dock's lineage and nothing else, with no change to
+    /// their logic. A repo predating per-dock heads has no `heads` file; we then
+    /// treat the whole shared graph as the default dock's lineage (back-compat).
+    pub fn load_from(store: &RepoStore, root: PathBuf) -> Result<Self, RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-        let store = RepoStore::new(dir);
+        let dir = store.dot();
         let identity = String::from_utf8(std::fs::read(store.identity()).map_err(io)?)
             .map_err(|e| RepoError::Backend(e.to_string()))?;
         let objects = persist_codec::load_objects_loose(dir)?;
-        let graph = persist_codec::decode_graph(&std::fs::read(store.graph()).map_err(io)?)?;
+
+        // Build the candidate node pool: shared finalized nodes plus this dock's
+        // own working change (which lives outside the shared graph).
+        let mut pool: BTreeMap<Oid, ChangeNode> = BTreeMap::new();
+        for node in persist_codec::decode_nodes(&std::fs::read(store.graph()).map_err(io)?)? {
+            pool.insert(node.id.clone(), node);
+        }
+        if let Some(blob) = store.read_working_change() {
+            for node in persist_codec::decode_nodes(&blob)? {
+                pool.insert(node.id.clone(), node);
+            }
+        }
+        // Heads are authoritative when present; otherwise (legacy repo) the whole
+        // pool is the default dock's lineage.
+        let heads = store
+            .read_heads()
+            .unwrap_or_else(|| ChangeGraph::derive_all_heads(&pool));
+        let graph = ChangeGraph::reachable_from(&pool, &heads);
+
         let keyring = persist_codec::decode_keyring(&std::fs::read(store.keyring()).map_err(io)?)?;
         // Escrow file may not exist in repos created before ADR 0007 — default empty.
         let escrow = match std::fs::read(store.escrow()) {
@@ -1144,7 +1224,7 @@ impl DagRepo {
         self.graph
             .in_order()
             .into_iter()
-            .any(|c| c.author.is_some() && c.signature.is_none())
+            .any(is_working_change)
     }
 
     /// Object addresses in the closure of the changes this repo would send for
@@ -1155,7 +1235,7 @@ impl DagRepo {
         let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
         let mut addrs: std::collections::BTreeSet<Oid> = std::collections::BTreeSet::new();
         for c in self.graph.in_order() {
-            if have_set.contains(&c.id) || (c.author.is_some() && c.signature.is_none()) {
+            if have_set.contains(&c.id) || is_working_change(c) {
                 continue;
             }
             for (oid, _vis) in c.tree.values() {
@@ -1188,118 +1268,31 @@ impl DagRepo {
 
     /// Split `wants` into batches and produce one `SyncBundle` per batch (S6).
     ///
-    /// The change delta, keys, escrow, and attestations are computed once and
-    /// cloned into each bundle; only the object ciphertext subset differs per
-    /// batch. This is O(graph_size + N*batch_payload) rather than the
-    /// O(N*graph_size) cost of calling `bundle_wanted` N times in a loop.
-    ///
-    /// When `wants` is empty one bundle is returned (carrying the change delta
-    /// and attestations with no object bytes) so the caller always makes at
-    /// least one network round-trip to propagate metadata.
+    /// The change delta, keys, escrow, and attestations are computed once via
+    /// `bundle_impl`; only the object subset differs per batch. When `wants` is
+    /// empty one bundle is returned (carrying the change delta and attestations
+    /// with no object bytes) so the caller always makes at least one round-trip
+    /// to propagate metadata.
     pub fn bundle_wanted_batched(
         &self,
         have: &[Oid],
         wants: &[Oid],
         batch_size: usize,
     ) -> Result<Vec<SyncBundle>, RepoError> {
-        // Compute the shared payload (send-set, keys, escrow, attestations) once.
-        let (shared_changes, shared_keys, shared_escrow, shared_attestations, all_objects) =
-            self.bundle_shared(have)?;
-
-        let make_bundle = |batch_wants: Option<&[Oid]>| -> SyncBundle {
-            let needed: BTreeMap<Oid, SealedObject> = match batch_wants {
-                None => all_objects.clone(),
-                Some(batch) => {
-                    let batch_set: std::collections::BTreeSet<&Oid> = batch.iter().collect();
-                    all_objects
-                        .iter()
-                        .filter(|(oid, _)| batch_set.contains(oid))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                }
-            };
-            let body = BundleBody {
-                changes: shared_changes.clone(),
-                objs: needed,
-                keys: shared_keys.clone(),
-                escrow: shared_escrow.clone(),
-                attestations: shared_attestations.clone(),
-            };
-            SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode())
-        };
-
         if wants.is_empty() {
-            return Ok(vec![make_bundle(Some(&[]))]);
+            // One metadata-only bundle: change delta + attestations, no objects.
+            return Ok(vec![self.bundle_impl(have, Some(&Default::default()))?]);
         }
-        let bundles = wants
+        // Pre-partition objects across all batches in one pass over the wants list,
+        // then build each bundle independently. This avoids iterating all_objects
+        // once per batch (which would be O(total_objects × num_batches)).
+        wants
             .chunks(batch_size)
-            .map(|batch| make_bundle(Some(batch)))
-            .collect();
-        Ok(bundles)
-    }
-
-    /// Compute the shared (non-object) payload for a send relative to `have`:
-    /// returns (changes, keys, escrow, attestations, all_objects).
-    fn bundle_shared(
-        &self,
-        have: &[Oid],
-    ) -> Result<
-        (
-            Vec<ChangeNode>,
-            BTreeMap<Oid, ContentKey>,
-            BTreeMap<Oid, (ContentKey, u64)>,
-            Vec<Attestation>,
-            BTreeMap<Oid, SealedObject>,
-        ),
-        RepoError,
-    > {
-        let have_set: std::collections::BTreeSet<&Oid> = have.iter().collect();
-        let send: Vec<&ChangeNode> = self
-            .graph
-            .in_order()
-            .into_iter()
-            .filter(|c| !have_set.contains(&c.id) && !(c.author.is_some() && c.signature.is_none()))
-            .collect();
-
-        let mut all_objects: BTreeMap<Oid, SealedObject> = BTreeMap::new();
-        let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
-        let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
-        for c in &send {
-            for (oid, vis) in c.tree.values() {
-                if let Ok(obj) = self.object(oid) {
-                    all_objects.entry(oid.clone()).or_insert_with(|| obj.clone());
-                    if obj.grant_ids.iter().any(|g| g == ANYONE) {
-                        if let Visibility::Embargoed { reveal_at } = vis {
-                            if let Some(k) = self.escrow.iter()
-                                .find(|(o, _)| *o == oid)
-                                .map(|(_, e)| e.key)
-                                .or_else(|| self.keyring.key_for(oid))
-                            {
-                                escrow_entries.insert(oid.clone(), (k, *reveal_at));
-                            }
-                        } else if let Some(k) = self.keyring.key_for(oid) {
-                            public_keys.insert(oid.clone(), k);
-                        }
-                    }
-                }
-            }
-        }
-
-        let sent_ids: std::collections::BTreeSet<&Oid> = send.iter().map(|c| &c.id).collect();
-        let attestations: Vec<Attestation> = self
-            .attestations
-            .iter()
-            .filter(|a| sent_ids.contains(&a.change_id))
-            .cloned()
-            .collect();
-
-        Ok((
-            send.into_iter().cloned().collect(),
-            public_keys,
-            escrow_entries,
-            attestations,
-            all_objects,
-        ))
+            .map(|batch| {
+                let batch_set: std::collections::BTreeSet<Oid> = batch.iter().cloned().collect();
+                self.bundle_impl(have, Some(&batch_set))
+            })
+            .collect()
     }
 
     /// Shared bundle builder. `wants = None` ships every referenced object;
@@ -1319,7 +1312,7 @@ impl DagRepo {
             // Skip changes the recipient has, and any authored-but-unsigned
             // working change: only finalized, signed history travels (ADR 0018).
             // Legacy unauthored changes still travel, so keyless repos are unaffected.
-            .filter(|c| !have_set.contains(&c.id) && !(c.author.is_some() && c.signature.is_none()))
+            .filter(|c| !have_set.contains(&c.id) && !is_working_change(c))
             .collect();
 
         // Ship SealedObjects (ciphertext, no keys) plus:
@@ -1397,6 +1390,17 @@ impl converge::KeyOracle for DagRepo {
 /// signing and are accepted. Called inside `apply`/`stow` so validity is
 /// enforced structurally — never a toggle a caller can skip. loot-core is
 /// verify-only here; signing and key custody live in loot-identity.
+/// A node is a *working change* iff it is authored but not yet signed — the
+/// in-progress tip a keyholder is still editing (ADR 0018). It is finalized (and
+/// publishable to the shared graph) exactly when `loot new` attaches its
+/// signature. Legacy/unauthored nodes (`author == None`) are never working
+/// changes: they predate signing and are already finalized. This is the single
+/// discriminator CA1.5 uses to keep a dock's uncommitted work out of the shared
+/// node store (ADR 0022).
+fn is_working_change(node: &ChangeNode) -> bool {
+    node.author.is_some() && node.signature.is_none()
+}
+
 fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let Some(author) = node.author else {
