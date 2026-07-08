@@ -52,6 +52,27 @@ well-known name and *no permissions attached* — is the integrator agents
 converge into and re-base from. It is a coordination convention, not a gated
 branch. The relay remains the path for *remote* agents only.
 
+#### As built (CA2)
+
+On the tip/anchor dock model (CA1), a dock reconciles against *its own line*
+(`snapshot(base = tip)` forks from `tree_at(tip)`, `parents = [tip]`). So a merge
+is not left as a dangling second parent on a working change — a later `status`
+would re-fork from `[tip]` and drop it — but produces a real **merge change**
+parented on both finalized tips:
+
+- `converge::merge_trees` extends the ADR 0001 module (its home) to *assemble*
+  the reconciled tree, reusing the same classify/line-set rule (no new rule):
+  converged/cleanly-merged paths take the other/superset side; a `Conflict` keeps
+  ours and is recorded (theirs survives via the merge's second parent, for
+  `loot resolve`); a sealed `RelayedUnmerged` path is carried forward untouched.
+- Only **finalized (signed) tips** merge (ADR 0018): the current dock's WIP is
+  captured and finalized first, so both merge parents are signed and bundle-safe;
+  the engine builds the merge change unsigned and the Workspace signs it
+  (loot-core stays verify-only). The merge change becomes the dock's tip and its
+  tree is `materialize`d; conflicts flow through the existing `conflicts`/
+  `resolve` path. No relay, no bundle file — a local fork collapse over the
+  shared store.
+
 ### Landmarks are derived attestations (buoys), not mutable refs
 
 "Mark a historical change to build from" reuses the existing attestation lane

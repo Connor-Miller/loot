@@ -8,7 +8,7 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
-use loot_core::{valid_dock_name, DagRepo, Oid, Repo, RepoStore, Visibility, HOME_DOCK};
+use loot_core::{valid_dock_name, DagRepo, MergeOutcome, Oid, Repo, RepoStore, Visibility, HOME_DOCK};
 use loot_identity::Identity;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -398,6 +398,64 @@ impl Workspace {
         self.store.clear_tree_hash(self.dock_opt());
         self.persist()?;
         Ok(if creating { DockAction::Created } else { DockAction::Switched })
+    }
+
+    /// Merge dock `name`'s finalized tip into the current dock, in process (CA2,
+    /// ADR 0022). Docks share one object store and graph, so this is a local fork
+    /// collapse — no relay, no bundle file. Reuses the ADR 0001 convergence rule
+    /// via [`DagRepo::merge_tips`]; adds none.
+    ///
+    /// Only *finalized* (signed) history merges (ADR 0018): the source contributes
+    /// its `tip`, and our own in-progress work is captured and finalized first, so
+    /// both parents of the merge change are signed and can travel in a later
+    /// bundle. The merge change is then signed and becomes this dock's tip; its
+    /// tree is materialized. Conflicts flow through the existing
+    /// `conflicts`/`resolve` path — no side is dropped. Returns
+    /// `(source dock, per-path outcomes)`.
+    pub fn merge_dock(&mut self, name: &str) -> Result<(String, BTreeMap<PathBuf, MergeOutcome>), String> {
+        if name == self.dock {
+            return Err(format!("'{name}' is the current dock — nothing to merge"));
+        }
+        if !self.store.dock_exists(name) {
+            return Err(format!("no such dock '{name}' (see `loot docks`)"));
+        }
+        // The source dock's finalized tip — only signed history merges.
+        let their = self.store.read_tip(opt(name)).ok_or_else(|| {
+            format!("dock '{name}' has no finalized change to merge — run `loot new` in it first")
+        })?;
+
+        // Capture and finalize any in-progress work so our side of the merge is a
+        // signed tip (a merge parent must be finalized to travel in a bundle).
+        if self.working.is_some() {
+            let msg = self
+                .working
+                .as_ref()
+                .and_then(|w| self.repo.change_message(w))
+                .unwrap_or_else(|| "(working change)".to_string());
+            self.snapshot(&msg)?;
+            self.finalize_working()?;
+        }
+        let ours = self
+            .anchor()
+            .ok_or("nothing to merge into yet — record a change first (`loot new`)")?;
+        if ours == their {
+            return Ok((name.to_string(), BTreeMap::new()));
+        }
+
+        // Reconcile the two lines into a merge change (reuses converge), then sign
+        // it and make it this dock's tip.
+        let msg = format!("merge dock '{name}' into '{}'", self.dock);
+        let (merge_id, outcomes) = self
+            .repo
+            .merge_tips(&ours, &their, &msg, self.now)
+            .map_err(|e| e.to_string())?;
+        self.working = Some(merge_id.clone());
+        self.finalize_working()?;
+        // Reflect the merged tree in the working directory.
+        self.repo
+            .materialize(Some(&ours), &merge_id, &self.identity, self.now)
+            .map_err(|e| e.to_string())?;
+        Ok((name.to_string(), outcomes))
     }
 
     /// Every dock with its head and visibility summary, for `loot docks`.
@@ -962,6 +1020,98 @@ mod tests {
         assert!(ws.dock_goto("../escape").is_err(), "path traversal rejected");
         assert!(matches!(ws.dock_goto("feat").unwrap(), DockAction::Created));
         assert!(matches!(ws.dock_goto("feat"), Ok(DockAction::Already)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- CA2: local dock merge ---
+
+    #[test]
+    fn dock_merge_converges_disjoint_edits() {
+        // Acceptance: two docks editing disjoint paths merge cleanly with no
+        // conflict, and the merged tree carries both lines' files.
+        let (dir, mut ws) = dock_repo("merge-disjoint");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
+        ws.snapshot("feature work").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("home").unwrap();
+        std::fs::write(dir.join("home.txt"), b"H").unwrap();
+        ws.snapshot("home work").unwrap();
+        ws.finalize_working().unwrap();
+
+        let (src, outcomes) = ws.merge_dock("feature").unwrap();
+        assert_eq!(src, "feature");
+        assert!(ws.repo().conflicts().is_empty(), "disjoint edits: no conflicts");
+        assert_eq!(outcomes[&PathBuf::from("feature.txt")], MergeOutcome::Converged);
+        // Merge materialized both lines onto the home working tree.
+        assert!(dir.join("base.txt").exists());
+        assert!(dir.join("home.txt").exists());
+        assert!(dir.join("feature.txt").exists(), "feature work present after merge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_merge_same_path_conflicts_and_keeps_both_sides() {
+        // Acceptance: a genuine same-path divergence surfaces as a Conflict via the
+        // existing conflicts/resolve flow, with neither side dropped.
+        let (dir, mut ws) = dock_repo("merge-conflict");
+        std::fs::write(dir.join("a.txt"), b"base\n").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("a.txt"), b"feature side\n").unwrap();
+        ws.snapshot("feat").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("home").unwrap();
+        std::fs::write(dir.join("a.txt"), b"home side\n").unwrap();
+        ws.snapshot("home").unwrap();
+        ws.finalize_working().unwrap();
+
+        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
+        assert!(
+            ws.repo().conflicts().contains_key(&PathBuf::from("a.txt")),
+            "conflict recorded for `loot resolve`"
+        );
+        // Ours is kept on disk; theirs is preserved in the recorded conflict and
+        // via the merge change's second parent — no side dropped.
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"home side\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harbor_is_an_ordinary_dock_that_round_trips() {
+        // Acceptance: `harbor` is a plain dock by convention; merging into it and
+        // re-basing from it round-trips through the same machinery.
+        let (dir, mut ws) = dock_repo("harbor");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("feat.txt"), b"F").unwrap();
+        ws.snapshot("feat").unwrap();
+        ws.finalize_working().unwrap();
+
+        // Integrate feature into harbor (an ordinary dock).
+        ws.dock_goto("harbor").unwrap();
+        let (_s, o1) = ws.merge_dock("feature").unwrap();
+        assert!(o1.contains_key(&PathBuf::from("feat.txt")));
+        assert!(dir.join("feat.txt").exists(), "harbor integrated feature work");
+
+        // Re-base home from harbor: the work flows back cleanly.
+        ws.dock_goto("home").unwrap();
+        assert!(!dir.join("feat.txt").exists(), "home has not merged yet");
+        ws.merge_dock("harbor").unwrap();
+        assert!(dir.join("feat.txt").exists(), "home re-based from harbor");
+        assert!(ws.repo().conflicts().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

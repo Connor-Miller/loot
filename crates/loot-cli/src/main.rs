@@ -76,7 +76,9 @@ usage:
   loot new                                  finalize the working change; start a fresh one
   loot surface                              materialize what the current identity may see
   loot dock <name>                          create a dock (isolated working tree + tip), or switch to one
+  loot dock merge <name> [--porcelain|--json]  merge another dock's finalized tip into the current dock (local)
   loot docks                                list docks with their tip and visibility
+                                            (convention: a dock named `harbor` is the shared integration dock)
   loot log                                  show change history
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
@@ -259,9 +261,14 @@ fn cmd_surface() -> Result<(), String> {
 }
 
 fn cmd_dock(args: &[String]) -> Result<(), String> {
+    // Subcommand: `loot dock merge <name>` collapses another dock's tip into the
+    // current one locally (CA2). Anything else is create/switch.
+    if first_positional(args) == Some("merge") {
+        return cmd_dock_merge(args);
+    }
     let name = args
         .first()
-        .ok_or("dock requires <name>\n  loot dock <name>   create a dock, or switch to an existing one")?;
+        .ok_or("dock requires <name>\n  loot dock <name>          create a dock, or switch to an existing one\n  loot dock merge <name>    merge another dock's tip into this one")?;
     let mut ws = Workspace::open()?;
     let from = ws.current_dock().to_string();
     match ws.dock_goto(name)? {
@@ -272,6 +279,46 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
         DockAction::Created => {
             println!("created dock '{name}' off '{from}' and switched to it");
         }
+    }
+    Ok(())
+}
+
+fn cmd_dock_merge(args: &[String]) -> Result<(), String> {
+    let fmt = out_fmt(args);
+    // positionals are ["merge", "<name>"]; take the second.
+    let name = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .nth(1)
+        .ok_or("usage: loot dock merge <name> [--porcelain|--json]")?;
+    let mut ws = Workspace::open()?;
+    let (source, outcomes) = ws.merge_dock(name)?;
+    let current = ws.current_dock().to_string();
+
+    match fmt {
+        OutFmt::Human => {
+            if outcomes.is_empty() {
+                println!("merge '{source}' → '{current}': already up to date");
+            } else {
+                println!("merged dock '{source}' into '{current}':");
+                for (path, outcome) in &outcomes {
+                    println!("  {:<24} {}", path.display(), describe(outcome));
+                }
+                let conflicts = outcomes
+                    .values()
+                    .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
+                    .count();
+                if conflicts > 0 {
+                    println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>`, then `loot new`");
+                } else {
+                    println!("merge committed as this dock's tip; run `loot log` to see it");
+                }
+            }
+        }
+        // Machine output: verdict rows only, matching the other reconciliation verbs.
+        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
+        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
     }
     Ok(())
 }

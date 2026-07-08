@@ -763,6 +763,43 @@ impl DagRepo {
         (total, restricted, embargoed)
     }
 
+    /// Merge finalized tip `theirs` into finalized tip `ours`, producing a merge
+    /// change parented on both (CA2, ADR 0022/0001). Docks share one object store
+    /// and graph, so this is a local fork collapse — no relay, no bundle. The new
+    /// change's tree is the ADR 0001 reconciliation of the two lines
+    /// ([`converge::merge_trees`]): converged/cleanly-merged paths take the other
+    /// (or superset) side, genuine same-path divergences keep *ours* and are
+    /// recorded as conflicts (theirs stays reachable via the second parent, for
+    /// `loot resolve`), and sealed paths we cannot open are carried forward.
+    ///
+    /// Reuses the shared convergence rule; adds none. The change is returned
+    /// unsigned — the caller finalizes (signs) it, as loot-core stays verify-only
+    /// for signatures (ADR 0018). Returns `(merge change id, per-path outcomes)`.
+    pub fn merge_tips(
+        &mut self,
+        ours: &Oid,
+        theirs: &Oid,
+        message: &str,
+        now: u64,
+    ) -> Result<(Oid, BTreeMap<PathBuf, MergeOutcome>), RepoError> {
+        let our_tree = self.graph.tree_at(ours);
+        let their_tree = self.graph.tree_at(theirs);
+        let merged = converge::merge_trees(&our_tree, &their_tree, self, now);
+        // Record conflicts so `loot conflicts`/`loot resolve` see them, exactly
+        // as the apply path does.
+        for (path, (o, t)) in &merged.conflicts {
+            self.conflicts.insert(path.clone(), (o.clone(), t.clone()));
+        }
+        let change = Change {
+            id: Oid([0; 32]),
+            parents: vec![ours.clone(), theirs.clone()],
+            message: message.to_string(),
+            tree: merged.tree,
+        };
+        let id = self.record(change)?;
+        Ok((id, merged.outcomes))
+    }
+
     /// Verify and record an attestation over a change (S4, ADR 0018). Returns
     /// `true` if it verified and was stored, `false` if the signature was invalid
     /// (dropped — an attestation is advisory and never fatal). Attestations never
