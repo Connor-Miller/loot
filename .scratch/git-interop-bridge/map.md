@@ -1,4 +1,5 @@
 # Map: Chart the git interop bridge (bidirectional loot ↔ git mirror) to a spec
+GitHub: #78
 
 <!-- wayfinder:map -->
 

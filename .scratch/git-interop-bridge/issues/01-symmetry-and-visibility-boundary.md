@@ -1,4 +1,5 @@
 # 01 — Symmetry & the visibility boundary
+GitHub: #79
 
 Type: grilling
 Status: resolved

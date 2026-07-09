@@ -1,4 +1,5 @@
 # 07 — Write the git interop bridge spec (the hand-off deliverable)
+GitHub: #85
 
 Type: task
 Status: resolved
