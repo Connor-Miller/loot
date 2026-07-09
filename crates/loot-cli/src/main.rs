@@ -20,6 +20,11 @@ fn main() -> ExitCode {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let rest = &args[args.len().min(1)..];
 
+    // `buoy` returns its own ExitCode (0/2/3/1) rather than the generic Ok/Err.
+    if cmd == "buoy" {
+        return cmd_buoy(rest);
+    }
+
     let result = match cmd {
         "init" => cmd_init(rest),
         "status" => cmd_status(rest),
@@ -92,6 +97,7 @@ usage:
                                             (convention: a dock named `harbor` is the shared integration dock)
   loot manifest                             show the grant audit trail (and attestations)
   loot attest <change-id> [role]            attest a change (advisory sign-off, ADR 0018)
+  loot buoy [role] [--verbose] [--porcelain|--json]  resolve the newest trusted role-attested change (CA4, ADR 0025)
   loot conflicts [--porcelain|--json]       list paths that need human resolution
   loot resolve <path> <file>                resolve a conflict at <path> using the content of <file>
   loot remote add <name> <url>              register a relay URL under a name
@@ -806,6 +812,180 @@ fn cmd_attest(args: &[String]) -> Result<(), String> {
     ws.attest(&change_id, role)?;
     println!("attested {} as \"{}\"", short(&change_id), role);
     Ok(())
+}
+
+/// `loot buoy [role] [--verbose] [--porcelain|--json]`
+///
+/// Resolve the newest trusted role-attested change — the buoy (CA4, ADR 0025).
+/// Returns its own ExitCode: 0 = resolved, 2 = no buoy, 3 = ambiguous, 1 = error.
+fn cmd_buoy(args: &[String]) -> ExitCode {
+    match cmd_buoy_inner(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("loot: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
+    // `--verbose`, `--porcelain`, `--json` are flags; the first non-flag arg is the role.
+    let verbose = has_flag(args, "--verbose");
+    let fmt = out_fmt(args);
+    let role = first_positional(args).unwrap_or("reviewed");
+
+    let ws = Workspace::open()?;
+    let dot = ws.dot().to_owned();
+    let reg = identity::PeerRegistry::load(&dot);
+
+    // The local identity's own pubkey enables self-trust.
+    let my_pubkey: Option<[u8; 32]> = if identity::keypair_exists(&dot) {
+        let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
+        Some(id.public_key_bytes())
+    } else {
+        None
+    };
+
+    // Build the trusted predicate: peer registry OR self.
+    let trusted = |pk: &[u8; 32]| -> bool {
+        if my_pubkey.as_ref() == Some(pk) {
+            return true;
+        }
+        for (_name, pubkey_line) in reg.list() {
+            if identity::PeerRegistry::parse_pubkey_bytes_from_line(pubkey_line)
+                .map_or(false, |p| &p == pk)
+            {
+                return true;
+            }
+        }
+        false
+    };
+
+    // Build the present-changes set and parent-lookup from the engine.
+    use std::collections::BTreeSet;
+    let present: BTreeSet<loot_core::Oid> = ws.repo().log().into_iter().map(|(id, _)| id).collect();
+    let parents_fn = |id: &loot_core::Oid| ws.repo().parents_of(id);
+
+    let all_attestations = ws.repo().all_attestations();
+
+    // Collect verbose exclusions: trusted attestations naming absent changes.
+    let excluded: Vec<&&loot_core::attestation::Attestation> = if verbose {
+        all_attestations
+            .iter()
+            .filter(|a| a.role == role && a.verify() && trusted(&a.attester) && !present.contains(&a.change_id))
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let result = loot_core::buoy::resolve(
+        &present,
+        &parents_fn,
+        all_attestations.iter().copied(),
+        &trusted,
+        role,
+    );
+
+    if verbose && !excluded.is_empty() {
+        eprintln!("buoy: trusted attestations for changes absent locally:");
+        for a in &excluded {
+            eprintln!("  {} ({})", loot_core::hex::encode(&a.change_id.0), a.role);
+        }
+    }
+
+    match result {
+        loot_core::buoy::BuoyResult::Resolved { change, attesters } => {
+            match fmt {
+                OutFmt::Porcelain => {
+                    print!("B\t{}\t{role}\n", loot_core::hex::encode(&change.0));
+                }
+                OutFmt::Json => {
+                    let attesters_json: Vec<String> =
+                        attesters.iter().map(|pk| loot_core::hex::encode(pk)).collect();
+                    println!(
+                        "{{\"contract\":{},\"role\":{role_json},\"status\":\"resolved\",\"buoy\":\"{hex}\",\"attesters\":[{atts}]}}",
+                        loot_core::format::FORMAT_MAJOR,
+                        role_json = json_str(role),
+                        hex = loot_core::hex::encode(&change.0),
+                        atts = attesters_json.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(","),
+                    );
+                }
+                OutFmt::Human => {
+                    let attester_names: Vec<String> =
+                        attesters.iter().map(|pk| resolve_pubkey_name(&reg, pk)).collect();
+                    println!(
+                        "buoy ({}): {} — attested by {}",
+                        role,
+                        short(&change),
+                        attester_names.join(", "),
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        loot_core::buoy::BuoyResult::Ambiguous { candidates } => {
+            match fmt {
+                OutFmt::Porcelain => {
+                    for c in &candidates {
+                        print!("A\t{}\t{role}\n", loot_core::hex::encode(&c.change.0));
+                    }
+                }
+                OutFmt::Json => {
+                    let cands_json: Vec<String> = candidates
+                        .iter()
+                        .map(|c| {
+                            let atts: Vec<String> =
+                                c.attesters.iter().map(|pk| format!("\"{}\"", loot_core::hex::encode(pk))).collect();
+                            format!(
+                                "{{\"change\":\"{}\",\"attesters\":[{}]}}",
+                                loot_core::hex::encode(&c.change.0),
+                                atts.join(","),
+                            )
+                        })
+                        .collect();
+                    println!(
+                        "{{\"contract\":{},\"role\":{role_json},\"status\":\"ambiguous\",\"candidates\":[{cands}]}}",
+                        loot_core::format::FORMAT_MAJOR,
+                        role_json = json_str(role),
+                        cands = cands_json.join(","),
+                    );
+                }
+                OutFmt::Human => {
+                    println!("ambiguous: {role} is attested on {} concurrent changes — attest one to resolve:", candidates.len());
+                    for c in &candidates {
+                        let names: Vec<String> =
+                            c.attesters.iter().map(|pk| resolve_pubkey_name(&reg, pk)).collect();
+                        println!("  {} (attested by {})", short(&c.change), names.join(", "));
+                    }
+                    println!("  run `loot attest <id> {role}` to pin one as the buoy");
+                }
+            }
+            Ok(ExitCode::from(3))
+        }
+        loot_core::buoy::BuoyResult::None => {
+            match fmt {
+                OutFmt::Porcelain => {
+                    // No lines — the exit code carries the signal.
+                }
+                OutFmt::Json => {
+                    println!(
+                        "{{\"contract\":{},\"role\":{role_json},\"status\":\"none\"}}",
+                        loot_core::format::FORMAT_MAJOR,
+                        role_json = json_str(role),
+                    );
+                }
+                OutFmt::Human => {
+                    println!("no buoy for role '{role}'");
+                }
+            }
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+/// Minimal JSON string escaping for role values (role is a free-form String).
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> String {
