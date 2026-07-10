@@ -191,6 +191,19 @@ tree already records) **refuses** unless that path is passed via
 `loot status --allow-demote <path>`. Widening a Restricted identity set is
 not guarded — `grant`/`maroon` own that audit trail.
 
+**`.lootignore`** *(#64, 2026-07-09)* — a gitignore-style file excluding paths
+from [[Snapshot (reconcile)]]: one glob per line, `#` comments, the **same
+dialect as `.lootattributes`** (full relative path; `*` stops at `/`, `**`
+crosses it) — deliberately *not* full gitignore semantics (no negation, no
+implicit any-depth matching; use `**/target/` for that). A trailing `/`
+ignores the whole subtree (`target/` ≡ `target/**`) and the walk **prunes**
+there — ignored build output is never even read. An ignored path simply isn't
+part of the tree the engine reconciles, so ignoring an already-snapshotted
+readable path drops it from the working change on the next `status` — the
+remedy for the pilot's 38 MB `target/` mis-seal. The policy files themselves
+(`.lootattributes`, `.lootignore`) are never ignorable and stay versioned
+(#62's rationale: policy travels).
+
 **loot (the CLI)** — the first product crate (`loot-cli`, binary `loot`):
 `init`, `status`, `describe`, `new`, `checkout`, `log`, `bundle`, `apply`. Thin
 verbs over the [[Workspace]]; the JJ-style working change replaces git's
