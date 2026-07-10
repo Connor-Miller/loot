@@ -1067,6 +1067,41 @@ impl DagRepo {
         self.graph.remove_head(id);
     }
 
+    /// Whether two changes hold identical trees by *content*: same paths and
+    /// visibilities, and per path either the same sealed address or equal
+    /// plaintext this identity can open. Sealing mints a fresh key+nonce per
+    /// write (#98), so address equality alone cannot see that two separately
+    /// recorded changes carry the same bytes — exactly the bridge's case,
+    /// where a capture snapshot and an ingested commit both seal the same
+    /// pulled content (GB1, ADR 0028). An unopenable pair counts as different.
+    pub fn same_tree_content(&self, a: &Oid, b: &Oid, now: u64) -> bool {
+        let ta = self.graph.tree_at(a);
+        let tb = self.graph.tree_at(b);
+        if ta.len() != tb.len() {
+            return false;
+        }
+        for (path, (oa, va)) in &ta {
+            let Some((ob, vb)) = tb.get(path) else {
+                return false;
+            };
+            if va != vb {
+                return false;
+            }
+            if oa == ob {
+                continue;
+            }
+            let (Ok(ba), Ok(bb)) =
+                (self.get(oa, &self.identity, now), self.get(ob, &self.identity, now))
+            else {
+                return false;
+            };
+            if ba != bb {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Count `(total, restricted, embargoed)` paths in a tip's tree — the
     /// visibility summary `loot docks` shows per dock (ADR 0022).
     pub fn visibility_summary_at(&self, tip: &Oid) -> (usize, usize, usize) {

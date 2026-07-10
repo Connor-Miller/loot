@@ -167,6 +167,19 @@ impl Workspace {
         message: &str,
         allow_demote: &[PathBuf],
     ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+        let tip = self.tip.clone();
+        self.snapshot_from(tip.as_ref(), message, allow_demote)
+    }
+
+    /// `snapshot_allowing` with an explicit fork base instead of the ambient
+    /// dock tip — the bridge captures against its pinned pre-ingest anchor so
+    /// a pre-dock home capture never folds a freshly ingested head in.
+    fn snapshot_from(
+        &mut self,
+        base: Option<&Oid>,
+        message: &str,
+        allow_demote: &[PathBuf],
+    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
         // Promote any embargoed keys whose reveal time has passed before reading
         // content — `sealed::open` will then find them in the Keyring (ADR 0007).
         self.repo.flush_escrow(self.now);
@@ -200,13 +213,13 @@ impl Workspace {
             }
         }
 
-        // Fork the working change from the ambient dock's tip (ADR 0022). `tip`
-        // is `None` on the pre-dock home dock, which preserves the original
-        // fork-from-all-heads behavior exactly.
+        // Fork the working change from `base` — the ambient dock's tip (ADR
+        // 0022) on the normal path. `None` (the pre-dock home dock) preserves
+        // the original fork-from-all-heads behavior exactly.
         let id = self
             .repo
             .snapshot_allowing(
-                self.tip.as_ref(),
+                base,
                 self.working.as_ref(),
                 &entries,
                 message,
@@ -701,32 +714,47 @@ impl Workspace {
         self.signer.as_ref().map(|s| s.public_key_bytes())
     }
 
-    /// Capture and finalize any in-progress work, exactly as `merge_dock` does
-    /// before merging: the bridge calls this before it moves the dock tip, so
-    /// no uncommitted work is stranded under a moved tip.
+    /// Capture in-progress disk work before the bridge moves the dock tip,
+    /// exactly as `merge_dock` captures before merging: adopt/merge
+    /// re-materialize the full target tree, so uncaptured edits — including
+    /// ones that never saw a `status` and so have no working change yet —
+    /// would be silently overwritten.
     ///
-    /// Snapshots unconditionally: disk edits that never saw a `status` have no
-    /// working change yet, and the adopt path re-materializes the full target
-    /// tree — capture first or those edits are silently overwritten. A snapshot
-    /// that turns out identical to the anchor is dropped from the graph again,
-    /// so a clean tree mints no redundant change and leaves no stray head for
-    /// this pass's reconcile (or the next pass's anchor) to trip over.
-    pub fn ferry_capture(&mut self) -> Result<(), String> {
+    /// Forks explicitly from `base` (the bridge's pinned pre-ingest anchor):
+    /// the pre-dock home dock would otherwise fork from every head and fold
+    /// the freshly ingested line in without the converge classifier seeing
+    /// it. A snapshot identical to `base` (nothing new) or to `target` (the
+    /// disk already holds exactly what the ingested line delivers — the
+    /// co-located checkout after a `git pull`) is dropped from the graph
+    /// again, so no redundant change is minted and no stray head is left for
+    /// reconcile or a later pass's anchor derivation to trip over. Returns
+    /// the captured change when real work was finalized.
+    pub fn ferry_capture(
+        &mut self,
+        base: Option<&Oid>,
+        target: Option<&Oid>,
+    ) -> Result<Option<Oid>, String> {
         let msg = self
             .working
             .as_ref()
             .and_then(|w| self.repo.change_message(w))
             .unwrap_or_else(|| "(working change)".to_string());
-        let (id, _) = self.snapshot(&msg)?;
-        let anchor_tree = self.anchor().and_then(|a| self.repo.change_tree(&a));
-        if self.repo.change_tree(&id) != anchor_tree {
-            self.finalize_working()?;
-        } else {
+        let (id, _) = self.snapshot_from(base, &msg, &[])?;
+        let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
+        let duplicate = empty
+            || [base, target]
+                .into_iter()
+                .flatten()
+                .any(|o| self.repo.same_tree_content(o, &id, self.now));
+        if duplicate {
             self.repo.drop_working(&id);
             self.working = None;
             self.persist()?;
+            Ok(None)
+        } else {
+            self.finalize_working()?;
+            Ok(Some(id))
         }
-        Ok(())
     }
 
     /// Fast-forward the ambient dock to `new_tip` (an ingested change that
