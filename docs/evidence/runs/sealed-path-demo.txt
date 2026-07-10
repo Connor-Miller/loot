@@ -1,0 +1,138 @@
+=== loot sealed-from-agents path demo (section B, ADR 0026) ===
+run started (utc): 2026-07-10 16:00:45Z
+relay:             https://relay.millerbyte.com
+dev repo:          C:\Users\conno\source\repos\loot
+sealed path:       docs/pitch/zk-host.md   (.lootattributes: docs/pitch/** restricted=connor)
+
+>>> building loot (release)
+
+>>> agent: clone the live relay as identity 'reviewer' (read-only)
+    initialized empty loot repo at C:\Users\conno\AppData\Local\Temp\loot-sealed-path-1783699245\agent, identity = reviewer
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFpW5xCHy3VH8NOp986hZyQQufb/eySEOxiWmlNi82qU reviewer@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=reviewer`
+    pulled 91 change(s) from https://relay.millerbyte.com
+    cloned https://relay.millerbyte.com → C:\Users\conno\AppData\Local\Temp\loot-sealed-path-1783699245\agent
+    run `loot status` to see the working tree
+
+>>> agent: loot surface (materialize what 'reviewer' may see)
+      .gitignore                       public
+      .lootattributes                  public
+      .lootignore                      public
+      CONTEXT.md                       public
+      Cargo.lock                       public
+      Cargo.toml                       public
+      README.md                        public
+      crates\loot-bench\Cargo.toml     public
+      crates\loot-bench\src\lib.rs     public
+      crates\loot-cli\Cargo.toml       public
+      crates\loot-cli\src\main.rs      public
+      crates\loot-cli\src\workspace.rs public
+      crates\loot-core\Cargo.toml      public
+      crates\loot-core\src\attestation.rs public
+      crates\loot-core\src\bundle_codec.rs public
+      crates\loot-core\src\buoy.rs     public
+      crates\loot-core\src\converge.rs public
+      crates\loot-core\src\engine\change_graph.rs public
+      crates\loot-core\src\engine\object_store.rs public
+      crates\loot-core\src\engine\persist_codec.rs public
+      crates\loot-core\src\engine.rs   public
+      crates\loot-core\src\escrow.rs   public
+      crates\loot-core\src\format.rs   public
+      crates\loot-core\src\hex.rs      public
+      crates\loot-core\src\lib.rs      public
+      crates\loot-core\src\manifest.rs public
+      crates\loot-core\src\sealed.rs   public
+      crates\loot-core\src\store.rs    public
+      crates\loot-core\src\verdict.rs  public
+      crates\loot-identity\Cargo.toml  public
+      crates\loot-identity\src\key_seal.rs public
+      crates\loot-identity\src\lib.rs  public
+      crates\loot-identity\src\peers.rs public
+      crates\loot-net\Cargo.toml       public
+      crates\loot-net\src\lib.rs       public
+      crates\loot-net\src\mailbox.rs   public
+      crates\loot-net\src\relay_store.rs public
+      crates\loot-net\tests\sync_round_trip.rs public
+      crates\spike-crdt\Cargo.toml     public
+      crates\spike-crdt\src\lib.rs     public
+      crates\spike-dag\Cargo.toml      public
+      crates\spike-dag\src\lib.rs      public
+      docs\adr\0001-per-content-decrypt-then-merge-convergence.md public
+      docs\adr\0002-encrypted-dag-foundation.md public
+      docs\adr\0003-sealed-content-module-keyring-custody.md public
+      docs\adr\0004-drop-plaintext-dedup-equality-oracle.md public
+      docs\adr\0005-cli-slice-persistence-and-attributes.md public
+      docs\adr\0006-workspace-auto-snapshot.md public
+      docs\adr\0007-embargo-escrow-module.md public
+      docs\adr\0008-grant-log-and-targeted-key-bundles.md public
+      docs\adr\0009-two-level-revocation.md public
+      docs\adr\0010-forward-maroon-implementation.md public
+      docs\adr\0011-relay-stow-append-only.md public
+      docs\adr\0012-per-object-loose-storage.md public
+      docs\adr\0013-named-remotes-and-grant-bundle-delivery.md public
+      docs\adr\0014-identity-keypairs-openssh-ed25519.md public
+      docs\adr\0015-grant-authentication-and-trust.md public
+      docs\adr\0016-identity-portability-and-rotation.md public
+      docs\adr\0017-repostore-loot-layout.md public
+      docs\adr\0018-signed-changes-authored-history.md public
+      docs\adr\0019-format-versioning-and-compatibility.md public
+      docs\adr\0020-compress-public-content.md public
+      docs\adr\0021-object-level-wants-negotiation.md public
+      docs\adr\0022-concurrent-agent-model-docks.md public
+      docs\adr\0023-agent-facing-machine-output.md public
+      docs\adr\0024-resumable-transfer.md public
+      docs\adr\0025-buoy-resolver.md   public
+      docs\adr\0026-agent-identity-model.md public
+      docs\adr\0027-hard-embargo-timed-sealed-grants.md public
+      docs\agents\identity.md          public
+      docs\bakeoff\index.html          public
+      docs\evidence\loot-hosts-loot.md public
+      docs\lore-comparison.md          public
+      issues\CA1-docks.md              public
+      issues\CA2-dock-merge-harbor.md  public
+      issues\CA3-porcelain-machine-output.md public
+      issues\CA4-buoy-resolver.md      public
+      issues\README.md                 public
+      issues\S1-format-versioning.md   public
+      issues\S2-compress-public-content.md public
+      issues\S3-signed-changes.md      public
+      issues\S4-attestation-lane.md    public
+      issues\S5-wants-negotiation.md   public
+      issues\S6-resumable-transfer.md  public
+      issues\S7-pluggable-relay-backend-s3.md public
+      issues\S8-sparse-views.md        public
+      issues\S9-relay-fault-injection-tests.md public
+      issues\create-agent-issues.sh    public
+      issues\create-issues.sh          public
+      tools\new-agent.ps1              public
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced 7784bcac as reviewer
+PASS: the agent's clone does NOT materialize the sealed path (docs/pitch/zk-host.md absent)
+PASS: the agent's clone DOES materialize public content (CONTEXT.md present)
+PASS: loot reports sealed path(s) skipped for the agent (it holds the ciphertext, not the key)
+
+>>> dev: loot whoami (the real repo's identity)
+    identity: connor
+    pubkey:   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINvz2+YyJofdHNWWRplLv1RRwA/XVIMi2uHJfLevIzbu connor@loot
+    share with peers:  loot peer add connor ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINvz2+YyJofdHNWWRplLv1RRwA/XVIMi2uHJfLevIzbu connor@loot
+PASS: the dev repo's identity is connor (the grantee of docs/pitch/**)
+PASS: the dev's working tree HAS the sealed path present and readable (docs/pitch/zk-host.md)
+
+>>> dev reads the sealed path (first line of docs/pitch/zk-host.md):
+    # The host that cannot read your code
+
+================  RESULT  ================
+Same ciphertext on the relay; docs/pitch/ is present for the dev (connor
+holds the key) and absent for the agent clone (ciphertext only). Visibility
+is a property of the content, not the repository.
+
+Honesty (ADR 0026): this is one machine under one OS user. 'Agents cannot
+read the sealed path' means key custody PLUS the agent harness's file
+sandbox -- an honest-participant posture. A hostile process running as the
+dev's OS user could read the dev's keyring off disk; the claim is about
+identity-scoped visibility within a cooperating multi-identity repo, which
+is exactly what the thesis is about.
+
+ALL CHECKS PASSED -- the sealed path is dev-visible, agent-invisible.
+run finished (utc): 2026-07-10 16:00:46Z

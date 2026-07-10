@@ -664,6 +664,12 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
         }
     })?;
 
+    // Finalize (sign) the re-seal change so it propagates: the engine records it
+    // authored-but-unsigned, and unsigned authored changes never travel via
+    // push/bundle (ADR 0018). Without this, a maroon's re-seal is stranded on
+    // the originator and peers keep reading the old content.
+    ws.sign_change(&result.change_id)?;
+
     let level = if hard { "hard-marooned" } else { "marooned" };
     println!(
         "{} {} from {} (new oid: {})",

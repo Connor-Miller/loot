@@ -74,6 +74,12 @@ pub struct LogGraph {
 pub struct MaroonResult {
     pub new_oid: Oid,
     pub grants: Vec<(String, SyncBundle)>,
+    /// The id of the re-seal change this maroon recorded. In an authored repo
+    /// (one with a keypair) the change is recorded authored-but-**unsigned**,
+    /// so — like any working change — it does not yet propagate (ADR 0018: only
+    /// signed history travels). The caller must finalize it (attach a
+    /// signature) before `push`/`bundle` will ship the re-seal to peers.
+    pub change_id: Oid,
 }
 
 /// Returned by `migrate`: the new object address plus any targeted grant
@@ -361,7 +367,7 @@ impl DagRepo {
             message: format!("maroon {} from {}", marooned, path.display()),
             tree: new_tree,
         };
-        self.record(change)?;
+        let change_id = self.record(change)?;
 
         // Produce grant bundles for remaining identities.
         let remaining_grantees: Vec<String> = self.manifest.grants_for(&old_oid)
@@ -377,7 +383,7 @@ impl DagRepo {
             }
         }
 
-        Ok(MaroonResult { new_oid, grants })
+        Ok(MaroonResult { new_oid, grants, change_id })
     }
 
     /// Migrate `path` to a new visibility policy: re-seal the content under
@@ -3037,6 +3043,42 @@ mod tests {
 
         carol.apply(&purge_bundle, 0).unwrap();
         assert!(carol.keyring.holds(&oid), "carol's key must NOT be purged");
+    }
+
+    #[test]
+    fn authored_maroon_reseal_travels_only_after_signing() {
+        // The regression behind the section-B grant/maroon demo: in an AUTHORED
+        // repo the maroon re-seal change is recorded authored-but-unsigned, so —
+        // like any working change — its new object is NOT offered for push
+        // (ADR 0018: only signed history travels). The CLI must finalize it via
+        // the returned change_id, after which the re-seal propagates. (Keyless
+        // repos are unaffected: their unauthored changes always travel, which is
+        // why the older maroon tests above never caught this.)
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(11);
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        alice.set_author(pk);
+        let restricted = Visibility::Restricted(vec!["alice".into(), "bob".into()]);
+        let oid = alice.put(b"secret", restricted.clone()).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("s.txt"), (oid, restricted));
+        let add_id = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree })
+            .unwrap();
+        alice.attach_signature(&add_id, sk.sign(&add_id.0).to_bytes()).unwrap();
+
+        let res = alice.maroon_hard(Path::new("s.txt"), "bob", 0).unwrap();
+        assert!(
+            !alice.offered_objects(&[]).contains(&res.new_oid),
+            "an unsigned maroon re-seal must not be offered (it would strand on the originator)"
+        );
+
+        // Finalize exactly as `cmd_maroon` now does.
+        alice.attach_signature(&res.change_id, sk.sign(&res.change_id.0).to_bytes()).unwrap();
+        assert!(
+            alice.offered_objects(&[]).contains(&res.new_oid),
+            "after signing, the maroon re-seal must be offered so peers receive it"
+        );
     }
 
     // --- migrate (ADR 0010) ---
