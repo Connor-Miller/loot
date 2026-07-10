@@ -651,15 +651,20 @@ impl Workspace {
             .repo
             .resolve(base.as_ref(), path, resolution, vis, self.now)
             .map_err(|e| e.to_string())?;
-        // On a dock, the resolution advances (and is signed as) the dock's tip so
-        // it isn't orphaned and the next snapshot builds on it.
+        // A resolution is a deliberate, finished change — sign it now (S3, ADR
+        // 0018) in both modes. The pre-dock hint to "finalize with `loot new`"
+        // never worked: resolve doesn't set the working pointer, so `new` had
+        // nothing to sign and the resolution (and every descendant) was
+        // stranded as untravelable working history.
+        if let Some(signer) = &self.signer {
+            let sig = signer.sign(&change_id.0);
+            self.repo
+                .attach_signature(&change_id, sig)
+                .map_err(|e| e.to_string())?;
+        }
+        // On a dock, the resolution also advances the dock's tip so it isn't
+        // orphaned and the next snapshot builds on it.
         if self.docks_active() {
-            if let Some(signer) = &self.signer {
-                let sig = signer.sign(&change_id.0);
-                self.repo
-                    .attach_signature(&change_id, sig)
-                    .map_err(|e| e.to_string())?;
-            }
             // Reflect the resolved tree on disk (writing the resolution over the
             // still-conflicted working copy) so a later `status` captures the
             // resolution, not the pre-resolution content.

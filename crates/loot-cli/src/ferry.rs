@@ -1179,6 +1179,25 @@ mod tests {
         assert_eq!(held.content(), b"clean\n", "conflicted path held at last clean state");
         let other = tree.get_name("other.txt").unwrap();
         assert_eq!(git.find_blob(other.id()).unwrap().content(), b"git touch\n");
+
+        // Pre-dock resolve must sign the resolution on the spot — unsigned it
+        // (and every descendant) is stranded as untravelable working history,
+        // and the next projection dies on "parent has no mirrored commit"
+        // (found live on the dogfood repo).
+        ws.resolve_conflict(Path::new("shared.txt"), b"resolved\n", Visibility::Public)
+            .unwrap();
+        assert!(ws.repo().conflicts().is_empty());
+        let heads = ws.repo().heads();
+        assert_eq!(heads.len(), 1, "resolution is the sole head");
+        assert!(ws.repo().change_author(&heads[0]).is_some());
+        assert!(ws.repo().change_signature(&heads[0]).is_some(), "resolution signed at resolve");
+
+        let after = ferry(&mut ws, &mirror);
+        assert!(after.projected >= 1, "the resolution projects: {}", after.projected);
+        let resolved_tip = main_commit(&git);
+        let resolved_tree = resolved_tip.tree().unwrap();
+        let blob = resolved_tree.get_name("shared.txt").unwrap();
+        assert_eq!(git.find_blob(blob.id()).unwrap().content(), b"resolved\n");
     }
 
     #[test]
