@@ -44,16 +44,26 @@ that log is dogfood data, not failure.
       `..\loot-crew\crew` via `tools/new-agent.ps1`; peer registry + relay
       allowlist; clone verified: full public tree present, `docs/pitch/`
       absent)
-- [ ] **Sealed-path script**: the agent's clone surfaces the repo with
-      `docs/pitch/` absent; the dev's surfaces it present. Captured output
-      committed.
-- [ ] **Grant/maroon script**: grant a restricted path to the agent → agent
+- [x] **Sealed-path script**: the agent's clone surfaces the repo with
+      `docs/pitch/` absent; the dev's surfaces it present. Script
+      `scripts/sealed-path-demo.ps1`, output `runs/sealed-path-demo.txt` (run
+      2026-07-10 against the live relay: a fresh non-dev clone materializes 90
+      public paths and skips the sealed path; the dev repo (connor) reads
+      `docs/pitch/zk-host.md`). Read-only — no push, no relay pollution.
+- [x] **Grant/maroon script**: grant a restricted path to the agent → agent
       reads it → maroon the agent → agent's next pull carries the new seal it
-      cannot open. The Manifest audit trail (grant + re-seal events, as
-      pubkeys) printed in the output.
-- [ ] Honesty statement in the captured output: on one machine under one OS
+      cannot open. Script `scripts/grant-maroon-demo.ps1`, output
+      `runs/grant-maroon-demo.txt`. Hermetic against a local `loot serve` (the
+      cycle mutates history, so it stays off the shared VPS DAG). The Manifest
+      audit trail (grantor/grantee as pubkeys) is printed. NB: fixed a real bug
+      en route — `loot maroon` recorded the re-seal change unsigned, so it never
+      propagated (ADR 0018: only signed history travels); the CLI now finalizes
+      it.
+- [x] Honesty statement in the captured output: on one machine under one OS
       user, "agents cannot read" = key custody **plus the agent harness's file
-      sandbox** (honest-participant posture, per ADR 0026).
+      sandbox** (honest-participant posture, per ADR 0026). Both demos print it;
+      grant/maroon also flags that already-decrypted bytes are not forward-secret
+      (ADR 0009).
 
 ## C. Hard embargo (ADR 0027)
 

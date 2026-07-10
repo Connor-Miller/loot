@@ -252,6 +252,22 @@ impl Workspace {
         self.persist()
     }
 
+    /// Finalize a specific already-recorded change by signing it (S3, ADR 0018),
+    /// so it stops counting as a working change and propagates via push/bundle.
+    /// Used by `maroon`, which records a complete re-seal change the engine
+    /// leaves unsigned. In a keyless repo the change is unauthored and already
+    /// travels, so this is a no-op there.
+    pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), String> {
+        if let Some(signer) = &self.signer {
+            let sig = signer.sign(&change_id.0);
+            self.repo
+                .attach_signature(change_id, sig)
+                .map_err(|e| e.to_string())?;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
     /// Attest an existing change with this repo's identity (S4, ADR 0018): sign
     /// `change_id || attester || role` and record the attestation. Advisory — it
     /// never changes the change id. Errors if the repo has no keypair.
