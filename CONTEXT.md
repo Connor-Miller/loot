@@ -23,8 +23,12 @@ change, *visibility-aware* (ADR 0006). Against the last change's full tree, at
 time `now`: paths the current identity can open are updated/deleted to match the
 tree; paths it cannot open are carried forward unchanged (never seen, so never
 changed); a write onto a non-visible path is refused (no silent clobber of
-sealed content). Lives in the engine (`DagRepo::snapshot`); the Workspace only
-supplies the tree.
+sealed content). A path whose plaintext and visibility are unchanged **keeps
+its sealed object and address** (#98) — snapshots and pushes are O(delta), not
+O(repo). Reuse never mints or moves a key (the object and its key are already
+held), so ADR 0004's no-plaintext-dedup stance is untouched; a path the
+identity cannot open *now* (e.g. still-embargoed) re-seals fresh. Lives in the
+engine (`DagRepo::snapshot`); the Workspace only supplies the tree.
 
 **Workspace** — the CLI module owning the *process-bound ambient repo*: it
 discovers `.loot/`, supplies the current identity and the clock, and persists on
@@ -264,8 +268,10 @@ the ADR 0001 rule and touches no storage or disk, so it is unit-testable with
 a fake oracle. The **merge base** (#65, 2026-07-09) is the nearest common
 ancestor's full tree, supplied by the caller (`apply` walks the incoming
 chain's parents into the local graph; `dock merge` asks the graph directly):
-because changes carry full trees and every snapshot re-seals under fresh
-addresses, address inequality does *not* mean both sides edited — a side
+because changes carry full trees and a snapshot may re-seal content under a
+fresh address without a real edit (routine before #98's unchanged-path reuse;
+still possible whenever a peer re-seals content it holds, e.g. a visibility
+change), address inequality does *not* mean both sides edited — a side
 whose plaintext equals the base is untouched since the fork and the other
 side simply wins. Only genuinely double-edited content reaches the line-set
 heuristic (and, when undecidable, *Conflict*). No base known (disjoint

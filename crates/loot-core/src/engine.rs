@@ -796,7 +796,10 @@ impl DagRepo {
     ///   - an `entries` path that collides with a base path it CANNOT open:
     ///     refused (no silent clobber of sealed content).
     ///
-    /// Returns the new working-change id. Idempotent on an unchanged tree.
+    /// Returns the new working-change id. Idempotent on an unchanged tree:
+    /// a path whose plaintext and visibility are unchanged keeps its sealed
+    /// object and oid (#98), so snapshots — and the pushes that ship their
+    /// objects — are O(delta), not O(repo).
     pub fn snapshot(
         &mut self,
         base: Option<&Oid>,
@@ -892,7 +895,28 @@ impl DagRepo {
 
         // Seal every working-tree entry (visible by construction — we read it).
         // Absent-but-visible base paths simply don't get re-added => deleted.
+        //
+        // Reuse the outgoing tree's oid when a path's plaintext AND visibility
+        // are unchanged (#98): sealing mints a fresh key+nonce, so re-sealing
+        // identical content gives it a new address, and every push ships the
+        // whole repo instead of the delta. Reuse never mints or moves a key —
+        // the object and its key are already held (we just opened it), and the
+        // parent change already referenced this address — so ADR 0004's
+        // no-plaintext-dedup stance is untouched: address equality here means
+        // "same sealed object carried forward", never "equal plaintext
+        // discovered". A path we cannot open *now* (e.g. still-embargoed)
+        // re-seals fresh as before.
         for (path, bytes, vis) in entries {
+            if let Some((old_oid, old_vis)) = old_tree.get(path) {
+                if old_vis == vis
+                    && self
+                        .get(old_oid, &self.identity, now)
+                        .is_ok_and(|old| old == *bytes)
+                {
+                    tree.insert(path.clone(), (old_oid.clone(), vis.clone()));
+                    continue;
+                }
+            }
             let oid = self.put(bytes, vis.clone())?;
             tree.insert(path.clone(), (oid, vis.clone()));
         }
@@ -2240,6 +2264,111 @@ mod tests {
         let tree = repo.graph.current_tree();
         let oid = &tree[&PathBuf::from("a.txt")].0;
         assert_eq!(repo.get(oid, "alice", 0).unwrap(), b"two");
+    }
+
+    #[test]
+    fn snapshot_reuses_sealed_object_for_unchanged_paths() {
+        // #98: a one-file edit must not re-address the whole repo. The
+        // unchanged path keeps its oid across the rewrite, so the push
+        // wants-negotiation (S5) ships only the delta.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(
+                None,
+                None,
+                &[
+                    entry("edited.txt", b"one", Visibility::Public),
+                    entry("stable.txt", b"same", Visibility::Public),
+                ],
+                "wip",
+                0,
+            )
+            .unwrap();
+        let t1 = repo.graph.tree_at(&w1);
+        let w2 = repo
+            .snapshot(
+                None,
+                Some(&w1),
+                &[
+                    entry("edited.txt", b"two", Visibility::Public),
+                    entry("stable.txt", b"same", Visibility::Public),
+                ],
+                "wip",
+                0,
+            )
+            .unwrap();
+        let t2 = repo.graph.tree_at(&w2);
+        assert_eq!(
+            t1[&PathBuf::from("stable.txt")].0,
+            t2[&PathBuf::from("stable.txt")].0,
+            "unchanged path must keep its sealed object"
+        );
+        assert_ne!(
+            t1[&PathBuf::from("edited.txt")].0,
+            t2[&PathBuf::from("edited.txt")].0,
+            "edited path must get a fresh object"
+        );
+        // The reused object still opens.
+        let oid = &t2[&PathBuf::from("stable.txt")].0;
+        assert_eq!(repo.get(oid, "alice", 0).unwrap(), b"same");
+    }
+
+    #[test]
+    fn snapshot_is_idempotent_at_the_engine_level() {
+        // With oid reuse (#98) the doc's idempotency claim holds in the engine
+        // itself, not just behind the workspace's tree-hash short-circuit:
+        // unchanged entries + same message => the same change id.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let entries = [entry("a.txt", b"body", Visibility::Public)];
+        let w1 = repo.snapshot(None, None, &entries, "wip", 0).unwrap();
+        let w2 = repo.snapshot(None, Some(&w1), &entries, "wip", 0).unwrap();
+        assert_eq!(w1, w2, "unchanged tree must rewrite to the same change id");
+    }
+
+    #[test]
+    fn snapshot_reseals_on_visibility_change_even_with_same_bytes() {
+        // Visibility lives on the sealed object (grant_ids, compression),
+        // so a promotion must mint a fresh seal — reuse would leave the old
+        // policy on the object.
+        let restricted = Visibility::Restricted(vec!["alice".into()]);
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(None, None, &[entry("a.txt", b"s", Visibility::Public)], "wip", 0)
+            .unwrap();
+        let t1 = repo.graph.tree_at(&w1);
+        let w2 = repo
+            .snapshot(None, Some(&w1), &[entry("a.txt", b"s", restricted.clone())], "wip", 0)
+            .unwrap();
+        let t2 = repo.graph.tree_at(&w2);
+        assert_ne!(
+            t1[&PathBuf::from("a.txt")].0,
+            t2[&PathBuf::from("a.txt")].0,
+            "visibility change must re-seal"
+        );
+        assert_eq!(t2[&PathBuf::from("a.txt")].1, restricted);
+    }
+
+    #[test]
+    fn snapshot_of_still_embargoed_path_reseals_rather_than_leaking_a_read() {
+        // Before reveal_at even the author cannot open the object
+        // (sealed::open checks embargo first), so reuse cannot compare
+        // plaintexts. The path re-seals fresh — same behavior as before #98,
+        // and the demotion guard still applies on top.
+        let embargoed = Visibility::Embargoed { reveal_at: 100 };
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(None, None, &[entry("fix.rs", b"cve", embargoed.clone())], "wip", 0)
+            .unwrap();
+        let t1 = repo.graph.tree_at(&w1);
+        let w2 = repo
+            .snapshot(None, Some(&w1), &[entry("fix.rs", b"cve", embargoed.clone())], "wip", 0)
+            .unwrap();
+        let t2 = repo.graph.tree_at(&w2);
+        assert_ne!(
+            t1[&PathBuf::from("fix.rs")].0,
+            t2[&PathBuf::from("fix.rs")].0,
+            "still-embargoed content re-seals (no plaintext comparison possible)"
+        );
     }
 
     #[test]
