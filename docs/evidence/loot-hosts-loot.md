@@ -40,8 +40,10 @@ that log is dogfood data, not failure.
 
 ## B. Agents as distinct identities (ADR 0026)
 
-- [ ] First agent identity minted and registered — #86 (`new-agent.ps1`,
-      peer add, relay allowlist)
+- [x] First agent identity minted and registered — #86 (`crew` @
+      `..\loot-crew\crew` via `tools/new-agent.ps1`; peer registry + relay
+      allowlist; clone verified: full public tree present, `docs/pitch/`
+      absent)
 - [ ] **Sealed-path script**: the agent's clone surfaces the repo with
       `docs/pitch/` absent; the dev's surfaces it present. Captured output
       committed.
