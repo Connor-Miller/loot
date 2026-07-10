@@ -1,0 +1,5 @@
+# Build artifacts and generated repos never belong in history (loot#64).
+target/
+test-repos/
+.claude/
+.scratch/

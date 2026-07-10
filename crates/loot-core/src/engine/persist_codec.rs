@@ -184,6 +184,9 @@ pub fn encode_nodes(nodes: &[&ChangeNode]) -> Vec<u8> {
     out
 }
 
+// The load path decodes via `decode_nodes` (+ heads/reachability); this whole-graph
+// decoder is still exercised by the golden format-compatibility tests below.
+#[allow(dead_code)]
 pub fn decode_graph(b: &[u8]) -> Result<ChangeGraph, RepoError> {
     let mut graph = ChangeGraph::new();
     for node in decode_nodes(b)? {
@@ -510,7 +513,11 @@ mod tests {
 
     #[test]
     fn golden_v4_graph_matches_and_round_trips() {
-        assert_eq!(encode_graph(&one_change_graph()), GOLDEN_GRAPH_V4, "v4 graph layout must not drift");
+        // v5 changed only the bundle body (ADR 0027); the durable graph layout
+        // is byte-identical to v4 apart from the marker.
+        let mut golden_v5 = GOLDEN_GRAPH_V4.to_vec();
+        golden_v5[0] = format::FORMAT_MAJOR;
+        assert_eq!(encode_graph(&one_change_graph()), golden_v5, "v5 graph layout must not drift");
         assert_eq!(decode_graph(&GOLDEN_GRAPH_V4).unwrap().in_order().len(), 1);
     }
 
@@ -549,7 +556,9 @@ mod tests {
 
     #[test]
     fn golden_v4_object_matches_and_round_trips() {
-        assert_eq!(encode_object(&sample_object()), GOLDEN_OBJECT_V4, "v4 object layout must not drift");
+        let mut golden_v5 = GOLDEN_OBJECT_V4.to_vec();
+        golden_v5[0] = format::FORMAT_MAJOR;
+        assert_eq!(encode_object(&sample_object()), golden_v5, "v5 object layout must not drift");
         assert_eq!(decode_object(&GOLDEN_OBJECT_V4).unwrap(), sample_object());
     }
 
@@ -611,7 +620,9 @@ mod tests {
 
     #[test]
     fn golden_v4_keyring_matches_and_round_trips() {
-        assert_eq!(encode_keyring(&sample_keyring()), GOLDEN_KEYRING_V4, "v4 keyring layout must not drift");
+        let mut golden_v5 = GOLDEN_KEYRING_V4.to_vec();
+        golden_v5[0] = format::FORMAT_MAJOR;
+        assert_eq!(encode_keyring(&sample_keyring()), golden_v5, "v5 keyring layout must not drift");
         assert!(decode_keyring(&GOLDEN_KEYRING_V4).unwrap().holds(&Oid([4; 32])));
     }
 
@@ -633,7 +644,11 @@ mod tests {
 
     #[test]
     fn golden_v4_escrow_matches_and_round_trips() {
-        assert_eq!(encode_escrow(&sample_escrow()), GOLDEN_ESCROW_V4, "v4 escrow layout must not drift");
+        // The DURABLE escrow file (originator-side staging) survives v5; only
+        // the bundle's escrow *section* was removed (ADR 0027).
+        let mut golden_v5 = GOLDEN_ESCROW_V4.to_vec();
+        golden_v5[0] = format::FORMAT_MAJOR;
+        assert_eq!(encode_escrow(&sample_escrow()), golden_v5, "v5 escrow layout must not drift");
         assert!(decode_escrow(&GOLDEN_ESCROW_V4).unwrap().holds(&Oid([5; 32])));
     }
 

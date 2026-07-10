@@ -24,7 +24,10 @@ blake3 = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 axum = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
+# rustls-tls (not native-tls) so the push/pull client speaks HTTPS to a
+# TLS-terminating relay without pulling in OpenSSL — keeps loot's pure-Rust,
+# no-system-TLS build (relay#57: the edge is nginx + Let's Encrypt).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["reusable_secrets", "static_secrets"] }
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }

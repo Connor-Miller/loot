@@ -34,6 +34,16 @@ use object_store::{ObjectStore, Stored};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// Returned by `gc`: how many loose objects were (or, on a dry run, would be)
+/// pruned, and the total bytes they occupied on disk (ADR 0012, #66).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Number of unreferenced object files pruned.
+    pub pruned: usize,
+    /// Total on-disk size of the pruned object files, in bytes.
+    pub bytes: u64,
+}
+
 /// One change in a [`LogGraph`]: its id, message, and which heads can reach it
 /// (as indices into [`LogGraph::heads`]). A change reachable from exactly one
 /// head is unique to that head's lineage; one reachable from several is shared
@@ -64,6 +74,12 @@ pub struct LogGraph {
 pub struct MaroonResult {
     pub new_oid: Oid,
     pub grants: Vec<(String, SyncBundle)>,
+    /// The id of the re-seal change this maroon recorded. In an authored repo
+    /// (one with a keypair) the change is recorded authored-but-**unsigned**,
+    /// so — like any working change — it does not yet propagate (ADR 0018: only
+    /// signed history travels). The caller must finalize it (attach a
+    /// signature) before `push`/`bundle` will ship the re-seal to peers.
+    pub change_id: Oid,
 }
 
 /// Returned by `migrate`: the new object address plus any targeted grant
@@ -173,7 +189,6 @@ impl DagRepo {
             changes: Vec::new(),
             objs,
             keys,
-            escrow: BTreeMap::new(),
             attestations: Vec::new(),
         };
 
@@ -193,18 +208,24 @@ impl DagRepo {
     /// mailbox addressing and the manifest audit record (ADR 0015).
     /// `grantor_pubkey` — the issuer's ed25519 pubkey. Recorded in the manifest
     /// so every peer can verify who issued the grant (ADR 0015).
+    /// `reveal_at` — `0` for an ordinary grant; nonzero makes it a **timed**
+    /// grant the relay withholds until its own clock passes it (hard embargo,
+    /// ADR 0027). For embargoed content the originator's key sits in the local
+    /// Escrow (pre-reveal staging, ADR 0007), so the lookup falls back there.
     ///
-    /// Wire format: `[3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][payload]`
+    /// Wire format: `[3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][reveal_at(8)][payload]`
     pub fn grant_sealed(
         &mut self,
         oid: &Oid,
         grantee_name: &str,
         grantee_pubkey: [u8; 32],
         grantor_pubkey: [u8; 32],
+        reveal_at: u64,
         now: u64,
         seal: impl FnOnce(&[u8; 32]) -> Result<[u8; 80], RepoError>,
     ) -> Result<SyncBundle, RepoError> {
         let key = self.keyring.key_for(oid)
+            .or_else(|| self.escrow.iter().find(|(o, _)| *o == oid).map(|(_, e)| e.key))
             .ok_or_else(|| RepoError::Unauthorized(oid.clone()))?;
         let wrapped = seal(&key)?;
 
@@ -217,13 +238,19 @@ impl DagRepo {
             changes: Vec::new(),
             objs,
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: Vec::new(),
         };
 
         self.manifest.record(oid.clone(), grantee_name.to_string(), grantee_pubkey, grantor_pubkey, now);
         Ok(SyncBundle(
-            Frame::SealedGrant { grantee_pubkey, wrapped_key: wrapped, oid: oid.clone(), body }.encode(),
+            Frame::SealedGrant {
+                grantee_pubkey,
+                wrapped_key: wrapped,
+                oid: oid.clone(),
+                reveal_at,
+                body,
+            }
+            .encode(),
         ))
     }
 
@@ -243,7 +270,7 @@ impl DagRepo {
         unseal: impl FnOnce(&[u8; 80]) -> Result<[u8; 32], RepoError>,
     ) -> Result<(), RepoError> {
         // Decode through the one codec; reject anything that isn't a sealed grant.
-        let Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body } =
+        let Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, body } =
             Frame::decode(&bundle.0)?
         else {
             return Err(RepoError::Backend("not a sealed-key grant bundle (tag 3)".into()));
@@ -263,12 +290,14 @@ impl DagRepo {
         for (addr, obj) in body.objs {
             self.store(addr, obj, None);
         }
-        for (escrow_oid, (escrow_key, reveal_at)) in body.escrow {
-            if !self.escrow.holds(&escrow_oid) && !self.keyring.holds(&escrow_oid) {
-                self.escrow.insert(escrow_oid, escrow_key, reveal_at);
+        // A timed grant not yet due stages in the local Escrow, not the Keyring —
+        // cooperative defense-in-depth if a relay releases early; the hard
+        // guarantee is the relay withholding (ADR 0027).
+        if reveal_at > now {
+            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
+                self.escrow.insert(oid.clone(), key, reveal_at);
             }
-        }
-        if !self.keyring.holds(&oid) {
+        } else if !self.keyring.holds(&oid) {
             self.keyring.insert(oid.clone(), key);
         }
 
@@ -338,7 +367,7 @@ impl DagRepo {
             message: format!("maroon {} from {}", marooned, path.display()),
             tree: new_tree,
         };
-        self.record(change)?;
+        let change_id = self.record(change)?;
 
         // Produce grant bundles for remaining identities.
         let remaining_grantees: Vec<String> = self.manifest.grants_for(&old_oid)
@@ -354,7 +383,7 @@ impl DagRepo {
             }
         }
 
-        Ok(MaroonResult { new_oid, grants })
+        Ok(MaroonResult { new_oid, grants, change_id })
     }
 
     /// Migrate `path` to a new visibility policy: re-seal the content under
@@ -413,6 +442,35 @@ impl DagRepo {
     /// for relay delivery of grant bundles without pulling crypto into the engine.
     pub fn content_key_for(&self, oid: &Oid) -> Option<[u8; 32]> {
         self.keyring.key_for(oid)
+    }
+
+    /// Every embargoed path in the current tree whose content key this repo
+    /// holds — `(path, oid, reveal_at)`. The key may sit in the Keyring
+    /// (reveal passed) or still in Escrow (originator staging, ADR 0007);
+    /// either way this repo can issue grants for it. The push-time deposit
+    /// pass (ADR 0027) grants exactly these — a non-keyholder peer has
+    /// nothing to deposit.
+    pub fn embargoed_paths(&self) -> Vec<(PathBuf, Oid, u64)> {
+        self.graph
+            .current_tree()
+            .into_iter()
+            .filter_map(|(path, (oid, vis))| match vis {
+                Visibility::Embargoed { reveal_at }
+                    if self.keyring.holds(&oid) || self.escrow.holds(&oid) =>
+                {
+                    Some((path, oid, reveal_at))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The stored visibility of the object at `oid`, if the object is held.
+    /// Lets the CLI inherit an embargoed seal's `reveal_at` when issuing a
+    /// grant for it (ADR 0027: a late-added recipient gets a timed grant,
+    /// never an early key).
+    pub fn visibility_of(&self, oid: &Oid) -> Option<Visibility> {
+        self.objects.get(oid).ok().map(|o| o.vis.clone())
     }
 
     /// The OID for `path` in the current tree, or `NotFound` if absent.
@@ -496,7 +554,7 @@ impl DagRepo {
                 "a relay can only stow sync bundles (tag 0), not grant bundles".into(),
             ));
         };
-        let BundleBody { changes, objs, keys, escrow, attestations } = body;
+        let BundleBody { changes, objs, keys, attestations } = body;
 
         // Reject any change with a missing/invalid author signature before we
         // store anything — a keyless relay still enforces authorship (ADR 0018).
@@ -513,20 +571,16 @@ impl DagRepo {
         }
 
         // Store ciphertext, retaining any keys that rode along so they keep
-        // forwarding downstream. Only ANYONE-granted (public) keys and embargoed
-        // escrow entries ever travel in a sync bundle — RESTRICTED keys never do
-        // (ADR 0003). So the relay's "keylessness" for restricted content is
-        // automatic: it cannot receive a restricted key here, and thus can never
-        // read restricted content. Public keys are non-secret by definition;
+        // forwarding downstream. Only ANYONE-granted, non-embargoed (public)
+        // keys ever travel in a sync bundle — RESTRICTED keys never do
+        // (ADR 0003), and embargoed keys lost their bundle lane entirely
+        // (ADR 0027, v5). So the relay's "keylessness" for private content is
+        // automatic: it cannot receive those keys here, and thus can never
+        // read the content. Public keys are non-secret by definition;
         // carrying them lets the relay forward readable public content.
         for (addr, obj) in objs {
             let key = keys.get(&addr).copied();
             self.store(addr, obj, key);
-        }
-        for (oid, (key, reveal_at)) in escrow {
-            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                self.escrow.insert(oid, key, reveal_at);
-            }
         }
         // Accumulate purge events so they keep propagating downstream. A relay
         // is never the marooned identity for its own keyring (it holds none),
@@ -554,7 +608,7 @@ impl DagRepo {
         body: BundleBody,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
-        let BundleBody { changes, objs, keys, escrow, attestations } = body;
+        let BundleBody { changes, objs, keys, attestations } = body;
 
         // Reject any change with a missing/invalid author signature before we
         // mutate state (ADR 0018 — validity is always enforced, not a toggle).
@@ -581,24 +635,29 @@ impl DagRepo {
         let local_before = self.graph.current_tree();
 
         // Ingest SealedObjects, filing only the public (non-embargoed) keys that
-        // rode along. Embargoed keys travel in escrow and go into our Escrow, not
-        // the Keyring (ADR 0007). No Restricted key can be here.
+        // rode along. Embargoed keys have no bundle lane at all (ADR 0027, v5):
+        // they reach a peer only as a relay-withheld timed SealedGrant, after
+        // the relay's clock passes reveal_at. No Restricted key can be here.
         for (addr, obj) in objs {
             let key = keys.get(&addr).copied();
             self.store(addr, obj, key);
-        }
-        for (oid, (key, reveal_at)) in escrow {
-            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                self.escrow.insert(oid, key, reveal_at);
-            }
         }
 
         // Classify every incoming change against our pre-apply tree using the
         // shared ADR 0001 classifier. We are the KeyOracle: it asks us for
         // plaintext, we answer via sealed::open. The classifier owns the rule.
+        //
+        // Each change is classified with its merge base (#65): the nearest
+        // ancestor we already hold, found by walking the incoming batch's
+        // parent links into our graph. Changes carry full trees, so a pulled
+        // chain re-raises every path its author never touched — without the
+        // base, those classified as conflicts whenever our line had moved on.
+        let batch: BTreeMap<&Oid, &ChangeNode> = changes.iter().map(|n| (&n.id, n)).collect();
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
         for node in &changes {
-            let per_change = converge::classify(&local_before, &node.tree, self, now);
+            let base_tree = self.incoming_base_tree(node, &batch);
+            let per_change =
+                converge::classify(&local_before, &node.tree, base_tree.as_ref(), self, now);
             for (path, outcome) in per_change {
                 let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
                 *slot = converge::worst(slot.clone(), outcome);
@@ -617,6 +676,75 @@ impl DagRepo {
         }
 
         Ok(outcomes)
+    }
+
+    /// The merge-base tree for an incoming change (#65): the nearest ancestor
+    /// this repo already holds, walking parent links through the incoming
+    /// `batch` for nodes not yet ingested. A change we already hold is its own
+    /// base, so a re-delivered chain classifies as wholly untouched. `None`
+    /// for disjoint history (a root chain we have never seen).
+    fn incoming_base_tree(
+        &self,
+        node: &ChangeNode,
+        batch: &BTreeMap<&Oid, &ChangeNode>,
+    ) -> Option<BTreeMap<PathBuf, (Oid, Visibility)>> {
+        let mut queue: std::collections::VecDeque<&Oid> = std::collections::VecDeque::new();
+        let mut seen: std::collections::BTreeSet<&Oid> = std::collections::BTreeSet::new();
+        queue.push_back(&node.id);
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(known) = self.graph.get(id) {
+                return Some(known.tree.clone());
+            }
+            if let Some(n) = batch.get(id) {
+                queue.extend(n.parents.iter());
+            }
+        }
+        None
+    }
+
+    /// Every content address in the live set for `gc`: anything referenced by
+    /// any change in the graph — across ALL changes, not just the current heads,
+    /// and including working changes (every dock's in-progress node rides in the
+    /// loaded graph, ADR 0022) — plus the sides of unresolved conflicts.
+    /// Anything in the object store outside this set is unreachable (ADR 0012).
+    pub fn referenced_oids(&self) -> BTreeSet<Oid> {
+        let mut live = BTreeSet::new();
+        for node in self.graph.in_order() {
+            for (oid, _vis) in node.tree.values() {
+                live.insert(oid.clone());
+            }
+        }
+        // Unresolved conflict sides are already graph-covered (both changes are
+        // recorded, append-only), but keep them explicitly live so gc stays
+        // correct if that invariant ever loosens.
+        for (ours, theirs) in self.conflicts.values() {
+            live.insert(ours.clone());
+            live.insert(theirs.clone());
+        }
+        live
+    }
+
+    /// Prune loose objects not referenced by any change in the graph (ADR 0012,
+    /// #17, restored in #66). Content-addressing makes this exact: an object
+    /// whose address no ChangeNode names can never be needed, so deleting it is
+    /// loss-free. Walks the on-disk object store under `dir` and removes every
+    /// unreferenced file; with `dry_run` it only reports what would be pruned.
+    /// On a real run the in-memory store is compacted to match, so a subsequent
+    /// `save` stays consistent.
+    ///
+    /// Objects referenced by non-HEAD changes are retained — the whole reachable
+    /// history is preserved, only truly orphaned objects go. `dir` is the same
+    /// `.loot/` directory passed to [`Self::save`]/[`Self::load`].
+    pub fn gc(&mut self, dir: &Path, dry_run: bool) -> Result<GcReport, RepoError> {
+        let live = self.referenced_oids();
+        let (pruned, bytes) = persist_codec::prune_orphaned_objects_loose(dir, &live, dry_run)?;
+        if !dry_run {
+            self.objects.retain(&live);
+        }
+        Ok(GcReport { pruned, bytes })
     }
 
     /// Persist the whole repo under `dir` (typically `.loot/`): all sealed
@@ -708,7 +836,10 @@ impl DagRepo {
     ///   - an `entries` path that collides with a base path it CANNOT open:
     ///     refused (no silent clobber of sealed content).
     ///
-    /// Returns the new working-change id. Idempotent on an unchanged tree.
+    /// Returns the new working-change id. Idempotent on an unchanged tree:
+    /// a path whose plaintext and visibility are unchanged keeps its sealed
+    /// object and oid (#98), so snapshots — and the pushes that ship their
+    /// objects — are O(delta), not O(repo).
     pub fn snapshot(
         &mut self,
         base: Option<&Oid>,
@@ -717,6 +848,54 @@ impl DagRepo {
         message: &str,
         now: u64,
     ) -> Result<Oid, RepoError> {
+        self.snapshot_allowing(base, working, entries, message, now, &[])
+    }
+
+    /// `snapshot` with an explicit demotion allowlist (#62). A visibility
+    /// demotion — an entry re-resolving *more readable* than the tree already
+    /// records (Restricted/Embargoed -> Public, Embargoed -> Restricted) — is
+    /// refused unless its path is in `allow_demote`: a dropped or mangled
+    /// `.lootattributes` line would otherwise re-seal private content publicly
+    /// with no ceremony, the fail-open that leaked in the dogfood pilot.
+    /// Widening a Restricted identity set is not guarded here — `grant` is the
+    /// audited verb for that.
+    pub fn snapshot_allowing(
+        &mut self,
+        base: Option<&Oid>,
+        working: Option<&Oid>,
+        entries: &[(PathBuf, Vec<u8>, Visibility)],
+        message: &str,
+        now: u64,
+        allow_demote: &[PathBuf],
+    ) -> Result<Oid, RepoError> {
+        // Refuse implicit visibility demotion (#62) BEFORE mutating anything.
+        // The "before" picture is the outgoing working tree when there is one —
+        // it carries forward everything from base, and a working change is a
+        // real change (it pushes) even though it was never finalized.
+        let old_tree = match working {
+            Some(w) => self.graph.tree_at(w),
+            None => match base {
+                Some(tip) => self.graph.tree_at(tip),
+                None => self.graph.current_tree(),
+            },
+        };
+        let mut demoted: Vec<String> = Vec::new();
+        for (path, _, new_vis) in entries {
+            if let Some((_, old_vis)) = old_tree.get(path) {
+                if demotes(old_vis, new_vis) && !allow_demote.contains(path) {
+                    demoted.push(path.display().to_string());
+                }
+            }
+        }
+        if !demoted.is_empty() {
+            return Err(RepoError::Backend(format!(
+                "refusing to demote visibility of {}: an attributes change would re-seal \
+                 private content more readably; restore the .lootattributes rule, or run \
+                 `loot status --allow-demote <path>` to demote deliberately",
+                demoted.join(", ")
+            )));
+        }
+
         // Drop the prior working change so we reconcile against finalized history,
         // not against our own last snapshot.
         if let Some(w) = working {
@@ -756,7 +935,28 @@ impl DagRepo {
 
         // Seal every working-tree entry (visible by construction — we read it).
         // Absent-but-visible base paths simply don't get re-added => deleted.
+        //
+        // Reuse the outgoing tree's oid when a path's plaintext AND visibility
+        // are unchanged (#98): sealing mints a fresh key+nonce, so re-sealing
+        // identical content gives it a new address, and every push ships the
+        // whole repo instead of the delta. Reuse never mints or moves a key —
+        // the object and its key are already held (we just opened it), and the
+        // parent change already referenced this address — so ADR 0004's
+        // no-plaintext-dedup stance is untouched: address equality here means
+        // "same sealed object carried forward", never "equal plaintext
+        // discovered". A path we cannot open *now* (e.g. still-embargoed)
+        // re-seals fresh as before.
         for (path, bytes, vis) in entries {
+            if let Some((old_oid, old_vis)) = old_tree.get(path) {
+                if old_vis == vis
+                    && self
+                        .get(old_oid, &self.identity, now)
+                        .is_ok_and(|old| old == *bytes)
+                {
+                    tree.insert(path.clone(), (old_oid.clone(), vis.clone()));
+                    continue;
+                }
+            }
             let oid = self.put(bytes, vis.clone())?;
             tree.insert(path.clone(), (oid, vis.clone()));
         }
@@ -854,7 +1054,11 @@ impl DagRepo {
     ) -> Result<(Oid, BTreeMap<PathBuf, MergeOutcome>), RepoError> {
         let our_tree = self.graph.tree_at(ours);
         let their_tree = self.graph.tree_at(theirs);
-        let merged = converge::merge_trees(&our_tree, &their_tree, self, now);
+        // The two tips share a graph, so the merge base is the nearest common
+        // ancestor — it keeps a stale side's untouched paths from classifying
+        // as conflicts (#65).
+        let base_tree = self.graph.common_ancestor_tree(ours, theirs);
+        let merged = converge::merge_trees(&our_tree, &their_tree, base_tree.as_ref(), self, now);
         // Record conflicts so `loot conflicts`/`loot resolve` see them, exactly
         // as the apply path does.
         for (path, (o, t)) in &merged.conflicts {
@@ -1233,7 +1437,7 @@ impl Repo for DagRepo {
         match Frame::decode(&bundle.0)? {
             Frame::Sync { purges, body } => self.apply_sync(purges, body, now),
             Frame::Grant { grantee, body } => {
-                let BundleBody { objs, keys, escrow, .. } = body;
+                let BundleBody { objs, keys, .. } = body;
                 // Install objects and, if the grant is addressed to us, its keys.
                 for (addr, obj) in objs {
                     let key = keys.get(&addr).copied();
@@ -1247,11 +1451,6 @@ impl Repo for DagRepo {
                                 self.keyring.insert(addr, k);
                             }
                         }
-                    }
-                }
-                for (oid, (key, reveal_at)) in escrow {
-                    if grantee == self.identity && !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                        self.escrow.insert(oid, key, reveal_at);
                     }
                 }
                 Ok(BTreeMap::new())
@@ -1372,32 +1571,25 @@ impl DagRepo {
 
         // Ship SealedObjects (ciphertext, no keys) plus:
         //   - Public content keys -> plain keyring section (ANYONE-granted, not embargoed)
-        //   - Embargoed content keys -> escrow section (ANYONE-granted, time-gated)
+        //   - Embargoed content keys NEVER ride in a bundle (ADR 0027, v5): they
+        //     reach peers only as relay-withheld timed SealedGrants after
+        //     reveal_at. Ciphertext still syncs; the key lane is the relay.
         //   - Restricted keys NEVER travel (ADR 0003)
         let mut needed: BTreeMap<Oid, SealedObject> = BTreeMap::new();
         let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
-        let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
         for c in &send {
             for (oid, vis) in c.tree.values() {
                 if let Ok(obj) = self.object(oid) {
                     // Object bytes: when negotiating (S5), ship only wanted addrs;
-                    // keys/escrow below always ride (tiny, and a peer may hold the
+                    // keys below always ride (tiny, and a peer may hold the
                     // ciphertext but not the key).
                     if wants.map_or(true, |w| w.contains(oid)) {
                         needed.entry(oid.clone()).or_insert_with(|| obj.clone());
                     }
-                    if obj.grant_ids.iter().any(|g| g == ANYONE) {
-                        if let Visibility::Embargoed { reveal_at } = vis {
-                            // Embargoed: key rides as an escrow entry so the receiver
-                            // files it into their Escrow, not their Keyring (ADR 0007).
-                            if let Some(k) = self.escrow.iter()
-                                .find(|(o, _)| *o == oid)
-                                .map(|(_, e)| e.key)
-                                .or_else(|| self.keyring.key_for(oid))
-                            {
-                                escrow_entries.insert(oid.clone(), (k, *reveal_at));
-                            }
-                        } else if let Some(k) = self.keyring.key_for(oid) {
+                    if obj.grant_ids.iter().any(|g| g == ANYONE)
+                        && !matches!(vis, Visibility::Embargoed { .. })
+                    {
+                        if let Some(k) = self.keyring.key_for(oid) {
                             public_keys.insert(oid.clone(), k);
                         }
                     }
@@ -1421,7 +1613,6 @@ impl DagRepo {
             changes: send.into_iter().cloned().collect(),
             objs: needed,
             keys: public_keys,
-            escrow: escrow_entries,
             attestations,
         };
         Ok(SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode()))
@@ -1445,6 +1636,18 @@ impl converge::KeyOracle for DagRepo {
 /// signing and are accepted. Called inside `apply`/`stow` so validity is
 /// enforced structurally — never a toggle a caller can skip. loot-core is
 /// verify-only here; signing and key custody live in loot-identity.
+/// True if sealing at `new` would make a path readable to a wider audience
+/// than `old` sealed it for (#62). Restricted-set membership changes are
+/// deliberately not compared — `grant`/`maroon` own that audit trail.
+fn demotes(old: &Visibility, new: &Visibility) -> bool {
+    matches!(
+        (old, new),
+        (Visibility::Restricted(_), Visibility::Public)
+            | (Visibility::Embargoed { .. }, Visibility::Public)
+            | (Visibility::Embargoed { .. }, Visibility::Restricted(_))
+    )
+}
+
 /// A node is a *working change* iff it is authored but not yet signed — the
 /// in-progress tip a keyholder is still editing (ADR 0018). It is finalized (and
 /// publishable to the shared graph) exactly when `loot new` attaches its
@@ -1668,7 +1871,7 @@ mod tests {
 
     fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
         let payload = extract_sync_payload(bundle);
-        let (_changes, objs, _keys, _escrow, _attestations) =
+        let (_changes, objs, _keys, _attestations) =
             bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
         assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
         objs.into_iter().next().unwrap().1.ciphertext
@@ -1688,7 +1891,7 @@ mod tests {
             panic!("expected sync bundle (tag 0)");
         };
         let changes: Vec<&ChangeNode> = body.changes.iter().collect();
-        bundle_codec::encode(&changes, &body.objs, &body.keys, &body.escrow, &body.attestations)
+        bundle_codec::encode(&changes, &body.objs, &body.keys, &body.attestations)
     }
 
     /// S1/S2 compatibility: a v1-format sync bundle (marker `[1,0]`, no
@@ -1746,12 +1949,7 @@ mod tests {
             wire.extend_from_slice(&addr.0);
             wire.extend_from_slice(key);
         }
-        put_u32(&mut wire, body.escrow.len());
-        for (addr, (key, reveal_at)) in &body.escrow {
-            wire.extend_from_slice(&addr.0);
-            wire.extend_from_slice(key);
-            wire.extend_from_slice(&reveal_at.to_le_bytes());
-        }
+        put_u32(&mut wire, 0); // v1 escrow section: empty (v5 bodies have none to copy)
         put_u32(&mut wire, body.changes.len());
         for c in &body.changes {
             wire.extend_from_slice(&c.id.0);
@@ -1944,6 +2142,128 @@ mod tests {
         assert_eq!(find(&c).reachable_from.len(), 1);
     }
 
+    // --- gc: prune orphaned loose objects (ADR 0012, #17, restored in #66) ---
+
+    /// A dry run reports the orphan count and total size but deletes nothing —
+    /// neither the on-disk file nor the in-memory store entry.
+    #[test]
+    fn gc_dry_run_reports_orphans_without_deleting() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        // Referenced object: named by a change, so it is part of the live set.
+        let kept = repo.put(b"keep me\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("keep.txt"), (kept.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+        // Orphan: stored but never referenced by any change.
+        let orphan = repo.put(b"unreferenced orphan bytes\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = dir.join("objects");
+        let kept_path = obj_dir.join(crate::hex::encode(&kept.0));
+        let orphan_path = obj_dir.join(crate::hex::encode(&orphan.0));
+        assert!(kept_path.exists() && orphan_path.exists());
+
+        let report = repo.gc(&dir, true).unwrap();
+        assert_eq!(report.pruned, 1, "exactly one orphan would be pruned");
+        assert!(report.bytes > 0, "dry run reports the orphan's on-disk size");
+        // Dry run mutates nothing.
+        assert!(orphan_path.exists(), "dry run must not delete files");
+        assert!(kept_path.exists());
+        assert!(repo.object(&orphan).is_ok(), "in-memory store untouched by dry run");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real run deletes the orphan file, compacts the in-memory store, and
+    /// leaves referenced content intact and readable — including across reload.
+    /// A second pass is a no-op.
+    #[test]
+    fn gc_deletes_orphaned_objects_and_keeps_referenced() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let kept = repo.put(b"referenced\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (kept.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+        let orphan = repo.put(b"unreferenced\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = dir.join("objects");
+        let kept_path = obj_dir.join(crate::hex::encode(&kept.0));
+        let orphan_path = obj_dir.join(crate::hex::encode(&orphan.0));
+
+        let report = repo.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 1);
+        assert!(!orphan_path.exists(), "orphan file deleted");
+        assert!(kept_path.exists(), "referenced file retained");
+        // In-memory store compacted: orphan gone, referenced object still readable.
+        assert!(matches!(repo.object(&orphan), Err(RepoError::NotFound(_))));
+        assert_eq!(repo.get(&kept, "alice", 0).unwrap(), b"referenced\n");
+
+        // Idempotent: nothing left to prune.
+        let report2 = repo.gc(&dir, false).unwrap();
+        assert_eq!(report2.pruned, 0);
+
+        // Reload from disk: referenced content survives; orphan is gone.
+        let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        assert_eq!(loaded.get(&kept, "alice", 0).unwrap(), b"referenced\n");
+        assert!(matches!(loaded.get(&orphan, "alice", 0), Err(RepoError::NotFound(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Objects referenced by a NON-HEAD change (older history) must be retained —
+    /// gc walks the whole graph, not just the tips.
+    #[test]
+    fn gc_retains_objects_referenced_by_non_head_changes() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-nonhead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        // Parent change references old_oid.
+        let old_oid = repo.put(b"v1\n", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a.txt"), (old_oid.clone(), Visibility::Public));
+        let parent = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "v1".into(), tree: t1 })
+            .unwrap();
+        // Child change references new_oid on top of the parent.
+        let new_oid = repo.put(b"v2\n", Visibility::Public).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("a.txt"), (new_oid.clone(), Visibility::Public));
+        repo.record(Change {
+            id: Oid([0; 32]),
+            parents: vec![parent.clone()],
+            message: "v2".into(),
+            tree: t2,
+        })
+        .unwrap();
+        assert!(!repo.heads().contains(&parent), "parent is no longer a head");
+        // Orphan object.
+        let orphan = repo.put(b"orphan\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let report = repo.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 1, "only the orphan is pruned");
+
+        let obj_dir = dir.join("objects");
+        assert!(
+            obj_dir.join(crate::hex::encode(&old_oid.0)).exists(),
+            "object referenced only by a non-HEAD change must be retained"
+        );
+        assert!(obj_dir.join(crate::hex::encode(&new_oid.0)).exists(), "head object retained");
+        assert!(!obj_dir.join(crate::hex::encode(&orphan.0)).exists(), "orphan deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- snapshot / reconcile (ADR 0006) ---
 
     fn entry(path: &str, body: &[u8], vis: Visibility) -> (PathBuf, Vec<u8>, Visibility) {
@@ -1966,6 +2286,276 @@ mod tests {
         let tree = repo.graph.current_tree();
         let oid = &tree[&PathBuf::from("a.txt")].0;
         assert_eq!(repo.get(oid, "alice", 0).unwrap(), b"two");
+    }
+
+    #[test]
+    fn snapshot_reuses_sealed_object_for_unchanged_paths() {
+        // #98: a one-file edit must not re-address the whole repo. The
+        // unchanged path keeps its oid across the rewrite, so the push
+        // wants-negotiation (S5) ships only the delta.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(
+                None,
+                None,
+                &[
+                    entry("edited.txt", b"one", Visibility::Public),
+                    entry("stable.txt", b"same", Visibility::Public),
+                ],
+                "wip",
+                0,
+            )
+            .unwrap();
+        let t1 = repo.graph.tree_at(&w1);
+        let w2 = repo
+            .snapshot(
+                None,
+                Some(&w1),
+                &[
+                    entry("edited.txt", b"two", Visibility::Public),
+                    entry("stable.txt", b"same", Visibility::Public),
+                ],
+                "wip",
+                0,
+            )
+            .unwrap();
+        let t2 = repo.graph.tree_at(&w2);
+        assert_eq!(
+            t1[&PathBuf::from("stable.txt")].0,
+            t2[&PathBuf::from("stable.txt")].0,
+            "unchanged path must keep its sealed object"
+        );
+        assert_ne!(
+            t1[&PathBuf::from("edited.txt")].0,
+            t2[&PathBuf::from("edited.txt")].0,
+            "edited path must get a fresh object"
+        );
+        // The reused object still opens.
+        let oid = &t2[&PathBuf::from("stable.txt")].0;
+        assert_eq!(repo.get(oid, "alice", 0).unwrap(), b"same");
+    }
+
+    #[test]
+    fn snapshot_is_idempotent_at_the_engine_level() {
+        // With oid reuse (#98) the doc's idempotency claim holds in the engine
+        // itself, not just behind the workspace's tree-hash short-circuit:
+        // unchanged entries + same message => the same change id.
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let entries = [entry("a.txt", b"body", Visibility::Public)];
+        let w1 = repo.snapshot(None, None, &entries, "wip", 0).unwrap();
+        let w2 = repo.snapshot(None, Some(&w1), &entries, "wip", 0).unwrap();
+        assert_eq!(w1, w2, "unchanged tree must rewrite to the same change id");
+    }
+
+    #[test]
+    fn snapshot_reseals_on_visibility_change_even_with_same_bytes() {
+        // Visibility lives on the sealed object (grant_ids, compression),
+        // so a promotion must mint a fresh seal — reuse would leave the old
+        // policy on the object.
+        let restricted = Visibility::Restricted(vec!["alice".into()]);
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(None, None, &[entry("a.txt", b"s", Visibility::Public)], "wip", 0)
+            .unwrap();
+        let t1 = repo.graph.tree_at(&w1);
+        let w2 = repo
+            .snapshot(None, Some(&w1), &[entry("a.txt", b"s", restricted.clone())], "wip", 0)
+            .unwrap();
+        let t2 = repo.graph.tree_at(&w2);
+        assert_ne!(
+            t1[&PathBuf::from("a.txt")].0,
+            t2[&PathBuf::from("a.txt")].0,
+            "visibility change must re-seal"
+        );
+        assert_eq!(t2[&PathBuf::from("a.txt")].1, restricted);
+    }
+
+    #[test]
+    fn snapshot_of_still_embargoed_path_reseals_rather_than_leaking_a_read() {
+        // Before reveal_at even the author cannot open the object
+        // (sealed::open checks embargo first), so reuse cannot compare
+        // plaintexts. The path re-seals fresh — same behavior as before #98,
+        // and the demotion guard still applies on top.
+        let embargoed = Visibility::Embargoed { reveal_at: 100 };
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(None, None, &[entry("fix.rs", b"cve", embargoed.clone())], "wip", 0)
+            .unwrap();
+        let t1 = repo.graph.tree_at(&w1);
+        let w2 = repo
+            .snapshot(None, Some(&w1), &[entry("fix.rs", b"cve", embargoed.clone())], "wip", 0)
+            .unwrap();
+        let t2 = repo.graph.tree_at(&w2);
+        assert_ne!(
+            t1[&PathBuf::from("fix.rs")].0,
+            t2[&PathBuf::from("fix.rs")].0,
+            "still-embargoed content re-seals (no plaintext comparison possible)"
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_implicit_visibility_demotion() {
+        // #62: a path already sealed Restricted must not re-seal Public just
+        // because the attributes resolution changed — that is the fail-open
+        // that leaked in the dogfood pilot.
+        let restricted = Visibility::Restricted(vec!["alice".into()]);
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(None, None, &[entry(".env", b"s", restricted.clone())], "wip", 0)
+            .unwrap();
+        let err = repo
+            .snapshot(None, Some(&w1), &[entry(".env", b"s", Visibility::Public)], "wip", 0)
+            .unwrap_err();
+        assert!(err.to_string().contains("demote"), "unexpected error: {err}");
+        // The refusal happened before any mutation: the working head survives.
+        assert!(repo.heads().contains(&w1));
+
+        // The same demotion goes through when explicitly allowed.
+        let w2 = repo
+            .snapshot_allowing(
+                None,
+                Some(&w1),
+                &[entry(".env", b"s", Visibility::Public)],
+                "wip",
+                0,
+                &[PathBuf::from(".env")],
+            )
+            .unwrap();
+        let tree = repo.graph.tree_at(&w2);
+        assert!(matches!(tree[&PathBuf::from(".env")].1, Visibility::Public));
+    }
+
+    #[test]
+    fn snapshot_demotion_guard_covers_embargo_and_frees_promotion() {
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let embargoed = Visibility::Embargoed { reveal_at: 100 };
+        let restricted = Visibility::Restricted(vec!["alice".into()]);
+
+        // Embargoed -> Restricted reveals to named ids before reveal_at: demotion.
+        let w = repo
+            .snapshot(None, None, &[entry("fix.rs", b"cve", embargoed.clone())], "wip", 0)
+            .unwrap();
+        assert!(repo
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", restricted.clone())], "wip", 0)
+            .is_err());
+        // Embargoed -> Public: demotion.
+        assert!(repo
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", Visibility::Public)], "wip", 0)
+            .is_err());
+
+        // Promotion (Public -> Restricted) needs no ceremony.
+        let w2 = repo
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", embargoed), entry("a.md", b"x", Visibility::Public)], "wip", 0)
+            .unwrap();
+        assert!(repo
+            .snapshot(None, Some(&w2), &[entry("fix.rs", b"cve", Visibility::Embargoed { reveal_at: 100 }), entry("a.md", b"x", restricted)], "wip", 0)
+            .is_ok());
+    }
+
+    #[test]
+    fn pull_of_stale_chain_does_not_conflict_on_paths_it_never_touched() {
+        // Pilot finding 6 (#65): bob clones connor's push; his snapshot
+        // re-seals every path under fresh addresses; connor edits ctx.md
+        // locally (a line MODIFICATION, so the line-set heuristic can't save
+        // it); connor pulls. Bob never touched ctx.md since the base — the
+        // pull must not report a conflict on it.
+        let base_bytes: &[u8] = b"# context\nalpha\nbeta\n";
+        let vis = Visibility::Public;
+
+        let mut connor = DagRepo::init(std::env::temp_dir(), "connor").unwrap();
+        let c_ctx = connor.put(base_bytes, vis.clone()).unwrap();
+        let mut t = BTreeMap::new();
+        t.insert(PathBuf::from("ctx.md"), (c_ctx, vis.clone()));
+        let base_id = connor
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: t })
+            .unwrap();
+        let base_bundle = connor.bundle(&[]).unwrap();
+
+        // bob clones the base, then his clone-day snapshot re-seals ctx.md
+        // (same bytes, fresh key/address) and adds his own file.
+        let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
+        bob.apply(&base_bundle, 0).unwrap();
+        let b_ctx = bob.put(base_bytes, vis.clone()).unwrap();
+        let b_new = bob.put(b"bob's file\n", vis.clone()).unwrap();
+        let mut bt = BTreeMap::new();
+        bt.insert(PathBuf::from("ctx.md"), (b_ctx, vis.clone()));
+        bt.insert(PathBuf::from("bob.txt"), (b_new, vis.clone()));
+        bob.record(Change {
+            id: Oid([0; 32]),
+            parents: vec![base_id.clone()],
+            message: "bob work".into(),
+            tree: bt,
+        })
+        .unwrap();
+
+        // connor meanwhile modifies a line of ctx.md on his own head.
+        let c_ctx2 = connor.put(b"# context\nalpha\nbeta EDITED\n", vis.clone()).unwrap();
+        let mut ct = BTreeMap::new();
+        ct.insert(PathBuf::from("ctx.md"), (c_ctx2.clone(), vis.clone()));
+        let connor_head = connor
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![base_id],
+                message: "connor edit".into(),
+                tree: ct,
+            })
+            .unwrap();
+
+        // connor pulls bob's chain (full bundle: re-delivery must also be safe).
+        let outcomes = connor.apply(&bob.bundle(&[]).unwrap(), 0).unwrap();
+        let ctx = outcomes.get(&PathBuf::from("ctx.md")).cloned();
+        assert!(
+            matches!(ctx, Some(MergeOutcome::Converged) | Some(MergeOutcome::Merged)),
+            "path untouched by the incoming chain must not conflict, got {ctx:?}"
+        );
+        assert_eq!(outcomes[&PathBuf::from("bob.txt")], MergeOutcome::Converged);
+        // Connor's own line still carries his edit.
+        let tree = connor.graph.tree_at(&connor_head);
+        assert_eq!(
+            connor.get(&tree[&PathBuf::from("ctx.md")].0, "connor", 0).unwrap(),
+            b"# context\nalpha\nbeta EDITED\n"
+        );
+    }
+
+    #[test]
+    fn dock_merge_of_stale_side_does_not_conflict_on_untouched_paths() {
+        // Same root cause through merge_tips (#65): tip B re-sealed ctx.md
+        // without touching it while tip A modified a line.
+        let vis = Visibility::Public;
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let base_oid = repo.put(b"alpha\nbeta\n", vis.clone()).unwrap();
+        let mut t = BTreeMap::new();
+        t.insert(PathBuf::from("ctx.md"), (base_oid, vis.clone()));
+        let base = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: t })
+            .unwrap();
+
+        let a_oid = repo.put(b"alpha\nbeta EDITED\n", vis.clone()).unwrap();
+        let mut at = BTreeMap::new();
+        at.insert(PathBuf::from("ctx.md"), (a_oid.clone(), vis.clone()));
+        let tip_a = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![base.clone()],
+                message: "a".into(),
+                tree: at,
+            })
+            .unwrap();
+
+        let b_oid = repo.put(b"alpha\nbeta\n", vis.clone()).unwrap(); // untouched re-seal
+        let b_new = repo.put(b"b's file\n", vis.clone()).unwrap();
+        let mut bt = BTreeMap::new();
+        bt.insert(PathBuf::from("ctx.md"), (b_oid, vis.clone()));
+        bt.insert(PathBuf::from("b.txt"), (b_new, vis.clone()));
+        let tip_b = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![base], message: "b".into(), tree: bt })
+            .unwrap();
+
+        let (merge_id, outcomes) = repo.merge_tips(&tip_a, &tip_b, "merge", 0).unwrap();
+        assert_eq!(outcomes[&PathBuf::from("ctx.md")], MergeOutcome::Merged);
+        let tree = repo.graph.tree_at(&merge_id);
+        assert_eq!(tree[&PathBuf::from("ctx.md")].0, a_oid, "the edited side wins");
+        assert_eq!(outcomes[&PathBuf::from("b.txt")], MergeOutcome::Converged);
     }
 
     #[test]
@@ -2175,37 +2765,46 @@ mod tests {
         assert_eq!(alice.get(&oid, "alice", 100).unwrap(), b"cve fix");
     }
 
-    /// A bundle ships embargoed keys in the escrow section, not the keyring
-    /// section, and the receiver's Escrow is populated — not their Keyring.
+    /// Hard embargo (ADR 0027, #14): an embargoed key never rides in a sync
+    /// bundle at all. The receiver gets ciphertext only — the key bytes are
+    /// simply not on their machine, no matter what clock they claim or how
+    /// they read their own storage. Keys arrive only as relay-withheld timed
+    /// SealedGrants after reveal.
     #[test]
-    fn bundle_carries_embargoed_key_as_escrow_entry_not_keyring() {
+    fn bundle_never_carries_an_embargoed_key() {
         let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let oid = alice.put(b"cve fix", Visibility::Embargoed { reveal_at: 100 }).unwrap();
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from("cve.txt"), (oid.clone(), Visibility::Embargoed { reveal_at: 100 }));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "cve".into(), tree }).unwrap();
+        // Alice's own key stages in HER escrow (originator staging, ADR 0007) —
+        // that never travels.
+        assert!(alice.escrow.holds(&oid));
 
         let bundle = alice.bundle(&[]).unwrap();
 
-        // The raw wire must have the key in the escrow section, not the keyring.
+        // Wire check: no key for the embargoed object anywhere in the body, and
+        // the raw key bytes appear nowhere in the whole bundle.
         let payload = extract_sync_payload(&bundle.0);
-        let (_changes, _objs, plain_keys, escrow_entries, _attestations) =
+        let (_changes, objs, plain_keys, _attestations) =
             bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
-        assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in keyring section");
-        assert!(escrow_entries.contains_key(&oid), "embargoed key must be in escrow section");
+        assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in the keys section");
+        assert!(objs.iter().any(|(a, _)| *a == oid), "the ciphertext itself still syncs");
+        let alice_key = alice.escrow.iter().find(|(o, _)| *o == &oid).map(|(_, e)| e.key).unwrap();
+        assert!(
+            !contains_window(&bundle.0, &alice_key),
+            "raw embargoed key bytes must not appear anywhere on the wire"
+        );
 
-        // Bob applies: key lands in his Escrow, not his Keyring.
+        // Bob applies: ciphertext lands, but no key exists on his machine —
+        // neither keyring nor escrow — even long after reveal_at. A lying clock
+        // or a modified binary has nothing to find.
         let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
         bob.apply(&bundle, 50).unwrap();
-        assert!(bob.escrow.holds(&oid), "bob's escrow must hold the key");
-        assert!(!bob.keyring.holds(&oid), "bob's keyring must be empty before reveal");
-
-        // Before reveal: still blocked.
-        assert!(matches!(bob.get(&oid, "bob", 50), Err(RepoError::Embargoed(100))));
-
-        // After flush at reveal time: bob can read the CVE fix.
-        bob.flush_escrow(100);
-        assert_eq!(bob.get(&oid, "bob", 100).unwrap(), b"cve fix");
+        assert!(!bob.escrow.holds(&oid), "no escrow entry arrives via bundle (v5)");
+        assert!(!bob.keyring.holds(&oid), "no keyring entry arrives via bundle");
+        bob.flush_escrow(1_000_000);
+        assert!(bob.get(&oid, "bob", 1_000_000).is_err(), "no key, no read — ever, via this lane");
     }
 
     /// Escrow persists across save/load so reveal works in a new process.
@@ -2444,6 +3043,42 @@ mod tests {
 
         carol.apply(&purge_bundle, 0).unwrap();
         assert!(carol.keyring.holds(&oid), "carol's key must NOT be purged");
+    }
+
+    #[test]
+    fn authored_maroon_reseal_travels_only_after_signing() {
+        // The regression behind the section-B grant/maroon demo: in an AUTHORED
+        // repo the maroon re-seal change is recorded authored-but-unsigned, so —
+        // like any working change — its new object is NOT offered for push
+        // (ADR 0018: only signed history travels). The CLI must finalize it via
+        // the returned change_id, after which the re-seal propagates. (Keyless
+        // repos are unaffected: their unauthored changes always travel, which is
+        // why the older maroon tests above never caught this.)
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(11);
+        let mut alice = DagRepo::init(tmp(), "alice").unwrap();
+        alice.set_author(pk);
+        let restricted = Visibility::Restricted(vec!["alice".into(), "bob".into()]);
+        let oid = alice.put(b"secret", restricted.clone()).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("s.txt"), (oid, restricted));
+        let add_id = alice
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree })
+            .unwrap();
+        alice.attach_signature(&add_id, sk.sign(&add_id.0).to_bytes()).unwrap();
+
+        let res = alice.maroon_hard(Path::new("s.txt"), "bob", 0).unwrap();
+        assert!(
+            !alice.offered_objects(&[]).contains(&res.new_oid),
+            "an unsigned maroon re-seal must not be offered (it would strand on the originator)"
+        );
+
+        // Finalize exactly as `cmd_maroon` now does.
+        alice.attach_signature(&res.change_id, sk.sign(&res.change_id.0).to_bytes()).unwrap();
+        assert!(
+            alice.offered_objects(&[]).contains(&res.new_oid),
+            "after signing, the maroon re-seal must be offered so peers receive it"
+        );
     }
 
     // --- migrate (ADR 0010) ---
@@ -2860,7 +3495,11 @@ mod tests {
 
     #[test]
     fn golden_v4_manifest_matches_and_round_trips() {
-        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V4, "v4 manifest layout must not drift");
+        // v5 changed only the bundle body (ADR 0027); durable layouts are
+        // byte-identical to v4 apart from the marker.
+        let mut golden_v5 = GOLDEN_MANIFEST_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_manifest(&sample_manifest()), golden_v5, "v5 manifest layout must not drift");
         assert_eq!(decode_manifest(&GOLDEN_MANIFEST_V4).unwrap().grants_for(&Oid([1; 32])).len(), 1);
     }
 
@@ -2885,7 +3524,9 @@ mod tests {
     #[test]
     fn golden_v4_purges_matches_and_round_trips() {
         let purges = vec![(Oid([6; 32]), "eve".to_string())];
-        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V4, "v4 purges layout must not drift");
+        let mut golden_v5 = GOLDEN_PURGES_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_purges(&purges), golden_v5, "v5 purges layout must not drift");
         assert_eq!(decode_purges(&GOLDEN_PURGES_V4).unwrap().len(), 1);
     }
 
@@ -2911,7 +3552,9 @@ mod tests {
     fn golden_v4_conflicts_matches_and_round_trips() {
         let mut conflicts = BTreeMap::new();
         conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
-        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V4, "v4 conflicts layout must not drift");
+        let mut golden_v5 = GOLDEN_CONFLICTS_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_conflicts(&conflicts), golden_v5, "v5 conflicts layout must not drift");
         assert!(decode_conflicts(&GOLDEN_CONFLICTS_V4).unwrap().contains_key(Path::new("f.txt")));
     }
 
@@ -2928,7 +3571,9 @@ mod tests {
             role: "reviewed".into(),
             signature: [9; 64],
         });
-        assert_eq!(encode_attestations(&log), GOLDEN_ATTEST_V4, "v4 attestation layout must not drift");
+        let mut golden_v5 = GOLDEN_ATTEST_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_attestations(&log), golden_v5, "v5 attestation layout must not drift");
     }
 
     #[test]
@@ -2977,7 +3622,6 @@ mod tests {
             changes: vec![node],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![],
         };
         SyncBundle(Frame::Sync { purges: vec![], body }.encode())
@@ -3071,7 +3715,6 @@ mod tests {
             changes: vec![],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: atts,
         };
         SyncBundle(Frame::Sync { purges: vec![], body }.encode())
@@ -3143,7 +3786,6 @@ mod tests {
             changes: vec![carried_change(Oid([5; 32]))],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![att],
         };
         let bundle = SyncBundle(Frame::Sync { purges: vec![], body }.encode());
@@ -3186,7 +3828,6 @@ mod tests {
             changes: vec![carried_change(Oid([5; 32]))],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![att],
         };
         let mut relay = DagRepo::init(tmp(), "relay").unwrap();

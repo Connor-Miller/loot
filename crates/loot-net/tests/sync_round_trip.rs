@@ -212,9 +212,10 @@ fn sealed_grant_relay_round_trip() {
     // names, ADR 0015). Callers pass raw key bytes, not a pre-hexed string.
     let now = 0u64;
 
-    // Alice produces a sealed grant bundle (tag 3): grantee_pubkey + wrapped_key + oid + payload.
+    // Alice produces a sealed grant bundle (tag 3): grantee_pubkey + wrapped_key
+    // + oid + reveal_at(0 = untimed) + payload.
     let sealed_bundle = alice_repo.grant_sealed(
-        &oid, "bob", bob_ed_pubkey, alice_pubkey, now,
+        &oid, "bob", bob_ed_pubkey, alice_pubkey, 0, now,
         |content_key| {
             key_seal::seal_key(content_key, &bob_x25519)
                 .map_err(|e| RepoError::Backend(e.to_string()))
@@ -257,5 +258,121 @@ fn sealed_grant_relay_round_trip() {
         bob_repo.get(&oid, "bob", 0).unwrap(),
         b"secret bytes\n",
         "bob must be able to read the content after receiving the sealed grant"
+    );
+}
+
+/// Hard embargo end-to-end (ADR 0027, #14): a timed SealedGrant deposited at
+/// the relay is invisible and unfetchable until the RELAY's clock passes its
+/// `reveal_at` — the recipient's machine simply never holds the key bytes.
+/// A due (past-reveal) timed grant delivers like any other.
+#[test]
+fn relay_withholds_timed_grant_until_reveal() {
+    let relay_dir = tmp("relay-timed");
+    let addr = "127.0.0.1:47198";
+    let base = format!("http://{addr}");
+    let serve_dir = relay_dir.clone();
+    std::thread::spawn(move || {
+        let _ = loot_net::serve(serve_dir, addr, vec![]);
+    });
+    wait_for_relay(&base);
+
+    let alice_id = alice_identity();
+    let alice_pubkey = alice_id.public_key_bytes();
+    let alice_dir = tmp("alice-timed");
+    let (mut alice_repo, oid) = build_restricted_repo(&alice_dir, "alice");
+
+    let bob_id = Identity::generate();
+    let bob_ed_pubkey = bob_id.public_key_bytes();
+    let bob_x25519 = bob_id.x25519_pubkey_bytes();
+
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // A grant embargoed until far in the future, and one already due.
+    let far_future = wall_now + 3600;
+    let withheld = alice_repo
+        .grant_sealed(&oid, "bob", bob_ed_pubkey, alice_pubkey, far_future, 0, |k| {
+            key_seal::seal_key(k, &bob_x25519).map_err(|e| RepoError::Backend(e.to_string()))
+        })
+        .unwrap();
+    let due = alice_repo
+        .grant_sealed(&oid, "bob", bob_ed_pubkey, alice_pubkey, wall_now.saturating_sub(60), 0, |k| {
+            key_seal::seal_key(k, &bob_x25519).map_err(|e| RepoError::Backend(e.to_string()))
+        })
+        .unwrap();
+
+    loot_net::deliver_grant(&base, &bob_ed_pubkey, &alice_id.wrap_envelope(&withheld.0)).unwrap();
+    loot_net::deliver_grant(&base, &bob_ed_pubkey, &alice_id.wrap_envelope(&due.0)).unwrap();
+
+    // The withheld grant is invisible: peek shows only the due one, and a
+    // fetch delivers only the due one — the embargoed key bytes never leave
+    // the relay, no matter what the CALLER's clock claims (there is no clock
+    // parameter to lie with; the relay uses its own).
+    assert_eq!(loot_net::peek_grants(&base, &bob_ed_pubkey).unwrap(), 1);
+    let delivered = loot_net::fetch_grants(&base, &bob_ed_pubkey).unwrap();
+    assert_eq!(delivered.len(), 1, "only the due grant is released");
+
+    // The withheld one is still there for a post-reveal fetch (not dropped).
+    assert_eq!(
+        loot_net::peek_grants(&base, &bob_ed_pubkey).unwrap(),
+        0,
+        "the withheld grant stays invisible on subsequent peeks"
+    );
+
+    // The delivered (due) grant round-trips into readable content.
+    let (grantor, bundle_bytes) = loot_identity::unwrap_envelope(&delivered[0], &[]).unwrap();
+    assert_eq!(grantor, alice_pubkey);
+    let mut bob_repo = DagRepo::init(tmp("bob-timed").join("work"), "bob").unwrap();
+    bob_repo
+        .apply_sealed_grant(&SyncBundle(bundle_bytes.to_vec()), grantor, wall_now, |w| {
+            bob_id.unseal_key(w).map_err(|e| RepoError::Backend(e.to_string()))
+        })
+        .unwrap();
+    assert_eq!(bob_repo.get(&oid, "bob", wall_now).unwrap(), b"secret bytes\n");
+}
+
+/// AC (#14): `reveal_at` rides inside the grantor-signed envelope — flipping
+/// any byte of the frame (e.g. shortening the embargo) breaks the signature,
+/// so a tampered copy cannot masquerade as a valid earlier-revealing grant.
+#[test]
+fn tampered_reveal_at_breaks_the_envelope_signature() {
+    let alice_id = alice_identity();
+    let alice_pubkey = alice_id.public_key_bytes();
+    let alice_dir = tmp("alice-tamper");
+    let (mut alice_repo, oid) = build_restricted_repo(&alice_dir, "alice");
+    let bob_id = Identity::generate();
+    let bob_x25519 = bob_id.x25519_pubkey_bytes();
+
+    let timed = alice_repo
+        .grant_sealed(&oid, "bob", bob_id.public_key_bytes(), alice_pubkey, 999_999, 0, |k| {
+            key_seal::seal_key(k, &bob_x25519).map_err(|e| RepoError::Backend(e.to_string()))
+        })
+        .unwrap();
+    let envelope = alice_id.wrap_envelope(&timed.0);
+
+    // Intact: verifies, and the frame carries the declared reveal_at.
+    let (_, bundle) = loot_identity::unwrap_envelope(&envelope, &[]).unwrap();
+    match loot_core::bundle_codec::Frame::decode(bundle).unwrap() {
+        loot_core::bundle_codec::Frame::SealedGrant { reveal_at, .. } => {
+            assert_eq!(reveal_at, 999_999)
+        }
+        _ => panic!("expected SealedGrant"),
+    }
+
+    // Tamper with the reveal_at bytes inside the enveloped frame: the
+    // signature check must fail — there is no way to alter the embargo
+    // without becoming an invalid envelope.
+    let mut tampered = envelope.clone();
+    let n = tampered.len();
+    // reveal_at sits in the frame header; flip a byte well past the envelope
+    // header (1 + 32 + 64) and the frame's own marker/tag/pubkey/wrapped-key.
+    let target = 1 + 32 + 64 + 2 + 1 + 32 + 80 + 32; // first reveal_at byte
+    assert!(target < n);
+    tampered[target] ^= 0xFF;
+    assert!(
+        loot_identity::unwrap_envelope(&tampered, &[]).is_err(),
+        "a tampered reveal_at must break the grantor's envelope signature"
     );
 }

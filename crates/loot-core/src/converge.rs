@@ -32,11 +32,14 @@ pub trait KeyOracle {
 /// Classify every path an incoming tree touches against the local tree.
 ///
 /// `local` is the repo's current view; `incoming` is the tree of the change
-/// being applied. Returns one outcome per touched path. Pure: the only repo
-/// access is through `oracle`.
+/// being applied; `base` is the merge-base tree (the nearest common ancestor's
+/// full tree) when the caller's history knows one — see [`merge_pair`] for how
+/// it prevents spurious conflicts. Returns one outcome per touched path. Pure:
+/// the only repo access is through `oracle`.
 pub fn classify(
     local: &Tree,
     incoming: &Tree,
+    base: Option<&Tree>,
     oracle: &dyn KeyOracle,
     now: u64,
 ) -> BTreeMap<PathBuf, MergeOutcome> {
@@ -44,7 +47,8 @@ pub fn classify(
     for (path, (their_oid, _vis)) in incoming {
         // The same per-path rule `merge_trees` builds on — here we keep only the
         // label and discard the tree action.
-        let outcome = reconcile_path(local.get(path), their_oid, oracle, now).outcome();
+        let base_oid = base.and_then(|b| b.get(path)).map(|(o, _)| o);
+        let outcome = reconcile_path(local.get(path), their_oid, base_oid, oracle, now).outcome();
         let slot = outcomes.entry(path.clone()).or_insert(MergeOutcome::Converged);
         *slot = worst(slot.clone(), outcome);
     }
@@ -94,21 +98,48 @@ impl MergeDecision {
 fn reconcile_path(
     ours: Option<&(Oid, Visibility)>,
     their_oid: &Oid,
+    base_oid: Option<&Oid>,
     oracle: &dyn KeyOracle,
     now: u64,
 ) -> MergeDecision {
     match ours {
         None => MergeDecision::AdoptTheirs,
         Some((our_oid, _)) if our_oid == their_oid => MergeDecision::Converged,
-        Some((our_oid, _)) => merge_pair(our_oid, their_oid, oracle, now),
+        Some((our_oid, _)) => merge_pair(our_oid, their_oid, base_oid, oracle, now),
     }
 }
 
 /// Decide a concurrent same-path edit where the two sides differ. Opening both
 /// is the merger role; failing to open either is the relay role.
-fn merge_pair(ours: &Oid, theirs: &Oid, oracle: &dyn KeyOracle, now: u64) -> MergeDecision {
+///
+/// `base_oid` is the path's content at the merge base, when the caller's
+/// history knows one. Every change carries a *full* tree and re-seals mint
+/// fresh addresses, so address inequality does NOT mean both sides edited —
+/// a pulled chain re-raises paths its author never touched (#65, pilot
+/// finding 6). A side whose bytes equal the base is untouched since the
+/// fork: the other side simply wins, and only genuinely double-edited
+/// content proceeds to the line-set heuristic.
+fn merge_pair(
+    ours: &Oid,
+    theirs: &Oid,
+    base_oid: Option<&Oid>,
+    oracle: &dyn KeyOracle,
+    now: u64,
+) -> MergeDecision {
     match (oracle.open(ours, now), oracle.open(theirs, now)) {
-        (Some(a), Some(b)) => line_set_merge(ours, theirs, &a, &b),
+        (Some(a), Some(b)) => {
+            if let Some(base) = base_oid.and_then(|o| oracle.open(o, now)) {
+                if base == b && base != a {
+                    // Theirs is untouched since the base — ours is the only edit.
+                    return MergeDecision::Merged { winner: ours.clone() };
+                }
+                if base == a && base != b {
+                    // Ours is untouched since the base — adopt their edit.
+                    return MergeDecision::Merged { winner: theirs.clone() };
+                }
+            }
+            line_set_merge(ours, theirs, &a, &b)
+        }
         // Can't open at least one side -> relay, defer to a keyholder.
         _ => MergeDecision::Relayed,
     }
@@ -156,14 +187,21 @@ pub struct Merge {
     pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
 }
 
-pub fn merge_trees(ours: &Tree, theirs: &Tree, oracle: &dyn KeyOracle, now: u64) -> Merge {
+pub fn merge_trees(
+    ours: &Tree,
+    theirs: &Tree,
+    base: Option<&Tree>,
+    oracle: &dyn KeyOracle,
+    now: u64,
+) -> Merge {
     let mut tree = ours.clone();
     let mut conflicts: BTreeMap<PathBuf, (Oid, Oid)> = BTreeMap::new();
     let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
     for (path, their_entry) in theirs {
         // `tree` starts as ours, so "keep ours" cases need no write — only the
         // adopt/conflict actions touch the tree.
-        let decision = reconcile_path(ours.get(path), &their_entry.0, oracle, now);
+        let base_oid = base.and_then(|b| b.get(path)).map(|(o, _)| o);
+        let decision = reconcile_path(ours.get(path), &their_entry.0, base_oid, oracle, now);
         match &decision {
             MergeDecision::Converged | MergeDecision::Relayed => {} // keep ours untouched
             MergeDecision::AdoptTheirs => {
@@ -230,7 +268,7 @@ mod tests {
     fn absent_path_converges() {
         let local = BTreeMap::new();
         let inc = tree(&[("a.txt", oid(1))]);
-        let out = classify(&local, &inc, &FakeOracle(BTreeMap::new()), 0);
+        let out = classify(&local, &inc, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(out[&PathBuf::from("a.txt")], MergeOutcome::Converged);
     }
 
@@ -239,7 +277,7 @@ mod tests {
         let mut local = BTreeMap::new();
         local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Public));
         let inc = tree(&[("a.txt", oid(1))]);
-        let out = classify(&local, &inc, &FakeOracle(BTreeMap::new()), 0);
+        let out = classify(&local, &inc, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(out[&PathBuf::from("a.txt")], MergeOutcome::Converged);
     }
 
@@ -249,7 +287,7 @@ mod tests {
         local.insert(PathBuf::from("a.txt"), (oid(1), Visibility::Public));
         let inc = tree(&[("a.txt", oid(2))]);
         // Oracle opens neither -> relay.
-        let out = classify(&local, &inc, &FakeOracle(BTreeMap::new()), 0);
+        let out = classify(&local, &inc, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(out[&PathBuf::from("a.txt")], MergeOutcome::RelayedUnmerged);
     }
 
@@ -261,7 +299,7 @@ mod tests {
         let mut plain = BTreeMap::new();
         plain.insert(oid(1), b"x\n".to_vec());
         plain.insert(oid(2), b"x\ny\n".to_vec()); // superset
-        let out = classify(&local, &inc, &FakeOracle(plain), 0);
+        let out = classify(&local, &inc, None, &FakeOracle(plain), 0);
         assert_eq!(out[&PathBuf::from("a.txt")], MergeOutcome::Merged);
     }
 
@@ -273,9 +311,87 @@ mod tests {
         let mut plain = BTreeMap::new();
         plain.insert(oid(1), b"left\n".to_vec());
         plain.insert(oid(2), b"right\n".to_vec());
-        let out = classify(&local, &inc, &FakeOracle(plain), 0);
+        let out = classify(&local, &inc, None, &FakeOracle(plain), 0);
         assert_eq!(
             out[&PathBuf::from("a.txt")],
+            MergeOutcome::Conflict { ours: oid(1), theirs: oid(2) }
+        );
+    }
+
+    // --- base-aware downgrade (#65): untouched-since-fork must not conflict ---
+
+    #[test]
+    fn theirs_untouched_since_base_keeps_ours_not_conflict() {
+        // Pilot finding 6: our line edited the path, theirs still carries the
+        // base bytes under a fresh re-seal address. Two-way this line-conflicts
+        // (modified line = no subset); with the base it is ours-wins Merged.
+        let mut local = BTreeMap::new();
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        let inc = tree(&[("ctx.md", oid(2))]);
+        let base = tree(&[("ctx.md", oid(3))]);
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(1), b"alpha\nbeta EDITED\n".to_vec()); // our edit
+        plain.insert(oid(2), b"alpha\nbeta\n".to_vec()); // their re-seal of base
+        plain.insert(oid(3), b"alpha\nbeta\n".to_vec()); // the base
+        let out = classify(&local, &inc, Some(&base), &FakeOracle(plain.clone()), 0);
+        assert_eq!(out[&PathBuf::from("ctx.md")], MergeOutcome::Merged);
+
+        // And merge_trees keeps ours in the assembled tree.
+        let ours = tree(&[("ctx.md", oid(1))]);
+        let m = merge_trees(&ours, &inc, Some(&base), &FakeOracle(plain), 0);
+        assert_eq!(m.tree[&p("ctx.md")].0, oid(1), "our edit wins");
+        assert!(m.conflicts.is_empty());
+    }
+
+    #[test]
+    fn ours_untouched_since_base_adopts_theirs() {
+        let mut local = BTreeMap::new();
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        let inc = tree(&[("ctx.md", oid(2))]);
+        let base = tree(&[("ctx.md", oid(3))]);
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(1), b"alpha\nbeta\n".to_vec()); // ours == base
+        plain.insert(oid(2), b"alpha\nbeta EDITED\n".to_vec()); // their edit
+        plain.insert(oid(3), b"alpha\nbeta\n".to_vec());
+        let ours = tree(&[("ctx.md", oid(1))]);
+        let m = merge_trees(&ours, &inc, Some(&base), &FakeOracle(plain), 0);
+        assert_eq!(m.tree[&p("ctx.md")].0, oid(2), "their edit adopted");
+        assert_eq!(m.outcomes[&p("ctx.md")], MergeOutcome::Merged);
+    }
+
+    #[test]
+    fn both_edited_since_base_still_conflicts() {
+        // The base only rescues an untouched side — a genuine double edit is
+        // still a conflict for a human.
+        let mut local = BTreeMap::new();
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        let inc = tree(&[("ctx.md", oid(2))]);
+        let base = tree(&[("ctx.md", oid(3))]);
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(1), b"left\n".to_vec());
+        plain.insert(oid(2), b"right\n".to_vec());
+        plain.insert(oid(3), b"original\n".to_vec());
+        let out = classify(&local, &inc, Some(&base), &FakeOracle(plain), 0);
+        assert_eq!(
+            out[&PathBuf::from("ctx.md")],
+            MergeOutcome::Conflict { ours: oid(1), theirs: oid(2) }
+        );
+    }
+
+    #[test]
+    fn unopenable_base_falls_back_to_two_way() {
+        // The base path exists but we can't open it (sealed to us) — behave
+        // exactly as if no base were known.
+        let mut local = BTreeMap::new();
+        local.insert(PathBuf::from("ctx.md"), (oid(1), Visibility::Public));
+        let inc = tree(&[("ctx.md", oid(2))]);
+        let base = tree(&[("ctx.md", oid(9))]); // oid(9) not in the oracle
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(1), b"left\n".to_vec());
+        plain.insert(oid(2), b"right\n".to_vec());
+        let out = classify(&local, &inc, Some(&base), &FakeOracle(plain), 0);
+        assert_eq!(
+            out[&PathBuf::from("ctx.md")],
             MergeOutcome::Conflict { ours: oid(1), theirs: oid(2) }
         );
     }
@@ -291,7 +407,7 @@ mod tests {
         // ours has a.txt, theirs adds b.txt — a clean disjoint merge.
         let ours = tree(&[("a.txt", oid(1))]);
         let theirs = tree(&[("b.txt", oid(2))]);
-        let m = merge_trees(&ours, &theirs, &FakeOracle(BTreeMap::new()), 0);
+        let m = merge_trees(&ours, &theirs, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(m.tree[&p("a.txt")].0, oid(1), "ours kept");
         assert_eq!(m.tree[&p("b.txt")].0, oid(2), "theirs adopted");
         assert!(m.conflicts.is_empty());
@@ -305,7 +421,7 @@ mod tests {
         let mut plain = BTreeMap::new();
         plain.insert(oid(1), b"x\n".to_vec());
         plain.insert(oid(2), b"x\ny\n".to_vec()); // theirs is the superset
-        let m = merge_trees(&ours, &theirs, &FakeOracle(plain), 0);
+        let m = merge_trees(&ours, &theirs, None, &FakeOracle(plain), 0);
         assert_eq!(m.tree[&p("a.txt")].0, oid(2), "superset (theirs) wins");
         assert_eq!(m.outcomes[&p("a.txt")], MergeOutcome::Merged);
         assert!(m.conflicts.is_empty());
@@ -318,7 +434,7 @@ mod tests {
         let mut plain = BTreeMap::new();
         plain.insert(oid(1), b"x\ny\n".to_vec()); // ours is the superset
         plain.insert(oid(2), b"x\n".to_vec());
-        let m = merge_trees(&ours, &theirs, &FakeOracle(plain), 0);
+        let m = merge_trees(&ours, &theirs, None, &FakeOracle(plain), 0);
         assert_eq!(m.tree[&p("a.txt")].0, oid(1), "superset (ours) wins");
         assert_eq!(m.outcomes[&p("a.txt")], MergeOutcome::Merged);
     }
@@ -330,7 +446,7 @@ mod tests {
         let mut plain = BTreeMap::new();
         plain.insert(oid(1), b"left\n".to_vec());
         plain.insert(oid(2), b"right\n".to_vec());
-        let m = merge_trees(&ours, &theirs, &FakeOracle(plain), 0);
+        let m = merge_trees(&ours, &theirs, None, &FakeOracle(plain), 0);
         // Ours stays in the tree; theirs is recorded for resolution, not dropped.
         assert_eq!(m.tree[&p("a.txt")].0, oid(1));
         assert_eq!(m.conflicts[&p("a.txt")], (oid(1), oid(2)));
@@ -345,7 +461,7 @@ mod tests {
         // We can't open either side (no keys) -> relay role, ours carried forward.
         let ours = tree(&[("a.txt", oid(1))]);
         let theirs = tree(&[("a.txt", oid(2))]);
-        let m = merge_trees(&ours, &theirs, &FakeOracle(BTreeMap::new()), 0);
+        let m = merge_trees(&ours, &theirs, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(m.tree[&p("a.txt")].0, oid(1), "ours carried forward");
         assert_eq!(m.outcomes[&p("a.txt")], MergeOutcome::RelayedUnmerged);
         assert!(m.conflicts.is_empty(), "relay is not a conflict");
@@ -355,7 +471,7 @@ mod tests {
     fn merge_identical_address_is_converged_noop() {
         let ours = tree(&[("a.txt", oid(1))]);
         let theirs = tree(&[("a.txt", oid(1))]);
-        let m = merge_trees(&ours, &theirs, &FakeOracle(BTreeMap::new()), 0);
+        let m = merge_trees(&ours, &theirs, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(m.tree[&p("a.txt")].0, oid(1));
         assert_eq!(m.outcomes[&p("a.txt")], MergeOutcome::Converged);
     }

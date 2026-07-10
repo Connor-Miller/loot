@@ -23,8 +23,12 @@ change, *visibility-aware* (ADR 0006). Against the last change's full tree, at
 time `now`: paths the current identity can open are updated/deleted to match the
 tree; paths it cannot open are carried forward unchanged (never seen, so never
 changed); a write onto a non-visible path is refused (no silent clobber of
-sealed content). Lives in the engine (`DagRepo::snapshot`); the Workspace only
-supplies the tree.
+sealed content). A path whose plaintext and visibility are unchanged **keeps
+its sealed object and address** (#98) — snapshots and pushes are O(delta), not
+O(repo). Reuse never mints or moves a key (the object and its key are already
+held), so ADR 0004's no-plaintext-dedup stance is untouched; a path the
+identity cannot open *now* (e.g. still-embargoed) re-seals fresh. Lives in the
+engine (`DagRepo::snapshot`); the Workspace only supplies the tree.
 
 **Workspace** — the CLI module owning the *process-bound ambient repo*: it
 discovers `.loot/`, supplies the current identity and the clock, and persists on
@@ -102,6 +106,19 @@ attest <change> [role]`.
 **Identity** — a keyholder. Visibility is ultimately enforced by who holds the
 decryption key for a unit of content. "Permissioning is key management."
 
+**Agent identity** *(decided 2026-07-09, ADR 0026)* — an AI agent exists as a
+loot identity via a **persistent clone**: its own repo directory + keypair +
+keyring, cloned from the relay, synced by `push`/`pull`. Ceremony happens once
+at minting (clone, `peer add`, relay allowlist line); an ephemeral session just
+starts in the clone directory — session ≠ identity. One agent identity to
+start, minted freely when more are needed. Bootstrap grants: none — public
+content arrives with the clone; restricted keys are withheld by construction,
+and on-demand grant/maroon is the milestone's audit-trail evidence. The
+genuinely-sealed-from-agents path is `docs/pitch/` (restricted to the dev).
+[[Dock]]s/[[Harbor]] stay the *same-identity* parallelism tool; a per-dock
+identity/keyring split (store as "a relay on your own disk") is a recorded
+post-milestone enhancement, not the current model.
+
 **Sealed content** — the module that owns loot's thesis: encryption, visibility,
 and embargo behind two operations. `seal(bytes, visibility)` produces a
 *Sealed object* plus a freshly-minted content key; `open(sealed, reader, now)`
@@ -115,23 +132,44 @@ into the Escrow — not the Keyring — for every identity including the origina
 `flush_escrow(now)` promotes eligible entries into the Keyring once
 `now >= reveal_at`; until then the Keyring holds nothing for that object and
 `open` returns `Embargoed`. The Workspace calls `flush_escrow` before every
-content-reading operation (`checkout`, `snapshot`). Bundles ship embargoed keys
-as a separate escrow section so peers receive them into their own Escrow.
+content-reading operation (`checkout`, `snapshot`). As of format v5 (ADR 0027,
+#14) bundles ship **no** escrow section — that lane shipped plaintext keys,
+the exact bypass hard embargo closes. The Escrow is originator-side staging
+only; peers receive embargoed keys solely from the relay after `reveal_at`,
+as timed SealedGrants filed via `apply_sealed_grant` (which itself stages a
+not-yet-due grant in Escrow rather than the Keyring, as defense-in-depth
+against an early-releasing relay).
 
-**Threat model (be precise — the earlier glossary overclaimed).** Embargo is
-currently enforced **cooperatively**, against an *honest holder running an honest
-clock*. The escrow withholds the key from the Keyring until `flush_escrow(now)`
-sees `now >= reveal_at`, where `now` is the local clock injected by the
-Workspace. Against an adversarial holder this is **not** a hard guarantee: they
-can advance their clock, pass a future `now`, or read the escrow key bytes
-directly with a modified binary. So embargo today raises the bar (a normal
-client cannot read embargoed content early) but does not *cryptographically*
-withhold the key from a determined local adversary. The D-threat is closed only
-against honest participants. A hard guarantee requires a third party that holds
-the key and releases it at `reveal_at` (network escrow, time-lock, or threshold
-crypto) — see *External-service escrow* under Open / undecided. The seam is
-designed for that swap; until then, do not represent embargo as
-adversary-proof.
+**Threat model.** Hard embargo's engine/wire slice is **implemented** (ADR
+0027, #14, format v5): embargoed keys have **no bundle lane at all** — the
+v1–v4 plaintext escrow section is gone (a v5 reader parses an old section for
+cursor correctness and DROPS its keys), and they travel only as **timed
+SealedGrants** — ECIES-wrapped per recipient, withheld from the relay's grant
+mailbox until the *relay's* clock passes `reveal_at` (the relay never takes a
+caller clock; `reveal_at` rides inside the grantor-signed envelope, so it
+cannot be altered without breaking the signature). A non-originator holder is
+adversary-proof-ed by **absence**: the key bytes are not on their machine —
+no lying clock, escrow inspection, or modified binary can read what never
+arrived. The claim is **holder**-adversary-proof: residual trust is the relay
+operator releasing on time — a distinct role holding only wrapped blobs it
+cannot read (drand timelock is the recorded post-milestone hardening). The
+*originator's* own local Escrow staging (ADR 0007) remains cooperative/
+honest-clock — moot, since the originator already knows the plaintext they
+sealed. The CLI surface (#88) is implemented: `loot push` runs a deposit pass
+after stowing bundles — one timed SealedGrant per registered peer for every
+embargoed path this repo holds the key for, deduped against the Manifest (a
+recorded oid→peer grant is never re-deposited, which also makes an interrupted
+deposit loop resumable); `loot grant --relay` on an embargoed path inherits the
+seal's `reveal_at` (a late-added recipient gets a timed grant, never an early
+key); receipt is plain `loot pull-grants` — no new verbs. The attack demo
+(#89) is the scripted proof: `docs/evidence/scripts/attack-demo.ps1` runs an
+adversarial holder against the live relay — an advanced `LOOT_CLOCK`, direct
+`.loot` inspection, and a patched binary (`loot-core` example `patched-client`,
+every client time gate removed) all **fail** to read before `reveal_at`, then
+the read succeeds after the relay releases; output committed at
+`docs/evidence/runs/attack-demo.txt`. With no relay configured, ciphertext
+syncs and embargoed keys simply never reach peers — one `Embargoed` label, one
+guarantee.
 
 **Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
 identities permitted to hold a key). It deliberately does **not** contain any
@@ -162,7 +200,27 @@ the layout has one documented home.
 **`.lootattributes`** — a gitattributes-style file mapping path globs to
 visibility (`.env restricted=alice`, `*.md public`). The Workspace reads it on
 snapshot to seal each path; unmatched paths default to Public. This is the
-user-facing surface of the thesis — where you declare a file private.
+user-facing surface of the thesis — where you declare a file private. Two
+safeguards (#62, 2026-07-09): the file is **versioned** like any other path
+(policy travels to peers and clones — a fresh keyholder clone without the
+rules would otherwise re-seal restricted content Public), and a snapshot that
+would **demote** a path's visibility (Restricted/Embargoed → wider than the
+tree already records) **refuses** unless that path is passed via
+`loot status --allow-demote <path>`. Widening a Restricted identity set is
+not guarded — `grant`/`maroon` own that audit trail.
+
+**`.lootignore`** *(#64, 2026-07-09)* — a gitignore-style file excluding paths
+from [[Snapshot (reconcile)]]: one glob per line, `#` comments, the **same
+dialect as `.lootattributes`** (full relative path; `*` stops at `/`, `**`
+crosses it) — deliberately *not* full gitignore semantics (no negation, no
+implicit any-depth matching; use `**/target/` for that). A trailing `/`
+ignores the whole subtree (`target/` ≡ `target/**`) and the walk **prunes**
+there — ignored build output is never even read. An ignored path simply isn't
+part of the tree the engine reconciles, so ignoring an already-snapshotted
+readable path drops it from the working change on the next `status` — the
+remedy for the pilot's 38 MB `target/` mis-seal. The policy files themselves
+(`.lootattributes`, `.lootignore`) are never ignorable and stay versioned
+(#62's rationale: policy travels).
 
 **loot (the CLI)** — the first product crate (`loot-cli`, binary `loot`):
 `init`, `status`, `describe`, `new`, `checkout`, `log`, `bundle`, `apply`. Thin
@@ -182,11 +240,13 @@ decrypt.
 
 **Frame** — the typed, tag-resolved form of a bundle on the wire, and the single
 value the engine matches on. There are three: *Sync* (tag 0, carries purge
-events + the change/object/key/escrow body), *Grant* (tag 1, a targeted key
+events + the change/object/key body — the plaintext escrow section is gone as
+of v5, ADR 0027), *Grant* (tag 1, a targeted key
 handoff whose key rides in the body), and *SealedGrant* (tag 3, the content key
-ECIES-wrapped to a recipient pubkey, carried beside the body). All wire framing
+ECIES-wrapped to a recipient pubkey, carried beside the body with a `reveal_at`
+— `0` untimed; nonzero makes it a relay-withheld timed grant). All wire framing
 — the tag byte, the Sync purge prefix, the Grant grantee prefix, the SealedGrant
-`[pubkey·wrapped·oid]` header, and every length/offset — lives behind
+`[pubkey·wrapped·oid·reveal_at]` header, and every length/offset — lives behind
 `bundle_codec::Frame::{decode, encode}`; the engine does no byte arithmetic. Both
 `apply` (keyholder merge) and `stow` (relay ingest) decode to a `Frame` and match;
 `stow` accepts only *Sync*. A `SealedGrant`'s wrapped key is surfaced verbatim and
@@ -219,8 +279,19 @@ See ADR 0001.
 **Convergence classifier** — the module that decides, per path, what happens
 when an incoming change meets the local tree: *Converged* (disjoint or
 identical), *Merged*, *Conflict*, or *RelayedUnmerged*. It is a pure function
-of (local tree, incoming change, a *Key oracle*) — it owns the ADR 0001 rule
-and touches no storage or disk, so it is unit-testable with a fake oracle.
+of (local tree, incoming change, merge-base tree, a *Key oracle*) — it owns
+the ADR 0001 rule and touches no storage or disk, so it is unit-testable with
+a fake oracle. The **merge base** (#65, 2026-07-09) is the nearest common
+ancestor's full tree, supplied by the caller (`apply` walks the incoming
+chain's parents into the local graph; `dock merge` asks the graph directly):
+because changes carry full trees and a snapshot may re-seal content under a
+fresh address without a real edit (routine before #98's unchanged-path reuse;
+still possible whenever a peer re-seals content it holds, e.g. a visibility
+change), address inequality does *not* mean both sides edited — a side
+whose plaintext equals the base is untouched since the fork and the other
+side simply wins. Only genuinely double-edited content reaches the line-set
+heuristic (and, when undecidable, *Conflict*). No base known (disjoint
+history, unopenable base) falls back to the two-way comparison.
 
 **Key oracle** — the narrow seam the classifier uses to ask the repo for
 plaintext: `open(oid, now) -> Option<bytes>`. `None` *is* the relay role (this
@@ -234,7 +305,7 @@ ciphertext — only this oracle.
 
 **Maroon** — to cut off an identity's access to a path. Two levels:
 
-- *Forward maroon* (`loot maroon <path> <identity>`) — re-seals content under a new key, re-grants remaining authorized identities (each receives a targeted grant bundle), publishes a new Change. The marooned identity retains the key for any past versions they already hold. Natural for "you may read the old code but not future updates." Implemented (ADR 0010).
+- *Forward maroon* (`loot maroon <path> <identity>`) — re-seals content under a new key, re-grants remaining authorized identities (each receives a targeted grant bundle), publishes a new Change. The CLI **finalizes (signs) that re-seal change**, so it propagates via push/bundle — an unsigned re-seal is treated as a working change and never travels (ADR 0018), which would strand the maroon on the originator. The marooned identity retains the key for any past versions they already hold. Natural for "you may read the old code but not future updates." Implemented (ADR 0010).
 - *Hard maroon* (`loot maroon --hard <path> <identity>`) — forward maroon plus a published purge event signaling all cooperating peers to remove the marooned identity's Keyring entry for the affected OID. Best-effort operational guarantee: cooperating machines purge; offline or modified-binary peers cannot be forced. Models the "person left the org" case. Implemented (ADR 0009, ADR 0010).
 
 **Visibility migration** — promoting or demoting a path's Visibility as a first-class operation with history. Implemented as grant + maroon over the affected identity set: promoting `Restricted` → `Public` re-seals under a new ANYONE-granted key; demoting `Public` → `Restricted` re-seals under a new Restricted key and grants only the named identities. Falls out of grant and maroon working correctly — not a separate primitive.
@@ -292,18 +363,13 @@ tree so the decision is reproducible (`cargo test --release`).
 
 ## Open / undecided
 
-- **External-service escrow (hard embargo enforcement).** The current Escrow
-  module is local and trusts the local clock: a determined keyholder can read the
-  key bytes directly with a modified binary, OR simply advance their clock / pass
-  a future `now` to trigger `flush_escrow` early. Both the *key-custody* gap and
-  the *clock-trust* gap are the same slice — a production guarantee requires a
-  third party that holds the key and releases it at `reveal_at` (network escrow,
-  time-lock, or threshold crypto), which also removes the local-clock dependency.
-  A half-measure (e.g. tamper-evident flush logging, or a second time source) was
-  considered and rejected: it implies unbuilt monitoring/authority infrastructure
-  and would be thrown away when real escrow lands. The seam is designed: replacing
-  `Escrow::flush` with a network call leaves everything else unmodified. Deferred
-  as one coherent slice until the network layer exists.
+- **External-service escrow (hard embargo enforcement).** DECIDED 2026-07-09
+  (ADR 0027) and implemented (#14 engine/wire, #88 CLI): embargoed keys travel
+  as timed SealedGrants the relay withholds until `reveal_at`; the plaintext
+  bundle escrow section is removed (breaking, `FORMAT_MAJOR`). Remaining open
+  here is only the post-milestone hardening: **drand timelock (tlock)** to
+  remove even the relay-operator trust — composable later by timelocking the
+  SealedGrant payload to a drand round.
 
 - **Relay announcement.** A relay peer declaring its relay status so senders
   can discover who holds a key before bundling — enabling selective delivery

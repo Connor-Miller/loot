@@ -208,6 +208,39 @@ impl ChangeGraph {
         tree
     }
 
+    /// The full tree of the nearest common ancestor of `a` and `b` — the merge
+    /// base the convergence classifier consults to tell "untouched since the
+    /// fork" from "both sides edited" (#65). Walks breadth-first from `b`
+    /// (inclusive: if one tip is an ancestor of the other, that tip IS the
+    /// base) through parents until it hits `a`'s ancestry. `None` when the two
+    /// lines share no history.
+    pub fn common_ancestor_tree(&self, a: &Oid, b: &Oid) -> Option<Tree> {
+        let mut a_ancestry: std::collections::BTreeSet<Oid> = std::collections::BTreeSet::new();
+        let mut stack = vec![a.clone()];
+        while let Some(id) = stack.pop() {
+            if !a_ancestry.insert(id.clone()) {
+                continue;
+            }
+            if let Some(node) = self.changes.get(&id) {
+                stack.extend(node.parents.iter().cloned());
+            }
+        }
+        let mut queue: std::collections::VecDeque<Oid> = std::collections::VecDeque::new();
+        let mut seen: std::collections::BTreeSet<Oid> = std::collections::BTreeSet::new();
+        queue.push_back(b.clone());
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(node) = self.changes.get(&id) else { continue };
+            if a_ancestry.contains(&id) {
+                return Some(node.tree.clone());
+            }
+            queue.extend(node.parents.iter().cloned());
+        }
+        None
+    }
+
     /// Changes ordered so parents precede children (DFS topo sort).
     pub fn in_order(&self) -> Vec<&ChangeNode> {
         let mut ordered = Vec::with_capacity(self.changes.len());

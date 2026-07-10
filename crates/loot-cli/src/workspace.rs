@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOT: &str = ".loot";
 const ATTRS: &str = ".lootattributes";
+const IGNORE: &str = ".lootignore";
 
 pub struct Workspace {
     dot: PathBuf,
@@ -124,6 +125,14 @@ impl Workspace {
         &self.dot
     }
 
+    /// Prune orphaned loose objects from `.loot/objects/` (ADR 0012, #66).
+    /// Delegates to the engine, which owns the object store and the reachability
+    /// walk over the change graph. `dry_run` reports what would be pruned
+    /// without deleting.
+    pub fn gc(&mut self, dry_run: bool) -> Result<loot_core::GcReport, String> {
+        self.repo.gc(&self.dot, dry_run).map_err(|e| e.to_string())
+    }
+
     /// Resolve the visibility for `path` according to `.lootattributes` — the
     /// same rule `snapshot` uses. Returns `Public` if no rule matches.
     pub fn visibility_for(&self, path: &str) -> Visibility {
@@ -148,13 +157,24 @@ impl Workspace {
     /// the message matches, the engine call is skipped and the current working id
     /// is returned unchanged. This makes repeated `loot status` calls cheap.
     pub fn snapshot(&mut self, message: &str) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+        self.snapshot_allowing(message, &[])
+    }
+
+    /// `snapshot` with an explicit demotion allowlist (#62): paths listed here
+    /// may re-seal more readably than the tree records (`--allow-demote`).
+    pub fn snapshot_allowing(
+        &mut self,
+        message: &str,
+        allow_demote: &[PathBuf],
+    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
         // Promote any embargoed keys whose reveal time has passed before reading
         // content — `sealed::open` will then find them in the Keyring (ADR 0007).
         self.repo.flush_escrow(self.now);
         let attrs = Attributes::load(&self.root.join(ATTRS));
+        let ignore = Ignore::load(&self.root.join(IGNORE));
         let mut entries: Vec<(PathBuf, Vec<u8>, Visibility)> = Vec::new();
         let mut reported: Vec<(PathBuf, Visibility)> = Vec::new();
-        for path in walk(&self.root)? {
+        for path in walk(&self.root, &ignore)? {
             // Store paths relative to the repo root so tree keys are stable
             // regardless of whether the root is "." (the CLI) or an absolute dir
             // (tests, `clone` into a path). Fall back to stripping a leading "./".
@@ -185,7 +205,14 @@ impl Workspace {
         // fork-from-all-heads behavior exactly.
         let id = self
             .repo
-            .snapshot(self.tip.as_ref(), self.working.as_ref(), &entries, message, self.now)
+            .snapshot_allowing(
+                self.tip.as_ref(),
+                self.working.as_ref(),
+                &entries,
+                message,
+                self.now,
+                allow_demote,
+            )
             .map_err(|e| e.to_string())?;
         self.working = Some(id.clone());
         // Persist the new tree hash before persisting the rest of state.
@@ -223,6 +250,22 @@ impl Workspace {
         // Clear the tree-hash so the next snapshot always runs the engine.
         self.store.clear_tree_hash(self.dock_opt());
         self.persist()
+    }
+
+    /// Finalize a specific already-recorded change by signing it (S3, ADR 0018),
+    /// so it stops counting as a working change and propagates via push/bundle.
+    /// Used by `maroon`, which records a complete re-seal change the engine
+    /// leaves unsigned. In a keyless repo the change is unauthored and already
+    /// travels, so this is a no-op there.
+    pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), String> {
+        if let Some(signer) = &self.signer {
+            let sig = signer.sign(&change_id.0);
+            self.repo
+                .attach_signature(change_id, sig)
+                .map_err(|e| e.to_string())?;
+            self.persist()?;
+        }
+        Ok(())
     }
 
     /// Attest an existing change with this repo's identity (S4, ADR 0018): sign
@@ -674,7 +717,18 @@ pub struct DockInfo {
     pub current: bool,
 }
 
+/// The workspace clock (unix seconds). `LOOT_CLOCK` overrides it when set —
+/// deliberately: the client clock is an input the embargo design must survive
+/// (the relay never reads it; there is no clock field on the wire, ADR 0027),
+/// so letting a holder lie with it is not a weakening but the attack demo's
+/// first exhibit (#89). Everything a lying clock gates locally (Escrow flush,
+/// embargo checks in `open`) fails anyway for lack of key bytes.
 fn real_now() -> u64 {
+    if let Ok(fake) = std::env::var("LOOT_CLOCK") {
+        if let Ok(t) = fake.parse() {
+            return t;
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -685,8 +739,14 @@ fn read_to_string(path: &Path) -> Result<String, String> {
     String::from_utf8(std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
-/// Recursively list files under `dir`, skipping `.loot/`, `.lootattributes`, `.git`.
-fn walk(dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// Recursively list files under `dir`, skipping `.loot/`, `.git`, and paths
+/// matched by `.lootignore` (#64). Ignored directories are pruned without
+/// descending, so an ignored `target/` is never read — the pilot's 38 MB
+/// mis-seal cost nothing but a glob match.
+/// `.lootattributes` is deliberately included (#62): the policy is versioned
+/// like any file so it travels to peers and clones — a fresh keyholder clone
+/// without the rules would silently re-seal restricted content Public.
+fn walk(dir: &Path, ignore: &Ignore) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -696,18 +756,75 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>, String> {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == DOT || name == ATTRS || name == ".git" {
+            if name == DOT || name == ".git" {
                 continue;
             }
+            let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().to_string();
             if path.is_dir() {
-                stack.push(path);
-            } else {
+                if !ignore.ignores_dir(&rel) {
+                    stack.push(path);
+                }
+            } else if !ignore.ignores_file(&rel) {
                 out.push(path);
             }
         }
     }
     out.sort();
     Ok(out)
+}
+
+/// Parsed `.lootignore` (#64): ordered globs excluding paths from snapshot,
+/// in the same dialect as `.lootattributes` (full relative path, `*` stops at
+/// `/`, `**` crosses it — see `Glob`). A trailing `/` ignores the whole
+/// subtree (`target/` ≡ `target/**`). One pattern per line; `#` comments.
+///
+/// Semantics: an ignored path simply isn't part of the tree the engine
+/// reconciles — if it was previously snapshotted and is readable, the next
+/// snapshot records its deletion (which is the remedy for a mis-sealed
+/// `target/`: add the ignore line, run `loot status`, the working change
+/// drops it). The policy files themselves (`.lootattributes`, `.lootignore`)
+/// are never ignorable — like #62, policy must stay versioned and travel.
+struct Ignore {
+    globs: Vec<Glob>,
+}
+
+impl Ignore {
+    fn load(path: &Path) -> Self {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut globs = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(subtree) = line.strip_suffix('/') {
+                globs.push(Glob::new(&format!("{subtree}/**")));
+            } else {
+                globs.push(Glob::new(line));
+            }
+        }
+        Ignore { globs }
+    }
+
+    fn ignores_file(&self, rel: &str) -> bool {
+        let unix = rel.replace('\\', "/");
+        if unix == ATTRS || unix == IGNORE {
+            return false;
+        }
+        self.globs.iter().any(|g| g.matches(&unix))
+    }
+
+    /// A directory is pruned when every possible descendant is ignored. That
+    /// is provable only for subtree globs (`…/**`): strip the suffix and match
+    /// the prefix against the dir. File globs (`target/*.o`) never prune —
+    /// deeper non-matching descendants may exist — their files are still
+    /// excluded one-by-one in `ignores_file`.
+    fn ignores_dir(&self, rel: &str) -> bool {
+        let unix = rel.replace('\\', "/");
+        self.globs
+            .iter()
+            .any(|g| g.pattern.strip_suffix("/**").is_some_and(|prefix| glob_match(prefix, &unix)))
+    }
 }
 
 /// Parsed `.lootattributes`: ordered (glob, visibility) rules. First match wins;
@@ -915,16 +1032,20 @@ fn global_config_path() -> PathBuf {
 }
 
 /// Minimal glob: `*` matches a run of non-`/`; `**` matches across separators.
+/// Patterns and paths are both normalized to `/` before matching — snapshot
+/// hands over OS-native paths (`docs\private\x` on Windows), and a portable
+/// rule like `docs/private/*` that silently fails to match seals content
+/// **Public**: fail-open, the worst failure mode for a privacy-first VCS (#61).
 struct Glob {
     pattern: String,
 }
 
 impl Glob {
     fn new(pattern: &str) -> Self {
-        Glob { pattern: pattern.to_string() }
+        Glob { pattern: pattern.replace('\\', "/") }
     }
     fn matches(&self, path: &str) -> bool {
-        glob_match(&self.pattern, path)
+        glob_match(&self.pattern, &path.replace('\\', "/"))
     }
 }
 
@@ -1012,6 +1133,167 @@ mod tests {
         assert!(!glob_match("*.md", "src/x.md"));
         assert!(glob_match("secrets/**", "secrets/a/b.txt"));
         assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn glob_normalizes_separators_both_ways() {
+        // #61: portable `/` rules must match OS-native `\` paths — a rule that
+        // silently matches nothing seals content Public (fail-open).
+        assert!(Glob::new("docs/private/*").matches(r"docs\private\secrets.md"));
+        assert!(Glob::new("secrets/**").matches(r"secrets\a\b.txt"));
+        // The non-portable backslash spelling keeps working.
+        assert!(Glob::new(r"docs\private\*").matches("docs/private/secrets.md"));
+        // `*` must not leak across a `\` separator any more than a `/` one.
+        assert!(!Glob::new("*.md").matches(r"docs\x.md"));
+    }
+
+    #[test]
+    fn snapshot_seals_forward_slash_rule_in_subdir() {
+        // End-to-end #61 reproduction: on Windows, snapshot's relative paths are
+        // backslash-native; the portable rule must still seal the file.
+        let dir = std::env::temp_dir().join(format!("loot-attrs-sep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::create_dir_all(dir.join("docs/private")).unwrap();
+        std::fs::write(dir.join("docs/private/secret.md"), b"sealed?").unwrap();
+        std::fs::write(dir.join(".lootattributes"), "docs/private/* restricted=connor\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("").unwrap();
+        let vis = reported
+            .iter()
+            .find(|(p, _)| p.ends_with("secret.md"))
+            .map(|(_, v)| v.clone())
+            .expect("secret.md snapshotted");
+        assert!(
+            matches!(vis, Visibility::Restricted(ref ids) if *ids == ["connor"]),
+            "docs/private/* must seal OS-native paths, got {vis:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lootignore_excludes_subtree_and_never_reads_it() {
+        // #64 (pilot finding 4): one `status` with target/ present sealed
+        // 301 files / 38 MB into the working change.
+        let dir = std::env::temp_dir().join(format!("loot-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("target/debug/junk.o"), b"38MB of regret").unwrap();
+        std::fs::write(dir.join("src.rs"), b"fn main() {}").unwrap();
+        std::fs::write(dir.join(".lootignore"), "# build output\ntarget/\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("").unwrap();
+        assert!(
+            !reported.iter().any(|(p, _)| p.to_string_lossy().contains("target")),
+            "ignored subtree must not be snapshotted: {reported:?}"
+        );
+        assert!(reported.iter().any(|(p, _)| p.ends_with("src.rs")));
+        // The ignore policy itself is versioned, like .lootattributes (#62).
+        assert!(
+            reported.iter().any(|(p, _)| p.ends_with(".lootignore")),
+            ".lootignore must be snapshotted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lootignore_drops_previously_tracked_path() {
+        // The pilot remedy: after a mis-seal, add the ignore line and re-run
+        // `status` — the (still-working) change must drop the path.
+        let dir = std::env::temp_dir().join(format!("loot-ignore2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::write(dir.join("junk.log"), b"oops").unwrap();
+        std::fs::write(dir.join("keep.rs"), b"fn main() {}").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("mis-seal").unwrap();
+        assert!(reported.iter().any(|(p, _)| p.ends_with("junk.log")));
+
+        std::fs::write(dir.join(".lootignore"), "*.log\n").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("remedied").unwrap();
+        assert!(
+            !reported.iter().any(|(p, _)| p.ends_with("junk.log")),
+            "ignored path must leave the working change: {reported:?}"
+        );
+        assert!(reported.iter().any(|(p, _)| p.ends_with("keep.rs")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lootignore_cannot_ignore_policy_files() {
+        // Ignoring the policy files would strand peers without the rules —
+        // the same fail-open shape #62 closed for attributes edits.
+        let dir = std::env::temp_dir().join(format!("loot-ignore3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::write(dir.join(".lootattributes"), "# empty\n").unwrap();
+        std::fs::write(dir.join(".lootignore"), ".lootattributes\n.lootignore\n.loot*\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("").unwrap();
+        assert!(reported.iter().any(|(p, _)| p.ends_with(".lootattributes")));
+        assert!(reported.iter().any(|(p, _)| p.ends_with(".lootignore")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lootignore_nested_subtree_rule_prunes_any_depth() {
+        let dir = std::env::temp_dir().join(format!("loot-ignore4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::create_dir_all(dir.join("crates/a/target/debug")).unwrap();
+        std::fs::write(dir.join("crates/a/target/debug/x.o"), b"junk").unwrap();
+        std::fs::create_dir_all(dir.join("crates/a/src")).unwrap();
+        std::fs::write(dir.join("crates/a/src/lib.rs"), b"pub fn a() {}").unwrap();
+        std::fs::write(dir.join(".lootignore"), "**/target/\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("").unwrap();
+        assert!(
+            !reported.iter().any(|(p, _)| p.to_string_lossy().contains("target")),
+            "nested target/ must be ignored: {reported:?}"
+        );
+        assert!(reported.iter().any(|(p, _)| p.ends_with("lib.rs")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attributes_edit_cannot_silently_demote() {
+        // #62 (pilot finding 2): deleting the .lootattributes line used to
+        // re-seal the path Public on the next snapshot with no warning.
+        let dir = std::env::temp_dir().join(format!("loot-demote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::write(dir.join("secret.txt"), b"private").unwrap();
+        std::fs::write(dir.join(".lootattributes"), "secret.txt restricted=connor\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("seal").unwrap();
+        // The policy itself is versioned (travels to peers and clones).
+        assert!(
+            reported.iter().any(|(p, v)| p.ends_with(".lootattributes")
+                && matches!(v, Visibility::Public)),
+            ".lootattributes must be snapshotted"
+        );
+
+        // Mangle the policy: the next snapshot must refuse, not leak.
+        std::fs::write(dir.join(".lootattributes"), "").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let err = ws.snapshot("oops").unwrap_err();
+        assert!(err.contains("demote") && err.contains("secret.txt"), "got: {err}");
+
+        // Deliberate demotion goes through with --allow-demote.
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) =
+            ws.snapshot_allowing("public now", &[PathBuf::from("secret.txt")]).unwrap();
+        let vis = reported.iter().find(|(p, _)| p.ends_with("secret.txt")).unwrap();
+        assert!(matches!(vis.1, Visibility::Public));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

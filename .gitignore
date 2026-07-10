@@ -2,3 +2,12 @@
 **/*.rs.bk
 .DS_Store
 /.claude/worktrees/
+# Throwaway loot repos for relay/identity testing; keep the generator tracked.
+/test-repos/*
+!/test-repos/new-test-repo.ps1
+# loot-hosts-loot (ADR 0026): the repo's own loot state. NEVER commit — .loot/
+# holds the identity's PRIVATE KEY and keyring.
+/.loot/
+# Sealed content (restricted=connor in .lootattributes). git dual-runs to
+# GitHub, which would publish it in plaintext — loot is its only host.
+/docs/pitch/

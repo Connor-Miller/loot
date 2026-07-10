@@ -1,0 +1,89 @@
+=== loot grant / maroon lifecycle demo (section B, ADR 0008/0009/0015) ===
+run started (utc): 2026-07-10 15:59:12Z
+relay:             http://127.0.0.1:47452   (local loot serve -- hermetic; mutating demo)
+work dir:          C:\Users\conno\AppData\Local\Temp\loot-grant-maroon-1783699152
+
+>>> building loot (release)
+
+>>> starting local relay: loot serve --dir <tmp> --addr 127.0.0.1:47452
+    relay is up.
+
+>>> dev: loot init --identity dev
+    initialized empty loot repo at ., identity = dev
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMn/Wp5WhJV/sE/7ksjfPYSReO3vvhHbVxkCv47hwefe dev@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=dev`
+
+>>> dev: seal + finalize + push the restricted change
+    remote 'origin' → http://127.0.0.1:47452
+    working change 46fc4936 — "add restricted secret"
+      .lootattributes          public
+      secret.txt               restricted=dev
+    finalized working change; the next `status` starts a fresh one
+    pushed 2 new object(s) to http://127.0.0.1:47452 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent: clone the relay as identity 'agent'
+    initialized empty loot repo at C:\Users\conno\AppData\Local\Temp\loot-grant-maroon-1783699152\agent, identity = agent
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMzKPjUUgJVNk1hsGccqDfdDVdb/053urMs75gSmwauE agent@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=agent`
+    pulled 2 change(s) from http://127.0.0.1:47452
+    cloned http://127.0.0.1:47452 → C:\Users\conno\AppData\Local\Temp\loot-grant-maroon-1783699152\agent
+    run `loot status` to see the working tree
+PASS: before any grant, the agent cannot read the restricted path (secret.txt absent)
+
+>>> dev: peer add agent + grant --relay secret.txt agent
+    registered peer 'agent'
+    delivered sealed grant for 'agent' via relay http://127.0.0.1:47452
+      secret.txt → agent (sealed, signed, recorded in manifest)
+      recipient runs `loot pull-grants` to receive it
+
+>>> agent: peer add dev + pull-grants + surface
+    registered peer 'dev'
+    applied 1/1 grant(s) from http://127.0.0.1:47452
+    run `loot surface` to materialize newly-accessible content
+      .lootattributes                  public
+      secret.txt                       restricted=dev
+    surfaced 46fc4936 as agent
+PASS: after the sealed grant, the agent files the key and reads the restricted content
+
+>>> dev: loot maroon --hard secret.txt agent (re-seal excluding the agent) + push
+    hard-marooned agent from secret.txt (new oid: 36683014)
+      purge event recorded — cooperating peers will remove agent's old key on next bundle apply
+      agent no longer has future access
+      (no remaining grantees — content is now accessible only to you)
+    pushed 1 new object(s) to http://127.0.0.1:47452 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent: drop the old copy, then loot pull + surface (receives the re-seal + purge)
+    pulled from http://127.0.0.1:47452 as agent:
+      .lootattributes          converged
+      secret.txt               relayed (sealed — you lack the key)
+    run `loot surface` to materialize what you may see
+      .lootattributes                  public
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced f7da8ba3 as agent
+PASS: after the hard maroon, the agent's pull carries a seal it cannot open (loot cannot restore secret.txt -- no key)
+
+>>> dev: loot manifest (grant audit trail, grantor/grantee as pubkeys)
+    granted_at   grantee          grantor          oid
+    ------------------------------------------------------------------------
+    1783699153   agent            c9ff5a9e…        129b7c8c
+PASS: the Manifest records the grant to the agent (auditable key-handoff trail)
+
+================  RESULT  ================
+Access to secret.txt was granted to the agent, exercised, then revoked --
+each step per-content, propagated over a keyless relay, and recorded in the
+Manifest. Permissions are a property of the content and the grant graph,
+not of the repository.
+
+Honesty (ADR 0026): one machine under one OS user. 'The agent cannot read
+after maroon' means key custody PLUS the agent harness's file sandbox --
+an honest-participant posture. The re-seal denies the NEW content to the
+marooned key; the hard-maroon purge additionally drops the old key on
+cooperating peers. Forward secrecy for already-read bytes is out of scope
+(the agent may have copied what it already decrypted -- ADR 0009).
+
+ALL CHECKS PASSED -- grant, read, maroon, and audit all behaved.
+run finished (utc): 2026-07-10 15:59:13Z
