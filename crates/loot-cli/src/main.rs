@@ -1162,11 +1162,10 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
 
     println!("resolved {} (new oid: {})", path.display(), short(&new_oid));
 
-    // Check if all conflicts are now clear. On a dock the resolution has already
-    // advanced the tip; on the primary dock, `loot new` finalizes.
+    // The resolution is signed on the spot; on a dock it also advanced the tip.
     if ws.repo().conflicts().is_empty() {
         if ws.current_dock().is_none() {
-            println!("all conflicts resolved — run `loot new` to finalize");
+            println!("all conflicts resolved");
         } else {
             println!("all conflicts resolved — dock tip advanced");
         }
