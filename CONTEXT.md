@@ -259,8 +259,17 @@ See ADR 0001.
 **Convergence classifier** — the module that decides, per path, what happens
 when an incoming change meets the local tree: *Converged* (disjoint or
 identical), *Merged*, *Conflict*, or *RelayedUnmerged*. It is a pure function
-of (local tree, incoming change, a *Key oracle*) — it owns the ADR 0001 rule
-and touches no storage or disk, so it is unit-testable with a fake oracle.
+of (local tree, incoming change, merge-base tree, a *Key oracle*) — it owns
+the ADR 0001 rule and touches no storage or disk, so it is unit-testable with
+a fake oracle. The **merge base** (#65, 2026-07-09) is the nearest common
+ancestor's full tree, supplied by the caller (`apply` walks the incoming
+chain's parents into the local graph; `dock merge` asks the graph directly):
+because changes carry full trees and every snapshot re-seals under fresh
+addresses, address inequality does *not* mean both sides edited — a side
+whose plaintext equals the base is untouched since the fork and the other
+side simply wins. Only genuinely double-edited content reaches the line-set
+heuristic (and, when undecidable, *Conflict*). No base known (disjoint
+history, unopenable base) falls back to the two-way comparison.
 
 **Key oracle** — the narrow seam the classifier uses to ask the repo for
 plaintext: `open(oid, now) -> Option<bytes>`. `None` *is* the relay role (this

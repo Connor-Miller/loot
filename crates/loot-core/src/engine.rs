@@ -34,6 +34,16 @@ use object_store::{ObjectStore, Stored};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// Returned by `gc`: how many loose objects were (or, on a dry run, would be)
+/// pruned, and the total bytes they occupied on disk (ADR 0012, #66).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Number of unreferenced object files pruned.
+    pub pruned: usize,
+    /// Total on-disk size of the pruned object files, in bytes.
+    pub bytes: u64,
+}
+
 /// One change in a [`LogGraph`]: its id, message, and which heads can reach it
 /// (as indices into [`LogGraph::heads`]). A change reachable from exactly one
 /// head is unique to that head's lineage; one reachable from several is shared
@@ -596,9 +606,18 @@ impl DagRepo {
         // Classify every incoming change against our pre-apply tree using the
         // shared ADR 0001 classifier. We are the KeyOracle: it asks us for
         // plaintext, we answer via sealed::open. The classifier owns the rule.
+        //
+        // Each change is classified with its merge base (#65): the nearest
+        // ancestor we already hold, found by walking the incoming batch's
+        // parent links into our graph. Changes carry full trees, so a pulled
+        // chain re-raises every path its author never touched — without the
+        // base, those classified as conflicts whenever our line had moved on.
+        let batch: BTreeMap<&Oid, &ChangeNode> = changes.iter().map(|n| (&n.id, n)).collect();
         let mut outcomes: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
         for node in &changes {
-            let per_change = converge::classify(&local_before, &node.tree, self, now);
+            let base_tree = self.incoming_base_tree(node, &batch);
+            let per_change =
+                converge::classify(&local_before, &node.tree, base_tree.as_ref(), self, now);
             for (path, outcome) in per_change {
                 let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
                 *slot = converge::worst(slot.clone(), outcome);
@@ -617,6 +636,75 @@ impl DagRepo {
         }
 
         Ok(outcomes)
+    }
+
+    /// The merge-base tree for an incoming change (#65): the nearest ancestor
+    /// this repo already holds, walking parent links through the incoming
+    /// `batch` for nodes not yet ingested. A change we already hold is its own
+    /// base, so a re-delivered chain classifies as wholly untouched. `None`
+    /// for disjoint history (a root chain we have never seen).
+    fn incoming_base_tree(
+        &self,
+        node: &ChangeNode,
+        batch: &BTreeMap<&Oid, &ChangeNode>,
+    ) -> Option<BTreeMap<PathBuf, (Oid, Visibility)>> {
+        let mut queue: std::collections::VecDeque<&Oid> = std::collections::VecDeque::new();
+        let mut seen: std::collections::BTreeSet<&Oid> = std::collections::BTreeSet::new();
+        queue.push_back(&node.id);
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(known) = self.graph.get(id) {
+                return Some(known.tree.clone());
+            }
+            if let Some(n) = batch.get(id) {
+                queue.extend(n.parents.iter());
+            }
+        }
+        None
+    }
+
+    /// Every content address in the live set for `gc`: anything referenced by
+    /// any change in the graph — across ALL changes, not just the current heads,
+    /// and including working changes (every dock's in-progress node rides in the
+    /// loaded graph, ADR 0022) — plus the sides of unresolved conflicts.
+    /// Anything in the object store outside this set is unreachable (ADR 0012).
+    pub fn referenced_oids(&self) -> BTreeSet<Oid> {
+        let mut live = BTreeSet::new();
+        for node in self.graph.in_order() {
+            for (oid, _vis) in node.tree.values() {
+                live.insert(oid.clone());
+            }
+        }
+        // Unresolved conflict sides are already graph-covered (both changes are
+        // recorded, append-only), but keep them explicitly live so gc stays
+        // correct if that invariant ever loosens.
+        for (ours, theirs) in self.conflicts.values() {
+            live.insert(ours.clone());
+            live.insert(theirs.clone());
+        }
+        live
+    }
+
+    /// Prune loose objects not referenced by any change in the graph (ADR 0012,
+    /// #17, restored in #66). Content-addressing makes this exact: an object
+    /// whose address no ChangeNode names can never be needed, so deleting it is
+    /// loss-free. Walks the on-disk object store under `dir` and removes every
+    /// unreferenced file; with `dry_run` it only reports what would be pruned.
+    /// On a real run the in-memory store is compacted to match, so a subsequent
+    /// `save` stays consistent.
+    ///
+    /// Objects referenced by non-HEAD changes are retained — the whole reachable
+    /// history is preserved, only truly orphaned objects go. `dir` is the same
+    /// `.loot/` directory passed to [`Self::save`]/[`Self::load`].
+    pub fn gc(&mut self, dir: &Path, dry_run: bool) -> Result<GcReport, RepoError> {
+        let live = self.referenced_oids();
+        let (pruned, bytes) = persist_codec::prune_orphaned_objects_loose(dir, &live, dry_run)?;
+        if !dry_run {
+            self.objects.retain(&live);
+        }
+        Ok(GcReport { pruned, bytes })
     }
 
     /// Persist the whole repo under `dir` (typically `.loot/`): all sealed
@@ -902,7 +990,11 @@ impl DagRepo {
     ) -> Result<(Oid, BTreeMap<PathBuf, MergeOutcome>), RepoError> {
         let our_tree = self.graph.tree_at(ours);
         let their_tree = self.graph.tree_at(theirs);
-        let merged = converge::merge_trees(&our_tree, &their_tree, self, now);
+        // The two tips share a graph, so the merge base is the nearest common
+        // ancestor — it keeps a stale side's untouched paths from classifying
+        // as conflicts (#65).
+        let base_tree = self.graph.common_ancestor_tree(ours, theirs);
+        let merged = converge::merge_trees(&our_tree, &their_tree, base_tree.as_ref(), self, now);
         // Record conflicts so `loot conflicts`/`loot resolve` see them, exactly
         // as the apply path does.
         for (path, (o, t)) in &merged.conflicts {
@@ -1493,13 +1585,6 @@ impl converge::KeyOracle for DagRepo {
 /// signing and are accepted. Called inside `apply`/`stow` so validity is
 /// enforced structurally — never a toggle a caller can skip. loot-core is
 /// verify-only here; signing and key custody live in loot-identity.
-/// A node is a *working change* iff it is authored but not yet signed — the
-/// in-progress tip a keyholder is still editing (ADR 0018). It is finalized (and
-/// publishable to the shared graph) exactly when `loot new` attaches its
-/// signature. Legacy/unauthored nodes (`author == None`) are never working
-/// changes: they predate signing and are already finalized. This is the single
-/// discriminator CA1.5 uses to keep a dock's uncommitted work out of the shared
-/// node store (ADR 0022).
 /// True if sealing at `new` would make a path readable to a wider audience
 /// than `old` sealed it for (#62). Restricted-set membership changes are
 /// deliberately not compared — `grant`/`maroon` own that audit trail.
@@ -1512,6 +1597,13 @@ fn demotes(old: &Visibility, new: &Visibility) -> bool {
     )
 }
 
+/// A node is a *working change* iff it is authored but not yet signed — the
+/// in-progress tip a keyholder is still editing (ADR 0018). It is finalized (and
+/// publishable to the shared graph) exactly when `loot new` attaches its
+/// signature. Legacy/unauthored nodes (`author == None`) are never working
+/// changes: they predate signing and are already finalized. This is the single
+/// discriminator CA1.5 uses to keep a dock's uncommitted work out of the shared
+/// node store (ADR 0022).
 fn is_working_change(node: &ChangeNode) -> bool {
     node.author.is_some() && node.signature.is_none()
 }
@@ -2004,6 +2096,128 @@ mod tests {
         assert_eq!(find(&c).reachable_from.len(), 1);
     }
 
+    // --- gc: prune orphaned loose objects (ADR 0012, #17, restored in #66) ---
+
+    /// A dry run reports the orphan count and total size but deletes nothing —
+    /// neither the on-disk file nor the in-memory store entry.
+    #[test]
+    fn gc_dry_run_reports_orphans_without_deleting() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        // Referenced object: named by a change, so it is part of the live set.
+        let kept = repo.put(b"keep me\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("keep.txt"), (kept.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+        // Orphan: stored but never referenced by any change.
+        let orphan = repo.put(b"unreferenced orphan bytes\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = dir.join("objects");
+        let kept_path = obj_dir.join(crate::hex::encode(&kept.0));
+        let orphan_path = obj_dir.join(crate::hex::encode(&orphan.0));
+        assert!(kept_path.exists() && orphan_path.exists());
+
+        let report = repo.gc(&dir, true).unwrap();
+        assert_eq!(report.pruned, 1, "exactly one orphan would be pruned");
+        assert!(report.bytes > 0, "dry run reports the orphan's on-disk size");
+        // Dry run mutates nothing.
+        assert!(orphan_path.exists(), "dry run must not delete files");
+        assert!(kept_path.exists());
+        assert!(repo.object(&orphan).is_ok(), "in-memory store untouched by dry run");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real run deletes the orphan file, compacts the in-memory store, and
+    /// leaves referenced content intact and readable — including across reload.
+    /// A second pass is a no-op.
+    #[test]
+    fn gc_deletes_orphaned_objects_and_keeps_referenced() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let kept = repo.put(b"referenced\n", Visibility::Public).unwrap();
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (kept.clone(), Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "c".into(), tree })
+            .unwrap();
+        let orphan = repo.put(b"unreferenced\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let obj_dir = dir.join("objects");
+        let kept_path = obj_dir.join(crate::hex::encode(&kept.0));
+        let orphan_path = obj_dir.join(crate::hex::encode(&orphan.0));
+
+        let report = repo.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 1);
+        assert!(!orphan_path.exists(), "orphan file deleted");
+        assert!(kept_path.exists(), "referenced file retained");
+        // In-memory store compacted: orphan gone, referenced object still readable.
+        assert!(matches!(repo.object(&orphan), Err(RepoError::NotFound(_))));
+        assert_eq!(repo.get(&kept, "alice", 0).unwrap(), b"referenced\n");
+
+        // Idempotent: nothing left to prune.
+        let report2 = repo.gc(&dir, false).unwrap();
+        assert_eq!(report2.pruned, 0);
+
+        // Reload from disk: referenced content survives; orphan is gone.
+        let loaded = DagRepo::load(&dir, dir.join("work")).unwrap();
+        assert_eq!(loaded.get(&kept, "alice", 0).unwrap(), b"referenced\n");
+        assert!(matches!(loaded.get(&orphan, "alice", 0), Err(RepoError::NotFound(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Objects referenced by a NON-HEAD change (older history) must be retained —
+    /// gc walks the whole graph, not just the tips.
+    #[test]
+    fn gc_retains_objects_referenced_by_non_head_changes() {
+        let dir = std::env::temp_dir().join(format!("loot-gc-nonhead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        // Parent change references old_oid.
+        let old_oid = repo.put(b"v1\n", Visibility::Public).unwrap();
+        let mut t1 = BTreeMap::new();
+        t1.insert(PathBuf::from("a.txt"), (old_oid.clone(), Visibility::Public));
+        let parent = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "v1".into(), tree: t1 })
+            .unwrap();
+        // Child change references new_oid on top of the parent.
+        let new_oid = repo.put(b"v2\n", Visibility::Public).unwrap();
+        let mut t2 = BTreeMap::new();
+        t2.insert(PathBuf::from("a.txt"), (new_oid.clone(), Visibility::Public));
+        repo.record(Change {
+            id: Oid([0; 32]),
+            parents: vec![parent.clone()],
+            message: "v2".into(),
+            tree: t2,
+        })
+        .unwrap();
+        assert!(!repo.heads().contains(&parent), "parent is no longer a head");
+        // Orphan object.
+        let orphan = repo.put(b"orphan\n", Visibility::Public).unwrap();
+        repo.save(&dir).unwrap();
+
+        let report = repo.gc(&dir, false).unwrap();
+        assert_eq!(report.pruned, 1, "only the orphan is pruned");
+
+        let obj_dir = dir.join("objects");
+        assert!(
+            obj_dir.join(crate::hex::encode(&old_oid.0)).exists(),
+            "object referenced only by a non-HEAD change must be retained"
+        );
+        assert!(obj_dir.join(crate::hex::encode(&new_oid.0)).exists(), "head object retained");
+        assert!(!obj_dir.join(crate::hex::encode(&orphan.0)).exists(), "orphan deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- snapshot / reconcile (ADR 0006) ---
 
     fn entry(path: &str, body: &[u8], vis: Visibility) -> (PathBuf, Vec<u8>, Visibility) {
@@ -2085,6 +2299,112 @@ mod tests {
         assert!(repo
             .snapshot(None, Some(&w2), &[entry("fix.rs", b"cve", Visibility::Embargoed { reveal_at: 100 }), entry("a.md", b"x", restricted)], "wip", 0)
             .is_ok());
+    }
+
+    #[test]
+    fn pull_of_stale_chain_does_not_conflict_on_paths_it_never_touched() {
+        // Pilot finding 6 (#65): bob clones connor's push; his snapshot
+        // re-seals every path under fresh addresses; connor edits ctx.md
+        // locally (a line MODIFICATION, so the line-set heuristic can't save
+        // it); connor pulls. Bob never touched ctx.md since the base — the
+        // pull must not report a conflict on it.
+        let base_bytes: &[u8] = b"# context\nalpha\nbeta\n";
+        let vis = Visibility::Public;
+
+        let mut connor = DagRepo::init(std::env::temp_dir(), "connor").unwrap();
+        let c_ctx = connor.put(base_bytes, vis.clone()).unwrap();
+        let mut t = BTreeMap::new();
+        t.insert(PathBuf::from("ctx.md"), (c_ctx, vis.clone()));
+        let base_id = connor
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: t })
+            .unwrap();
+        let base_bundle = connor.bundle(&[]).unwrap();
+
+        // bob clones the base, then his clone-day snapshot re-seals ctx.md
+        // (same bytes, fresh key/address) and adds his own file.
+        let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
+        bob.apply(&base_bundle, 0).unwrap();
+        let b_ctx = bob.put(base_bytes, vis.clone()).unwrap();
+        let b_new = bob.put(b"bob's file\n", vis.clone()).unwrap();
+        let mut bt = BTreeMap::new();
+        bt.insert(PathBuf::from("ctx.md"), (b_ctx, vis.clone()));
+        bt.insert(PathBuf::from("bob.txt"), (b_new, vis.clone()));
+        bob.record(Change {
+            id: Oid([0; 32]),
+            parents: vec![base_id.clone()],
+            message: "bob work".into(),
+            tree: bt,
+        })
+        .unwrap();
+
+        // connor meanwhile modifies a line of ctx.md on his own head.
+        let c_ctx2 = connor.put(b"# context\nalpha\nbeta EDITED\n", vis.clone()).unwrap();
+        let mut ct = BTreeMap::new();
+        ct.insert(PathBuf::from("ctx.md"), (c_ctx2.clone(), vis.clone()));
+        let connor_head = connor
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![base_id],
+                message: "connor edit".into(),
+                tree: ct,
+            })
+            .unwrap();
+
+        // connor pulls bob's chain (full bundle: re-delivery must also be safe).
+        let outcomes = connor.apply(&bob.bundle(&[]).unwrap(), 0).unwrap();
+        let ctx = outcomes.get(&PathBuf::from("ctx.md")).cloned();
+        assert!(
+            matches!(ctx, Some(MergeOutcome::Converged) | Some(MergeOutcome::Merged)),
+            "path untouched by the incoming chain must not conflict, got {ctx:?}"
+        );
+        assert_eq!(outcomes[&PathBuf::from("bob.txt")], MergeOutcome::Converged);
+        // Connor's own line still carries his edit.
+        let tree = connor.graph.tree_at(&connor_head);
+        assert_eq!(
+            connor.get(&tree[&PathBuf::from("ctx.md")].0, "connor", 0).unwrap(),
+            b"# context\nalpha\nbeta EDITED\n"
+        );
+    }
+
+    #[test]
+    fn dock_merge_of_stale_side_does_not_conflict_on_untouched_paths() {
+        // Same root cause through merge_tips (#65): tip B re-sealed ctx.md
+        // without touching it while tip A modified a line.
+        let vis = Visibility::Public;
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let base_oid = repo.put(b"alpha\nbeta\n", vis.clone()).unwrap();
+        let mut t = BTreeMap::new();
+        t.insert(PathBuf::from("ctx.md"), (base_oid, vis.clone()));
+        let base = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "base".into(), tree: t })
+            .unwrap();
+
+        let a_oid = repo.put(b"alpha\nbeta EDITED\n", vis.clone()).unwrap();
+        let mut at = BTreeMap::new();
+        at.insert(PathBuf::from("ctx.md"), (a_oid.clone(), vis.clone()));
+        let tip_a = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![base.clone()],
+                message: "a".into(),
+                tree: at,
+            })
+            .unwrap();
+
+        let b_oid = repo.put(b"alpha\nbeta\n", vis.clone()).unwrap(); // untouched re-seal
+        let b_new = repo.put(b"b's file\n", vis.clone()).unwrap();
+        let mut bt = BTreeMap::new();
+        bt.insert(PathBuf::from("ctx.md"), (b_oid, vis.clone()));
+        bt.insert(PathBuf::from("b.txt"), (b_new, vis.clone()));
+        let tip_b = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![base], message: "b".into(), tree: bt })
+            .unwrap();
+
+        let (merge_id, outcomes) = repo.merge_tips(&tip_a, &tip_b, "merge", 0).unwrap();
+        assert_eq!(outcomes[&PathBuf::from("ctx.md")], MergeOutcome::Merged);
+        let tree = repo.graph.tree_at(&merge_id);
+        assert_eq!(tree[&PathBuf::from("ctx.md")].0, a_oid, "the edited side wins");
+        assert_eq!(outcomes[&PathBuf::from("b.txt")], MergeOutcome::Converged);
     }
 
     #[test]
