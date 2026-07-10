@@ -28,15 +28,18 @@ pushed to the relay the same day**; git dual-runs as backup only (commits may
 batch, but loot is the primary record). Divergence pain is logged per day —
 that log is dogfood data, not failure.
 
+Per-day detail lives in [../dogfood/drive-log.md](../dogfood/drive-log.md); the
+daily ritual is one command, `tools/loot-day.ps1` (see that log's header).
+
 | Day | Date | Changes pushed | Divergence / friction notes |
 |-----|------|----------------|------------------------------|
-| 1   |      |                |                              |
+| 1   | 2026-07-10 | `c670cc2b` embargo CLI (#88) + attack demo (#89) + section-B evidence + maroon fix + drive setup | loot was 3 PRs behind git; caught up in one O(delta) push (14 objects), no conflicts |
 | 2   |      |                |                              |
 | 3   |      |                |                              |
 | 4   |      |                |                              |
 | 5   |      |                |                              |
 
-- [ ] 5 consecutive working days completed and logged above
+- [ ] 5 consecutive working days completed and logged above (1/5 done)
 
 ## B. Agents as distinct identities (ADR 0026)
 
