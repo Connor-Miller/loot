@@ -171,6 +171,7 @@ loot surface                             materialize what the current identity m
 loot dock <name>                         create a dock (isolated tree + tip), or switch to an existing one
 loot docks                               list docks with their tip and visibility
 loot log                                 show change history with visibility hints
+loot gc [--dry-run]                      prune loose objects no change references
 loot bundle <file>                       write a sync bundle (ciphertext, no keys)
 loot apply <file>                        merge a peer's bundle (idempotent)
 loot grant <path> <identity> <file>      write a targeted grant bundle (file delivery)
