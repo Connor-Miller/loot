@@ -14,7 +14,7 @@ content in the repo the thesis is about.
 - [x] #61 — `.lootattributes` forward-slash globs fail open to Public on Windows
 - [x] #62 — attributes edit silently demotes restricted content to Public
 - [ ] #64 — `.lootignore` (pilot: one stray `status` sealed 38 MB of `target/`)
-- [ ] #65 — spurious conflict on content neither side edited
+- [x] #65 — spurious conflict on content neither side edited
 - [ ] #66 — `loot gc` regression (merged in #17, gone from the CLI)
 
 #61/#62 gate every sealed-path claim (a fail-open seal is theater); the rest
