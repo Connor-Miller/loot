@@ -128,8 +128,11 @@ into the Escrow — not the Keyring — for every identity including the origina
 `flush_escrow(now)` promotes eligible entries into the Keyring once
 `now >= reveal_at`; until then the Keyring holds nothing for that object and
 `open` returns `Embargoed`. The Workspace calls `flush_escrow` before every
-content-reading operation (`checkout`, `snapshot`). Bundles ship embargoed keys
-as a separate escrow section so peers receive them into their own Escrow.
+content-reading operation (`checkout`, `snapshot`). Bundles currently ship
+embargoed keys as a separate escrow section so peers receive them into their
+own Escrow — ADR 0027 removes that section (it ships plaintext keys, the exact
+bypass hard embargo closes); once it lands, the Escrow is originator-side
+staging only and peers receive embargoed keys from the relay after `reveal_at`.
 
 **Threat model (be precise — the earlier glossary overclaimed).** Embargo is
 currently enforced **cooperatively**, against an *honest holder running an honest
@@ -140,11 +143,15 @@ can advance their clock, pass a future `now`, or read the escrow key bytes
 directly with a modified binary. So embargo today raises the bar (a normal
 client cannot read embargoed content early) but does not *cryptographically*
 withhold the key from a determined local adversary. The D-threat is closed only
-against honest participants. A hard guarantee requires a third party that holds
-the key and releases it at `reveal_at` (network escrow, time-lock, or threshold
-crypto) — see *External-service escrow* under Open / undecided. The seam is
-designed for that swap; until then, do not represent embargo as
-adversary-proof.
+against honest participants. The hard mechanism is **decided** (ADR 0027, not
+yet implemented): embargoed keys are deposited at push as **timed
+SealedGrants** — ECIES-wrapped per recipient, withheld from the relay's grant
+mailbox until the *relay's* clock passes `reveal_at` — and the plaintext bundle
+escrow section is removed. That makes embargo **holder-adversary-proof** (a
+modified client cannot read key bytes that aren't on its machine); residual
+trust is the relay operator releasing on time — a distinct role holding only
+wrapped blobs it cannot read. Until it lands, do not represent embargo as
+adversary-proof in any sense.
 
 **Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
 identities permitted to hold a key). It deliberately does **not** contain any
@@ -305,18 +312,13 @@ tree so the decision is reproducible (`cargo test --release`).
 
 ## Open / undecided
 
-- **External-service escrow (hard embargo enforcement).** The current Escrow
-  module is local and trusts the local clock: a determined keyholder can read the
-  key bytes directly with a modified binary, OR simply advance their clock / pass
-  a future `now` to trigger `flush_escrow` early. Both the *key-custody* gap and
-  the *clock-trust* gap are the same slice — a production guarantee requires a
-  third party that holds the key and releases it at `reveal_at` (network escrow,
-  time-lock, or threshold crypto), which also removes the local-clock dependency.
-  A half-measure (e.g. tamper-evident flush logging, or a second time source) was
-  considered and rejected: it implies unbuilt monitoring/authority infrastructure
-  and would be thrown away when real escrow lands. The seam is designed: replacing
-  `Escrow::flush` with a network call leaves everything else unmodified. Deferred
-  as one coherent slice until the network layer exists.
+- **External-service escrow (hard embargo enforcement).** DECIDED 2026-07-09
+  (ADR 0027), implementation pending: embargoed keys travel as timed
+  SealedGrants the relay withholds until `reveal_at`; the plaintext bundle
+  escrow section is removed (breaking, `FORMAT_MAJOR`). Remaining open here is
+  only the post-milestone hardening: **drand timelock (tlock)** to remove even
+  the relay-operator trust — composable later by timelocking the SealedGrant
+  payload to a drand round.
 
 - **Relay announcement.** A relay peer declaring its relay status so senders
   can discover who holds a key before bundling — enabling selective delivery
