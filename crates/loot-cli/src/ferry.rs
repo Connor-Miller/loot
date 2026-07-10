@@ -1014,6 +1014,62 @@ mod tests {
     }
 
     #[test]
+    fn uncaptured_disk_wip_survives_ingest() {
+        let (mut ws, dir, mirror) = setup("wip");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // Disk edits with no `status` behind them — no working change exists —
+        // while git advances. The adopt/merge path re-materializes the full
+        // tree, so ferry must capture these first or they are overwritten.
+        put_file(&dir, "wip.txt", "uncaptured\n");
+        let git = git2::Repository::open(&mirror).unwrap();
+        git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
+
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!(report.ingested, 1);
+        assert!(
+            !report.outcomes.values().any(|o| matches!(o, MergeOutcome::Conflict { .. })),
+            "disjoint paths merge cleanly: {:?}",
+            report.outcomes
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("wip.txt")).unwrap(), "uncaptured\n");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "from git\n");
+        let head = ws.finalized_anchor().unwrap();
+        let tree = ws.repo().change_tree(&head).unwrap();
+        assert!(tree.contains_key(Path::new("wip.txt")), "WIP captured into loot");
+        assert!(tree.contains_key(Path::new("b.txt")), "git edit ingested");
+
+        let after = ferry(&mut ws, &mirror);
+        assert_eq!((after.ingested, after.projected), (0, 0));
+    }
+
+    #[test]
+    fn clean_tree_capture_mints_no_redundant_change() {
+        let (mut ws, dir, mirror) = setup("clean");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // git advances while the loot tree is untouched: the pre-ingest capture
+        // snapshot is identical to the anchor and must evaporate, leaving only
+        // the ingested change — no redundant capture, no stale fork.
+        let git = git2::Repository::open(&mirror).unwrap();
+        git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!((report.ingested, report.projected), (1, 0));
+
+        let ws2 = Workspace::open_at(&dir).unwrap();
+        assert_eq!(
+            ws2.repo().change_ids_topo().len(),
+            2,
+            "base + ingested only — the identical capture snapshot evaporated"
+        );
+        assert_eq!(ws2.repo().heads().len(), 1, "single head: no stale fork left behind");
+    }
+
+    #[test]
     fn git_author_matching_self_ingests_authored_and_signed() {
         let (mut ws, dir, mirror) = setup("self");
         put_file(&dir, "a.txt", "base\n");

@@ -704,15 +704,27 @@ impl Workspace {
     /// Capture and finalize any in-progress work, exactly as `merge_dock` does
     /// before merging: the bridge calls this before it moves the dock tip, so
     /// no uncommitted work is stranded under a moved tip.
+    ///
+    /// Snapshots unconditionally: disk edits that never saw a `status` have no
+    /// working change yet, and the adopt path re-materializes the full target
+    /// tree — capture first or those edits are silently overwritten. A snapshot
+    /// that turns out identical to the anchor is dropped from the graph again,
+    /// so a clean tree mints no redundant change and leaves no stray head for
+    /// this pass's reconcile (or the next pass's anchor) to trip over.
     pub fn ferry_capture(&mut self) -> Result<(), String> {
-        if self.working.is_some() {
-            let msg = self
-                .working
-                .as_ref()
-                .and_then(|w| self.repo.change_message(w))
-                .unwrap_or_else(|| "(working change)".to_string());
-            self.snapshot(&msg)?;
+        let msg = self
+            .working
+            .as_ref()
+            .and_then(|w| self.repo.change_message(w))
+            .unwrap_or_else(|| "(working change)".to_string());
+        let (id, _) = self.snapshot(&msg)?;
+        let anchor_tree = self.anchor().and_then(|a| self.repo.change_tree(&a));
+        if self.repo.change_tree(&id) != anchor_tree {
             self.finalize_working()?;
+        } else {
+            self.repo.drop_working(&id);
+            self.working = None;
+            self.persist()?;
         }
         Ok(())
     }
