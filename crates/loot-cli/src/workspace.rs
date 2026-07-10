@@ -915,16 +915,20 @@ fn global_config_path() -> PathBuf {
 }
 
 /// Minimal glob: `*` matches a run of non-`/`; `**` matches across separators.
+/// Patterns and paths are both normalized to `/` before matching — snapshot
+/// hands over OS-native paths (`docs\private\x` on Windows), and a portable
+/// rule like `docs/private/*` that silently fails to match seals content
+/// **Public**: fail-open, the worst failure mode for a privacy-first VCS (#61).
 struct Glob {
     pattern: String,
 }
 
 impl Glob {
     fn new(pattern: &str) -> Self {
-        Glob { pattern: pattern.to_string() }
+        Glob { pattern: pattern.replace('\\', "/") }
     }
     fn matches(&self, path: &str) -> bool {
-        glob_match(&self.pattern, path)
+        glob_match(&self.pattern, &path.replace('\\', "/"))
     }
 }
 
@@ -1012,6 +1016,43 @@ mod tests {
         assert!(!glob_match("*.md", "src/x.md"));
         assert!(glob_match("secrets/**", "secrets/a/b.txt"));
         assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn glob_normalizes_separators_both_ways() {
+        // #61: portable `/` rules must match OS-native `\` paths — a rule that
+        // silently matches nothing seals content Public (fail-open).
+        assert!(Glob::new("docs/private/*").matches(r"docs\private\secrets.md"));
+        assert!(Glob::new("secrets/**").matches(r"secrets\a\b.txt"));
+        // The non-portable backslash spelling keeps working.
+        assert!(Glob::new(r"docs\private\*").matches("docs/private/secrets.md"));
+        // `*` must not leak across a `\` separator any more than a `/` one.
+        assert!(!Glob::new("*.md").matches(r"docs\x.md"));
+    }
+
+    #[test]
+    fn snapshot_seals_forward_slash_rule_in_subdir() {
+        // End-to-end #61 reproduction: on Windows, snapshot's relative paths are
+        // backslash-native; the portable rule must still seal the file.
+        let dir = std::env::temp_dir().join(format!("loot-attrs-sep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::create_dir_all(dir.join("docs/private")).unwrap();
+        std::fs::write(dir.join("docs/private/secret.md"), b"sealed?").unwrap();
+        std::fs::write(dir.join(".lootattributes"), "docs/private/* restricted=connor\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("").unwrap();
+        let vis = reported
+            .iter()
+            .find(|(p, _)| p.ends_with("secret.md"))
+            .map(|(_, v)| v.clone())
+            .expect("secret.md snapshotted");
+        assert!(
+            matches!(vis, Visibility::Restricted(ref ids) if *ids == ["connor"]),
+            "docs/private/* must seal OS-native paths, got {vis:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

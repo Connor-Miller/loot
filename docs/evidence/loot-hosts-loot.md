@@ -11,7 +11,7 @@ content in the repo the thesis is about.
 
 ## Prerequisites (must land before evidence counts)
 
-- [ ] #61 — `.lootattributes` forward-slash globs fail open to Public on Windows
+- [x] #61 — `.lootattributes` forward-slash globs fail open to Public on Windows
 - [ ] #62 — attributes edit silently demotes restricted content to Public
 - [ ] #64 — `.lootignore` (pilot: one stray `status` sealed 38 MB of `target/`)
 - [ ] #65 — spurious conflict on content neither side edited
