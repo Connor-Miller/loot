@@ -183,7 +183,6 @@ impl DagRepo {
             changes: Vec::new(),
             objs,
             keys,
-            escrow: BTreeMap::new(),
             attestations: Vec::new(),
         };
 
@@ -203,18 +202,24 @@ impl DagRepo {
     /// mailbox addressing and the manifest audit record (ADR 0015).
     /// `grantor_pubkey` — the issuer's ed25519 pubkey. Recorded in the manifest
     /// so every peer can verify who issued the grant (ADR 0015).
+    /// `reveal_at` — `0` for an ordinary grant; nonzero makes it a **timed**
+    /// grant the relay withholds until its own clock passes it (hard embargo,
+    /// ADR 0027). For embargoed content the originator's key sits in the local
+    /// Escrow (pre-reveal staging, ADR 0007), so the lookup falls back there.
     ///
-    /// Wire format: `[3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][payload]`
+    /// Wire format: `[3][grantee_pubkey(32)][wrapped_key(80)][oid(32)][reveal_at(8)][payload]`
     pub fn grant_sealed(
         &mut self,
         oid: &Oid,
         grantee_name: &str,
         grantee_pubkey: [u8; 32],
         grantor_pubkey: [u8; 32],
+        reveal_at: u64,
         now: u64,
         seal: impl FnOnce(&[u8; 32]) -> Result<[u8; 80], RepoError>,
     ) -> Result<SyncBundle, RepoError> {
         let key = self.keyring.key_for(oid)
+            .or_else(|| self.escrow.iter().find(|(o, _)| *o == oid).map(|(_, e)| e.key))
             .ok_or_else(|| RepoError::Unauthorized(oid.clone()))?;
         let wrapped = seal(&key)?;
 
@@ -227,13 +232,19 @@ impl DagRepo {
             changes: Vec::new(),
             objs,
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: Vec::new(),
         };
 
         self.manifest.record(oid.clone(), grantee_name.to_string(), grantee_pubkey, grantor_pubkey, now);
         Ok(SyncBundle(
-            Frame::SealedGrant { grantee_pubkey, wrapped_key: wrapped, oid: oid.clone(), body }.encode(),
+            Frame::SealedGrant {
+                grantee_pubkey,
+                wrapped_key: wrapped,
+                oid: oid.clone(),
+                reveal_at,
+                body,
+            }
+            .encode(),
         ))
     }
 
@@ -253,7 +264,7 @@ impl DagRepo {
         unseal: impl FnOnce(&[u8; 80]) -> Result<[u8; 32], RepoError>,
     ) -> Result<(), RepoError> {
         // Decode through the one codec; reject anything that isn't a sealed grant.
-        let Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body } =
+        let Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, body } =
             Frame::decode(&bundle.0)?
         else {
             return Err(RepoError::Backend("not a sealed-key grant bundle (tag 3)".into()));
@@ -273,12 +284,14 @@ impl DagRepo {
         for (addr, obj) in body.objs {
             self.store(addr, obj, None);
         }
-        for (escrow_oid, (escrow_key, reveal_at)) in body.escrow {
-            if !self.escrow.holds(&escrow_oid) && !self.keyring.holds(&escrow_oid) {
-                self.escrow.insert(escrow_oid, escrow_key, reveal_at);
+        // A timed grant not yet due stages in the local Escrow, not the Keyring —
+        // cooperative defense-in-depth if a relay releases early; the hard
+        // guarantee is the relay withholding (ADR 0027).
+        if reveal_at > now {
+            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
+                self.escrow.insert(oid.clone(), key, reveal_at);
             }
-        }
-        if !self.keyring.holds(&oid) {
+        } else if !self.keyring.holds(&oid) {
             self.keyring.insert(oid.clone(), key);
         }
 
@@ -506,7 +519,7 @@ impl DagRepo {
                 "a relay can only stow sync bundles (tag 0), not grant bundles".into(),
             ));
         };
-        let BundleBody { changes, objs, keys, escrow, attestations } = body;
+        let BundleBody { changes, objs, keys, attestations } = body;
 
         // Reject any change with a missing/invalid author signature before we
         // store anything — a keyless relay still enforces authorship (ADR 0018).
@@ -523,20 +536,16 @@ impl DagRepo {
         }
 
         // Store ciphertext, retaining any keys that rode along so they keep
-        // forwarding downstream. Only ANYONE-granted (public) keys and embargoed
-        // escrow entries ever travel in a sync bundle — RESTRICTED keys never do
-        // (ADR 0003). So the relay's "keylessness" for restricted content is
-        // automatic: it cannot receive a restricted key here, and thus can never
-        // read restricted content. Public keys are non-secret by definition;
+        // forwarding downstream. Only ANYONE-granted, non-embargoed (public)
+        // keys ever travel in a sync bundle — RESTRICTED keys never do
+        // (ADR 0003), and embargoed keys lost their bundle lane entirely
+        // (ADR 0027, v5). So the relay's "keylessness" for private content is
+        // automatic: it cannot receive those keys here, and thus can never
+        // read the content. Public keys are non-secret by definition;
         // carrying them lets the relay forward readable public content.
         for (addr, obj) in objs {
             let key = keys.get(&addr).copied();
             self.store(addr, obj, key);
-        }
-        for (oid, (key, reveal_at)) in escrow {
-            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                self.escrow.insert(oid, key, reveal_at);
-            }
         }
         // Accumulate purge events so they keep propagating downstream. A relay
         // is never the marooned identity for its own keyring (it holds none),
@@ -564,7 +573,7 @@ impl DagRepo {
         body: BundleBody,
         now: u64,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, RepoError> {
-        let BundleBody { changes, objs, keys, escrow, attestations } = body;
+        let BundleBody { changes, objs, keys, attestations } = body;
 
         // Reject any change with a missing/invalid author signature before we
         // mutate state (ADR 0018 — validity is always enforced, not a toggle).
@@ -591,16 +600,12 @@ impl DagRepo {
         let local_before = self.graph.current_tree();
 
         // Ingest SealedObjects, filing only the public (non-embargoed) keys that
-        // rode along. Embargoed keys travel in escrow and go into our Escrow, not
-        // the Keyring (ADR 0007). No Restricted key can be here.
+        // rode along. Embargoed keys have no bundle lane at all (ADR 0027, v5):
+        // they reach a peer only as a relay-withheld timed SealedGrant, after
+        // the relay's clock passes reveal_at. No Restricted key can be here.
         for (addr, obj) in objs {
             let key = keys.get(&addr).copied();
             self.store(addr, obj, key);
-        }
-        for (oid, (key, reveal_at)) in escrow {
-            if !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                self.escrow.insert(oid, key, reveal_at);
-            }
         }
 
         // Classify every incoming change against our pre-apply tree using the
@@ -1397,7 +1402,7 @@ impl Repo for DagRepo {
         match Frame::decode(&bundle.0)? {
             Frame::Sync { purges, body } => self.apply_sync(purges, body, now),
             Frame::Grant { grantee, body } => {
-                let BundleBody { objs, keys, escrow, .. } = body;
+                let BundleBody { objs, keys, .. } = body;
                 // Install objects and, if the grant is addressed to us, its keys.
                 for (addr, obj) in objs {
                     let key = keys.get(&addr).copied();
@@ -1411,11 +1416,6 @@ impl Repo for DagRepo {
                                 self.keyring.insert(addr, k);
                             }
                         }
-                    }
-                }
-                for (oid, (key, reveal_at)) in escrow {
-                    if grantee == self.identity && !self.escrow.holds(&oid) && !self.keyring.holds(&oid) {
-                        self.escrow.insert(oid, key, reveal_at);
                     }
                 }
                 Ok(BTreeMap::new())
@@ -1536,32 +1536,25 @@ impl DagRepo {
 
         // Ship SealedObjects (ciphertext, no keys) plus:
         //   - Public content keys -> plain keyring section (ANYONE-granted, not embargoed)
-        //   - Embargoed content keys -> escrow section (ANYONE-granted, time-gated)
+        //   - Embargoed content keys NEVER ride in a bundle (ADR 0027, v5): they
+        //     reach peers only as relay-withheld timed SealedGrants after
+        //     reveal_at. Ciphertext still syncs; the key lane is the relay.
         //   - Restricted keys NEVER travel (ADR 0003)
         let mut needed: BTreeMap<Oid, SealedObject> = BTreeMap::new();
         let mut public_keys: BTreeMap<Oid, ContentKey> = BTreeMap::new();
-        let mut escrow_entries: BTreeMap<Oid, (ContentKey, u64)> = BTreeMap::new();
         for c in &send {
             for (oid, vis) in c.tree.values() {
                 if let Ok(obj) = self.object(oid) {
                     // Object bytes: when negotiating (S5), ship only wanted addrs;
-                    // keys/escrow below always ride (tiny, and a peer may hold the
+                    // keys below always ride (tiny, and a peer may hold the
                     // ciphertext but not the key).
                     if wants.map_or(true, |w| w.contains(oid)) {
                         needed.entry(oid.clone()).or_insert_with(|| obj.clone());
                     }
-                    if obj.grant_ids.iter().any(|g| g == ANYONE) {
-                        if let Visibility::Embargoed { reveal_at } = vis {
-                            // Embargoed: key rides as an escrow entry so the receiver
-                            // files it into their Escrow, not their Keyring (ADR 0007).
-                            if let Some(k) = self.escrow.iter()
-                                .find(|(o, _)| *o == oid)
-                                .map(|(_, e)| e.key)
-                                .or_else(|| self.keyring.key_for(oid))
-                            {
-                                escrow_entries.insert(oid.clone(), (k, *reveal_at));
-                            }
-                        } else if let Some(k) = self.keyring.key_for(oid) {
+                    if obj.grant_ids.iter().any(|g| g == ANYONE)
+                        && !matches!(vis, Visibility::Embargoed { .. })
+                    {
+                        if let Some(k) = self.keyring.key_for(oid) {
                             public_keys.insert(oid.clone(), k);
                         }
                     }
@@ -1585,7 +1578,6 @@ impl DagRepo {
             changes: send.into_iter().cloned().collect(),
             objs: needed,
             keys: public_keys,
-            escrow: escrow_entries,
             attestations,
         };
         Ok(SyncBundle(Frame::Sync { purges: self.purges.clone(), body }.encode()))
@@ -1844,7 +1836,7 @@ mod tests {
 
     fn single_ciphertext(bundle: &[u8]) -> Vec<u8> {
         let payload = extract_sync_payload(bundle);
-        let (_changes, objs, _keys, _escrow, _attestations) =
+        let (_changes, objs, _keys, _attestations) =
             bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
         assert_eq!(objs.len(), 1, "test fixture commits exactly one object");
         objs.into_iter().next().unwrap().1.ciphertext
@@ -1864,7 +1856,7 @@ mod tests {
             panic!("expected sync bundle (tag 0)");
         };
         let changes: Vec<&ChangeNode> = body.changes.iter().collect();
-        bundle_codec::encode(&changes, &body.objs, &body.keys, &body.escrow, &body.attestations)
+        bundle_codec::encode(&changes, &body.objs, &body.keys, &body.attestations)
     }
 
     /// S1/S2 compatibility: a v1-format sync bundle (marker `[1,0]`, no
@@ -1922,12 +1914,7 @@ mod tests {
             wire.extend_from_slice(&addr.0);
             wire.extend_from_slice(key);
         }
-        put_u32(&mut wire, body.escrow.len());
-        for (addr, (key, reveal_at)) in &body.escrow {
-            wire.extend_from_slice(&addr.0);
-            wire.extend_from_slice(key);
-            wire.extend_from_slice(&reveal_at.to_le_bytes());
-        }
+        put_u32(&mut wire, 0); // v1 escrow section: empty (v5 bodies have none to copy)
         put_u32(&mut wire, body.changes.len());
         for c in &body.changes {
             wire.extend_from_slice(&c.id.0);
@@ -2743,37 +2730,46 @@ mod tests {
         assert_eq!(alice.get(&oid, "alice", 100).unwrap(), b"cve fix");
     }
 
-    /// A bundle ships embargoed keys in the escrow section, not the keyring
-    /// section, and the receiver's Escrow is populated — not their Keyring.
+    /// Hard embargo (ADR 0027, #14): an embargoed key never rides in a sync
+    /// bundle at all. The receiver gets ciphertext only — the key bytes are
+    /// simply not on their machine, no matter what clock they claim or how
+    /// they read their own storage. Keys arrive only as relay-withheld timed
+    /// SealedGrants after reveal.
     #[test]
-    fn bundle_carries_embargoed_key_as_escrow_entry_not_keyring() {
+    fn bundle_never_carries_an_embargoed_key() {
         let mut alice = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
         let oid = alice.put(b"cve fix", Visibility::Embargoed { reveal_at: 100 }).unwrap();
         let mut tree = BTreeMap::new();
         tree.insert(PathBuf::from("cve.txt"), (oid.clone(), Visibility::Embargoed { reveal_at: 100 }));
         alice.record(Change { id: Oid([0; 32]), parents: vec![], message: "cve".into(), tree }).unwrap();
+        // Alice's own key stages in HER escrow (originator staging, ADR 0007) —
+        // that never travels.
+        assert!(alice.escrow.holds(&oid));
 
         let bundle = alice.bundle(&[]).unwrap();
 
-        // The raw wire must have the key in the escrow section, not the keyring.
+        // Wire check: no key for the embargoed object anywhere in the body, and
+        // the raw key bytes appear nowhere in the whole bundle.
         let payload = extract_sync_payload(&bundle.0);
-        let (_changes, _objs, plain_keys, escrow_entries, _attestations) =
+        let (_changes, objs, plain_keys, _attestations) =
             bundle_codec::decode(&payload, crate::format::FORMAT_MAJOR).unwrap();
-        assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in keyring section");
-        assert!(escrow_entries.contains_key(&oid), "embargoed key must be in escrow section");
+        assert!(plain_keys.get(&oid).is_none(), "embargoed key must not be in the keys section");
+        assert!(objs.iter().any(|(a, _)| *a == oid), "the ciphertext itself still syncs");
+        let alice_key = alice.escrow.iter().find(|(o, _)| *o == &oid).map(|(_, e)| e.key).unwrap();
+        assert!(
+            !contains_window(&bundle.0, &alice_key),
+            "raw embargoed key bytes must not appear anywhere on the wire"
+        );
 
-        // Bob applies: key lands in his Escrow, not his Keyring.
+        // Bob applies: ciphertext lands, but no key exists on his machine —
+        // neither keyring nor escrow — even long after reveal_at. A lying clock
+        // or a modified binary has nothing to find.
         let mut bob = DagRepo::init(std::env::temp_dir(), "bob").unwrap();
         bob.apply(&bundle, 50).unwrap();
-        assert!(bob.escrow.holds(&oid), "bob's escrow must hold the key");
-        assert!(!bob.keyring.holds(&oid), "bob's keyring must be empty before reveal");
-
-        // Before reveal: still blocked.
-        assert!(matches!(bob.get(&oid, "bob", 50), Err(RepoError::Embargoed(100))));
-
-        // After flush at reveal time: bob can read the CVE fix.
-        bob.flush_escrow(100);
-        assert_eq!(bob.get(&oid, "bob", 100).unwrap(), b"cve fix");
+        assert!(!bob.escrow.holds(&oid), "no escrow entry arrives via bundle (v5)");
+        assert!(!bob.keyring.holds(&oid), "no keyring entry arrives via bundle");
+        bob.flush_escrow(1_000_000);
+        assert!(bob.get(&oid, "bob", 1_000_000).is_err(), "no key, no read — ever, via this lane");
     }
 
     /// Escrow persists across save/load so reveal works in a new process.
@@ -3428,7 +3424,11 @@ mod tests {
 
     #[test]
     fn golden_v4_manifest_matches_and_round_trips() {
-        assert_eq!(encode_manifest(&sample_manifest()), GOLDEN_MANIFEST_V4, "v4 manifest layout must not drift");
+        // v5 changed only the bundle body (ADR 0027); durable layouts are
+        // byte-identical to v4 apart from the marker.
+        let mut golden_v5 = GOLDEN_MANIFEST_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_manifest(&sample_manifest()), golden_v5, "v5 manifest layout must not drift");
         assert_eq!(decode_manifest(&GOLDEN_MANIFEST_V4).unwrap().grants_for(&Oid([1; 32])).len(), 1);
     }
 
@@ -3453,7 +3453,9 @@ mod tests {
     #[test]
     fn golden_v4_purges_matches_and_round_trips() {
         let purges = vec![(Oid([6; 32]), "eve".to_string())];
-        assert_eq!(encode_purges(&purges), GOLDEN_PURGES_V4, "v4 purges layout must not drift");
+        let mut golden_v5 = GOLDEN_PURGES_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_purges(&purges), golden_v5, "v5 purges layout must not drift");
         assert_eq!(decode_purges(&GOLDEN_PURGES_V4).unwrap().len(), 1);
     }
 
@@ -3479,7 +3481,9 @@ mod tests {
     fn golden_v4_conflicts_matches_and_round_trips() {
         let mut conflicts = BTreeMap::new();
         conflicts.insert(PathBuf::from("f.txt"), (Oid([7; 32]), Oid([8; 32])));
-        assert_eq!(encode_conflicts(&conflicts), GOLDEN_CONFLICTS_V4, "v4 conflicts layout must not drift");
+        let mut golden_v5 = GOLDEN_CONFLICTS_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_conflicts(&conflicts), golden_v5, "v5 conflicts layout must not drift");
         assert!(decode_conflicts(&GOLDEN_CONFLICTS_V4).unwrap().contains_key(Path::new("f.txt")));
     }
 
@@ -3496,7 +3500,9 @@ mod tests {
             role: "reviewed".into(),
             signature: [9; 64],
         });
-        assert_eq!(encode_attestations(&log), GOLDEN_ATTEST_V4, "v4 attestation layout must not drift");
+        let mut golden_v5 = GOLDEN_ATTEST_V4.to_vec();
+        golden_v5[0] = crate::format::FORMAT_MAJOR;
+        assert_eq!(encode_attestations(&log), golden_v5, "v5 attestation layout must not drift");
     }
 
     #[test]
@@ -3545,7 +3551,6 @@ mod tests {
             changes: vec![node],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![],
         };
         SyncBundle(Frame::Sync { purges: vec![], body }.encode())
@@ -3639,7 +3644,6 @@ mod tests {
             changes: vec![],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: atts,
         };
         SyncBundle(Frame::Sync { purges: vec![], body }.encode())
@@ -3711,7 +3715,6 @@ mod tests {
             changes: vec![carried_change(Oid([5; 32]))],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![att],
         };
         let bundle = SyncBundle(Frame::Sync { purges: vec![], body }.encode());
@@ -3754,7 +3757,6 @@ mod tests {
             changes: vec![carried_change(Oid([5; 32]))],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![att],
         };
         let mut relay = DagRepo::init(tmp(), "relay").unwrap();

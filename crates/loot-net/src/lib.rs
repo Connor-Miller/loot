@@ -267,6 +267,32 @@ async fn handle_wants(
     Ok(encode_addrs(&relay.missing_objects(&offered)))
 }
 
+/// The relay's own clock (unix seconds) — the ONLY time source grant
+/// withholding trusts (ADR 0027). Never derived from a request.
+fn relay_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The `reveal_at` a grant blob declares (ADR 0027, #14). The blob is a
+/// grantor-signed envelope around a `Frame`; the signature is verified here,
+/// so a tampered `reveal_at` (it rides inside the signed bytes) makes the
+/// whole deposit unparseable rather than an earlier-revealing copy. Anything
+/// that does not parse as a signed SealedGrant deposits as untimed (0): a
+/// malformed blob cannot be a *valid* timed grant — its wrapped key would
+/// never unseal — so delivering garbage early reveals nothing.
+fn grant_reveal_at(blob: &[u8]) -> u64 {
+    let Ok((_grantor, bundle)) = identity::unwrap_envelope(blob, &[]) else {
+        return 0;
+    };
+    match loot_core::bundle_codec::Frame::decode(bundle) {
+        Ok(loot_core::bundle_codec::Frame::SealedGrant { reveal_at, .. }) => reveal_at,
+        _ => 0,
+    }
+}
+
 async fn handle_deposit_grant(
     axum::extract::State(state): axum::extract::State<ServerState>,
     body: axum::body::Bytes,
@@ -281,7 +307,8 @@ async fn handle_deposit_grant(
     let recipient = std::str::from_utf8(&body[4..4 + name_len])
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
     let blob = &body[4 + name_len..];
-    mailbox::deposit(&state.relay_dir, recipient, blob)
+    let reveal_at = grant_reveal_at(blob);
+    mailbox::deposit(&state.relay_dir, recipient, blob, reveal_at)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok("deposited".into())
 }
@@ -299,7 +326,7 @@ async fn handle_peek_grants(
     }
     let recipient = std::str::from_utf8(&body[4..4 + name_len])
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
-    let count = mailbox::peek_count(&state.relay_dir, recipient)
+    let count = mailbox::peek_count(&state.relay_dir, recipient, relay_now())
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((count as u32).to_le_bytes().to_vec())
 }
@@ -317,7 +344,7 @@ async fn handle_pull_grants(
     }
     let recipient = std::str::from_utf8(&body[4..4 + name_len])
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
-    let blobs = mailbox::fetch_and_drain(&state.relay_dir, recipient)
+    let blobs = mailbox::fetch_and_drain(&state.relay_dir, recipient, relay_now())
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(mailbox::encode_blobs(&blobs))
 }
