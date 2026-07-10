@@ -107,7 +107,7 @@ usage:
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
   loot dock <name> [--at <dir>]             create/switch a dock (isolated tree over the shared store, ADR 0022)
-  loot dock merge <name>                    merge another dock's finalized tip into the current dock (local, CA2)
+  loot dock merge <name> [--porcelain|--json]  merge another dock's finalized tip into the current dock (local, CA2)
   loot docks                                list docks with their working tip
                                             (convention: a dock named `harbor` is the shared integration dock)
   loot manifest                             show the grant audit trail (and attestations)
@@ -813,7 +813,7 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
         let name = positional
             .get(1)
             .ok_or("usage: loot dock merge <name>")?;
-        return cmd_dock_merge(name);
+        return cmd_dock_merge(name, args);
     }
     let name = positional
         .first()
@@ -831,26 +831,40 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_dock_merge(name: &str) -> Result<(), String> {
+/// `loot dock merge <name> [--porcelain|--json]` — collapse another dock's tip
+/// into this one (CA2). A reconciliation verb, so it emits the shared verdict
+/// rows for the merge outcomes in machine formats (CA3, ADR 0023) — dropping the
+/// typed outcomes at the `println!` boundary was the exact anti-pattern CA3
+/// removed everywhere else (#126).
+fn cmd_dock_merge(name: &str, args: &[String]) -> Result<(), String> {
+    let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
     let current = ws.current_dock().unwrap_or("main").to_string();
     let (_source, outcomes) = ws.merge_dock(name)?;
-    if outcomes.is_empty() {
-        println!("merge '{name}' → '{current}': already up to date");
-        return Ok(());
-    }
-    println!("merged dock '{name}' into '{current}':");
-    for (path, outcome) in &outcomes {
-        println!("  {:<24} {}", path.display(), describe(outcome));
-    }
-    let conflicts = outcomes
-        .values()
-        .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
-        .count();
-    if conflicts > 0 {
-        println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances this dock's tip");
-    } else {
-        println!("merge committed as this dock's tip; run `loot log` to see it");
+
+    match fmt {
+        OutFmt::Human => {
+            if outcomes.is_empty() {
+                println!("merge '{name}' → '{current}': already up to date");
+                return Ok(());
+            }
+            println!("merged dock '{name}' into '{current}':");
+            for (path, outcome) in &outcomes {
+                println!("  {:<24} {}", path.display(), describe(outcome));
+            }
+            let conflicts = outcomes
+                .values()
+                .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
+                .count();
+            if conflicts > 0 {
+                println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances this dock's tip");
+            } else {
+                println!("merge committed as this dock's tip; run `loot log` to see it");
+            }
+        }
+        // Machine output: the merge verdict rows only, no prose (empty -> no lines).
+        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
+        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
     }
     Ok(())
 }
