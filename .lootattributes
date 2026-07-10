@@ -1,0 +1,4 @@
+# Per-content visibility (the thesis surface). Unmatched paths are Public.
+# docs/pitch/ is the genuinely-sealed-from-agents path (ADR 0026): the
+# zero-knowledge-host product notes, restricted to the dev identity.
+docs/pitch/** restricted=connor
