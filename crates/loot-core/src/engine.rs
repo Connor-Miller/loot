@@ -438,6 +438,35 @@ impl DagRepo {
         self.keyring.key_for(oid)
     }
 
+    /// Every embargoed path in the current tree whose content key this repo
+    /// holds — `(path, oid, reveal_at)`. The key may sit in the Keyring
+    /// (reveal passed) or still in Escrow (originator staging, ADR 0007);
+    /// either way this repo can issue grants for it. The push-time deposit
+    /// pass (ADR 0027) grants exactly these — a non-keyholder peer has
+    /// nothing to deposit.
+    pub fn embargoed_paths(&self) -> Vec<(PathBuf, Oid, u64)> {
+        self.graph
+            .current_tree()
+            .into_iter()
+            .filter_map(|(path, (oid, vis))| match vis {
+                Visibility::Embargoed { reveal_at }
+                    if self.keyring.holds(&oid) || self.escrow.holds(&oid) =>
+                {
+                    Some((path, oid, reveal_at))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The stored visibility of the object at `oid`, if the object is held.
+    /// Lets the CLI inherit an embargoed seal's `reveal_at` when issuing a
+    /// grant for it (ADR 0027: a late-added recipient gets a timed grant,
+    /// never an early key).
+    pub fn visibility_of(&self, oid: &Oid) -> Option<Visibility> {
+        self.objects.get(oid).ok().map(|o| o.vis.clone())
+    }
+
     /// The OID for `path` in the current tree, or `NotFound` if absent.
     pub fn current_tree_oid(&self, path: &Path) -> Result<Oid, RepoError> {
         self.graph.current_tree()
