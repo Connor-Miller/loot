@@ -131,6 +131,8 @@ pub fn load_objects_loose(dir: &Path) -> Result<ObjectStore, RepoError> {
 /// write) are ignored, never counted, and never removed. A missing objects
 /// directory yields `(0, 0)`. This is the on-disk half of `gc` (ADR 0012); the
 /// caller supplies the referenced set from the change graph.
+// gc is deferred (#17); this on-disk pruner is kept ready for when it lands.
+#[allow(dead_code)]
 pub fn prune_orphaned_objects_loose(
     dir: &Path,
     keep: &BTreeSet<Oid>,
@@ -184,6 +186,9 @@ pub fn encode_nodes(nodes: &[&ChangeNode]) -> Vec<u8> {
     out
 }
 
+// The load path decodes via `decode_nodes` (+ heads/reachability); this whole-graph
+// decoder is still exercised by the golden format-compatibility tests below.
+#[allow(dead_code)]
 pub fn decode_graph(b: &[u8]) -> Result<ChangeGraph, RepoError> {
     let mut graph = ChangeGraph::new();
     for node in decode_nodes(b)? {

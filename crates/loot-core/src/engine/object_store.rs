@@ -76,6 +76,8 @@ impl ObjectStore {
     /// unreachable and safe to delete — content-addressing makes this exact, with
     /// no false positives. Compacts the backing log so pruned ciphertext does not
     /// linger in memory.
+    // gc is deferred (#17); this backend is kept ready to wire up when it lands.
+    #[allow(dead_code)]
     pub fn retain(&mut self, keep: &BTreeSet<Oid>) -> Vec<Oid> {
         let mut removed = Vec::new();
         let mut new_log: Vec<SealedObject> = Vec::with_capacity(keep.len().min(self.log.len()));
