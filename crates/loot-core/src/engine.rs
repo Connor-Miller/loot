@@ -1059,6 +1059,14 @@ impl DagRepo {
         Ok(id)
     }
 
+    /// Drop an unfinalized working change from the graph — the bridge undoes a
+    /// capture snapshot that turned out identical to the anchor (GB1, ADR
+    /// 0028). The node was never signed, so nothing that travels references
+    /// it; `remove_head` restores its parents as heads. No-op otherwise.
+    pub fn drop_working(&mut self, id: &Oid) {
+        self.graph.remove_head(id);
+    }
+
     /// Count `(total, restricted, embargoed)` paths in a tip's tree — the
     /// visibility summary `loot docks` shows per dock (ADR 0022).
     pub fn visibility_summary_at(&self, tip: &Oid) -> (usize, usize, usize) {

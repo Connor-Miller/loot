@@ -1,20 +1,30 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-  One command for a loot-first working day: finalize the day's work in loot,
-  push it to the relay, and log the day (evidence for map #54 section A).
+  One command for a loot-first working day: capture the day's work in loot,
+  ferry the git side across the bridge, push to the relay, and log the day
+  (evidence for map #54 section A).
 
 .DESCRIPTION
   Runs the daily ritual and records it:
-    1. `loot status -m <message>` - snapshot the working tree into loot.
-    2. `loot new`                 - finalize (sign) the day's change.
-    3. `loot push`                - publish to the relay (O(delta), resumable).
+    1. If git sees uncommitted work (or -ForceSnapshot):
+         `loot status -m <message>` + `loot new`  - capture the day's WIP.
+       On a git-clean tree this is skipped: everything that reached git main
+       arrives through the bridge instead, one loot change per commit.
+    2. `git push <mirror> main` + `loot ferry`    - one bridge pass (ADR 0028):
+       ingest merged git commits as loot changes, reconcile with loot's
+       converge classifier, re-project loot heads into the private mirror.
+    3. `loot push`                                - publish to the relay.
   Then appends a dated section to docs/dogfood/drive-log.md with the mechanical
-  facts (loot change id, objects pushed, git backup head, loot-vs-git
-  divergence) and a `friction:` line for you to complete, and prints the row to
-  paste into the evidence table (section A).
+  facts (loot change id, ferry summary, objects pushed, git backup head) and a
+  `friction:` line for you to complete, and prints the row to paste into the
+  evidence table (section A).
 
-  git is the backup: this does NOT commit to git. Commit/push git as usual.
+  The bridge mirror lives at .loot/git-mirror/mirror.git and holds this
+  identity's FULL READABLE TREE in plaintext, including content sealed to
+  others (docs/pitch). It is local-only by design: never add a remote to it
+  and never push it anywhere (ADR 0028). git commits/pushes to GitHub happen
+  from the normal checkout as usual and never include sealed content.
 
 .PARAMETER Day
   Which drive day this is (1..5).
@@ -23,15 +33,21 @@
   The loot change message for the day (what changed).
 
 .PARAMETER DryRun
-  Snapshot + finalize locally but skip the push (for a rehearsal).
+  Capture + ferry locally but skip the relay push (for a rehearsal).
+
+.PARAMETER ForceSnapshot
+  Snapshot even when git reports a clean tree. Needed when the day's edits
+  live only under git-ignored, loot-tracked paths (e.g. docs/pitch/), which
+  the git-dirty check cannot see.
 
 .EXAMPLE
-  pwsh tools/loot-day.ps1 -Day 1 -Message "embargo CLI + attack demo + section-B evidence"
+  pwsh tools/loot-day.ps1 -Day 2 -Message "ferry binding + capture fix"
 #>
 param(
     [Parameter(Mandatory = $true)][int]$Day,
     [Parameter(Mandatory = $true)][string]$Message,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$ForceSnapshot
 )
 
 # NOTE: keep this file ASCII-only. PowerShell 5.1 parses a no-BOM script as ANSI,
@@ -40,6 +56,7 @@ param(
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot
 $Loot = Join-Path $Root "target\release\loot.exe"
+$Mirror = Join-Path $Root ".loot\git-mirror\mirror.git"
 $LogPath = Join-Path $Root "docs\dogfood\drive-log.md"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -63,12 +80,36 @@ try {
     $gitSubject = (git log -1 --pretty=%s).Trim()
 
     Write-Host "=== loot day $Day ($date) ===" -ForegroundColor Green
-    Write-Host ">>> loot status -m ..."
-    & $Loot status -m $Message
-    Write-Host ">>> loot new"
-    & $Loot new
 
-    # The finalized day change is now loot's head.
+    # 1. Capture the day's WIP when git can see uncommitted work. On a clean
+    #    tree the bridge carries everything, one loot change per git commit,
+    #    and an extra snapshot would only mint a redundant identical change.
+    $gitDirty = @(git status --porcelain).Count -gt 0
+    if ($gitDirty -or $ForceSnapshot) {
+        Write-Host ">>> loot status -m ..."
+        & $Loot status -m $Message
+        Write-Host ">>> loot new"
+        & $Loot new
+    } else {
+        Write-Host ">>> git-clean tree: skipping snapshot (the ferry ingests committed work; use -ForceSnapshot if today's edits are only under docs/pitch or other git-ignored loot paths)" -ForegroundColor Yellow
+    }
+
+    # 2. One bridge pass (ADR 0028). Sync the local-only mirror to this
+    #    checkout's main first, then let loot ingest/reconcile/project.
+    $ferryLine = '(mirror missing - ferry skipped; bind with: loot ferry --git-dir .loot/git-mirror/mirror.git)'
+    if (Test-Path $Mirror) {
+        Write-Host ">>> git push (private mirror) main"
+        git push --quiet "$Mirror" main:refs/heads/main
+        Write-Host ">>> loot ferry"
+        $ferryOut = (& $Loot ferry --git-dir .loot/git-mirror/mirror.git 2>&1 | Out-String)
+        Write-Host $ferryOut
+        $ferryLine = (($ferryOut -split "`r?`n") | Where-Object { $_ -match "^ferry:" } | Select-Object -First 1)
+        if (-not $ferryLine) { $ferryLine = "see ferry output" }
+    } else {
+        Write-Host ">>> $ferryLine" -ForegroundColor Yellow
+    }
+
+    # The day's finalized/reconciled change is now loot's head.
     $lootHead = ((& $Loot log 2>&1 | Select-Object -First 1) | Out-String).Trim()
     $changeId = ($lootHead -split '\s+')[0]
 
@@ -89,6 +130,7 @@ try {
 ## Day $Day - $date
 
 - loot change: ``$changeId`` "$Message"
+- ferry: $ferryLine
 - pushed: $pushed to the relay
 - git backup HEAD: ``$gitHead`` "$gitSubject"
 - loot head at start of day: $lootHeadBefore
