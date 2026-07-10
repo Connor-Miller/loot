@@ -146,28 +146,42 @@ pub fn run(
     // --- ingest: new commits on the mirrored branch ---
     if let Some(tip) = &main_tip {
         let new_shas = walk_new_commits(&git, tip, &marks, state.git_main.as_deref())?;
-        // Capture in-progress work BEFORE ingesting: the pre-dock home forks
-        // its snapshots from all heads, so capturing after ingest would fold
-        // the two lines together without the converge classifier seeing them.
-        if !new_shas.is_empty() {
-            ws.ferry_capture()?;
-        }
         // The loot side of the divergence check, pinned before ingest — an
         // ingested change becomes a graph head itself, so the post-ingest
         // anchor can't tell fast-forward from true divergence.
         let ours = ws.finalized_anchor();
+        let had_new = !new_shas.is_empty();
         for sha in new_shas {
             ingest_commit(ws, &git, &sha, &mut marks, &id_map, &mut report)?;
         }
+        let target = marks.change_for(tip).cloned().map(|(t, _)| t);
+
+        // Capture in-progress disk work before reconcile re-materializes the
+        // tree. Ingesting first lets the capture recognize (and drop) a
+        // snapshot that matches the incoming target — the co-located checkout
+        // after a `git pull`, where the disk already holds exactly what the
+        // ingested line delivers; without that check every pass would mint a
+        // spurious capture + merge and walk the mirror's main ahead of the
+        // checkout's. The capture forks from the pinned anchor, so the two
+        // lines still meet only through the converge classifier below.
+        let wip = if had_new {
+            ws.ferry_capture(ours.as_ref(), target.as_ref())?
+        } else {
+            None
+        };
 
         // --- reconcile: advance the ambient dock to cover the git side ---
-        if let Some((target, _)) = marks.change_for(tip).cloned() {
-            match ours {
-                None => ws.ferry_adopt(&target)?,
+        if let Some(target) = target {
+            match (wip, ours) {
+                // Real concurrent work was captured: both sides advanced.
+                (Some(w), _) => {
+                    report.outcomes = ws.ferry_merge(&w, &target, "ferry: reconcile git main")?;
+                }
+                (None, None) => ws.ferry_adopt(&target)?,
                 // git behind loot: projection moves main below, nothing here.
-                Some(ref o) if *o == target || is_ancestor(ws, &target, o) => {}
-                Some(ref o) if is_ancestor(ws, o, &target) => ws.ferry_adopt(&target)?,
-                Some(ref o) => {
+                (None, Some(ref o)) if *o == target || is_ancestor(ws, &target, o) => {}
+                (None, Some(ref o)) if is_ancestor(ws, o, &target) => ws.ferry_adopt(&target)?,
+                (None, Some(ref o)) => {
                     report.outcomes = ws.ferry_merge(o, &target, "ferry: reconcile git main")?;
                 }
             }
@@ -1043,6 +1057,37 @@ mod tests {
 
         let after = ferry(&mut ws, &mirror);
         assert_eq!((after.ingested, after.projected), (0, 0));
+    }
+
+    #[test]
+    fn pulled_content_is_not_recaptured() {
+        let (mut ws, dir, mirror) = setup("colo");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // Co-located checkout: git advances AND the pull already wrote the
+        // same content to disk before the ferry pass runs.
+        let git = git2::Repository::open(&mirror).unwrap();
+        let sha =
+            git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
+        put_file(&dir, "b.txt", "from git\n");
+
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!(
+            (report.ingested, report.projected),
+            (1, 0),
+            "pure ingest — no spurious capture or merge"
+        );
+        assert!(report.outcomes.is_empty(), "{:?}", report.outcomes);
+
+        // main must not walk ahead of the ingested commit, or the co-located
+        // checkout's next mirror-sync push stops fast-forwarding.
+        assert_eq!(main_commit(&git).id().to_string(), sha);
+
+        let ws2 = Workspace::open_at(&dir).unwrap();
+        assert_eq!(ws2.repo().change_ids_topo().len(), 2, "base + ingested only");
+        assert_eq!(ws2.repo().heads().len(), 1, "single head");
     }
 
     #[test]
