@@ -540,7 +540,9 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
     let bundle = ws.with_repo(|repo| {
-        repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, now, |content_key| {
+        // reveal_at = 0: an ordinary (untimed) grant. The timed deposit path is
+        // the hard-embargo CLI slice (#88).
+        repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, 0, now, |content_key| {
             identity::seal_key(content_key, &recipient_x25519)
                 .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
         }).map_err(|e| e.to_string())

@@ -79,7 +79,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Encode the bundle body payload (objects, keys, escrow, changes).
+/// Encode the bundle body payload (objects, keys, changes).
 /// This is the raw body — no version marker or frame tag. Use `Frame::encode`
 /// for the complete on-wire format; call this directly only when re-encoding a
 /// decoded body for inspection (e.g. in test helpers).
@@ -87,7 +87,6 @@ pub fn encode(
     changes: &[&ChangeNode],
     objs: &BTreeMap<Oid, SealedObject>,
     public_keys: &BTreeMap<Oid, ContentKey>,
-    escrow_entries: &BTreeMap<Oid, (ContentKey, u64)>,
     attestations: &[Attestation],
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -115,14 +114,9 @@ pub fn encode(
         out.extend_from_slice(key);
     }
 
-    // Embargoed keys as escrow entries: receiver files them into their Escrow
-    // (not Keyring) so they can't be read before reveal_at (ADR 0007).
-    put_u32(&mut out, escrow_entries.len());
-    for (addr, (key, reveal_at)) in escrow_entries {
-        out.extend_from_slice(&addr.0);
-        out.extend_from_slice(key);
-        out.extend_from_slice(&reveal_at.to_le_bytes());
-    }
+    // v5 (ADR 0027): the plaintext escrow section is GONE. Embargoed keys
+    // never ride in a bundle — they travel only as relay-withheld timed
+    // SealedGrants. v1–v4 wrote `[count][addr·key·reveal_at]...` here.
 
     put_u32(&mut out, changes.len());
     for c in changes {
@@ -154,7 +148,9 @@ pub fn encode(
 /// Use `Frame::decode` for the complete on-wire format; call this directly only
 /// when parsing a body slice that was already extracted by `Frame::decode`.
 /// `major` is the format major from the frame's version marker: it selects
-/// whether inline objects carry the v2 `compressed` flag (ADR 0019/0020).
+/// whether inline objects carry the v2 `compressed` flag (ADR 0019/0020) and
+/// whether a v1–v4 plaintext escrow section must be parsed — parsed for cursor
+/// correctness only; its raw keys are DROPPED, never surfaced (ADR 0027, #14).
 #[allow(clippy::type_complexity)]
 pub fn decode(
     b: &[u8],
@@ -164,7 +160,6 @@ pub fn decode(
         Vec<ChangeNode>,
         Vec<(Oid, SealedObject)>,
         BTreeMap<Oid, ContentKey>,
-        BTreeMap<Oid, (ContentKey, u64)>,
         Vec<Attestation>,
     ),
     RepoError,
@@ -205,13 +200,16 @@ pub fn decode(
         public_keys.insert(addr, key);
     }
 
-    let n_escrow = c.u32()?;
-    let mut escrow_entries = BTreeMap::new();
-    for _ in 0..n_escrow {
-        let addr = Oid(c.arr32()?);
-        let key = c.arr32()?;
-        let reveal_at = c.u64()?;
-        escrow_entries.insert(addr, (key, reveal_at));
+    // v1–v4 carried a plaintext escrow section here (`[addr·key·reveal_at]`).
+    // Parse it to keep the cursor in sync, then DROP it: filing those raw keys
+    // is the pre-reveal read hard embargo exists to close (ADR 0027).
+    if major <= 4 {
+        let n_escrow = c.u32()?;
+        for _ in 0..n_escrow {
+            let _addr = c.arr32()?;
+            let _key = c.arr32()?;
+            let _reveal_at = c.u64()?;
+        }
     }
 
     let n_changes = c.u32()?;
@@ -256,13 +254,14 @@ pub fn decode(
         Vec::new()
     };
 
-    Ok((changes, objs, public_keys, escrow_entries, attestations))
+    Ok((changes, objs, public_keys, attestations))
 }
 
-/// The decoded payload every bundle carries: changes plus the sealed objects,
-/// public keys, and embargoed escrow entries riding with them. This is exactly
-/// what the low-level [`encode`]/[`decode`] body codec moves; `Frame` wraps it
-/// with the per-kind header.
+/// The decoded payload every bundle carries: changes plus the sealed objects
+/// and public keys riding with them. This is exactly what the low-level
+/// [`encode`]/[`decode`] body codec moves; `Frame` wraps it with the per-kind
+/// header. Embargoed keys deliberately have no lane here (ADR 0027): they
+/// travel only as relay-withheld timed SealedGrants.
 #[derive(Clone)]
 pub struct BundleBody {
     pub changes: Vec<ChangeNode>,
@@ -270,7 +269,6 @@ pub struct BundleBody {
     /// `encode()` without rebuilding a map.
     pub objs: BTreeMap<Oid, SealedObject>,
     pub keys: BTreeMap<Oid, ContentKey>,
-    pub escrow: BTreeMap<Oid, (ContentKey, u64)>,
     /// Detachable, advisory attestations over changes (S4, ADR 0018). Carried
     /// with the bundle; verified and dropped-if-invalid on ingest.
     pub attestations: Vec<Attestation>,
@@ -297,11 +295,16 @@ pub enum Frame {
         body: BundleBody,
     },
     /// tag 3. A sealed-key grant: the content key is ECIES-wrapped to the
-    /// recipient's pubkey and carried in `wrapped_key`, not `body`.
+    /// recipient's pubkey and carried in `wrapped_key`, not `body`. `reveal_at`
+    /// (v5, ADR 0027) makes it a *timed* grant: the relay withholds it from the
+    /// mailbox until its own clock passes `reveal_at`; `0` means untimed
+    /// (deliver immediately). It rides inside the grantor-signed envelope, so a
+    /// recipient cannot alter it without breaking the signature.
     SealedGrant {
         grantee_pubkey: [u8; 32],
         wrapped_key: [u8; 80],
         oid: Oid,
+        reveal_at: u64,
         body: BundleBody,
     },
 }
@@ -310,13 +313,13 @@ pub enum Frame {
 /// there is exactly one definition of the payload layout.
 fn encode_body(body: &BundleBody) -> Vec<u8> {
     let changes: Vec<&ChangeNode> = body.changes.iter().collect();
-    encode(&changes, &body.objs, &body.keys, &body.escrow, &body.attestations)
+    encode(&changes, &body.objs, &body.keys, &body.attestations)
 }
 
 fn decode_body(b: &[u8], major: u8) -> Result<BundleBody, RepoError> {
-    let (changes, objs_vec, keys, escrow, attestations) = decode(b, major)?;
+    let (changes, objs_vec, keys, attestations) = decode(b, major)?;
     let objs = objs_vec.into_iter().collect();
-    Ok(BundleBody { changes, objs, keys, escrow, attestations })
+    Ok(BundleBody { changes, objs, keys, attestations })
 }
 
 impl Frame {
@@ -342,11 +345,12 @@ impl Frame {
                 put_bytes(&mut out, grantee.as_bytes());
                 out.extend_from_slice(&encode_body(body));
             }
-            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body } => {
+            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, body } => {
                 out.push(3);
                 out.extend_from_slice(grantee_pubkey);
                 out.extend_from_slice(wrapped_key);
                 out.extend_from_slice(&oid.0);
+                out.extend_from_slice(&reveal_at.to_le_bytes()); // v5 (ADR 0027)
                 out.extend_from_slice(&encode_body(body));
             }
         }
@@ -391,8 +395,11 @@ impl Frame {
                 let mut wrapped_key = [0u8; 80];
                 wrapped_key.copy_from_slice(c.take(80)?);
                 let oid = Oid(c.arr32()?);
+                // v5 (ADR 0027): timed grants carry reveal_at in the header.
+                // Pre-v5 sealed grants predate it — untimed (0).
+                let reveal_at = if major >= 5 { c.u64()? } else { 0 };
                 let body = decode_body(&c.b[c.i..], major)?;
-                Ok(Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, body })
+                Ok(Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, body })
             }
             t => Err(RepoError::Backend(format!("unknown bundle tag {t}"))),
         }
@@ -404,14 +411,13 @@ mod tests {
     use super::*;
 
     fn empty_body() -> BundleBody {
-        BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), escrow: BTreeMap::new(), attestations: vec![] }
+        BundleBody { changes: vec![], objs: BTreeMap::new(), keys: BTreeMap::new(), attestations: vec![] }
     }
 
     // Golden wire bytes for `Frame::Sync { purges: [], body: empty }`:
-    // [major][minor][tag=0][purge_count=0][objs=0][keys=0][escrow=0][changes=0].
-    // The empty bundle carries no inline objects, so v1 and v2 differ only in the
-    // marker byte. These lock the wire layout; a drift fails here and must bump
-    // FORMAT_MAJOR (ADR 0019/0020).
+    // v1–v4: [major][minor][tag=0][purge_count=0][objs=0][keys=0][escrow=0][changes=0]
+    // (+ attestation count from v4). These lock the wire layout; a drift fails
+    // here and must bump FORMAT_MAJOR (ADR 0019/0020).
     const GOLDEN_SYNC_V1: [u8; 23] =
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     const GOLDEN_SYNC_V2: [u8; 23] =
@@ -421,8 +427,13 @@ mod tests {
     // v4 grew by the attestation-count section (S4): empty bundle is 27 bytes.
     const GOLDEN_SYNC_V4: [u8; 27] =
         [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // v5 dropped the plaintext escrow section (ADR 0027): back to 23 bytes —
+    // [5][0][tag=0][purges=0][objs=0][keys=0][changes=0][attestations=0].
+    const GOLDEN_SYNC_V5: [u8; 23] =
+        [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     // v4 bundle with one authored+signed change (no tree, no objects, no attestations).
-    // Pins the put_author_sig layout: presence-byte + 32-byte pubkey, presence-byte + 64-byte sig.
+    // Kept as a decode-compat fixture: a v5 reader must still read it (and drop
+    // its empty escrow section). Pins the put_author_sig layout.
     const GOLDEN_SYNC_V4_AUTHORED: [u8; 177] = [
         4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 1, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5,
@@ -436,6 +447,21 @@ mod tests {
         9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
         9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0,
         0,
+    ];
+    // v5 equivalent of the authored-change fixture: no escrow section (4 bytes
+    // shorter). Pins the current writer's layout.
+    const GOLDEN_SYNC_V5_AUTHORED: [u8; 173] = [
+        5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 0, 0, 0, 0, 8, 0, 0, 0, 97, 117, 116, 104, 111,
+        114, 101, 100, 0, 0, 0, 0, 1, 7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 1, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0,
     ];
 
     fn object(compressed: bool) -> SealedObject {
@@ -473,14 +499,21 @@ mod tests {
     }
 
     #[test]
-    fn golden_v4_sync_bundle_matches_and_round_trips() {
-        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
-        assert_eq!(bytes, GOLDEN_SYNC_V4, "v4 wire layout must not drift");
+    fn v4_sync_bundle_still_decodes() {
+        // A v5 build still reads the committed v4 wire bytes, dropping the
+        // (empty) plaintext escrow section (newer reads older, ADR 0027).
         assert!(matches!(Frame::decode(&GOLDEN_SYNC_V4).unwrap(), Frame::Sync { .. }));
     }
 
     #[test]
-    fn golden_v4_authored_change_layout_matches_and_round_trips() {
+    fn golden_v5_sync_bundle_matches_and_round_trips() {
+        let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
+        assert_eq!(bytes, GOLDEN_SYNC_V5, "v5 wire layout must not drift");
+        assert!(matches!(Frame::decode(&GOLDEN_SYNC_V5).unwrap(), Frame::Sync { .. }));
+    }
+
+    #[test]
+    fn golden_v5_authored_change_layout_matches_and_round_trips() {
         // Pins the put_author_sig wire layout (presence-byte + 32-byte pubkey,
         // presence-byte + 64-byte sig). A field-ordering regression in that path
         // must break this test before it breaks interop with peers.
@@ -496,16 +529,60 @@ mod tests {
             changes: vec![node],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![],
         };
         let bytes = Frame::Sync { purges: vec![], body }.encode();
-        assert_eq!(bytes, GOLDEN_SYNC_V4_AUTHORED, "v4 authored-change wire layout must not drift");
-        match Frame::decode(&GOLDEN_SYNC_V4_AUTHORED).unwrap() {
+        assert_eq!(bytes, GOLDEN_SYNC_V5_AUTHORED, "v5 authored-change wire layout must not drift");
+        match Frame::decode(&GOLDEN_SYNC_V5_AUTHORED).unwrap() {
             Frame::Sync { body, .. } => {
                 assert_eq!(body.changes.len(), 1);
                 assert_eq!(body.changes[0].author, Some([7; 32]));
                 assert_eq!(body.changes[0].signature, Some([9; 64]));
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn v4_authored_fixture_still_decodes_and_drops_escrow() {
+        // The committed v4 fixture (which carries an escrow section) must stay
+        // readable by a v5 build — and there is structurally nowhere for its
+        // plaintext escrow keys to land (BundleBody has no escrow lane).
+        match Frame::decode(&GOLDEN_SYNC_V4_AUTHORED).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert_eq!(body.changes.len(), 1);
+                assert_eq!(body.changes[0].author, Some([7; 32]));
+            }
+            _ => panic!("expected Sync"),
+        }
+    }
+
+    #[test]
+    fn v4_escrow_section_is_parsed_and_dropped() {
+        // A v4 bundle whose escrow section actually carries a plaintext key:
+        // the v5 reader must parse past it (cursor correctness — the trailing
+        // change must decode) and drop the key on the floor.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[4, 0, 0]); // v4 marker + Sync tag
+        put_u32(&mut bytes, 0); // purges
+        put_u32(&mut bytes, 0); // objs
+        put_u32(&mut bytes, 0); // keys
+        put_u32(&mut bytes, 1); // ONE escrow entry
+        bytes.extend_from_slice(&[6; 32]); // addr
+        bytes.extend_from_slice(&[8; 32]); // plaintext content key
+        bytes.extend_from_slice(&500u64.to_le_bytes()); // reveal_at
+        put_u32(&mut bytes, 1); // one change (unauthored)
+        bytes.extend_from_slice(&[5; 32]); // id
+        put_u32(&mut bytes, 0); // parents
+        put_bytes(&mut bytes, b"after escrow"); // message
+        put_u32(&mut bytes, 0); // tree
+        format::put_author_sig(&mut bytes, &None, &None);
+        put_u32(&mut bytes, 0); // attestations
+        match Frame::decode(&bytes).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert_eq!(body.changes.len(), 1, "cursor must survive the escrow section");
+                assert_eq!(body.changes[0].message, "after escrow");
+                assert!(body.keys.is_empty(), "the plaintext escrow key must not surface");
             }
             _ => panic!("expected Sync"),
         }
@@ -523,7 +600,6 @@ mod tests {
             changes: vec![],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![att.clone()],
         };
         match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
@@ -549,7 +625,6 @@ mod tests {
             changes: vec![node],
             objs: BTreeMap::new(),
             keys: BTreeMap::new(),
-            escrow: BTreeMap::new(),
             attestations: vec![],
         };
         match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
@@ -568,7 +643,7 @@ mod tests {
         let addr = obj.address();
         let mut objs = BTreeMap::new();
         objs.insert(addr.clone(), obj);
-        let body = BundleBody { changes: vec![], objs, keys: BTreeMap::new(), escrow: BTreeMap::new(), attestations: vec![] };
+        let body = BundleBody { changes: vec![], objs, keys: BTreeMap::new(), attestations: vec![] };
         match Frame::decode(&Frame::Sync { purges: vec![], body }.encode()).unwrap() {
             Frame::Sync { body, .. } => {
                 assert!(
@@ -624,14 +699,40 @@ mod tests {
             grantee_pubkey: [1; 32],
             wrapped_key: [2; 80],
             oid: Oid([3; 32]),
+            reveal_at: 12345,
             body: empty_body(),
         };
         let bytes = f.encode();
         assert_eq!(bytes[2], 3, "sealed-grant tag follows the 2-byte version marker");
         match Frame::decode(&bytes).unwrap() {
-            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, .. } => {
+            Frame::SealedGrant { grantee_pubkey, wrapped_key, oid, reveal_at, .. } => {
                 assert_eq!(grantee_pubkey, [1; 32]);
                 assert_eq!(wrapped_key, [2; 80]);
+                assert_eq!(oid, Oid([3; 32]));
+                assert_eq!(reveal_at, 12345, "reveal_at must survive the frame (ADR 0027)");
+            }
+            _ => panic!("expected SealedGrant"),
+        }
+    }
+
+    #[test]
+    fn pre_v5_sealed_grant_decodes_as_untimed() {
+        // A v4 sealed grant has no reveal_at in its header; a v5 reader treats
+        // it as untimed (0) and keeps the body aligned.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[4, 0, 3]); // v4 marker + SealedGrant tag
+        bytes.extend_from_slice(&[1; 32]); // grantee pubkey
+        bytes.extend_from_slice(&[2; 80]); // wrapped key
+        bytes.extend_from_slice(&[3; 32]); // oid
+        // v4 body: objs, keys, escrow, changes (no attestations before... v4 HAS attestations)
+        put_u32(&mut bytes, 0); // objs
+        put_u32(&mut bytes, 0); // keys
+        put_u32(&mut bytes, 0); // escrow (v4)
+        put_u32(&mut bytes, 0); // changes
+        put_u32(&mut bytes, 0); // attestations (v4)
+        match Frame::decode(&bytes).unwrap() {
+            Frame::SealedGrant { reveal_at, oid, .. } => {
+                assert_eq!(reveal_at, 0, "pre-v5 grants are untimed");
                 assert_eq!(oid, Oid([3; 32]));
             }
             _ => panic!("expected SealedGrant"),

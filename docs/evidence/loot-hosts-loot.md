@@ -57,7 +57,7 @@ that log is dogfood data, not failure.
 
 ## C. Hard embargo (ADR 0027)
 
-- [ ] #14 — engine/wire: timed SealedGrant deposit, relay withholding,
+- [x] #14 — engine/wire: timed SealedGrant deposit, relay withholding,
       `FORMAT_MAJOR` bump
 - [ ] #88 — CLI: push deposits timed grants; `pull-grants` files revealed keys
 - [ ] **Attack-demo script (#89)**: a holder with an advanced clock, direct

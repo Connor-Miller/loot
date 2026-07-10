@@ -132,30 +132,32 @@ into the Escrow — not the Keyring — for every identity including the origina
 `flush_escrow(now)` promotes eligible entries into the Keyring once
 `now >= reveal_at`; until then the Keyring holds nothing for that object and
 `open` returns `Embargoed`. The Workspace calls `flush_escrow` before every
-content-reading operation (`checkout`, `snapshot`). Bundles currently ship
-embargoed keys as a separate escrow section so peers receive them into their
-own Escrow — ADR 0027 removes that section (it ships plaintext keys, the exact
-bypass hard embargo closes); once it lands, the Escrow is originator-side
-staging only and peers receive embargoed keys from the relay after `reveal_at`.
+content-reading operation (`checkout`, `snapshot`). As of format v5 (ADR 0027,
+#14) bundles ship **no** escrow section — that lane shipped plaintext keys,
+the exact bypass hard embargo closes. The Escrow is originator-side staging
+only; peers receive embargoed keys solely from the relay after `reveal_at`,
+as timed SealedGrants filed via `apply_sealed_grant` (which itself stages a
+not-yet-due grant in Escrow rather than the Keyring, as defense-in-depth
+against an early-releasing relay).
 
-**Threat model (be precise — the earlier glossary overclaimed).** Embargo is
-currently enforced **cooperatively**, against an *honest holder running an honest
-clock*. The escrow withholds the key from the Keyring until `flush_escrow(now)`
-sees `now >= reveal_at`, where `now` is the local clock injected by the
-Workspace. Against an adversarial holder this is **not** a hard guarantee: they
-can advance their clock, pass a future `now`, or read the escrow key bytes
-directly with a modified binary. So embargo today raises the bar (a normal
-client cannot read embargoed content early) but does not *cryptographically*
-withhold the key from a determined local adversary. The D-threat is closed only
-against honest participants. The hard mechanism is **decided** (ADR 0027, not
-yet implemented): embargoed keys are deposited at push as **timed
+**Threat model.** Hard embargo's engine/wire slice is **implemented** (ADR
+0027, #14, format v5): embargoed keys have **no bundle lane at all** — the
+v1–v4 plaintext escrow section is gone (a v5 reader parses an old section for
+cursor correctness and DROPS its keys), and they travel only as **timed
 SealedGrants** — ECIES-wrapped per recipient, withheld from the relay's grant
-mailbox until the *relay's* clock passes `reveal_at` — and the plaintext bundle
-escrow section is removed. That makes embargo **holder-adversary-proof** (a
-modified client cannot read key bytes that aren't on its machine); residual
-trust is the relay operator releasing on time — a distinct role holding only
-wrapped blobs it cannot read. Until it lands, do not represent embargo as
-adversary-proof in any sense.
+mailbox until the *relay's* clock passes `reveal_at` (the relay never takes a
+caller clock; `reveal_at` rides inside the grantor-signed envelope, so it
+cannot be altered without breaking the signature). A non-originator holder is
+adversary-proof-ed by **absence**: the key bytes are not on their machine —
+no lying clock, escrow inspection, or modified binary can read what never
+arrived. The claim is **holder**-adversary-proof: residual trust is the relay
+operator releasing on time — a distinct role holding only wrapped blobs it
+cannot read (drand timelock is the recorded post-milestone hardening). The
+*originator's* own local Escrow staging (ADR 0007) remains cooperative/
+honest-clock — moot, since the originator already knows the plaintext they
+sealed. Remaining: the CLI deposit/receive surface (#88) and the attack demo
+(#89). With no relay configured, ciphertext syncs and embargoed keys simply
+never reach peers — one `Embargoed` label, one guarantee.
 
 **Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
 identities permitted to hold a key). It deliberately does **not** contain any
@@ -226,11 +228,13 @@ decrypt.
 
 **Frame** — the typed, tag-resolved form of a bundle on the wire, and the single
 value the engine matches on. There are three: *Sync* (tag 0, carries purge
-events + the change/object/key/escrow body), *Grant* (tag 1, a targeted key
+events + the change/object/key body — the plaintext escrow section is gone as
+of v5, ADR 0027), *Grant* (tag 1, a targeted key
 handoff whose key rides in the body), and *SealedGrant* (tag 3, the content key
-ECIES-wrapped to a recipient pubkey, carried beside the body). All wire framing
+ECIES-wrapped to a recipient pubkey, carried beside the body with a `reveal_at`
+— `0` untimed; nonzero makes it a relay-withheld timed grant). All wire framing
 — the tag byte, the Sync purge prefix, the Grant grantee prefix, the SealedGrant
-`[pubkey·wrapped·oid]` header, and every length/offset — lives behind
+`[pubkey·wrapped·oid·reveal_at]` header, and every length/offset — lives behind
 `bundle_codec::Frame::{decode, encode}`; the engine does no byte arithmetic. Both
 `apply` (keyholder merge) and `stow` (relay ingest) decode to a `Frame` and match;
 `stow` accepts only *Sync*. A `SealedGrant`'s wrapped key is surfaced verbatim and

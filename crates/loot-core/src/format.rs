@@ -82,12 +82,16 @@ impl<'a> Cursor<'a> {
 ///   change layout (bundle and durable graph).
 /// - v4 (S4, ADR 0018) added the detachable attestation section to the bundle
 ///   body and a durable attestation log.
+/// - v5 (ADR 0027, #14) removed the plaintext bundle escrow section (it shipped
+///   raw embargoed `ContentKey` bytes to every peer and relay — the exact bypass
+///   hard embargo closes) and added `reveal_at` to the SealedGrant frame header.
 ///
 /// Each was a change an older reader cannot parse, so each bumped the major. A
-/// v4 reader still reads v1/v2/v3 artifacts (missing fields default to absent —
-/// uncompressed, unauthored, no attestations); an older reader cleanly rejects a
-/// newer major rather than mis-parsing.
-pub const FORMAT_MAJOR: u8 = 4;
+/// v5 reader still reads v1–v4 artifacts (missing fields default to absent;
+/// a v4 escrow section is parsed for cursor correctness but its plaintext keys
+/// are DROPPED, never filed); an older reader cleanly rejects a newer major
+/// rather than mis-parsing.
+pub const FORMAT_MAJOR: u8 = 5;
 /// The compatible revision this build writes.
 pub const FORMAT_MINOR: u8 = 0;
 /// Bytes the version marker occupies at the front of an artifact.
