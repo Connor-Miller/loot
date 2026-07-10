@@ -89,6 +89,22 @@ with the format gate (`format::FORMAT_MAJOR`, ADR 0019). CLI: `loot apply --porc
 `loot conflicts --json`, etc. (ADR 0023). _Avoid_: adding machine output to the
 ~25 non-reconciliation verbs — deliberately out of scope.
 
+**Ferry** *(GB1 shipped, 2026-07-10)* — one deliberate bidirectional loot ↔ git
+mirror pass (ADR 0028): ingest git-native commits from the mirrored `main` as
+loot changes (sealed at ingest under the *commit's own* `.lootattributes`),
+reconcile them into the ambient [[Dock]] with the [[Convergence classifier]]
+(loot is the merge authority — git never merges), then project every
+travel-worthy change as a git commit carrying `Loot-Change-Id`/`Loot-Author`/
+`Loot-Signature` trailers, SSHSIG-signed with the repo key, deterministic dates
+(`BASE_EPOCH + generation`). Sealed paths are omitted from git entirely (no
+filename, no bytes), so the mirror holds the syncing identity's readable tree —
+the git remote must be trusted as much as that identity (**not** a public
+host). Every head stays reachable under `refs/loot/heads/*`; `refs/heads/main`
+tracks a designated dock. The spine is the mark map (sha ↔ change-id ↔ origin)
+in `.loot/git-mirror/`, local-only and rebuildable from trailers. CLI: `loot
+ferry [--git-dir <path>] [--dock <name>]`. _Avoid_: sync, mirror-push — a ferry
+carries in both directions in one crossing.
+
 **Attestation** — a detachable, signed, advisory marker over a change id:
 `sign(change_id || attester || role)` (ADR 0018 / S4). Verified drop-not-fatal
 on `apply`/`stow`, never folded into the change id, never affects convergence.

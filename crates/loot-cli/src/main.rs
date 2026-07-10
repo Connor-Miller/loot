@@ -5,6 +5,7 @@
 //! All ambient state (`.loot/` home, identity, clock, persistence, working-change
 //! id) is owned by the [`Workspace`]; commands are thin verbs over it.
 
+mod ferry;
 mod workspace;
 
 use loot_core::{
@@ -81,6 +82,7 @@ const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
     ("clone", cmd_clone),
     ("config", cmd_config),
     ("id", cmd_id),
+    ("ferry", cmd_ferry),
 ];
 
 const USAGE: &str = "\
@@ -125,7 +127,8 @@ usage:
   loot peer list                            show all known peers
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
-  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay";
+  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay
+  loot ferry [--git-dir <path>] [--dock <name>] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028)";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -464,6 +467,40 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
         // Machine output: just the verdict rows, no prose (empty -> no lines).
         OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
         OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
+    }
+    Ok(())
+}
+
+/// `loot ferry` — one bidirectional loot ↔ git mirror pass (GB1, ADR 0028).
+/// A reconciliation verb, so it emits the shared verdict rows for the merge
+/// outcomes when the two sides had diverged (CA3, ADR 0023).
+fn cmd_ferry(args: &[String]) -> Result<(), String> {
+    let fmt = out_fmt(args);
+    let git_dir = flag(args, "--git-dir");
+    let dock = flag(args, "--dock");
+    let mut ws = Workspace::open()?;
+    let report = ferry::run(&mut ws, git_dir, dock)?;
+
+    match fmt {
+        OutFmt::Human => {
+            for note in &report.notes {
+                println!("note: {note}");
+            }
+            if report.ingested == 0 && report.projected == 0 && report.outcomes.is_empty() {
+                println!("ferry: up to date (nothing to ingest or project)");
+            } else {
+                println!(
+                    "ferry: ingested {} git commit(s), projected {} loot change(s)",
+                    report.ingested, report.projected
+                );
+                for (path, outcome) in &report.outcomes {
+                    println!("  {:<24} {}", path.display(), describe(outcome));
+                }
+            }
+        }
+        // Machine output: the merge verdict rows only (empty -> no lines).
+        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&report.outcomes))),
+        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&report.outcomes))),
     }
     Ok(())
 }

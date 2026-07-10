@@ -17,3 +17,4 @@ loot-core.workspace = true
 loot-net.workspace = true
 loot-identity.workspace = true
 blake3.workspace = true
+git2.workspace = true

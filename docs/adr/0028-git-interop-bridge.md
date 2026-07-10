@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted (spec; implementation pending)
+accepted (implemented 2026-07-10 — `loot ferry`, GB1 #105)
 
 ## Context
 

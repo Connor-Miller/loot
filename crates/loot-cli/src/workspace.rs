@@ -660,6 +660,107 @@ impl Workspace {
         Ok(content)
     }
 
+    // --- git interop bridge support (GB1, ADR 0028) ---
+
+    /// The repo's on-disk layout — the bridge keeps its marks/state/config
+    /// under `.loot/git-mirror/` via these paths.
+    pub fn store(&self) -> &RepoStore {
+        &self.store
+    }
+
+    /// The ambient dock's display name (`main` for home).
+    pub fn dock_name(&self) -> &str {
+        &self.dock
+    }
+
+    /// The finalized change the ambient dock sits on, without disturbing any
+    /// in-progress work — the loot side of the bridge's divergence check.
+    pub fn finalized_anchor(&self) -> Option<Oid> {
+        self.anchor()
+    }
+
+    /// SSHSIG-sign `msg` under `namespace` with this repo's keypair (mirrored
+    /// commits sign under `"git"`). Errors on a keyless repo.
+    pub fn ssh_sign(&self, namespace: &str, msg: &[u8]) -> Result<String, String> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or("no identity keypair — run `loot keygen` to generate one")?;
+        signer.ssh_sign(namespace, msg).map_err(|e| e.to_string())
+    }
+
+    /// This repo's OpenSSH public key line, if it has a keypair — seeds the
+    /// bridge's allowed-signers file so `git verify-commit` can check mirrors.
+    pub fn public_key_openssh(&self) -> Option<String> {
+        let comment = format!("{}@loot", self.identity);
+        self.signer.as_ref().and_then(|s| s.public_key_openssh(&comment).ok())
+    }
+
+    /// This repo's author pubkey, if it has a keypair.
+    pub fn author_pubkey(&self) -> Option<[u8; 32]> {
+        self.signer.as_ref().map(|s| s.public_key_bytes())
+    }
+
+    /// Capture and finalize any in-progress work, exactly as `merge_dock` does
+    /// before merging: the bridge calls this before it moves the dock tip, so
+    /// no uncommitted work is stranded under a moved tip.
+    pub fn ferry_capture(&mut self) -> Result<(), String> {
+        if self.working.is_some() {
+            let msg = self
+                .working
+                .as_ref()
+                .and_then(|w| self.repo.change_message(w))
+                .unwrap_or_else(|| "(working change)".to_string());
+            self.snapshot(&msg)?;
+            self.finalize_working()?;
+        }
+        Ok(())
+    }
+
+    /// Fast-forward the ambient dock to `new_tip` (an ingested change that
+    /// descends from the current anchor) and materialize its tree. The bridge's
+    /// no-fork path: git advanced, loot didn't.
+    pub fn ferry_adopt(&mut self, new_tip: &Oid) -> Result<(), String> {
+        let from = self.anchor();
+        self.repo
+            .materialize(from.as_ref(), new_tip, &self.identity, self.now)
+            .map_err(|e| e.to_string())?;
+        if self.docks_active() {
+            self.tip = Some(new_tip.clone());
+            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        }
+        self.store.clear_tree_hash(self.dock_opt());
+        self.persist()
+    }
+
+    /// Merge an ingested head into `ours` (the dock tip the bridge pinned
+    /// before ingest) — `merge_dock`'s reconcile step with the source being
+    /// the bridge instead of a dock. Caller runs [`ferry_capture`] first.
+    /// Conflicts flow through the shared `conflicts`/`resolve` path. Returns
+    /// the per-path outcomes.
+    ///
+    /// [`ferry_capture`]: Workspace::ferry_capture
+    pub fn ferry_merge(
+        &mut self,
+        ours: &Oid,
+        their: &Oid,
+        message: &str,
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        if ours == their {
+            return Ok(BTreeMap::new());
+        }
+        let (merge_id, outcomes) = self
+            .repo
+            .merge_tips(ours, their, message, self.now)
+            .map_err(|e| e.to_string())?;
+        self.working = Some(merge_id.clone());
+        self.finalize_working()?;
+        self.repo
+            .materialize(Some(ours), &merge_id, &self.identity, self.now)
+            .map_err(|e| e.to_string())?;
+        Ok(outcomes)
+    }
+
     /// Every dock with its head and visibility summary, for `loot docks`.
     pub fn dock_list(&self) -> Vec<DockInfo> {
         self.store
@@ -690,6 +791,20 @@ impl Workspace {
             .write_working(self.dock_opt(), self.working.as_ref())
             .map_err(|e| format!("write working: {e}"))
     }
+}
+
+/// Resolve visibility for `path` under an explicit `.lootattributes` text.
+/// The bridge classifies ingested files under the *ingested commit's own*
+/// rules — a commit that adds a sealing rule and the file it seals lands
+/// sealed, exactly as if it had been snapshotted locally (GB1, ADR 0028).
+pub fn visibility_under(attrs_text: &str, path: &str) -> Visibility {
+    Attributes::parse(attrs_text).visibility_for(path)
+}
+
+/// Whether `rel` is excluded under an explicit `.lootignore` text — the
+/// ingest-side twin of the snapshot walk's exclusion (#64).
+pub fn ignored_under(ignore_text: &str, rel: &str) -> bool {
+    Ignore::parse(ignore_text).ignores_file(rel)
 }
 
 /// Store selector for a dock name: `home` maps to the root files (`None`).
@@ -790,7 +905,10 @@ struct Ignore {
 
 impl Ignore {
     fn load(path: &Path) -> Self {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        Self::parse(&std::fs::read_to_string(path).unwrap_or_default())
+    }
+
+    fn parse(text: &str) -> Self {
         let mut globs = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -835,7 +953,10 @@ struct Attributes {
 
 impl Attributes {
     fn load(path: &Path) -> Self {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        Self::parse(&std::fs::read_to_string(path).unwrap_or_default())
+    }
+
+    fn parse(text: &str) -> Self {
         let mut rules = Vec::new();
         for line in text.lines() {
             let line = line.trim();

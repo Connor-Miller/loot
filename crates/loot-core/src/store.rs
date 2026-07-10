@@ -54,6 +54,7 @@ const TIP: &str = "tip";
 const DOCK: &str = "dock";
 const DOCKS: &str = "docks";
 const CONFIG: &str = "config";
+const GIT_MIRROR: &str = "git-mirror";
 
 /// The default dock every repo starts on — the primary directory (ADR 0022
 /// physical model). Its process files are the root `.loot/working`/`tree-hash`/
@@ -124,6 +125,17 @@ impl RepoStore {
     pub fn id(&self) -> PathBuf { self.dot.join(ID) }
     pub fn id_pub(&self) -> PathBuf { self.dot.join(ID_PUB) }
     pub fn peers(&self) -> PathBuf { self.dot.join(PEERS) }
+
+    // --- git interop bridge artifacts (GB1, ADR 0028) ---
+    //
+    // Local-only, like `keyring`/`escrow` — never synced. `marks` and `state`
+    // are rebuildable from commit trailers; the rest is per-machine config.
+    pub fn git_mirror_dir(&self) -> PathBuf { self.dot.join(GIT_MIRROR) }
+    pub fn git_marks(&self) -> PathBuf { self.git_mirror_dir().join("marks") }
+    pub fn git_state(&self) -> PathBuf { self.git_mirror_dir().join("state") }
+    pub fn git_identity_map(&self) -> PathBuf { self.git_mirror_dir().join("identity") }
+    pub fn git_allowed_signers(&self) -> PathBuf { self.git_mirror_dir().join("allowed-signers") }
+    pub fn git_config(&self) -> PathBuf { self.git_mirror_dir().join("config") }
 
     /// Read the working-change id (32 raw bytes) for `dock` if one is in
     /// progress. An absent or malformed file means finalized history.
