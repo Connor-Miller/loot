@@ -102,6 +102,19 @@ attest <change> [role]`.
 **Identity** — a keyholder. Visibility is ultimately enforced by who holds the
 decryption key for a unit of content. "Permissioning is key management."
 
+**Agent identity** *(decided 2026-07-09, ADR 0026)* — an AI agent exists as a
+loot identity via a **persistent clone**: its own repo directory + keypair +
+keyring, cloned from the relay, synced by `push`/`pull`. Ceremony happens once
+at minting (clone, `peer add`, relay allowlist line); an ephemeral session just
+starts in the clone directory — session ≠ identity. One agent identity to
+start, minted freely when more are needed. Bootstrap grants: none — public
+content arrives with the clone; restricted keys are withheld by construction,
+and on-demand grant/maroon is the milestone's audit-trail evidence. The
+genuinely-sealed-from-agents path is `docs/pitch/` (restricted to the dev).
+[[Dock]]s/[[Harbor]] stay the *same-identity* parallelism tool; a per-dock
+identity/keyring split (store as "a relay on your own disk") is a recorded
+post-milestone enhancement, not the current model.
+
 **Sealed content** — the module that owns loot's thesis: encryption, visibility,
 and embargo behind two operations. `seal(bytes, visibility)` produces a
 *Sealed object* plus a freshly-minted content key; `open(sealed, reader, now)`
