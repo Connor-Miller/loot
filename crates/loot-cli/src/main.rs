@@ -1358,9 +1358,13 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
     let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
     // S5: offer our object addresses; the relay replies with the subset it is
     // missing, so we ship only new object bytes (re-push transfers ~0 objects).
-    // Pass heads() as have so bundle_wanted ships only the change delta, not the
-    // full history on every push.
-    let have = ws.repo().heads();
+    //
+    // `have` is what the *relay* already holds — and a relay we push to may hold
+    // none of our history (a first push to a fresh relay), so we cannot assume it
+    // has our heads. Offer everything and let the object-level `wants` negotiation
+    // dedup what it already has; change metadata is small and `stow` is idempotent,
+    // so re-pushes stay cheap even though they re-send the change delta.
+    let have: Vec<Oid> = Vec::new();
     let offered = ws.repo().offered_objects(&have);
     if offered.is_empty() && ws.repo().has_unsigned_tip() {
         return Err(
