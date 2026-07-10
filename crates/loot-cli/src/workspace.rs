@@ -125,6 +125,14 @@ impl Workspace {
         &self.dot
     }
 
+    /// Prune orphaned loose objects from `.loot/objects/` (ADR 0012, #66).
+    /// Delegates to the engine, which owns the object store and the reachability
+    /// walk over the change graph. `dry_run` reports what would be pruned
+    /// without deleting.
+    pub fn gc(&mut self, dry_run: bool) -> Result<loot_core::GcReport, String> {
+        self.repo.gc(&self.dot, dry_run).map_err(|e| e.to_string())
+    }
+
     /// Resolve the visibility for `path` according to `.lootattributes` — the
     /// same rule `snapshot` uses. Returns `Public` if no rule matches.
     pub fn visibility_for(&self, path: &str) -> Visibility {
