@@ -161,9 +161,15 @@ embargoed path this repo holds the key for, deduped against the Manifest (a
 recorded oid→peer grant is never re-deposited, which also makes an interrupted
 deposit loop resumable); `loot grant --relay` on an embargoed path inherits the
 seal's `reveal_at` (a late-added recipient gets a timed grant, never an early
-key); receipt is plain `loot pull-grants` — no new verbs. Remaining: the
-attack demo (#89). With no relay configured, ciphertext syncs and embargoed
-keys simply never reach peers — one `Embargoed` label, one guarantee.
+key); receipt is plain `loot pull-grants` — no new verbs. The attack demo
+(#89) is the scripted proof: `docs/evidence/scripts/attack-demo.ps1` runs an
+adversarial holder against the live relay — an advanced `LOOT_CLOCK`, direct
+`.loot` inspection, and a patched binary (`loot-core` example `patched-client`,
+every client time gate removed) all **fail** to read before `reveal_at`, then
+the read succeeds after the relay releases; output committed at
+`docs/evidence/runs/attack-demo.txt`. With no relay configured, ciphertext
+syncs and embargoed keys simply never reach peers — one `Embargoed` label, one
+guarantee.
 
 **Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
 identities permitted to hold a key). It deliberately does **not** contain any

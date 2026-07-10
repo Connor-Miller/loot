@@ -1,0 +1,101 @@
+=== loot hard-embargo attack demo (#89, ADR 0027) ===
+run started (utc): 2026-07-10 15:33:32Z
+relay:             https://relay.millerbyte.com
+work dir:          C:\Users\conno\AppData\Local\Temp\loot-attack-demo-1783697612
+embargo window:    40s
+
+>>> building binaries (loot release + patched-client example)
+    loot:           C:\Users\conno\source\repos\loot\target\release\loot.exe
+    patched-client: C:\Users\conno\source\repos\loot\target\debug\examples\patched-client.exe
+
+>>> originator: loot init --identity connor
+    initialized empty loot repo at ., identity = connor
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBoaz1KpZgF2ImIiJeOnefVsqpTsrZltrAHvcB9elKnR connor@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=connor`
+
+>>> holder:     loot init --identity holder
+    initialized empty loot repo at ., identity = holder
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJpcRvRsiz7q56jtdVFHjhvP4lEG7PaKCBBr0A+0xWfm holder@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=holder`
+
+reveal_at (unix):  1783697653   (2026-07-10 15:34:13Z)
+
+>>> originator: seal + finalize the embargoed change
+    working change 4ee0e4a5 — "embargoed change"
+      .lootattributes          public
+      embargoed.md             embargoed@1783697653
+    finalized working change; the next `status` starts a fresh one
+
+>>> originator: loot bundle (ciphertext only, no key) -> file
+    wrote C:\Users\conno\AppData\Local\Temp\loot-attack-demo-1783697612\cipher.bundle (639 bytes) — copy it to a peer and `loot apply`
+
+>>> originator: peer add holder + grant --relay (timed deposit)
+    registered peer 'holder'
+    delivered sealed grant for 'holder' via relay https://relay.millerbyte.com
+      embargoed.md → holder (sealed, signed, recorded in manifest)
+      timed: the relay withholds the key until 1783697653 (hard embargo, ADR 0027)
+      recipient runs `loot pull-grants` to receive it
+
+>>> holder: peer add connor + apply the ciphertext bundle
+    registered peer 'connor'
+    applied C:\Users\conno\AppData\Local\Temp\loot-attack-demo-1783697612\cipher.bundle as holder:
+      .lootattributes          converged
+      embargoed.md             converged
+    run `loot surface` to materialize what you may see
+
+================  PRE-REVEAL ATTACKS (must all fail)  ================
+
+>>> attack 1 (lying clock): LOOT_CLOCK >> reveal_at; loot grants + pull-grants
+    no pending grants at https://relay.millerbyte.com
+    no pending grants at https://relay.millerbyte.com
+      .lootattributes                  public
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced 4ee0e4a5 as holder
+PASS: advanced holder clock does not release the key (relay clock gates, not the holder's)
+
+>>> attack 2 (inspection): grep the holder's entire .loot for the plaintext secret
+    scanned 14 file(s) under .loot
+    the plaintext secret appears in NO file under .loot
+    ciphertext objects held: 2 (the holder has the encrypted blob, not the key)
+    escrow file: 6 bytes (empty header = no embargoed key staged)
+PASS: the holder holds only ciphertext: the plaintext secret and key material are absent from .loot
+
+>>> attack 3 (patched binary): read at now = u64::MAX with every gate removed
+    patched client: all time gates removed (flush + read at now = u64::MAX)
+    read FAILED even with every gate removed: not authorized to read Oid([219, 93, 109, 20, 10, 2, 131, 185, 13, 2, 155, 101, 243, 43, 107, 119, 130, 179, 40, 254, 198, 25, 250, 47, 62, 108, 139, 55, 115, 151, 84, 70])
+    nothing to bypass — the key bytes never arrived on this machine
+PASS: a client with the time gate removed still cannot read (no key bytes to bypass)
+
+>>> relay check: loot grants (relay clock still < reveal_at)
+    no pending grants at https://relay.millerbyte.com
+PASS: the relay withholds the grant from its mailbox until its own clock passes reveal_at
+
+waiting 50s for the relay clock to pass reveal_at...
+
+================  POST-REVEAL READ (must succeed)  ================
+
+>>> holder: loot pull-grants + surface (relay has now released the key)
+    applied 1/1 grant(s) from https://relay.millerbyte.com
+    run `loot surface` to materialize newly-accessible content
+      .lootattributes                  public
+      embargoed.md                     embargoed@1783697653
+    surfaced 4ee0e4a5 as holder
+PASS: after reveal_at the relay delivers the key and the holder reads the embargoed change normally
+
+================  TRUST CLAIM (ADR 0027)  ================
+The claim is HOLDER-adversary-proof: no holder -- with an advanced clock, a
+patched binary, or direct disk inspection -- can read an embargoed change
+before reveal_at, because the key bytes are never on the holder's machine;
+they sit at the relay, ECIES-wrapped, until the RELAY's clock releases them.
+
+Residual trust: early release requires the RELAY OPERATOR -- a distinct role
+that holds only wrapped blobs it cannot read. In THIS demo the operator is
+the dev (operator = holder-of-the-VPS = the same person running loot), stated
+openly. Removing even that trust (drand timelock) is the recorded
+post-milestone hardening; the holder-adversary claim does not depend on it.
+
+================  RESULT  ================
+ALL CHECKS PASSED -- embargo is holder-adversary-proof against the live relay.
+run finished (utc): 2026-07-10 15:34:24Z
