@@ -37,7 +37,7 @@ under `issues/`. Verification runs in Connor's Rust/git environment.
 
 Spec written as two repo deliverables (not `.scratch/`):
 
-- **`docs/adr/0026-git-interop-bridge.md`** — the decision record: symmetry &
+- **`docs/adr/0028-git-interop-bridge.md`** — the decision record: symmetry &
   visibility boundary, change↔commit/DAG mapping + trailers + deterministic dates,
   identity map + SSH signing, loot-as-merge-authority reconciliation, and the
   `loot ferry` / git2 / mark-map mechanism, with considered alternatives and

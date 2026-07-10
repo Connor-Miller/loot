@@ -1,10 +1,10 @@
 # GB1 — git interop bridge: bidirectional loot ↔ git mirror (`loot ferry`)
 
-**Type:** (mostly) AFK · **Priority:** near · **Source:** ADR 0026; wayfinder
+**Type:** (mostly) AFK · **Priority:** near · **Source:** ADR 0028; wayfinder
 `.scratch/git-interop-bridge/` 2026-07-09.
 
 > Spec sharpened by the `.scratch/git-interop-bridge/` wayfinder map (tickets
-> 01–06). All design + mechanism decisions are pinned — see ADR 0026 for full
+> 01–06). All design + mechanism decisions are pinned — see ADR 0028 for full
 > rationale. Implementation-ready.
 
 ## What to build
@@ -85,4 +85,4 @@ stays canonical and permission-authoritative.
 
 ## Blocked by
 
-- None — implementation-ready per ADR 0026.
+- None — implementation-ready per ADR 0028.

@@ -1,4 +1,4 @@
-# PR: git interop bridge — design + spec (ADR 0026)
+# PR: git interop bridge — design + spec (ADR 0028)
 
 **Planning/spec only — no implementation.** Adds the design for a bidirectional
 loot ↔ git mirror, charted via wayfinder.
@@ -13,7 +13,7 @@ implementation-ready spec.
 
 ## What's included
 
-- `docs/adr/0026-git-interop-bridge.md` — decision record (symmetry & visibility
+- `docs/adr/0028-git-interop-bridge.md` — decision record (symmetry & visibility
   boundary, change↔commit/DAG mapping, identity + SSH signing, reconciliation,
   mechanism; with alternatives + consequences).
 - `issues/GB1-git-interop-bridge.md` — implementation-ready ticket: what to build,

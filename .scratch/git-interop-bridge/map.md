@@ -93,7 +93,7 @@ _Nothing left._ All seven tickets are resolved.
 
 **Map status: destination reached — route fully walked.** Every design and
 mechanism decision is pinned and the hand-off spec exists:
-[docs/adr/0026-git-interop-bridge.md](../../docs/adr/0026-git-interop-bridge.md)
+[docs/adr/0028-git-interop-bridge.md](../../docs/adr/0028-git-interop-bridge.md)
 (decision record) and [issues/GB1-git-interop-bridge.md](../../issues/GB1-git-interop-bridge.md)
 (implementation-ready ticket + test plan). Next step is implementation, not
 wayfinding.
