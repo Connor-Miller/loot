@@ -76,7 +76,7 @@ usage:
   loot init [--identity <name>]             initialize a repo here (identity from global config if omitted)
   loot clone <url> <dir> [--identity <name>]  clone a relay into <dir>
   loot config [set <key> <val>] [unset <key>] [list]  manage global config (~/.config/loot/config)
-  loot status [-m <message>] [--porcelain|--json]  snapshot the working tree into the working change
+  loot status [-m <message>] [--porcelain|--json] [--allow-demote <path>]...  snapshot the working tree into the working change
   loot describe -m <message>                name the working change
   loot new                                  finalize the working change; start a fresh one
   loot surface                              materialize what the current identity may see
@@ -127,6 +127,15 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn message_flag(args: &[String]) -> Option<&str> {
     flag(args, "-m").or_else(|| flag(args, "--message"))
+}
+
+/// Every value following an occurrence of `name` — for repeatable flags like
+/// `--allow-demote a.txt --allow-demote b.txt`.
+fn flag_values(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == name)
+        .map(|w| w[1].clone())
+        .collect()
 }
 
 /// Machine-output selector for the reconciliation verbs (CA3, ADR 0023).
@@ -217,7 +226,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     // Snapshot first (JJ: the tree IS the change), then report it.
     let message = message_flag(args).unwrap_or("(working change)");
-    let (id, entries) = ws.snapshot(message)?;
+    let allow_demote: Vec<std::path::PathBuf> =
+        flag_values(args, "--allow-demote").into_iter().map(Into::into).collect();
+    let (id, entries) = ws.snapshot_allowing(message, &allow_demote)?;
     match fmt {
         OutFmt::Human => {
             if entries.is_empty() {
