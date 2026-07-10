@@ -701,7 +701,18 @@ pub struct DockInfo {
     pub current: bool,
 }
 
+/// The workspace clock (unix seconds). `LOOT_CLOCK` overrides it when set —
+/// deliberately: the client clock is an input the embargo design must survive
+/// (the relay never reads it; there is no clock field on the wire, ADR 0027),
+/// so letting a holder lie with it is not a weakening but the attack demo's
+/// first exhibit (#89). Everything a lying clock gates locally (Escrow flush,
+/// embargo checks in `open`) fails anyway for lack of key bytes.
 fn real_now() -> u64 {
+    if let Ok(fake) = std::env::var("LOOT_CLOCK") {
+        if let Ok(t) = fake.parse() {
+            return t;
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

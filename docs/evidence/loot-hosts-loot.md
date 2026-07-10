@@ -13,9 +13,9 @@ content in the repo the thesis is about.
 
 - [x] #61 — `.lootattributes` forward-slash globs fail open to Public on Windows
 - [x] #62 — attributes edit silently demotes restricted content to Public
-- [ ] #64 — `.lootignore` (pilot: one stray `status` sealed 38 MB of `target/`)
+- [x] #64 — `.lootignore` (pilot: one stray `status` sealed 38 MB of `target/`)
 - [x] #65 — spurious conflict on content neither side edited
-- [ ] #66 — `loot gc` regression (merged in #17, gone from the CLI)
+- [x] #66 — `loot gc` regression (merged in #17, gone from the CLI)
 
 #61/#62 gate every sealed-path claim (a fail-open seal is theater); the rest
 gate daily driving (per the #56 pilot, a day fighting these is not a day of
@@ -59,12 +59,17 @@ that log is dogfood data, not failure.
 
 - [x] #14 — engine/wire: timed SealedGrant deposit, relay withholding,
       `FORMAT_MAJOR` bump
-- [ ] #88 — CLI: push deposits timed grants; `pull-grants` files revealed keys
-- [ ] **Attack-demo script (#89)**: a holder with an advanced clock, direct
+- [x] #88 — CLI: push deposits timed grants; `pull-grants` files revealed keys
+- [x] **Attack-demo script (#89)**: a holder with an advanced clock, direct
       `.loot/escrow` inspection, and a patched binary **fails** to read the
       embargoed change before `reveal_at`, then reads it after the relay
-      releases. Captured output committed.
-- [ ] Honesty statement in the captured output: the claim is
+      releases. Script `scripts/attack-demo.ps1`, captured output
+      `runs/attack-demo.txt` (run 2026-07-10 against the live VPS relay; all
+      three pre-reveal attacks failed, post-reveal read succeeded). The demo is
+      **mailbox-only** — the timed SealedGrant is deposited to the holder's
+      pubkey-addressed mailbox (self-draining) and the ciphertext travels as an
+      out-of-band bundle file, so nothing is stowed into the relay's shared DAG.
+- [x] Honesty statement in the captured output: the claim is
       **holder**-adversary-proof; residual trust is the relay operator
       releasing on time, and in this demo operator = dev (ADR 0027).
 
