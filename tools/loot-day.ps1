@@ -98,8 +98,13 @@ try {
     #    checkout's main first, then let loot ingest/reconcile/project.
     $ferryLine = '(mirror missing - ferry skipped; bind with: loot ferry --git-dir .loot/git-mirror/mirror.git)'
     if (Test-Path $Mirror) {
+        # Forced on purpose: this checkout is authoritative for the mirror's
+        # main (ferry re-points main at the loot dock tip after projecting, so
+        # a plain push stops fast-forwarding as soon as loot is ever ahead).
+        # Nothing is lost - every projected commit stays reachable under the
+        # mirror's refs/loot/* namespace, and the mirror is local-only.
         Write-Host ">>> git push (private mirror) main"
-        git push --quiet "$Mirror" main:refs/heads/main
+        git push --quiet --force "$Mirror" main:refs/heads/main
         Write-Host ">>> loot ferry"
         $ferryOut = (& $Loot ferry --git-dir .loot/git-mirror/mirror.git 2>&1 | Out-String)
         Write-Host $ferryOut

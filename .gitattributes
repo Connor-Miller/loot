@@ -1,0 +1,6 @@
+# No line-ending conversion, ever: the working tree must be byte-identical
+# to the blobs so the co-located git bridge (`loot ferry`, ADR 0028) can
+# recognize pulled content as already-ingested. With autocrlf smudging, the
+# same file has different bytes on disk (CRLF) and in git (LF), and every
+# ferry capture spuriously diverges from every ingest.
+* -text
