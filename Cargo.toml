@@ -31,5 +31,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["reusable_secrets", "static_secrets"] }
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
+# git plumbing for the interop bridge (`loot ferry`, ADR 0028). Objects + refs
+# only — loot does the merge — so the network transports stay switched off.
+git2 = { version = "0.19", default-features = false }
 rand = "0.8"
 chacha20poly1305 = "0.10"

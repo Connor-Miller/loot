@@ -1,0 +1,1107 @@
+//! `loot ferry` — the bidirectional loot ↔ git mirror driver (GB1, ADR 0028).
+//!
+//! One deliberate pass: **ingest** git-native commits from the mirrored branch
+//! as loot changes (sealing at ingest via `.lootattributes`), **reconcile**
+//! them into the ambient dock with loot's converge classifier (loot is the
+//! merge authority — git never merges), then **project** every travel-worthy
+//! loot change to a git commit carrying `Loot-*` trailers, with every head
+//! reachable under `refs/loot/heads/*` and `refs/heads/main` tracking the
+//! designated dock. Sealed / unreadable paths are omitted from git entirely.
+//!
+//! The spine is the mark map (sha ↔ change-id ↔ origin) plus last-synced
+//! pointers, both local-only under `.loot/git-mirror/` and rebuildable from
+//! trailers. The pure formats live in `loot_core::bridge`; this module owns
+//! the git2 plumbing.
+
+use crate::workspace::Workspace;
+use loot_core::bridge::{
+    self, FerryState, MarkMap, MarkOrigin, TRAILER_AUTHOR, TRAILER_CHANGE_ID, TRAILER_GIT_AUTHOR,
+    TRAILER_SIGNATURE,
+};
+use loot_core::{hex, MergeOutcome, Oid, Repo, RepoError, Visibility};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// The branch the bridge mirrors and ingests from (v1 watches exactly one).
+const MAIN_REF: &str = "refs/heads/main";
+/// SSHSIG namespace for git commit signing (what `git verify-commit` expects).
+const GIT_SIG_NAMESPACE: &str = "git";
+
+/// What one ferry pass did, for CLI reporting.
+#[derive(Default)]
+pub struct FerryReport {
+    /// git-native commits ingested as loot changes.
+    pub ingested: usize,
+    /// loot changes projected as git commits.
+    pub projected: usize,
+    /// Per-path outcomes when the pass had to merge diverged sides.
+    pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
+    /// Human-relevant events (baseline adoption, skipped main update, ...).
+    pub notes: Vec<String>,
+}
+
+/// Run one bidirectional reconcile pass. `git_dir_flag`/`dock_flag` override
+/// (and persist to) the mirror config under `.loot/git-mirror/config`.
+pub fn run(
+    ws: &mut Workspace,
+    git_dir_flag: Option<&str>,
+    dock_flag: Option<&str>,
+) -> Result<FerryReport, String> {
+    let mut report = FerryReport::default();
+    let mirror_dir = ws.store().git_mirror_dir();
+    std::fs::create_dir_all(&mirror_dir).map_err(|e| format!("create {}: {e}", mirror_dir.display()))?;
+
+    // --- config: where the mirror lives, which dock main tracks ---
+    let cfg_path = ws.store().git_config();
+    let mut cfg = parse_kv(&read_or_empty(&cfg_path));
+    if let Some(dir) = git_dir_flag {
+        cfg.insert("gitdir".into(), dir.into());
+    }
+    if let Some(dock) = dock_flag {
+        cfg.insert("dock".into(), dock.into());
+    }
+    let git_dir = cfg
+        .get("gitdir")
+        .cloned()
+        .ok_or("no mirror bound — run `loot ferry --git-dir <path>` once to bind one")?;
+    let main_dock = cfg.get("dock").cloned().unwrap_or_else(|| "main".to_string());
+    write_kv(&cfg_path, &cfg)?;
+
+    // --- open (or create, bare) the git side ---
+    let git = match git2::Repository::open(&git_dir) {
+        Ok(r) => r,
+        Err(_) if !Path::new(&git_dir).exists() => {
+            report.notes.push(format!("initialized bare mirror at {git_dir}"));
+            git2::Repository::init_bare(&git_dir).map_err(|e| format!("init mirror: {e}"))?
+        }
+        Err(e) => return Err(format!("open git mirror {git_dir}: {e}")),
+    };
+
+    // --- identity map + allowed-signers (seeded once, kept local) ---
+    let mut id_map = parse_kv(&read_or_empty(&ws.store().git_identity_map()));
+    if let Some(pk) = ws.author_pubkey() {
+        let pk_hex = hex::encode(&pk);
+        if !id_map.contains_key(&pk_hex) {
+            let (name, email) = self_name_email(ws, &git);
+            id_map.insert(pk_hex, format!("{name} <{email}>"));
+            write_kv(&ws.store().git_identity_map(), &id_map)?;
+        }
+        if let Some(pub_line) = ws.public_key_openssh() {
+            let (_, email) = self_name_email(ws, &git);
+            let signers = format!("{email} namespaces=\"{GIT_SIG_NAMESPACE}\" {pub_line}\n");
+            std::fs::write(ws.store().git_allowed_signers(), signers)
+                .map_err(|e| format!("write allowed-signers: {e}"))?;
+        }
+    }
+
+    // --- marks + state (rebuild loot-origin marks from trailers if lost) ---
+    let marks_path = ws.store().git_marks();
+    let mut marks = if marks_path.exists() {
+        MarkMap::parse(&read_or_empty(&marks_path))?
+    } else {
+        let rebuilt = rebuild_marks(ws, &git)?;
+        if !rebuilt.is_empty() {
+            report
+                .notes
+                .push(format!("rebuilt {} mark(s) from commit trailers", rebuilt.len()));
+        }
+        rebuilt
+    };
+    let state_path = ws.store().git_state();
+    let had_state = state_path.exists();
+    let mut state = FerryState::parse(&read_or_empty(&state_path))?;
+
+    // Promote any due embargoed keys before reading content, as every
+    // content-reading verb does (ADR 0007) — a due path projects readable.
+    let now = ws.now();
+    ws.with_repo(|repo| {
+        repo.flush_escrow(now);
+        Ok(())
+    })?;
+
+    // Bootstrap: pre-bridge git history (no trailers, no state) is adopted as
+    // the baseline, not ingested — the dogfood repo's dual-run past stays
+    // git's. The baseline commit is marked as standing for the current dock
+    // anchor, so later git-native commits on top of it parent-map exactly and
+    // pre-bridge loot history is never re-projected as a parallel root.
+    let main_tip = git
+        .find_reference(MAIN_REF)
+        .ok()
+        .and_then(|r| r.target())
+        .map(|o| o.to_string());
+    if !had_state && marks.is_empty() {
+        if let (Some(sha), Some(anchor)) = (&main_tip, ws.finalized_anchor()) {
+            state.git_main = Some(sha.clone());
+            marks.insert(sha.clone(), anchor, MarkOrigin::Git);
+            report.notes.push(format!(
+                "adopted existing git history at {} as the pre-bridge baseline (not ingested)",
+                &sha[..12.min(sha.len())]
+            ));
+        }
+    }
+    // The last-agreement tree, for holding conflicted paths at their last
+    // clean state in git (captured before this pass moves the pointer).
+    let last_clean_sha = state.git_main.clone();
+
+    // --- ingest: new commits on the mirrored branch ---
+    if let Some(tip) = &main_tip {
+        let new_shas = walk_new_commits(&git, tip, &marks, state.git_main.as_deref())?;
+        // Capture in-progress work BEFORE ingesting: the pre-dock home forks
+        // its snapshots from all heads, so capturing after ingest would fold
+        // the two lines together without the converge classifier seeing them.
+        if !new_shas.is_empty() {
+            ws.ferry_capture()?;
+        }
+        // The loot side of the divergence check, pinned before ingest — an
+        // ingested change becomes a graph head itself, so the post-ingest
+        // anchor can't tell fast-forward from true divergence.
+        let ours = ws.finalized_anchor();
+        for sha in new_shas {
+            ingest_commit(ws, &git, &sha, &mut marks, &id_map, &mut report)?;
+        }
+
+        // --- reconcile: advance the ambient dock to cover the git side ---
+        if let Some((target, _)) = marks.change_for(tip).cloned() {
+            match ours {
+                None => ws.ferry_adopt(&target)?,
+                // git behind loot: projection moves main below, nothing here.
+                Some(ref o) if *o == target || is_ancestor(ws, &target, o) => {}
+                Some(ref o) if is_ancestor(ws, o, &target) => ws.ferry_adopt(&target)?,
+                Some(ref o) => {
+                    report.outcomes = ws.ferry_merge(o, &target, "ferry: reconcile git main")?;
+                }
+            }
+        }
+    }
+
+    // --- project: every travel-worthy change gets a mirrored commit ---
+    let last_clean_tree = last_clean_sha
+        .as_deref()
+        .and_then(|sha| git2::Oid::from_str(sha).ok())
+        .and_then(|oid| git.find_commit(oid).ok())
+        .and_then(|c| c.tree().ok());
+    let generations = generations(ws);
+    // Everything a mark (or an ancestor of one) already stands for is
+    // represented in git — marked changes map 1:1, and their ancestry is the
+    // pre-bridge history the bootstrap baseline covers wholesale.
+    let represented = ancestor_closure(ws, marks.change_ids());
+    for id in ws.repo().change_ids_topo() {
+        if represented.contains(&id) {
+            continue;
+        }
+        // The ephemeral working change never travels (ADR 0018).
+        if ws.repo().change_author(&id).is_some() && ws.repo().change_signature(&id).is_none() {
+            continue;
+        }
+        let sha = project_change(ws, &git, &id, &marks, &generations, last_clean_tree.as_ref(), &id_map)?;
+        marks.insert(sha, id, MarkOrigin::Loot);
+        report.projected += 1;
+    }
+
+    // --- refs: heads, docks, and the designated-dock main ---
+    update_loot_refs(ws, &git, &marks)?;
+    let dock_sel = |name: &str| if name == "main" { None } else { Some(name.to_string()) };
+    let main_target = if ws.dock_name() == main_dock {
+        ws.finalized_anchor()
+    } else {
+        ws.store().read_tip(dock_sel(&main_dock).as_deref())
+    };
+    if let Some(tip_change) = main_target {
+        if let Some(sha) = marks.sha_for(&tip_change) {
+            let oid = git2::Oid::from_str(sha).map_err(|e| e.to_string())?;
+            let main_checked_out = !git.is_bare()
+                && git.head().ok().and_then(|h| h.name().map(String::from)).as_deref()
+                    == Some(MAIN_REF);
+            if main_checked_out {
+                report.notes.push(
+                    "main is checked out in the mirror — left to git (refs/loot/* updated)".into(),
+                );
+            } else {
+                git.reference(MAIN_REF, oid, true, "loot ferry")
+                    .map_err(|e| format!("update main: {e}"))?;
+                if git.is_bare() {
+                    let _ = git.set_head(MAIN_REF);
+                }
+            }
+        }
+    }
+
+    // --- persist the spine ---
+    state.git_main = git
+        .find_reference(MAIN_REF)
+        .ok()
+        .and_then(|r| r.target())
+        .map(|o| o.to_string());
+    state.loot_heads = ws.repo().heads();
+    std::fs::write(&marks_path, marks.encode()).map_err(|e| format!("write marks: {e}"))?;
+    std::fs::write(&state_path, state.encode()).map_err(|e| format!("write state: {e}"))?;
+    Ok(report)
+}
+
+// --- ingest ---
+
+/// The mirrored branch's commits not yet known to the bridge, parents first.
+fn walk_new_commits(
+    git: &git2::Repository,
+    tip: &str,
+    marks: &MarkMap,
+    baseline: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut rw = git.revwalk().map_err(|e| e.to_string())?;
+    rw.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+        .map_err(|e| e.to_string())?;
+    rw.push(git2::Oid::from_str(tip).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    for sha in marks.shas() {
+        if let Ok(oid) = git2::Oid::from_str(sha) {
+            let _ = rw.hide(oid);
+        }
+    }
+    if let Some(sha) = baseline {
+        if let Ok(oid) = git2::Oid::from_str(sha) {
+            let _ = rw.hide(oid);
+        }
+    }
+    let mut out = Vec::new();
+    for oid in rw {
+        out.push(oid.map_err(|e| e.to_string())?.to_string());
+    }
+    Ok(out)
+}
+
+/// Ingest one new commit: a trailered commit maps straight back to its change
+/// (lossless round-trip); a git-native commit becomes a loot change sealed at
+/// ingest via `.lootattributes` (ADR 0028).
+fn ingest_commit(
+    ws: &mut Workspace,
+    git: &git2::Repository,
+    sha: &str,
+    marks: &mut MarkMap,
+    id_map: &BTreeMap<String, String>,
+    report: &mut FerryReport,
+) -> Result<(), String> {
+    if marks.contains_sha(sha) {
+        return Ok(());
+    }
+    let commit = git
+        .find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let message = String::from_utf8_lossy(commit.message_bytes()).to_string();
+
+    // Trailer short-circuit: this commit *is* a loot change we projected.
+    if let Some(id_hex) = bridge::parse_trailer(&message, TRAILER_CHANGE_ID) {
+        let id = bridge::parse_oid_hex(&id_hex)
+            .ok_or_else(|| format!("commit {sha}: malformed {TRAILER_CHANGE_ID} trailer"))?;
+        if ws.repo().change_tree(&id).is_none() {
+            return Err(format!(
+                "commit {} names loot change {} which this repo does not have — \
+                 is the mirror bound to a different loot repo?",
+                &sha[..12],
+                hex::short(&id.0, 8)
+            ));
+        }
+        marks.insert(sha.to_string(), id, MarkOrigin::Loot);
+        return Ok(());
+    }
+
+    // Map git parents to loot parents (the pre-bridge baseline carries a mark
+    // standing for the dock anchor it was adopted against).
+    let mut parents_loot: Vec<Oid> = Vec::new();
+    for parent in commit.parent_ids() {
+        let p_sha = parent.to_string();
+        if let Some((pid, _)) = marks.change_for(&p_sha) {
+            parents_loot.push(pid.clone());
+        } else {
+            return Err(format!(
+                "commit {}: parent {} is unknown to the bridge — \
+                 delete .loot/git-mirror/marks to rebuild, or re-run after syncing",
+                &sha[..12],
+                &p_sha[..12]
+            ));
+        }
+    }
+    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = parents_loot
+        .first()
+        .and_then(|p| ws.repo().change_tree(p))
+        .unwrap_or_default();
+
+    // Diff against the first git parent — only touched paths re-seal (#98).
+    let commit_tree = commit.tree().map_err(|e| e.to_string())?;
+    let parent_git_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let diff = git
+        .diff_tree_to_tree(parent_git_tree.as_ref(), Some(&commit_tree), None)
+        .map_err(|e| e.to_string())?;
+
+    // Classification happens at ingest under the *ingested commit's own*
+    // policy files, so a commit that adds a sealing rule plus the file it
+    // seals lands sealed (ADR 0028; the fresh-clone lesson from #62).
+    let attrs_text = blob_text(git, &commit_tree, ".lootattributes");
+    let ignore_text = blob_text(git, &commit_tree, ".lootignore");
+
+    enum Act {
+        Put { bytes: Vec<u8>, vis: Visibility },
+        Reuse { entry: (Oid, Visibility) },
+        Remove,
+    }
+    let mut acts: Vec<(PathBuf, Act)> = Vec::new();
+    for delta in diff.deltas() {
+        let (old_path, new_path) = (delta.old_file().path(), delta.new_file().path());
+        match delta.status() {
+            git2::Delta::Deleted => {
+                if let Some(p) = old_path {
+                    acts.push((p.to_path_buf(), Act::Remove));
+                }
+            }
+            git2::Delta::Added | git2::Delta::Modified | git2::Delta::Typechange
+            | git2::Delta::Renamed | git2::Delta::Copied => {
+                if delta.status() == git2::Delta::Renamed {
+                    if let Some(p) = old_path {
+                        if old_path != new_path {
+                            acts.push((p.to_path_buf(), Act::Remove));
+                        }
+                    }
+                }
+                let Some(p) = new_path else { continue };
+                let rel = p.to_string_lossy().replace('\\', "/");
+                if crate::workspace::ignored_under(&ignore_text, &rel) {
+                    continue;
+                }
+                let blob = match git.find_blob(delta.new_file().id()) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        report.notes.push(format!(
+                            "commit {}: skipped non-blob entry at {rel} (submodule?)",
+                            &sha[..12]
+                        ));
+                        continue;
+                    }
+                };
+                let bytes = blob.content().to_vec();
+                let vis = crate::workspace::visibility_under(&attrs_text, &rel);
+                if let Some(old_entry) = parent_tree.get(p) {
+                    let readable = ws
+                        .repo()
+                        .get(&old_entry.0, ws.identity(), ws.now());
+                    match readable {
+                        Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => {
+                            return Err(format!(
+                                "commit {}: git edit would clobber sealed content at {rel} — \
+                                 the mirror never held this path; refusing",
+                                &sha[..12]
+                            ));
+                        }
+                        Ok(old_bytes) => {
+                            if demotes(&old_entry.1, &vis) {
+                                return Err(format!(
+                                    "commit {}: ingesting {rel} would demote its visibility — \
+                                     restore the .lootattributes rule before ferrying",
+                                    &sha[..12]
+                                ));
+                            }
+                            if old_bytes == bytes && old_entry.1 == vis {
+                                acts.push((p.to_path_buf(), Act::Reuse { entry: old_entry.clone() }));
+                                continue;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                acts.push((p.to_path_buf(), Act::Put { bytes, vis }));
+            }
+            _ => {}
+        }
+    }
+
+    // Authorship: the syncing identity when the git author resolves to it;
+    // otherwise an unauthored change preserving the git author (ADR 0028).
+    let author_sig = commit.author();
+    let author_str = format!(
+        "{} <{}>",
+        author_sig.name().unwrap_or(""),
+        author_sig.email().unwrap_or("")
+    );
+    let self_hex = ws.author_pubkey().map(|pk| hex::encode(&pk));
+    let is_self = self_hex
+        .as_ref()
+        .and_then(|h| id_map.get(h))
+        .is_some_and(|v| *v == author_str);
+
+    let loot_message = if is_self {
+        bridge::strip_trailers(&message)
+    } else {
+        bridge::append_trailers(
+            &bridge::strip_trailers(&message),
+            &[(TRAILER_GIT_AUTHOR, author_str.clone())],
+        )
+    };
+
+    let change_id = ws.with_repo(|repo| {
+        let mut tree = parent_tree.clone();
+        for (path, act) in acts {
+            match act {
+                Act::Remove => {
+                    tree.remove(&path);
+                }
+                Act::Reuse { entry } => {
+                    tree.insert(path, entry);
+                }
+                Act::Put { bytes, vis } => {
+                    let oid = repo.put(&bytes, vis.clone()).map_err(|e| e.to_string())?;
+                    tree.insert(path, (oid, vis));
+                }
+            }
+        }
+        let change = loot_core::Change {
+            id: Oid([0; 32]),
+            parents: parents_loot.clone(),
+            message: loot_message.clone(),
+            tree,
+        };
+        if is_self {
+            repo.record(change).map_err(|e| e.to_string())
+        } else {
+            repo.record_unauthored(change).map_err(|e| e.to_string())
+        }
+    })?;
+    if is_self {
+        ws.sign_change(&change_id)?;
+    }
+    marks.insert(sha.to_string(), change_id, MarkOrigin::Git);
+    report.ingested += 1;
+    Ok(())
+}
+
+// --- project ---
+
+/// Project one loot change as a git commit: surfaced tree only (sealed paths
+/// omitted — no filename, no bytes), `Loot-*` trailers, deterministic dates,
+/// SSHSIG-signed when the repo has a keypair. A path with an unresolved
+/// conflict is held at its last clean git state (ADR 0028).
+fn project_change(
+    ws: &Workspace,
+    git: &git2::Repository,
+    id: &Oid,
+    marks: &MarkMap,
+    generations: &BTreeMap<Oid, u64>,
+    last_clean: Option<&git2::Tree>,
+    id_map: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let repo = ws.repo();
+    let change_tree = repo
+        .change_tree(id)
+        .ok_or_else(|| format!("unknown change {}", hex::short(&id.0, 8)))?;
+    let conflicts = repo.conflicts();
+
+    let mut entries: Vec<(String, git2::Oid)> = Vec::new();
+    for (path, (oid, _vis)) in &change_tree {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        if conflicts.contains_key(path) {
+            // Held back: project the last clean content, or omit if it never
+            // reached git. The resolution change will carry the real content.
+            if let Some(tree) = last_clean {
+                if let Ok(entry) = tree.get_path(Path::new(&rel)) {
+                    entries.push((rel, entry.id()));
+                }
+            }
+            continue;
+        }
+        match repo.get(oid, ws.identity(), ws.now()) {
+            Ok(bytes) => {
+                let blob = git.blob(&bytes).map_err(|e| e.to_string())?;
+                entries.push((rel, blob));
+            }
+            Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let tree_oid = write_git_tree(git, &entries)?;
+    let tree = git.find_tree(tree_oid).map_err(|e| e.to_string())?;
+
+    let mut parent_commits = Vec::new();
+    for p in repo.parents_of(id) {
+        let sha = marks.sha_for(&p).ok_or_else(|| {
+            format!(
+                "change {}: parent {} has no mirrored commit yet",
+                hex::short(&id.0, 8),
+                hex::short(&p.0, 8)
+            )
+        })?;
+        parent_commits.push(
+            git.find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+
+    let (name, email) = author_name_email(ws, repo.change_author(id), id_map);
+    let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
+    let sig = git2::Signature::new(&name, &email, &when).map_err(|e| e.to_string())?;
+
+    let mut trailers: Vec<(&str, String)> = vec![(TRAILER_CHANGE_ID, hex::encode(&id.0))];
+    if let Some(author) = repo.change_author(id) {
+        trailers.push((TRAILER_AUTHOR, hex::encode(&author)));
+    }
+    if let Some(sig64) = repo.change_signature(id) {
+        trailers.push((TRAILER_SIGNATURE, hex::encode(&sig64)));
+    }
+    let message = bridge::append_trailers(
+        &repo.change_message(id).unwrap_or_default(),
+        &trailers,
+    );
+
+    let oid = if ws.author_pubkey().is_some() {
+        let buf = git
+            .commit_create_buffer(&sig, &sig, &message, &tree, &parent_refs)
+            .map_err(|e| e.to_string())?;
+        let content = std::str::from_utf8(&buf)
+            .map_err(|_| "commit buffer is not utf-8".to_string())?;
+        let ssh_sig = ws.ssh_sign(GIT_SIG_NAMESPACE, content.as_bytes())?;
+        git.commit_signed(content, &ssh_sig, None)
+            .map_err(|e| e.to_string())?
+    } else {
+        git.commit(None, &sig, &sig, &message, &tree, &parent_refs)
+            .map_err(|e| e.to_string())?
+    };
+    Ok(oid.to_string())
+}
+
+/// Build a (possibly nested) git tree from flat `path -> blob` entries.
+fn write_git_tree(git: &git2::Repository, entries: &[(String, git2::Oid)]) -> Result<git2::Oid, String> {
+    // Group this level's files and subdirectories.
+    let mut files: Vec<(&str, git2::Oid)> = Vec::new();
+    let mut dirs: BTreeMap<&str, Vec<(String, git2::Oid)>> = BTreeMap::new();
+    for (path, oid) in entries {
+        match path.split_once('/') {
+            None => files.push((path, *oid)),
+            Some((dir, rest)) => dirs.entry(dir).or_default().push((rest.to_string(), *oid)),
+        }
+    }
+    let mut builder = git.treebuilder(None).map_err(|e| e.to_string())?;
+    for (name, oid) in files {
+        builder.insert(name, oid, 0o100644).map_err(|e| e.to_string())?;
+    }
+    for (dir, children) in dirs {
+        let sub = write_git_tree(git, &children)?;
+        builder.insert(dir, sub, 0o040000).map_err(|e| e.to_string())?;
+    }
+    builder.write().map_err(|e| e.to_string())
+}
+
+// --- refs ---
+
+/// Point `refs/loot/heads/<id>` at every mirrored head (and prune stale ones),
+/// plus `refs/loot/docks/<name>` at each dock's mirrored tip. Mechanical
+/// reachability handles, not branches (ADR 0022 stands).
+fn update_loot_refs(ws: &Workspace, git: &git2::Repository, marks: &MarkMap) -> Result<(), String> {
+    let mut live: Vec<String> = Vec::new();
+    for head in ws.repo().heads() {
+        if let Some(sha) = marks.sha_for(&head) {
+            let name = format!("refs/loot/heads/{}", hex::encode(&head.0));
+            let oid = git2::Oid::from_str(sha).map_err(|e| e.to_string())?;
+            git.reference(&name, oid, true, "loot ferry").map_err(|e| e.to_string())?;
+            live.push(name);
+        }
+    }
+    if let Ok(refs) = git.references_glob("refs/loot/heads/*") {
+        let stale: Vec<String> = refs
+            .flatten()
+            .filter_map(|r| r.name().map(String::from))
+            .filter(|n| !live.contains(n))
+            .collect();
+        for name in stale {
+            if let Ok(mut r) = git.find_reference(&name) {
+                let _ = r.delete();
+            }
+        }
+    }
+    for info in ws.dock_list() {
+        let Some(head) = info.head else { continue };
+        if let Some(sha) = marks.sha_for(&head) {
+            let name = format!("refs/loot/docks/{}", info.name);
+            let oid = git2::Oid::from_str(sha).map_err(|e| e.to_string())?;
+            git.reference(&name, oid, true, "loot ferry").map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+// --- marks rebuild ---
+
+/// Rebuild the mark map from `Loot-Change-Id` trailers across every ref — the
+/// recovery path for a lost `.loot/git-mirror/marks` (AC: loot-origin entries
+/// rebuild with no data loss). Git-origin commits carry no trailer; they are
+/// re-matched by mapped parents + message so a rebuild doesn't re-ingest them.
+fn rebuild_marks(ws: &Workspace, git: &git2::Repository) -> Result<MarkMap, String> {
+    let mut marks = MarkMap::new();
+    let mut rw = match git.revwalk() {
+        Ok(rw) => rw,
+        Err(_) => return Ok(marks),
+    };
+    rw.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+        .map_err(|e| e.to_string())?;
+    let _ = rw.push_glob("refs/*");
+    let mut git_native: Vec<String> = Vec::new();
+    for oid in rw.flatten() {
+        let Ok(commit) = git.find_commit(oid) else { continue };
+        let message = String::from_utf8_lossy(commit.message_bytes()).to_string();
+        match bridge::parse_trailer(&message, TRAILER_CHANGE_ID).and_then(|h| bridge::parse_oid_hex(&h)) {
+            Some(id) if ws.repo().change_tree(&id).is_some() => {
+                marks.insert(oid.to_string(), id, MarkOrigin::Loot);
+            }
+            _ => git_native.push(oid.to_string()),
+        }
+    }
+    // Second pass: re-match ingested (git-origin) commits by parents + message.
+    let all_changes = ws.repo().change_ids_topo();
+    for sha in git_native {
+        let Ok(commit) = git.find_commit(git2::Oid::from_str(&sha).map_err(|e| e.to_string())?) else {
+            continue;
+        };
+        let parents: Option<Vec<Oid>> = commit
+            .parent_ids()
+            .map(|p| marks.change_for(&p.to_string()).map(|(id, _)| id.clone()))
+            .collect();
+        let Some(parents) = parents else { continue };
+        let message = bridge::strip_trailers(&String::from_utf8_lossy(commit.message_bytes()));
+        let candidates: Vec<&Oid> = all_changes
+            .iter()
+            .filter(|c| ws.repo().parents_of(c) == parents)
+            .filter(|c| {
+                ws.repo()
+                    .change_message(c)
+                    .is_some_and(|m| bridge::strip_trailers(&m) == message)
+            })
+            .collect();
+        if candidates.len() == 1 {
+            marks.insert(sha, candidates[0].clone(), MarkOrigin::Git);
+        }
+    }
+    Ok(marks)
+}
+
+// --- small shared helpers ---
+
+/// The ancestor closure (inclusive) of a set of changes — everything already
+/// represented in git by the marks that name them.
+fn ancestor_closure<'a>(
+    ws: &Workspace,
+    seeds: impl Iterator<Item = &'a Oid>,
+) -> std::collections::BTreeSet<Oid> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut stack: Vec<Oid> = seeds.cloned().collect();
+    while let Some(id) = stack.pop() {
+        if out.insert(id.clone()) {
+            stack.extend(ws.repo().parents_of(&id));
+        }
+    }
+    out
+}
+
+/// True when `ancestor` is reachable from `descendant` over parent edges
+/// (inclusive of equality) — the bridge's fast-forward test.
+fn is_ancestor(ws: &Workspace, ancestor: &Oid, descendant: &Oid) -> bool {
+    let mut stack = vec![descendant.clone()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(id) = stack.pop() {
+        if id == *ancestor {
+            return true;
+        }
+        if seen.insert(id.clone()) {
+            stack.extend(ws.repo().parents_of(&id));
+        }
+    }
+    false
+}
+
+/// Ancestor depth per change (root = 0), memoized over the whole graph — the
+/// deterministic commit-date input (ADR 0028).
+fn generations(ws: &Workspace) -> BTreeMap<Oid, u64> {
+    let mut gen: BTreeMap<Oid, u64> = BTreeMap::new();
+    for id in ws.repo().change_ids_topo() {
+        let g = ws
+            .repo()
+            .parents_of(&id)
+            .iter()
+            .filter_map(|p| gen.get(p))
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        gen.insert(id, g);
+    }
+    gen
+}
+
+/// Same demotion rule as the engine's snapshot guard (#62): re-sealing more
+/// readably is refused unless done deliberately.
+fn demotes(old: &Visibility, new: &Visibility) -> bool {
+    matches!(
+        (old, new),
+        (Visibility::Restricted(_), Visibility::Public)
+            | (Visibility::Embargoed { .. }, Visibility::Public)
+            | (Visibility::Embargoed { .. }, Visibility::Restricted(_))
+    )
+}
+
+/// The syncing identity's git-facing name/email: git config when available
+/// (native-looking history), else the loot identity (ADR 0028).
+fn self_name_email(ws: &Workspace, git: &git2::Repository) -> (String, String) {
+    let cfg = git.config().ok();
+    let name = cfg
+        .as_ref()
+        .and_then(|c| c.get_string("user.name").ok())
+        .unwrap_or_else(|| ws.identity().to_string());
+    let email = cfg
+        .as_ref()
+        .and_then(|c| c.get_string("user.email").ok())
+        .unwrap_or_else(|| format!("{}@loot.local", ws.identity()));
+    (name, email)
+}
+
+/// Name/email for a mirrored commit's author: the identity map, then the peer
+/// registry nickname (`<nick>@loot.local`), then a pubkey-derived stub.
+fn author_name_email(
+    ws: &Workspace,
+    author: Option<[u8; 32]>,
+    id_map: &BTreeMap<String, String>,
+) -> (String, String) {
+    let Some(pk) = author else {
+        return (ws.identity().to_string(), format!("{}@loot.local", ws.identity()));
+    };
+    let pk_hex = hex::encode(&pk);
+    if let Some(mapped) = id_map.get(&pk_hex) {
+        if let Some((name, email)) = split_name_email(mapped) {
+            return (name, email);
+        }
+    }
+    let peers = loot_identity::PeerRegistry::load(ws.store().dot());
+    for (nick, _) in peers.list() {
+        if peers.pubkey_bytes(nick).ok().flatten() == Some(pk) {
+            return (nick.to_string(), format!("{nick}@loot.local"));
+        }
+    }
+    let short = hex::short(&pk, 8);
+    (format!("loot-{short}"), format!("{short}@loot.local"))
+}
+
+/// The text of a top-level blob in a git tree, or empty if absent/non-utf8.
+fn blob_text(git: &git2::Repository, tree: &git2::Tree, name: &str) -> String {
+    tree.get_name(name)
+        .and_then(|e| git.find_blob(e.id()).ok())
+        .and_then(|b| String::from_utf8(b.content().to_vec()).ok())
+        .unwrap_or_default()
+}
+
+fn split_name_email(value: &str) -> Option<(String, String)> {
+    let (name, rest) = value.split_once(" <")?;
+    let email = rest.strip_suffix('>')?;
+    Some((name.to_string(), email.to_string()))
+}
+
+fn read_or_empty(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// `key = value` files under `.loot/git-mirror/` (config, identity map).
+fn parse_kv(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            out.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    out
+}
+
+fn write_kv(path: &Path, entries: &BTreeMap<String, String>) -> Result<(), String> {
+    let mut out = String::new();
+    for (k, v) in entries {
+        out.push_str(&format!("{k} = {v}\n"));
+    }
+    std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh keyed loot repo + a mirror path, isolated per test.
+    fn setup(tag: &str) -> (Workspace, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("loot-ferry-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        let mirror = base.join("mirror.git");
+        Workspace::init_at(&repo_dir, "alice").unwrap();
+        loot_identity::generate_and_save(&repo_dir.join(".loot"), "alice@loot").unwrap();
+        let ws = Workspace::open_at(&repo_dir).unwrap();
+        (ws, repo_dir, mirror)
+    }
+
+    fn put_file(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Snapshot + finalize: one signed change from the working tree.
+    fn seal_change(ws: &mut Workspace, msg: &str) -> Oid {
+        let (id, _) = ws.snapshot(msg).unwrap();
+        ws.finalize_working().unwrap();
+        id
+    }
+
+    fn ferry(ws: &mut Workspace, mirror: &Path) -> FerryReport {
+        run(ws, Some(mirror.to_str().unwrap()), None).unwrap()
+    }
+
+    /// All blob paths in a commit's tree, recursively (unix-style).
+    fn tree_paths(git: &git2::Repository, tree: &git2::Tree) -> Vec<String> {
+        let mut out = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                out.push(format!("{root}{}", entry.name().unwrap_or("")));
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .unwrap();
+        let _ = git;
+        out
+    }
+
+    fn main_commit(git: &git2::Repository) -> git2::Commit<'_> {
+        let oid = git.find_reference(MAIN_REF).unwrap().target().unwrap();
+        git.find_commit(oid).unwrap()
+    }
+
+    /// Append a git-native commit on main: parent tree + `files`, as `author`.
+    fn git_native_commit(
+        git: &git2::Repository,
+        files: &[(&str, &str)],
+        author: (&str, &str),
+        message: &str,
+    ) -> String {
+        let parent = main_commit(git);
+        let mut builder = git.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        for (rel, content) in files {
+            let blob = git.blob(content.as_bytes()).unwrap();
+            builder.insert(rel, blob, 0o100644).unwrap();
+        }
+        let tree = git.find_tree(builder.write().unwrap()).unwrap();
+        let sig = git2::Signature::now(author.0, author.1).unwrap();
+        git.commit(Some(MAIN_REF), &sig, &sig, message, &tree, &[&parent])
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn projection_omits_sealed_paths_signs_and_sets_refs() {
+        let (mut ws, dir, mirror) = setup("project");
+        put_file(&dir, ".lootattributes", "secret/** restricted=bob\n");
+        put_file(&dir, "readme.md", "hello\n");
+        put_file(&dir, "src/lib.rs", "pub fn a() {}\n");
+        put_file(&dir, "secret/pitch.md", "the plan\n");
+        seal_change(&mut ws, "first");
+
+        let report = ferry(&mut ws, &mirror);
+        assert!(report.projected >= 1, "projects the finalized change");
+
+        let git = git2::Repository::open(&mirror).unwrap();
+        let commit = main_commit(&git);
+        let paths = tree_paths(&git, &commit.tree().unwrap());
+        assert!(paths.contains(&"readme.md".to_string()));
+        assert!(paths.contains(&"src/lib.rs".to_string()), "nested trees work");
+        assert!(
+            !paths.iter().any(|p| p.contains("secret") || p.contains("pitch")),
+            "sealed path leaves no filename and no bytes: {paths:?}"
+        );
+
+        // Trailers make the round trip lossless.
+        let msg = commit.message().unwrap();
+        let head = ws.finalized_anchor().unwrap();
+        assert_eq!(
+            bridge::parse_trailer(msg, TRAILER_CHANGE_ID),
+            Some(hex::encode(&head.0))
+        );
+        assert!(bridge::parse_trailer(msg, TRAILER_AUTHOR).is_some());
+        assert!(bridge::parse_trailer(msg, TRAILER_SIGNATURE).is_some());
+
+        // SSHSIG verifies against the repo's own key.
+        let (sig, signed) = git.extract_signature(&commit.id(), None).unwrap();
+        let pub_line = ws.public_key_openssh().unwrap();
+        loot_identity::ssh_verify(
+            &pub_line,
+            GIT_SIG_NAMESPACE,
+            &signed,
+            std::str::from_utf8(&sig).unwrap(),
+        )
+        .expect("mirrored commit signature verifies with loot's key");
+
+        // Every head reachable under refs/loot/heads/*; main tracks the dock.
+        let head_ref = format!("refs/loot/heads/{}", hex::encode(&head.0));
+        assert!(git.find_reference(&head_ref).is_ok(), "head ref present");
+        assert_eq!(
+            git.find_reference(&head_ref).unwrap().target(),
+            git.find_reference(MAIN_REF).unwrap().target(),
+            "main tracks the designated dock tip"
+        );
+
+        // Deterministic dates: BASE_EPOCH + generation.
+        assert_eq!(commit.time().seconds(), bridge::commit_timestamp(0));
+    }
+
+    #[test]
+    fn second_run_is_a_no_op_and_marks_rebuild_from_trailers() {
+        let (mut ws, dir, mirror) = setup("idem");
+        put_file(&dir, "a.txt", "one\n");
+        seal_change(&mut ws, "first");
+        put_file(&dir, "a.txt", "two\n");
+        seal_change(&mut ws, "second");
+
+        let first = ferry(&mut ws, &mirror);
+        assert_eq!(first.projected, 2);
+        let git = git2::Repository::open(&mirror).unwrap();
+        let tip_before = main_commit(&git).id();
+
+        let second = ferry(&mut ws, &mirror);
+        assert_eq!((second.ingested, second.projected), (0, 0), "idempotent");
+        assert_eq!(main_commit(&git).id(), tip_before, "no duplicate commits");
+
+        // Lose the spine; rebuild recovers loot-origin marks from trailers and
+        // a third run still changes nothing (round-trip to the same ids).
+        let marks_before = read_or_empty(&ws.store().git_marks());
+        std::fs::remove_file(ws.store().git_marks()).unwrap();
+        std::fs::remove_file(ws.store().git_state()).unwrap();
+        let third = ferry(&mut ws, &mirror);
+        assert_eq!((third.ingested, third.projected), (0, 0), "rebuild, not re-ingest");
+        assert_eq!(main_commit(&git).id(), tip_before);
+        assert_eq!(
+            read_or_empty(&ws.store().git_marks()),
+            marks_before,
+            "rebuilt marks match the lost ones exactly"
+        );
+    }
+
+    #[test]
+    fn git_native_commit_ingests_as_unauthored_with_git_author() {
+        let (mut ws, dir, mirror) = setup("ingest");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        let git = git2::Repository::open(&mirror).unwrap();
+        git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
+
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!(report.ingested, 1);
+
+        // The change is unauthored (never forge another identity) and keeps
+        // the git author; the dock fast-forwarded and materialized the file.
+        let head = ws.finalized_anchor().unwrap();
+        assert!(ws.repo().change_author(&head).is_none(), "unauthored ingest");
+        let msg = ws.repo().change_message(&head).unwrap();
+        assert_eq!(
+            bridge::parse_trailer(&msg, TRAILER_GIT_AUTHOR),
+            Some("Bob <bob@example.com>".to_string())
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "from git\n");
+
+        // Round-trip: the ingested change is marked, never re-emitted.
+        let after = ferry(&mut ws, &mirror);
+        assert_eq!((after.ingested, after.projected), (0, 0));
+    }
+
+    #[test]
+    fn git_author_matching_self_ingests_authored_and_signed() {
+        let (mut ws, dir, mirror) = setup("self");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // Commit as exactly the name/email the bridge seeded for self in the
+        // identity map (it prefers git config, so read it back from disk).
+        let id_map = parse_kv(&read_or_empty(&ws.store().git_identity_map()));
+        let self_entry = id_map[&hex::encode(&ws.author_pubkey().unwrap())].clone();
+        let (name, email) = split_name_email(&self_entry).unwrap();
+        let git = git2::Repository::open(&mirror).unwrap();
+        git_native_commit(&git, &[("c.txt", "mine\n")], (&name, &email), "add c");
+
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!(report.ingested, 1);
+        let head = ws.finalized_anchor().unwrap();
+        assert_eq!(ws.repo().change_author(&head), ws.author_pubkey(), "authored as self");
+        assert!(ws.repo().change_signature(&head).is_some(), "signed at ingest");
+    }
+
+    #[test]
+    fn concurrent_edits_converge_and_conflicts_hold_git_clean() {
+        let (mut ws, dir, mirror) = setup("conflict");
+        put_file(&dir, "shared.txt", "clean\n");
+        put_file(&dir, "other.txt", "orig\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+        let git = git2::Repository::open(&mirror).unwrap();
+        let clean_tip = main_commit(&git).id();
+
+        // Both sides advance: loot edits shared.txt, git edits it differently
+        // (and touches other.txt, which loot left alone).
+        put_file(&dir, "shared.txt", "loot side\n");
+        seal_change(&mut ws, "loot edit");
+        git_native_commit(
+            &git,
+            &[("shared.txt", "git side\n"), ("other.txt", "git touch\n")],
+            ("Bob", "bob@example.com"),
+            "git edit",
+        );
+
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!(report.ingested, 1);
+        assert!(
+            matches!(report.outcomes.get(Path::new("shared.txt")), Some(MergeOutcome::Conflict { .. })),
+            "same-path divergence surfaces as a conflict: {:?}",
+            report.outcomes
+        );
+        assert!(
+            ws.repo().conflicts().contains_key(Path::new("shared.txt")),
+            "conflict visible to `loot conflicts`"
+        );
+
+        // The merge commit exists in git, but the conflicted path is held at
+        // its last clean state; the non-conflicting edit synced normally.
+        let merge = main_commit(&git);
+        assert_ne!(merge.id(), clean_tip, "merge projected");
+        let tree = merge.tree().unwrap();
+        let shared = tree.get_name("shared.txt").unwrap();
+        let held = git.find_blob(shared.id()).unwrap();
+        assert_eq!(held.content(), b"clean\n", "conflicted path held at last clean state");
+        let other = tree.get_name("other.txt").unwrap();
+        assert_eq!(git.find_blob(other.id()).unwrap().content(), b"git touch\n");
+    }
+
+    #[test]
+    fn bootstrap_adopts_prebridge_history_without_ingesting() {
+        let (mut ws, dir, mirror) = setup("bootstrap");
+        // A pre-existing git mirror with its own (trailerless) history.
+        let git = git2::Repository::init_bare(&mirror).unwrap();
+        {
+            let blob = git.blob(b"old\n").unwrap();
+            let mut builder = git.treebuilder(None).unwrap();
+            builder.insert("old.txt", blob, 0o100644).unwrap();
+            let tree = git.find_tree(builder.write().unwrap()).unwrap();
+            let sig = git2::Signature::now("Old", "old@example.com").unwrap();
+            git.commit(Some(MAIN_REF), &sig, &sig, "pre-bridge", &tree, &[]).unwrap();
+        }
+        let heads_before = {
+            put_file(&dir, "a.txt", "loot\n");
+            seal_change(&mut ws, "loot base");
+            ws.repo().heads()
+        };
+
+        let report = ferry(&mut ws, &mirror);
+        assert_eq!(report.ingested, 0, "pre-bridge history is baseline, not ingested");
+        assert!(report.notes.iter().any(|n| n.contains("baseline")));
+        assert_eq!(ws.repo().heads(), heads_before, "loot history untouched");
+    }
+}

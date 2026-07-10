@@ -1016,6 +1016,49 @@ impl DagRepo {
         self.graph.get(id).map(|n| n.message.clone())
     }
 
+    /// The author's signature on a change, if attached (S3, ADR 0018). `None`
+    /// for an in-progress working change, a legacy/unauthored change, or an
+    /// unknown id. The bridge uses this both to carry the signature in a commit
+    /// trailer and to skip ephemeral (authored-but-unsigned) changes — the same
+    /// "only signed history travels" rule push/bundle apply (GB1, ADR 0028).
+    pub fn change_signature(&self, id: &Oid) -> Option<[u8; 64]> {
+        self.graph.get(id).and_then(|n| n.signature)
+    }
+
+    /// A change's full tree (path -> content address + visibility), or `None`
+    /// if unknown. Each finalized change records its complete tree (deletion =
+    /// absence), so this is exactly the tree a mirrored commit projects
+    /// (GB1, ADR 0028).
+    pub fn change_tree(&self, id: &Oid) -> Option<BTreeMap<PathBuf, (Oid, Visibility)>> {
+        self.graph.get(id).map(|n| n.tree.clone())
+    }
+
+    /// Every change id in the graph, parents before children — the projection
+    /// order for the git bridge (GB1, ADR 0028): a change's parents are always
+    /// mapped to commits before the change itself is.
+    pub fn change_ids_topo(&self) -> Vec<Oid> {
+        self.graph.in_order().into_iter().map(|n| n.id.clone()).collect()
+    }
+
+    /// Record a change as *unauthored* (legacy id, no author folded in), even
+    /// when this repo has an author set. The bridge ingests a git-native commit
+    /// whose author is not the syncing identity this way — loot never forges
+    /// another identity's authorship (GB1, ADR 0028). Unauthored changes travel
+    /// unsigned, exactly like pre-0018 history.
+    pub fn record_unauthored(&mut self, change: Change) -> Result<Oid, RepoError> {
+        let id = compute_change_id(None, &change);
+        let node = ChangeNode {
+            id: id.clone(),
+            parents: change.parents,
+            message: change.message,
+            tree: change.tree,
+            author: None,
+            signature: None,
+        };
+        self.graph.insert(node);
+        Ok(id)
+    }
+
     /// Count `(total, restricted, embargoed)` paths in a tip's tree — the
     /// visibility summary `loot docks` shows per dock (ADR 0022).
     pub fn visibility_summary_at(&self, tip: &Oid) -> (usize, usize, usize) {

@@ -102,21 +102,25 @@ impl Identity {
         Ok(Identity { signing_key: SigningKey::from_bytes(&bytes) })
     }
 
-    /// Save to `.loot/id` (private, mode 0600) and `.loot/id.pub` (public).
-    pub fn save(&self, dot: &Path, comment: &str) -> Result<(), IdentityError> {
-        let private_path = dot.join("id");
-        let public_path = dot.join("id.pub");
-
+    /// This keypair as an ssh-key `PrivateKey` — the form OpenSSH serialization
+    /// and SSHSIG signing operate on.
+    fn to_ssh_private(&self, comment: &str) -> Result<PrivateKey, IdentityError> {
         let ed_private = ssh_key::private::Ed25519Keypair {
             public: ssh_key::public::Ed25519PublicKey(self.signing_key.verifying_key().to_bytes()),
             private: ssh_key::private::Ed25519PrivateKey::from_bytes(
                 &self.signing_key.to_bytes()
             ),
         };
-        let private = PrivateKey::new(
-            ssh_key::private::KeypairData::Ed25519(ed_private),
-            comment,
-        ).map_err(|e| IdentityError::Format(e.to_string()))?;
+        PrivateKey::new(ssh_key::private::KeypairData::Ed25519(ed_private), comment)
+            .map_err(|e| IdentityError::Format(e.to_string()))
+    }
+
+    /// Save to `.loot/id` (private, mode 0600) and `.loot/id.pub` (public).
+    pub fn save(&self, dot: &Path, comment: &str) -> Result<(), IdentityError> {
+        let private_path = dot.join("id");
+        let public_path = dot.join("id.pub");
+
+        let private = self.to_ssh_private(comment)?;
 
         let pem = private.to_openssh(LineEnding::LF)
             .map_err(|e| IdentityError::Format(e.to_string()))?;
@@ -231,6 +235,19 @@ impl Identity {
         self.signing_key.sign(message).to_bytes()
     }
 
+    /// Sign `msg` in the OpenSSH SSHSIG format under `namespace`, returning the
+    /// PEM (`-----BEGIN SSH SIGNATURE-----`). Namespace `"git"` makes a mirrored
+    /// commit verify with `git verify-commit` against an allowed-signers file —
+    /// one key vouches in both worlds (GB1, ADR 0028).
+    pub fn ssh_sign(&self, namespace: &str, msg: &[u8]) -> Result<String, IdentityError> {
+        let private = self.to_ssh_private("")?;
+        let sig = private
+            .sign(namespace, ssh_key::HashAlg::Sha512, msg)
+            .map_err(|e| IdentityError::Format(format!("sshsig: {e}")))?;
+        sig.to_pem(LineEnding::LF)
+            .map_err(|e| IdentityError::Format(format!("sshsig pem: {e}")))
+    }
+
     /// Wrap `bundle_bytes` in a signed push envelope:
     /// `[0x01][pubkey 32][signature 64][bundle...]`
     pub fn wrap_envelope(&self, bundle_bytes: &[u8]) -> Vec<u8> {
@@ -243,6 +260,25 @@ impl Identity {
         out.extend_from_slice(bundle_bytes);
         out
     }
+}
+
+/// Verify an SSHSIG PEM over `msg` under `namespace` against an OpenSSH public
+/// key line — the read side of [`Identity::ssh_sign`]. Used by the bridge's
+/// tests and anywhere loot needs to check a mirrored commit's signature without
+/// shelling out to `ssh-keygen`.
+pub fn ssh_verify(
+    pub_line: &str,
+    namespace: &str,
+    msg: &[u8],
+    sig_pem: &str,
+) -> Result<(), IdentityError> {
+    let public = PublicKey::from_openssh(pub_line)
+        .map_err(|e| IdentityError::Format(e.to_string()))?;
+    let sig = ssh_key::SshSig::from_pem(sig_pem)
+        .map_err(|e| IdentityError::Format(e.to_string()))?;
+    public
+        .verify(namespace, msg, &sig)
+        .map_err(|_| IdentityError::BadSignature)
 }
 
 /// Check whether `dot/.loot/id` exists.

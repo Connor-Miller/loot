@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub mod attestation;    // detachable advisory signatures over changes (S4, ADR 0018)
+pub mod bridge;         // git interop bridge formats: trailers, marks, dates (GB1, ADR 0028)
 pub mod buoy;           // navigational-role resolver over the attestation lane (CA4, ADR 0025)
 pub mod bundle_codec;   // sync bundle wire format (ADR 0003, 0004, 0007)
 pub mod converge;
