@@ -182,7 +182,14 @@ the layout has one documented home.
 **`.lootattributes`** — a gitattributes-style file mapping path globs to
 visibility (`.env restricted=alice`, `*.md public`). The Workspace reads it on
 snapshot to seal each path; unmatched paths default to Public. This is the
-user-facing surface of the thesis — where you declare a file private.
+user-facing surface of the thesis — where you declare a file private. Two
+safeguards (#62, 2026-07-09): the file is **versioned** like any other path
+(policy travels to peers and clones — a fresh keyholder clone without the
+rules would otherwise re-seal restricted content Public), and a snapshot that
+would **demote** a path's visibility (Restricted/Embargoed → wider than the
+tree already records) **refuses** unless that path is passed via
+`loot status --allow-demote <path>`. Widening a Restricted identity set is
+not guarded — `grant`/`maroon` own that audit trail.
 
 **loot (the CLI)** — the first product crate (`loot-cli`, binary `loot`):
 `init`, `status`, `describe`, `new`, `checkout`, `log`, `bundle`, `apply`. Thin

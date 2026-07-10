@@ -148,6 +148,16 @@ impl Workspace {
     /// the message matches, the engine call is skipped and the current working id
     /// is returned unchanged. This makes repeated `loot status` calls cheap.
     pub fn snapshot(&mut self, message: &str) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+        self.snapshot_allowing(message, &[])
+    }
+
+    /// `snapshot` with an explicit demotion allowlist (#62): paths listed here
+    /// may re-seal more readably than the tree records (`--allow-demote`).
+    pub fn snapshot_allowing(
+        &mut self,
+        message: &str,
+        allow_demote: &[PathBuf],
+    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
         // Promote any embargoed keys whose reveal time has passed before reading
         // content — `sealed::open` will then find them in the Keyring (ADR 0007).
         self.repo.flush_escrow(self.now);
@@ -185,7 +195,14 @@ impl Workspace {
         // fork-from-all-heads behavior exactly.
         let id = self
             .repo
-            .snapshot(self.tip.as_ref(), self.working.as_ref(), &entries, message, self.now)
+            .snapshot_allowing(
+                self.tip.as_ref(),
+                self.working.as_ref(),
+                &entries,
+                message,
+                self.now,
+                allow_demote,
+            )
             .map_err(|e| e.to_string())?;
         self.working = Some(id.clone());
         // Persist the new tree hash before persisting the rest of state.
@@ -685,7 +702,10 @@ fn read_to_string(path: &Path) -> Result<String, String> {
     String::from_utf8(std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
-/// Recursively list files under `dir`, skipping `.loot/`, `.lootattributes`, `.git`.
+/// Recursively list files under `dir`, skipping `.loot/` and `.git`.
+/// `.lootattributes` is deliberately included (#62): the policy is versioned
+/// like any file so it travels to peers and clones — a fresh keyholder clone
+/// without the rules would silently re-seal restricted content Public.
 fn walk(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -696,7 +716,7 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>, String> {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == DOT || name == ATTRS || name == ".git" {
+            if name == DOT || name == ".git" {
                 continue;
             }
             if path.is_dir() {
@@ -1052,6 +1072,40 @@ mod tests {
             matches!(vis, Visibility::Restricted(ref ids) if *ids == ["connor"]),
             "docs/private/* must seal OS-native paths, got {vis:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attributes_edit_cannot_silently_demote() {
+        // #62 (pilot finding 2): deleting the .lootattributes line used to
+        // re-seal the path Public on the next snapshot with no warning.
+        let dir = std::env::temp_dir().join(format!("loot-demote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::init_at(&dir, "connor").unwrap();
+        std::fs::write(dir.join("secret.txt"), b"private").unwrap();
+        std::fs::write(dir.join(".lootattributes"), "secret.txt restricted=connor\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) = ws.snapshot("seal").unwrap();
+        // The policy itself is versioned (travels to peers and clones).
+        assert!(
+            reported.iter().any(|(p, v)| p.ends_with(".lootattributes")
+                && matches!(v, Visibility::Public)),
+            ".lootattributes must be snapshotted"
+        );
+
+        // Mangle the policy: the next snapshot must refuse, not leak.
+        std::fs::write(dir.join(".lootattributes"), "").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let err = ws.snapshot("oops").unwrap_err();
+        assert!(err.contains("demote") && err.contains("secret.txt"), "got: {err}");
+
+        // Deliberate demotion goes through with --allow-demote.
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let (_, reported) =
+            ws.snapshot_allowing("public now", &[PathBuf::from("secret.txt")]).unwrap();
+        let vis = reported.iter().find(|(p, _)| p.ends_with("secret.txt")).unwrap();
+        assert!(matches!(vis.1, Visibility::Public));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

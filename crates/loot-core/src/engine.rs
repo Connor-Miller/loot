@@ -717,6 +717,54 @@ impl DagRepo {
         message: &str,
         now: u64,
     ) -> Result<Oid, RepoError> {
+        self.snapshot_allowing(base, working, entries, message, now, &[])
+    }
+
+    /// `snapshot` with an explicit demotion allowlist (#62). A visibility
+    /// demotion — an entry re-resolving *more readable* than the tree already
+    /// records (Restricted/Embargoed -> Public, Embargoed -> Restricted) — is
+    /// refused unless its path is in `allow_demote`: a dropped or mangled
+    /// `.lootattributes` line would otherwise re-seal private content publicly
+    /// with no ceremony, the fail-open that leaked in the dogfood pilot.
+    /// Widening a Restricted identity set is not guarded here — `grant` is the
+    /// audited verb for that.
+    pub fn snapshot_allowing(
+        &mut self,
+        base: Option<&Oid>,
+        working: Option<&Oid>,
+        entries: &[(PathBuf, Vec<u8>, Visibility)],
+        message: &str,
+        now: u64,
+        allow_demote: &[PathBuf],
+    ) -> Result<Oid, RepoError> {
+        // Refuse implicit visibility demotion (#62) BEFORE mutating anything.
+        // The "before" picture is the outgoing working tree when there is one —
+        // it carries forward everything from base, and a working change is a
+        // real change (it pushes) even though it was never finalized.
+        let old_tree = match working {
+            Some(w) => self.graph.tree_at(w),
+            None => match base {
+                Some(tip) => self.graph.tree_at(tip),
+                None => self.graph.current_tree(),
+            },
+        };
+        let mut demoted: Vec<String> = Vec::new();
+        for (path, _, new_vis) in entries {
+            if let Some((_, old_vis)) = old_tree.get(path) {
+                if demotes(old_vis, new_vis) && !allow_demote.contains(path) {
+                    demoted.push(path.display().to_string());
+                }
+            }
+        }
+        if !demoted.is_empty() {
+            return Err(RepoError::Backend(format!(
+                "refusing to demote visibility of {}: an attributes change would re-seal \
+                 private content more readably; restore the .lootattributes rule, or run \
+                 `loot status --allow-demote <path>` to demote deliberately",
+                demoted.join(", ")
+            )));
+        }
+
         // Drop the prior working change so we reconcile against finalized history,
         // not against our own last snapshot.
         if let Some(w) = working {
@@ -1452,6 +1500,18 @@ impl converge::KeyOracle for DagRepo {
 /// changes: they predate signing and are already finalized. This is the single
 /// discriminator CA1.5 uses to keep a dock's uncommitted work out of the shared
 /// node store (ADR 0022).
+/// True if sealing at `new` would make a path readable to a wider audience
+/// than `old` sealed it for (#62). Restricted-set membership changes are
+/// deliberately not compared — `grant`/`maroon` own that audit trail.
+fn demotes(old: &Visibility, new: &Visibility) -> bool {
+    matches!(
+        (old, new),
+        (Visibility::Restricted(_), Visibility::Public)
+            | (Visibility::Embargoed { .. }, Visibility::Public)
+            | (Visibility::Embargoed { .. }, Visibility::Restricted(_))
+    )
+}
+
 fn is_working_change(node: &ChangeNode) -> bool {
     node.author.is_some() && node.signature.is_none()
 }
@@ -1966,6 +2026,65 @@ mod tests {
         let tree = repo.graph.current_tree();
         let oid = &tree[&PathBuf::from("a.txt")].0;
         assert_eq!(repo.get(oid, "alice", 0).unwrap(), b"two");
+    }
+
+    #[test]
+    fn snapshot_refuses_implicit_visibility_demotion() {
+        // #62: a path already sealed Restricted must not re-seal Public just
+        // because the attributes resolution changed — that is the fail-open
+        // that leaked in the dogfood pilot.
+        let restricted = Visibility::Restricted(vec!["alice".into()]);
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w1 = repo
+            .snapshot(None, None, &[entry(".env", b"s", restricted.clone())], "wip", 0)
+            .unwrap();
+        let err = repo
+            .snapshot(None, Some(&w1), &[entry(".env", b"s", Visibility::Public)], "wip", 0)
+            .unwrap_err();
+        assert!(err.to_string().contains("demote"), "unexpected error: {err}");
+        // The refusal happened before any mutation: the working head survives.
+        assert!(repo.heads().contains(&w1));
+
+        // The same demotion goes through when explicitly allowed.
+        let w2 = repo
+            .snapshot_allowing(
+                None,
+                Some(&w1),
+                &[entry(".env", b"s", Visibility::Public)],
+                "wip",
+                0,
+                &[PathBuf::from(".env")],
+            )
+            .unwrap();
+        let tree = repo.graph.tree_at(&w2);
+        assert!(matches!(tree[&PathBuf::from(".env")].1, Visibility::Public));
+    }
+
+    #[test]
+    fn snapshot_demotion_guard_covers_embargo_and_frees_promotion() {
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let embargoed = Visibility::Embargoed { reveal_at: 100 };
+        let restricted = Visibility::Restricted(vec!["alice".into()]);
+
+        // Embargoed -> Restricted reveals to named ids before reveal_at: demotion.
+        let w = repo
+            .snapshot(None, None, &[entry("fix.rs", b"cve", embargoed.clone())], "wip", 0)
+            .unwrap();
+        assert!(repo
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", restricted.clone())], "wip", 0)
+            .is_err());
+        // Embargoed -> Public: demotion.
+        assert!(repo
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", Visibility::Public)], "wip", 0)
+            .is_err());
+
+        // Promotion (Public -> Restricted) needs no ceremony.
+        let w2 = repo
+            .snapshot(None, Some(&w), &[entry("fix.rs", b"cve", embargoed), entry("a.md", b"x", Visibility::Public)], "wip", 0)
+            .unwrap();
+        assert!(repo
+            .snapshot(None, Some(&w2), &[entry("fix.rs", b"cve", Visibility::Embargoed { reveal_at: 100 }), entry("a.md", b"x", restricted)], "wip", 0)
+            .is_ok());
     }
 
     #[test]
