@@ -155,9 +155,15 @@ operator releasing on time — a distinct role holding only wrapped blobs it
 cannot read (drand timelock is the recorded post-milestone hardening). The
 *originator's* own local Escrow staging (ADR 0007) remains cooperative/
 honest-clock — moot, since the originator already knows the plaintext they
-sealed. Remaining: the CLI deposit/receive surface (#88) and the attack demo
-(#89). With no relay configured, ciphertext syncs and embargoed keys simply
-never reach peers — one `Embargoed` label, one guarantee.
+sealed. The CLI surface (#88) is implemented: `loot push` runs a deposit pass
+after stowing bundles — one timed SealedGrant per registered peer for every
+embargoed path this repo holds the key for, deduped against the Manifest (a
+recorded oid→peer grant is never re-deposited, which also makes an interrupted
+deposit loop resumable); `loot grant --relay` on an embargoed path inherits the
+seal's `reveal_at` (a late-added recipient gets a timed grant, never an early
+key); receipt is plain `loot pull-grants` — no new verbs. Remaining: the
+attack demo (#89). With no relay configured, ciphertext syncs and embargoed
+keys simply never reach peers — one `Embargoed` label, one guarantee.
 
 **Sealed object** — ciphertext + nonce + visibility + the *grant ids* (the
 identities permitted to hold a key). It deliberately does **not** contain any
@@ -352,12 +358,12 @@ tree so the decision is reproducible (`cargo test --release`).
 ## Open / undecided
 
 - **External-service escrow (hard embargo enforcement).** DECIDED 2026-07-09
-  (ADR 0027), implementation pending: embargoed keys travel as timed
-  SealedGrants the relay withholds until `reveal_at`; the plaintext bundle
-  escrow section is removed (breaking, `FORMAT_MAJOR`). Remaining open here is
-  only the post-milestone hardening: **drand timelock (tlock)** to remove even
-  the relay-operator trust — composable later by timelocking the SealedGrant
-  payload to a drand round.
+  (ADR 0027) and implemented (#14 engine/wire, #88 CLI): embargoed keys travel
+  as timed SealedGrants the relay withholds until `reveal_at`; the plaintext
+  bundle escrow section is removed (breaking, `FORMAT_MAJOR`). Remaining open
+  here is only the post-milestone hardening: **drand timelock (tlock)** to
+  remove even the relay-operator trust — composable later by timelocking the
+  SealedGrant payload to a drand round.
 
 - **Relay announcement.** A relay peer declaring its relay status so senders
   can discover who holds a key before bundling — enabling selective delivery

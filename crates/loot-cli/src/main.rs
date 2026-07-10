@@ -539,10 +539,17 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
         .current_tree_oid(std::path::Path::new(path))
         .map_err(|_| format!("path '{path}' not found in current change"))?;
 
+    // An embargoed seal's grant inherits its reveal_at (ADR 0027): a late-added
+    // recipient gets a timed grant the relay withholds like the push-time
+    // deposits — never an immediately-delivered key. Everything else is an
+    // ordinary untimed grant (reveal_at = 0).
+    let reveal_at = match ws.repo().visibility_of(&oid) {
+        Some(Visibility::Embargoed { reveal_at }) => reveal_at,
+        _ => 0,
+    };
+
     let bundle = ws.with_repo(|repo| {
-        // reveal_at = 0: an ordinary (untimed) grant. The timed deposit path is
-        // the hard-embargo CLI slice (#88).
-        repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, 0, now, |content_key| {
+        repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, reveal_at, now, |content_key| {
             identity::seal_key(content_key, &recipient_x25519)
                 .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
         }).map_err(|e| e.to_string())
@@ -555,6 +562,9 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     loot_net::deliver_grant(&url, &grantee_ed_pubkey, &envelope).map_err(|e| e.to_string())?;
     println!("delivered sealed grant for '{grantee}' via relay {url}");
     println!("  {path} → {grantee} (sealed, signed, recorded in manifest)");
+    if reveal_at > 0 {
+        println!("  timed: the relay withholds the key until {reveal_at} (hard embargo, ADR 0027)");
+    }
     println!("  recipient runs `loot pull-grants` to receive it");
     Ok(())
 }
@@ -1421,7 +1431,7 @@ fn resolve_remote(args: &[String], ws: &Workspace) -> Result<String, String> {
 const OBJECTS_PER_BATCH: usize = 32;
 
 fn cmd_push(args: &[String]) -> Result<(), String> {
-    let ws = Workspace::open()?;
+    let mut ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
     // S5: offer our object addresses; the relay replies with the subset it is
@@ -1462,6 +1472,116 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
         wants.len(),
     );
     println!("  this published your sealed content to the relay (it still cannot read it)");
+
+    // Hard embargo (ADR 0027): push is also when embargoed keys are deposited,
+    // one timed SealedGrant per registered peer, withheld by the relay until
+    // its clock passes reveal_at. Ciphertext traveled in the bundles above;
+    // keys only ever travel wrapped, here.
+    deposit_embargo_grants(&mut ws, &url, &id)?;
+    Ok(())
+}
+
+/// One planned hard-embargo deposit: a timed grant for `oid` to `peer`.
+struct EmbargoDeposit {
+    path: std::path::PathBuf,
+    oid: Oid,
+    peer: String,
+    peer_pubkey: [u8; 32],
+    reveal_at: u64,
+}
+
+/// Which (embargoed oid × registered peer) pairs still need a timed grant
+/// deposited (ADR 0027: Embargoed means "everyone reads after reveal", so the
+/// default recipient set is every registered peer). The manifest is the dedupe
+/// ledger — a recorded (oid → peer) grant is never re-deposited, which is also
+/// what makes an interrupted deposit loop resumable by re-running `loot push`.
+fn plan_embargo_deposits(
+    repo: &loot_core::DagRepo,
+    peers: &[(String, [u8; 32])],
+    own_pubkey: [u8; 32],
+) -> Vec<EmbargoDeposit> {
+    let mut plan = Vec::new();
+    for (path, oid, reveal_at) in repo.embargoed_paths() {
+        for (peer, peer_pubkey) in peers {
+            if *peer_pubkey == own_pubkey {
+                continue; // the originator already holds the key
+            }
+            let already_granted = repo
+                .manifest()
+                .grants_for(&oid)
+                .iter()
+                .any(|e| e.grantee_pubkey == *peer_pubkey);
+            if !already_granted {
+                plan.push(EmbargoDeposit {
+                    path: path.clone(),
+                    oid: oid.clone(),
+                    peer: peer.clone(),
+                    peer_pubkey: *peer_pubkey,
+                    reveal_at,
+                });
+            }
+        }
+    }
+    plan
+}
+
+/// Deposit a timed SealedGrant at the relay mailbox for every planned
+/// (embargoed oid × peer) pair. Each deposit seals + delivers inside one
+/// `with_repo` closure so a failed delivery never persists its manifest
+/// record — the next push retries it instead of skipping it forever.
+fn deposit_embargo_grants(
+    ws: &mut Workspace,
+    url: &str,
+    id: &identity::Identity,
+) -> Result<(), String> {
+    let embargoed = ws.repo().embargoed_paths();
+    if embargoed.is_empty() {
+        return Ok(());
+    }
+    let reg = identity::PeerRegistry::load(ws.dot());
+    let peers: Vec<(String, [u8; 32])> = reg
+        .list()
+        .iter()
+        .filter_map(|(name, line)| {
+            identity::PeerRegistry::parse_pubkey_bytes_from_line(line)
+                .ok()
+                .map(|pk| (name.to_string(), pk))
+        })
+        .collect();
+    if peers.is_empty() {
+        println!(
+            "note: {} embargoed path(s) but no registered peers — no timed grants deposited.\n\
+             \x20 Their keys stay on this machine; run `loot peer add <name> <pubkey>` and push again.",
+            embargoed.len()
+        );
+        return Ok(());
+    }
+
+    let my_pubkey = id.public_key_bytes();
+    let plan = plan_embargo_deposits(ws.repo(), &peers, my_pubkey);
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let now = ws.now();
+    for d in &plan {
+        let recipient_x25519 = identity::x25519_pubkey_from_ed25519_bytes(&d.peer_pubkey)
+            .map_err(|e| format!("could not derive x25519 key for '{}': {e}", d.peer))?;
+        ws.with_repo(|repo| {
+            let bundle = repo
+                .grant_sealed(&d.oid, &d.peer, d.peer_pubkey, my_pubkey, d.reveal_at, now, |key| {
+                    identity::seal_key(key, &recipient_x25519)
+                        .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+                })
+                .map_err(|e| e.to_string())?;
+            let envelope = id.wrap_envelope(&bundle.0);
+            loot_net::deliver_grant(url, &d.peer_pubkey, &envelope).map_err(|e| e.to_string())
+        })?;
+        println!("  {} → {} (embargoed until {})", d.path.display(), d.peer, d.reveal_at);
+    }
+    println!(
+        "deposited {} timed grant(s) — the relay withholds each key until its reveal time (ADR 0027)",
+        plan.len()
+    );
     Ok(())
 }
 
@@ -1639,5 +1759,196 @@ mod tests {
         let v = conflict_verdicts(&c);
         assert_eq!(v[0].status_char(), 'C');
         assert_eq!(v[0].addrs(), (Some(Oid([7; 32])), Some(Oid([9; 32]))));
+    }
+
+    // --- hard-embargo CLI slice (#88, ADR 0027) ---
+
+    use loot_core::{Change, DagRepo};
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("loot-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// An alice repo holding one embargoed path; the minted key sits in her
+    /// Escrow (originator staging, ADR 0007) until `reveal_at`.
+    fn embargoed_repo(tag: &str, reveal_at: u64) -> (DagRepo, Oid) {
+        let dir = tmp(tag);
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let vis = Visibility::Embargoed { reveal_at };
+        let oid = repo.put(b"embargoed plans\n", vis.clone()).unwrap();
+        let mut tree = std::collections::BTreeMap::new();
+        tree.insert(std::path::PathBuf::from("plans.md"), (oid.clone(), vis));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+        (repo, oid)
+    }
+
+    fn peer(name: &str, byte: u8) -> (String, [u8; 32]) {
+        (name.to_string(), [byte; 32])
+    }
+
+    #[test]
+    fn plan_deposits_one_timed_grant_per_registered_peer() {
+        let (repo, oid) = embargoed_repo("plan-fanout", 9_999);
+        let peers = vec![peer("bob", 0xbb), peer("carol", 0xcc)];
+        let plan = plan_embargo_deposits(&repo, &peers, [0xaa; 32]);
+        assert_eq!(plan.len(), 2, "one deposit per registered peer");
+        assert!(plan.iter().all(|d| d.oid == oid && d.reveal_at == 9_999));
+        assert!(plan.iter().all(|d| d.path == std::path::PathBuf::from("plans.md")));
+    }
+
+    #[test]
+    fn plan_skips_already_granted_peers_and_the_originator() {
+        let (mut repo, oid) = embargoed_repo("plan-dedupe", 9_999);
+        // bob already got his timed grant on an earlier push (manifest records it).
+        repo.grant_sealed(&oid, "bob", [0xbb; 32], [0xaa; 32], 9_999, 0, |_| Ok([0u8; 80]))
+            .unwrap();
+        // alice's own key is registered as a peer too (e.g. a second machine).
+        let peers = vec![peer("alice", 0xaa), peer("bob", 0xbb), peer("carol", 0xcc)];
+        let plan = plan_embargo_deposits(&repo, &peers, [0xaa; 32]);
+        assert_eq!(plan.len(), 1, "only the late-added peer still needs a deposit");
+        assert_eq!(plan[0].peer, "carol");
+    }
+
+    #[test]
+    fn plan_ignores_non_embargoed_paths() {
+        let dir = tmp("plan-public");
+        let mut repo = DagRepo::init(dir.join("work"), "alice").unwrap();
+        let oid = repo.put(b"open\n", Visibility::Public).unwrap();
+        let mut tree = std::collections::BTreeMap::new();
+        tree.insert(std::path::PathBuf::from("open.md"), (oid, Visibility::Public));
+        repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+            .unwrap();
+        assert!(plan_embargo_deposits(&repo, &[peer("bob", 0xbb)], [0xaa; 32]).is_empty());
+    }
+
+    #[test]
+    fn plan_is_empty_for_a_non_keyholder() {
+        // bob applied alice's bundle: he holds the embargoed ciphertext and the
+        // tree, but no key (v5 bundles have no embargoed-key lane, ADR 0027) —
+        // so he has nothing to deposit for anyone.
+        let (mut alice, _) = embargoed_repo("plan-nonkey", 9_999);
+        let bundle = alice.bundle(&[]).unwrap();
+        let mut bob = DagRepo::init(tmp("plan-nonkey-bob").join("work"), "bob").unwrap();
+        bob.apply(&bundle, 0).unwrap();
+        assert!(plan_embargo_deposits(&bob, &[peer("carol", 0xcc)], [0xbb; 32]).is_empty());
+    }
+
+    fn contains_key(hay: &[u8], key: &[u8; 32]) -> bool {
+        hay.windows(32).any(|w| w == key)
+    }
+
+    /// AC (#88): no plaintext embargoed key ever leaves the originator machine.
+    /// The raw key surfaces exactly once — inside `grant_sealed`'s seal closure —
+    /// so capture it there and assert it appears in no outbound bytes: not in
+    /// the SealedGrant frame (only the ECIES-wrapped form travels) and not in
+    /// any push bundle (v5 removed the plaintext escrow lane).
+    #[test]
+    fn no_plaintext_embargoed_key_in_grant_frames_or_push_bundles() {
+        let (mut alice, oid) = embargoed_repo("leak", 9_999_999);
+        let bob = identity::Identity::generate();
+        let bob_x25519 = bob.x25519_pubkey_bytes();
+
+        let mut raw_key = [0u8; 32];
+        let grant = alice
+            .grant_sealed(&oid, "bob", bob.public_key_bytes(), [0xaa; 32], 9_999_999, 0, |k| {
+                raw_key = *k;
+                identity::seal_key(k, &bob_x25519)
+                    .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+            })
+            .unwrap();
+        assert_ne!(raw_key, [0u8; 32], "the seal closure must have seen the key");
+        assert!(!contains_key(&grant.0, &raw_key), "grant frame must carry only the wrapped key");
+
+        let offered = alice.offered_objects(&[]);
+        let bundles = alice.bundle_wanted_batched(&[], &offered, 8).unwrap();
+        assert!(!bundles.is_empty());
+        for b in &bundles {
+            assert!(!contains_key(&b.0, &raw_key), "push bundles must never carry the raw key");
+        }
+    }
+
+    /// AC (#88) end-to-end over a real relay: push-time deposits fan out one
+    /// timed grant per registered peer; the relay withholds a not-yet-due key
+    /// and releases a due one; re-running deposits nothing new (manifest
+    /// dedupe); a late-added peer gets grants from the next pass; the delivered
+    /// grant files the key so the recipient can read.
+    #[test]
+    fn push_deposit_flow_delivers_embargoed_keys_only_when_due() {
+        let relay_dir = tmp("relay-deposit");
+        let addr = "127.0.0.1:47301";
+        let base = format!("http://{addr}");
+        std::thread::spawn(move || {
+            let _ = loot_net::serve(relay_dir, addr, vec![]);
+        });
+        for _ in 0..50 {
+            if loot_net::pull(&base, &[]).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let alice_dir = tmp("alice-deposit");
+        init_repo(&alice_dir, "alice").unwrap();
+        let mut ws = Workspace::open_at(&alice_dir).unwrap();
+        let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string()).unwrap();
+
+        // One embargo already due (reveal passed) and one far in the future.
+        let due_vis = Visibility::Embargoed { reveal_at: wall.saturating_sub(60) };
+        let future_vis = Visibility::Embargoed { reveal_at: wall + 3600 };
+        let due_oid = ws
+            .with_repo(|repo| {
+                let a = repo.put(b"due\n", due_vis.clone()).map_err(|e| e.to_string())?;
+                let b = repo.put(b"future\n", future_vis.clone()).map_err(|e| e.to_string())?;
+                let mut tree = std::collections::BTreeMap::new();
+                tree.insert(std::path::PathBuf::from("due.md"), (a.clone(), due_vis.clone()));
+                tree.insert(std::path::PathBuf::from("future.md"), (b, future_vis.clone()));
+                repo.record(Change { id: Oid([0; 32]), parents: vec![], message: "init".into(), tree })
+                    .map_err(|e| e.to_string())?;
+                Ok(a)
+            })
+            .unwrap();
+
+        let bob = identity::Identity::generate();
+        let mut reg = identity::PeerRegistry::load(ws.dot());
+        reg.add("bob", &bob.public_key_openssh("bob@loot").unwrap());
+        reg.save().unwrap();
+
+        deposit_embargo_grants(&mut ws, &base, &id).unwrap();
+
+        // Two grants deposited for bob; the relay releases only the due one.
+        assert_eq!(loot_net::peek_grants(&base, &bob.public_key_bytes()).unwrap(), 1);
+
+        // Idempotent: a second pass finds everything already granted.
+        deposit_embargo_grants(&mut ws, &base, &id).unwrap();
+        assert_eq!(loot_net::peek_grants(&base, &bob.public_key_bytes()).unwrap(), 1);
+
+        // Late recipient: carol registers after the first push and still gets hers.
+        let carol = identity::Identity::generate();
+        reg.add("carol", &carol.public_key_openssh("carol@loot").unwrap());
+        reg.save().unwrap();
+        deposit_embargo_grants(&mut ws, &base, &id).unwrap();
+        assert_eq!(loot_net::peek_grants(&base, &carol.public_key_bytes()).unwrap(), 1);
+
+        // Bob pulls: the due grant verifies, files the key, and the content reads.
+        let envelopes = loot_net::fetch_grants(&base, &bob.public_key_bytes()).unwrap();
+        assert_eq!(envelopes.len(), 1, "the future-dated grant stays withheld");
+        let (grantor, bundle_bytes) = identity::unwrap_envelope(&envelopes[0], &[]).unwrap();
+        assert_eq!(grantor, id.public_key_bytes());
+        let mut bob_repo = DagRepo::init(tmp("bob-deposit").join("work"), "bob").unwrap();
+        bob_repo
+            .apply_sealed_grant(&SyncBundle(bundle_bytes.to_vec()), grantor, wall, |w| {
+                bob.unseal_key(w).map_err(|e| loot_core::RepoError::Backend(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(bob_repo.get(&due_oid, "bob", wall).unwrap(), b"due\n");
     }
 }
