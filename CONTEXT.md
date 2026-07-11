@@ -52,7 +52,7 @@ directories for truly simultaneous editing are a later, additive step (the
 on-disk format is already dock-agnostic). _Avoid_: worktree, checkout, berth,
 slip.
 
-**Buoy** *(proposed — concurrent-agents design, 2026-07-06)* — a change that
+**Buoy** *(CA4 shipped, 2026-07-09)* — a change that
 carries a navigational-role [[Attestation]] (e.g. `reviewed`, `base`), used as a
 fixed landmark to build from. Not a new primitive: `attest` stays the only
 write-verb, and a buoy is the *derived, read-side* concept — "the newest change
@@ -62,7 +62,7 @@ buoy is computed, never a mutable ref — so it carries none of the
 concurrent-writer race a git tag or branch pointer would. A moored fixed marker,
 in contrast to the moving [[Dock]]. _Avoid_: tag, bookmark, branch.
 
-**Harbor** *(proposed — concurrent-agents design, 2026-07-06)* — the conventional
+**Harbor** *(CA2 shipped, 2026-07-07)* — the conventional
 integrator [[Dock]] that agents converge into and re-base from: a dock with a
 well-known name and *no* permissions attached, so it is a coordination
 convention, not a gated branch (branches stay a permanent non-goal). Merging is
@@ -73,8 +73,8 @@ relay hop, because docks share one object store. The relay remains the path for
 
 **Verdict** *(CA3 shipped, 2026-07-07)* — the machine-readable form of a
 reconciliation outcome. The [[Convergence classifier]] already computes a
-per-path merge outcome; the reconciliation verbs (`apply`, `conflicts`, `status`, and
-`dock merge` once CA2 lands) can now emit it as data instead of prose. Default
+per-path merge outcome; the reconciliation verbs (`apply`, `conflicts`, `status`,
+`dock merge`, `pull`, and `ferry`) now emit it as data instead of prose. Default
 machine format is **porcelain**: one path per line, a leading status char (`=`
 converged, `M` merged, `C` conflict, `R` relayed), tab-separated columns
 `status<TAB>path<TAB>base<TAB>incoming`; `--json` is the opt-in fallback for
