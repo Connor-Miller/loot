@@ -353,7 +353,11 @@ ciphertext — only this oracle.
 ## Deliberately out of scope (for now)
 
 - **jj-style ergonomics** (auto-snapshot working copy, stable change-ids,
-  oplog). Desirable, but a UX layer added later — not the foundation.
+  oplog) — **specced** (map #132): stable change-ids (ADR 0029), implicit
+  auto-snapshot + reconciled verb surface (ADR 0030), operation log & undo
+  (ADR 0031). The *implementation* is the out-of-scope follow-on now (its own
+  build map); the design is locked. See `docs/research/jj-ergonomics.md`
+  (research) and `docs/research/jj-ergonomics-prototype.md` (verb-surface proof).
 - **git interop bridge.** Important eventually; not part of the first slice.
 
 These are excluded from the *foundation* so the first slice ships fast and
