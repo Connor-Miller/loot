@@ -1,0 +1,165 @@
+# The loot-first workflow: loot leads, git is downstream
+
+How work reaches `main` in this repo: every change **originates and finalizes in
+loot**, and git `main` is a mirror **projected downstream** from loot. The GitHub
+PR is a *review view*, not the merge target — loot is the merger. Read this before
+driving a working day here; it sits beside [identity.md](identity.md) (who agents
+are) and describes what everyone does day to day.
+
+> **Status (2026-07): target workflow, tooling landing in wayfinder #155.** The
+> design is settled (map [#148](https://github.com/Connor-Miller/loot/issues/148),
+> tickets #149-#153). The new surface below — `loot ferry --with-wip` and the
+> `loot-day` orchestrator — ships in #155; until then the repo still runs
+> git-first via `tools/loot-day.ps1`. The prototype transcript is
+> [../research/loot-first-workflow-prototype.md](../research/loot-first-workflow-prototype.md).
+
+## Why
+
+The #54 dogfood drive showed loot *following* git — work landed via GitHub PRs and
+the ferry only caught loot up afterward. This inverts the polarity so loot leads.
+It builds on the jj-ergonomics trio (map #132: auto-snapshot, stable `change_id`,
+oplog) which made loot *pleasant* to lead in; this workflow is how you *actually*
+lead in it.
+
+## The two ids (map #132)
+
+Every change carries two identifiers, shown throughout:
+
+- **version id** — content+author hash, 8 hex digits (`3f9a1c02`). Rewrites on
+  every snapshot.
+- **change id** — the durable handle, reverse-hex letters (`qsouzmpr`). Minted
+  once, carried across snapshots and rewrites. This is what ties a review branch,
+  its PR, and the eventual landed commit together.
+
+## The daily loop (same-identity work)
+
+The common case — the dev, or a trusted agent docking into the dev's store. One
+code path; **every change lands through a PR** (you self-approve your own).
+
+1. **Open a lane.** `loot dock <task>` — an isolated worktree over the store
+   (ADR 0022). Cheap; a lane hosts one in-flight change → PR at a time. Parallel
+   work = more docks.
+2. **Work.** Edit. The working change accrues by auto-snapshot (map #132); you
+   never run a manual `status -m` before finalize.
+3. **Project for review.** `loot ferry --with-wip` snapshots the dock's WIP and
+   projects it to a sealed-free `review/<dock>` branch, then a single-ref push
+   publishes it to GitHub; `loot-day review` opens the PR. The PR reviews
+   **unsigned** WIP.
+4. **Revise.** On a review comment, edit and re-run `loot ferry --with-wip`. It
+   **appends** a commit to the branch (same `change id`, new `version id`), so
+   GitHub shows *"changes since your last review."*
+5. **Approve.** Approve the PR on GitHub.
+6. **Finalize.** `loot new` signs the change (ADR 0018) and starts the next one.
+   This is **git-quiet** — no mirror I/O, so parallel lanes never contend here.
+7. **Land.** `loot-day land --pr <n>` detects the approval
+   (`reviewDecision == APPROVED`), projects the one **signed** commit onto `main`,
+   points the PR head at it, and GitHub marks the PR **Merged** by reachability —
+   no merge button, no merge commit. The provisional review branch collapses and
+   is reaped. A `landed: change_id=… version_id=… main=<sha> pr=#<n> status=merged`
+   verdict is emitted.
+
+## The review-projection mechanic
+
+- **Building the PR** (#149): the review commit carries `Loot-Change-Id` +
+  `Loot-Author` + `Loot-Provisional`, and **no** `Loot-Signature`. The git commit
+  is SSHSIG-signed (so GitHub shows **Verified**), but the *missing* signature
+  trailer is the machine-checkable "not finalized yet." Sealed paths are omitted
+  from every projected commit, so the branch's whole object closure is safe to
+  push to GitHub.
+- **Landing the PR** (#150): a finalized commit can never share the provisional
+  commit's oid (it adds the signature, drops the provisional marker). Every GitHub
+  *merge button* would rewrite oids or add a merge commit loot would have to
+  ingest — so we don't use it. Instead loot lands the signed commit on `main` and
+  points the PR head at it; GitHub's **Merged** is reachability-based, so it flips
+  automatically. `main` gets exactly **one clean commit per change**.
+
+## Cross-identity agents (clones)
+
+A keyring-separated agent (ADR 0026) works in its own clone and syncs via the
+relay. Because **only signed history crosses the relay** (ADR 0018), its unsigned
+WIP can't reach the dev — so the flow differs:
+
+- The agent works, `loot new` (signs), `loot push` (relay).
+- The dev's **single bridge** pulls the signed change, stages it, and surfaces it
+  as a `review/<agent>/<cid>` PR for **integration review** (`loot-day
+  surface-agents`).
+- The dev reviews the **signed** change (the one principled asymmetry — a clone's
+  review is post-finalize, not of raw WIP), approves, and `loot-day land`
+  integrates it into the harbor and onto `main`.
+- Revision rounds are **new signed changes** (edit → `loot new` → `loot push`); the
+  bridge re-surfaces them onto the same PR.
+
+The gate for a clone sits **before its change enters `main`** — the right gate for
+cross-identity work. The agent never touches GitHub or a mirror; it only speaks
+loot to the relay.
+
+## Ferry authority: loot leads
+
+loot was always the merge authority (git never merges). Loot-first flips two
+things: the **default direction** (loot→git projection is primary; git→loot ingest
+is the exception) and **who feeds GitHub `main`** (loot's single-ref push, not the
+checkout's `git push`).
+
+**Invariant: `git main == projection(loot dock tip)`.** Every ferry pass
+**ingests any git-origin commit before it projects**, so loot's projection is
+always a fast-forward over the current git `main` — which is why the land above is
+a clean FF.
+
+The **git→loot residual** — the ways git `main` can move without originating in
+loot — all absorb through the same converge+ingest path:
+
+- **A direct edit on github.com** (a browser typo fix) — ingested as an unauthored
+  change (or authored-self if the git author maps to the dev).
+- **An external contributor's PR** merged on GitHub the normal way — ingested
+  unauthored, preserving their git author.
+- **A break-glass local commit** (see guard rails) — same ingest.
+
+A genuine same-path conflict is held at its last clean state in git (ADR 0028) and
+surfaced by `loot conflicts`; that change can't land until you resolve it in loot.
+
+## Parallel work and landing
+
+- **Which lane?** Trusted work **docks** (same identity, shared store — reviewed
+  as unsigned WIP, no per-agent GitHub setup). A keyring-separated agent **clones**
+  (see above). The rule is trust: a dock shares the store's keyring, so anything
+  that must be sealed from an agent requires a clone.
+- **Landing serializes at the harbor.** `main` tracks the harbor (the integrator
+  dock, CA2). Lanes land by merging their tip into it — same-store docks via
+  `loot dock merge <lane>` (local), cross-identity changes via `loot pull` +
+  `converge_heads`. Two lanes finalizing at once converge *before* projection, so
+  `main` stays linear and the two-writer fork the CA epic fixed cannot reappear.
+
+## Abandonment
+
+- Reject a **docking** PR → `loot abandon <version-id>` (map #132) drops the dock's
+  working change; the ferry reaps the review branch + its provisional marks by
+  `change_id`. Nothing was signed, so nothing traveled.
+- Reject a **clone** PR → the bridge closes the PR and deletes the review branch;
+  the agent's signed change stays **unintegrated** on the relay (it never entered
+  `main`).
+
+## Guard rails — what NOT to do
+
+- **Don't commit straight to git `main`.** git `main` is a projection of loot. A
+  direct commit is **break-glass**, not routine: a pre-commit hook warns you (it
+  does *not* hard-block — break-glass must stay possible), and the next ferry
+  ingests the commit. Prefer the dock → PR flow.
+- **Never give the mirror a remote.** `.loot/git-mirror/mirror.git` is local-only
+  and holds sealed `docs/pitch/` in **plaintext** (ADR 0028). No `git remote add`,
+  no `--all`/`--mirror` push, ever. Publishing to GitHub is always a **single-ref
+  push with an inline URL** of a sealed-free branch (`main` or `review/*`).
+- **Sealed content never leaves.** Projection omits sealed paths from every commit
+  (no filename, no bytes). The branches pushed to GitHub are sealed-free by
+  construction — but only because projection is the *only* path to GitHub. Don't
+  invent a second path (e.g. pushing the mirror wholesale) that would bypass it.
+- **"Verified" ≠ blessed.** A WIP review commit shows GitHub **Verified** (SSHSIG
+  integrity) while deliberately unsigned in loot. Verification means "loot's key
+  produced this commit," not "this is finalized." The loot landing is what blesses.
+
+## See also
+
+- [identity.md](identity.md) — agents are clones (ADR 0026).
+- ADRs: 0018 (signed authored history), 0022 (docks/harbor), 0026 (agent
+  identity), 0028 (git bridge / ferry), 0023 (machine output).
+- Map [#148](https://github.com/Connor-Miller/loot/issues/148) and its tickets for
+  the reasoning behind each decision.
