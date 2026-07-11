@@ -39,6 +39,12 @@ const NONE_ADDR: &str = "-";
 /// status chars below, because a working-change entry is not a merge outcome.
 pub const WORKING_MARK: char = '~';
 
+/// Leading marker for the `status` change-identity header line (ADR 0029/0030):
+/// carries the working change's durable `change_id` and its live, non-durable
+/// version id, ahead of the `~` per-path rows. Distinct from `~` so a parser
+/// keys the header and the path rows apart; both are a frozen contract.
+pub const CHANGE_MARK: char = '@';
+
 /// One reconciliation verdict: the classifier's outcome for a single path.
 /// The base/incoming addresses are derived from the outcome (present only for a
 /// `Conflict`), so this stays a thin lift of the value the classifier computes.
@@ -144,15 +150,35 @@ pub fn json(verdicts: &[PathVerdict]) -> String {
 
 // --- status encoders (the working change — a distinct shape) ---
 
-/// Porcelain for `status`: `~ \t path \t visibility`, one working-change entry
-/// per line. Its own frozen shape — the leading `~` marks a working-change
-/// line, not a merge, and the third column is a visibility token, not an OID.
+/// The 16-byte durable change id as full lowercase hex, or `-` when absent
+/// (a keyless/legacy working change). Machine output uses hex, not the human
+/// reverse-hex letters — a parser wants the raw bytes.
+fn change_col(change_id: Option<[u8; 16]>) -> String {
+    change_id.map(|c| hex::encode(&c)).unwrap_or_else(|| NONE_ADDR.to_string())
+}
+
+/// Porcelain for `status`: a leading `@ \t change \t version` header row (the
+/// working change's durable change id + its live, non-durable version id, ADR
+/// 0029/0030), then `~ \t path \t visibility`, one working-change entry per
+/// line. Its own frozen shape — `@`/`~` mark the two row kinds, `change` is hex
+/// (`-` if none), `version` is hex (`-` when the change is empty), and a `~`
+/// row's third column is a visibility token, not an OID.
 ///
 /// **Limitation:** path bytes are written verbatim. A path containing a tab or
 /// newline corrupts the column structure — use [`status_json`] when paths may
 /// contain control characters.
-pub fn status_porcelain(entries: &[(PathBuf, Visibility)]) -> String {
+pub fn status_porcelain(
+    change_id: Option<[u8; 16]>,
+    version: Option<&Oid>,
+    entries: &[(PathBuf, Visibility)],
+) -> String {
     let mut out = String::new();
+    out.push(CHANGE_MARK);
+    out.push('\t');
+    out.push_str(&change_col(change_id));
+    out.push('\t');
+    out.push_str(&addr_col(version.cloned()));
+    out.push('\n');
     for (path, vis) in entries {
         out.push(WORKING_MARK);
         out.push('\t');
@@ -164,11 +190,25 @@ pub fn status_porcelain(entries: &[(PathBuf, Visibility)]) -> String {
     out
 }
 
-/// JSON for `status`: `{"contract":<n>,"working":[{path,visibility},...]}`.
-pub fn status_json(entries: &[(PathBuf, Visibility)]) -> String {
+/// JSON for `status`: `{"contract":<n>,"change":<hex|null>,"version":<hex|null>,
+/// "working":[{path,visibility},...]}`. `change` is the durable change id;
+/// `version` is the live, non-durable version id (`null` when the change is
+/// empty, ADR 0030).
+pub fn status_json(
+    change_id: Option<[u8; 16]>,
+    version: Option<&Oid>,
+    entries: &[(PathBuf, Visibility)],
+) -> String {
     let mut s = String::new();
     s.push_str("{\"contract\":");
     s.push_str(&VERDICT_CONTRACT.to_string());
+    s.push_str(",\"change\":");
+    match change_id {
+        Some(c) => json_string(&hex::encode(&c), &mut s),
+        None => s.push_str("null"),
+    }
+    s.push_str(",\"version\":");
+    json_opt_addr(version.cloned(), &mut s);
     s.push_str(",\"working\":[");
     for (i, (path, vis)) in entries.iter().enumerate() {
         if i > 0 {
@@ -310,8 +350,13 @@ mod tests {
     fn empty_input_is_empty_output() {
         assert_eq!(porcelain(&[]), "");
         assert_eq!(json(&[]), format!("{{\"contract\":{VERDICT_CONTRACT},\"verdicts\":[]}}"));
-        assert_eq!(status_porcelain(&[]), "");
-        assert_eq!(status_json(&[]), format!("{{\"contract\":{VERDICT_CONTRACT},\"working\":[]}}"));
+        // status always emits the `@` change header, even with no path rows; an
+        // absent change id and version render `-`.
+        assert_eq!(status_porcelain(None, None, &[]), "@\t-\t-\n");
+        assert_eq!(
+            status_json(None, None, &[]),
+            format!("{{\"contract\":{VERDICT_CONTRACT},\"change\":null,\"version\":null,\"working\":[]}}")
+        );
     }
 
     #[test]
@@ -321,19 +366,32 @@ mod tests {
             (PathBuf::from(".env"), Visibility::Restricted(vec!["alice".into(), "bob".into()])),
             (PathBuf::from("fix.patch"), Visibility::Embargoed { reveal_at: 42 }),
         ];
-        let out = status_porcelain(&entries);
+        let out = status_porcelain(Some([0xAB; 16]), Some(&oid(0x3f)), &entries);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "~\tREADME.md\tpublic");
-        assert_eq!(lines[1], "~\t.env\trestricted=alice,bob");
-        assert_eq!(lines[2], "~\tfix.patch\tembargoed@42");
+        // The `@` header carries the change id (hex) and live version id (hex).
+        assert_eq!(lines[0], format!("@\t{}\t{}", hex::encode(&[0xAB; 16]), hex::encode(&[0x3f; 32])));
+        assert_eq!(lines[1], "~\tREADME.md\tpublic");
+        assert_eq!(lines[2], "~\t.env\trestricted=alice,bob");
+        assert_eq!(lines[3], "~\tfix.patch\tembargoed@42");
     }
 
     #[test]
     fn status_json_escapes_and_tags_contract() {
         let entries = vec![(PathBuf::from("a\tb"), Visibility::Public)];
-        let out = status_json(&entries);
+        let out = status_json(Some([0xAB; 16]), Some(&oid(0x3f)), &entries);
         assert!(out.contains("\\t"), "path tab escaped: {out}");
         assert!(out.contains(&format!("\"contract\":{VERDICT_CONTRACT}")));
         assert!(out.contains("\"visibility\":\"public\""));
+        assert!(out.contains(&format!("\"change\":\"{}\"", hex::encode(&[0xAB; 16]))));
+        assert!(out.contains(&format!("\"version\":\"{}\"", hex::encode(&[0x3f; 32]))));
+    }
+
+    #[test]
+    fn status_empty_change_has_null_version() {
+        // An empty working change (no delta) renders `-`/null for the version.
+        let out = status_porcelain(Some([0xAB; 16]), None, &[]);
+        assert_eq!(out, format!("@\t{}\t-\n", hex::encode(&[0xAB; 16])));
+        let j = status_json(Some([0xAB; 16]), None, &[]);
+        assert!(j.contains("\"version\":null"), "empty version is null: {j}");
     }
 }
