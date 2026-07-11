@@ -14,7 +14,7 @@ use loot_core::{
 };
 use loot_identity as identity;
 use std::process::ExitCode;
-use workspace::{GlobalConfig, Workspace};
+use workspace::{GlobalConfig, StepReport, Workspace};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -56,6 +56,8 @@ const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
     ("status", cmd_status),
     ("describe", cmd_describe),
     ("new", cmd_new),
+    ("undo", |_| cmd_undo()),
+    ("op", cmd_op),
     ("surface", |_| cmd_surface()),
     ("dock", cmd_dock),
     ("docks", |_| cmd_docks()),
@@ -93,6 +95,9 @@ usage:
   loot status [--porcelain|--json]          show the working change read-only (live version id + durable change id; no snapshot)
   loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
+  loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
+  loot op log                               list the operation log (newest first; barriers flagged)
+  loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
   loot surface                              materialize what the current identity may see
   loot dock <name>                          create a dock (isolated working tree + tip), or switch to one
   loot docks                                list docks with their tip and visibility
@@ -295,7 +300,11 @@ fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
     // Re-open now that the keypair exists so the repo is authored, then mint the
     // first change's durable handle (ADR 0029/0030) — the repo's first change,
     // like every later one, has a name from birth that `status`/`log` can show.
-    Workspace::open_at(dir)?.start_fresh_change()?;
+    let mut ws = Workspace::open_at(dir)?;
+    ws.start_fresh_change()?;
+    // Genesis operation: the floor of the op log, so `undo` always has an
+    // initial view to walk back to and never below (ADR 0031).
+    ws.record_op("init", "initialized repo", false);
     println!("initialized empty loot repo at {}, identity = {id_name}", dir.display());
     println!("public key: {}", pub_line.trim());
     println!("tip: share your public key with peers via `loot whoami`");
@@ -367,6 +376,7 @@ fn cmd_describe(args: &[String]) -> Result<(), String> {
     // demotion guard still rides it via `--allow-demote`.
     let (id, _) = ws.snapshot_allowing(message, &allow_demote)?;
     println!("described working change {} as \"{message}\"", short(&id));
+    ws.record_op("describe", &format!("named \"{message}\""), false);
     Ok(())
 }
 
@@ -388,11 +398,84 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
         .next_change_id()
         .map(|c| short_change(&c))
         .unwrap_or_else(|| "a fresh change".to_string());
+    let desc = match &finalized {
+        Some(id) => format!("finalize {}", short(id)),
+        None => "new (nothing to finalize)".to_string(),
+    };
     match finalized {
         Some(id) => println!("finalized working change {}; started fresh change {next}", short(&id)),
         None => println!("nothing to finalize; started fresh change {next}"),
     }
+    ws.record_op("new", &desc, false);
     Ok(())
+}
+
+/// `loot undo` — step the view back one operation (ADR 0031). Refuses across a
+/// one-way barrier (push/grant/maroon/pull-grants) with the remedy to use instead.
+fn cmd_undo() -> Result<(), String> {
+    let mut ws = Workspace::open()?;
+    let report = ws.undo()?;
+    print_step(&report);
+    Ok(())
+}
+
+/// `loot op log` | `loot op restore <n>` — inspect and jump the operation log.
+fn cmd_op(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        None | Some("log") => cmd_op_log(),
+        Some("restore") => {
+            let target = args.get(1).ok_or("usage: loot op restore <op-number>")?;
+            let n: u32 = target
+                .parse()
+                .map_err(|_| format!("op restore expects an operation number, got '{target}'"))?;
+            let mut ws = Workspace::open()?;
+            let report = ws.restore_op(n)?;
+            print_step(&report);
+            Ok(())
+        }
+        Some(other) => Err(format!(
+            "unknown op subcommand '{other}' — use `loot op log` or `loot op restore <n>`"
+        )),
+    }
+}
+
+/// `loot op log` — the append-only operation history, newest first. Barrier ops
+/// (one-way disclosures undo won't cross) are flagged.
+fn cmd_op_log() -> Result<(), String> {
+    let ws = Workspace::open()?;
+    let ops = ws.op_log()?;
+    if ops.is_empty() {
+        println!("no operations recorded yet");
+        return Ok(());
+    }
+    for op in ops.iter().rev() {
+        let heads = op.heads();
+        let head_col = if heads.is_empty() {
+            String::new()
+        } else {
+            format!("  heads {{{}}}", heads.iter().map(short).collect::<Vec<_>>().join(", "))
+        };
+        let barrier = if op.barrier { "  ⚠ barrier" } else { "" };
+        println!(
+            "op {:<4} {:<11} {}{}{}",
+            op.index, op.command, op.description, head_col, barrier
+        );
+    }
+    Ok(())
+}
+
+/// Report what an `undo`/`op restore` did: which op the view now sits on, its
+/// heads, and the working change (if any).
+fn print_step(r: &StepReport) {
+    let heads = if r.heads.is_empty() {
+        "∅".to_string()
+    } else {
+        r.heads.iter().map(short).collect::<Vec<_>>().join(", ")
+    };
+    println!("{} — now at op {}, head {heads}", r.description, r.restored_to);
+    if let Some(w) = &r.working {
+        println!("  working change {}", short(w));
+    }
 }
 
 fn cmd_surface() -> Result<(), String> {
@@ -636,6 +719,9 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
         OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
         OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
     }
+    if !outcomes.is_empty() {
+        ws.record_op("apply", &format!("apply {infile} ({} path(s))", outcomes.len()), false);
+    }
     Ok(())
 }
 
@@ -669,6 +755,13 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
         // Machine output: the merge verdict rows only (empty -> no lines).
         OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&report.outcomes))),
         OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&report.outcomes))),
+    }
+    if report.ingested > 0 || report.projected > 0 || !report.outcomes.is_empty() {
+        ws.record_op(
+            "ferry",
+            &format!("ferry (+{} ingested, +{} projected)", report.ingested, report.projected),
+            false,
+        );
     }
     Ok(())
 }
@@ -707,6 +800,8 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
         bundle.0.len()
     );
     println!("  {path} → {grantee} (recorded in manifest)");
+    // A grant hands a content key to a peer — one-way (ADR 0031). Barrier.
+    ws.record_op("grant", &format!("grant {path} → {grantee}"), true);
     Ok(())
 }
 
@@ -782,6 +877,8 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
         println!("  timed: the relay withholds the key until {reveal_at} (hard embargo, ADR 0027)");
     }
     println!("  recipient runs `loot pull-grants` to receive it");
+    // Sealed grant delivered to the relay — a one-way disclosure (ADR 0031).
+    ws.record_op("grant", &format!("grant {path} → {grantee} (sealed)"), true);
     Ok(())
 }
 
@@ -920,6 +1017,8 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
         }
         println!("  also run `loot bundle` to ship the re-sealed object to all peers");
     }
+    // A maroon is an audited, one-way revocation of a restricted key (ADR 0031).
+    ws.record_op("maroon", &format!("maroon {} ⁄ {marooned}", path.display()), true);
     Ok(())
 }
 
@@ -988,6 +1087,7 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
         }
         println!("  run `loot bundle` to ship the re-sealed object to all peers");
     }
+    ws.record_op("migrate", &format!("migrate {} → {vis_label}", path.display()), false);
     Ok(())
 }
 
@@ -1014,6 +1114,7 @@ fn cmd_dock(args: &[String]) -> Result<(), String> {
         ),
         None => println!("on dock '{name}' — re-materialized its working tree here"),
     }
+    ws.record_op("dock", &format!("dock {name}"), false);
     Ok(())
 }
 
@@ -1027,6 +1128,9 @@ fn cmd_dock_merge(name: &str, args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let current = ws.current_dock().unwrap_or("main").to_string();
     let (_source, outcomes) = ws.merge_dock(name)?;
+    if !outcomes.is_empty() {
+        ws.record_op("dock merge", &format!("merge {name} → {current}"), false);
+    }
 
     match fmt {
         OutFmt::Human => {
@@ -1361,6 +1465,7 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
     let new_oid = ws.resolve_conflict(path, &bytes, vis)?;
 
     println!("resolved {} (new oid: {})", path.display(), short(&new_oid));
+    ws.record_op("resolve", &format!("resolve {}", path.display()), false);
 
     // The resolution is signed on the spot; on a dock it also advanced the tip.
     if ws.repo().conflicts().is_empty() {
@@ -1453,6 +1558,11 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
     }
     if applied > 0 {
         println!("run `loot surface` to materialize newly-accessible content");
+    }
+    if applied > 0 {
+        // pull-grants files keys into the keyring — key state undo never touches
+        // (ADR 0031). Record as a barrier so `undo` refuses to sit "before" it.
+        ws.record_op("pull-grants", &format!("pull-grants ({applied} applied)"), true);
     }
     Ok(())
 }
@@ -1720,6 +1830,9 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
     // its clock passes reveal_at. Ciphertext traveled in the bundles above;
     // keys only ever travel wrapped, here.
     deposit_embargo_grants(&mut ws, &url, &id)?;
+    // A push discloses to a relay — a one-way act undo cannot retract (ADR 0031).
+    // Record it as a barrier so `undo` refuses to step across it.
+    ws.record_op("push", &format!("push → {url}"), true);
     Ok(())
 }
 
@@ -1902,6 +2015,9 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
         // Machine output: the merge verdict rows only, no prose (empty -> no lines).
         OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
         OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
+    }
+    if !outcomes.is_empty() {
+        ws.record_op("pull", &format!("pull from {url} ({} path(s))", outcomes.len()), false);
     }
     Ok(())
 }

@@ -39,6 +39,28 @@ discovers `.loot/`, supplies the current identity and the clock, and persists on
 mutation. Commands are thin verbs over it; the snapshot invariant and clock
 injection live here. See ADR 0006.
 
+**Operation log & undo** *(S4, ADR 0031, #146)* — the safety net under implicit
+auto-snapshot. Every **view-changing** command (the mutating verbs above,
+`dock`/`dock merge`, `resolve`, `apply`/`pull`/`ferry`, and the barriers below)
+records one **operation** in an append-only, repo-wide, **local-only** log at
+`.loot/ops`. An operation captures the resulting **view** — the change-graph
+heads, each dock's `working`/`tip` pointers, the `conflicts` set, and the
+ambient-dock pointer — as raw pointer-file bytes, so restore is a pure pointer
+reset that never touches the object store or the append-only graph. `loot undo`
+steps the view back one operation, `loot op restore <n>` jumps to any operation
+(redo included), `loot op log` lists them; read-only verbs record nothing.
+Restoring is itself a *new* operation, so the log grows on undo (redo always has
+a landing spot) and **no change is ever deleted** — a signed change survives,
+undo just moves the head off it. **Barriers** it will not cross: `push` (a
+disclosure to a relay) and the restricted-key ops `grant`/`maroon`/`pull-grants`
+are recorded as non-undoable; undo refuses at one and names the real remedy
+(reverse it forward), because the keyring/manifest are one-way state a *view*
+reset cannot retract. Like the git mark map it is per-machine, never bundled,
+and rebuildable-from-nothing (losing it loses undo history, not repo data).
+NB: loot has no standalone auto-snapshot op — S2 made `status` read-only, so
+every capture rides a mutating verb; that verb *is* the one op (jj's separate
+"snapshot" op has no loot analogue).
+
 **Dock** *(CA1 shipped, 2026-07-06)* — an isolated working tree plus its own
 [[Working change]] tip, materialized cheaply over the *shared* `.loot/` object
 store and change graph. loot's answer to a git worktree, and the isolation unit
@@ -360,11 +382,13 @@ ciphertext — only this oracle.
 ## Deliberately out of scope (for now)
 
 - **jj-style ergonomics** (auto-snapshot working copy, stable change-ids,
-  oplog) — **specced** (map #132): stable change-ids (ADR 0029), implicit
-  auto-snapshot + reconciled verb surface (ADR 0030), operation log & undo
-  (ADR 0031). The *implementation* is the out-of-scope follow-on now (its own
-  build map); the design is locked. See `docs/research/jj-ergonomics.md`
-  (research) and `docs/research/jj-ergonomics-prototype.md` (verb-surface proof).
+  oplog) — **specced** (map #132) and now **building** (map #142): stable
+  change-ids (ADR 0029, S0 #143), implicit auto-snapshot + demotion guard (ADR
+  0030, S1 #144), reconciled read-only verb surface (S2 #145), operation log &
+  undo (ADR 0031, S4 #146 — see [[Operation log & undo]]) have landed; the
+  divergent-change marker + collapse verb (S3 #147) remains. See
+  `docs/research/jj-ergonomics.md` (research) and
+  `docs/research/jj-ergonomics-prototype.md` (verb-surface proof).
 - **git interop bridge.** Important eventually; not part of the first slice.
 
 These are excluded from the *foundation* so the first slice ships fast and
