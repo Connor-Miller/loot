@@ -888,12 +888,7 @@ impl DagRepo {
             }
         }
         if !demoted.is_empty() {
-            return Err(RepoError::Backend(format!(
-                "refusing to demote visibility of {}: an attributes change would re-seal \
-                 private content more readably; restore the .lootattributes rule, or run \
-                 `loot status --allow-demote <path>` to demote deliberately",
-                demoted.join(", ")
-            )));
+            return Err(RepoError::Demotion { paths: demoted });
         }
 
         // Drop the prior working change so we reconcile against finalized history,

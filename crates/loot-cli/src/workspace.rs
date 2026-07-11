@@ -234,6 +234,43 @@ impl Workspace {
         Ok((id, reported))
     }
 
+    /// The working change's current message, if one is in progress — so an
+    /// implicit snapshot (ADR 0030) re-records the tree without clobbering a
+    /// name a prior `describe` set. `None` when there is no working change.
+    pub fn working_message(&self) -> Option<String> {
+        self.working
+            .as_ref()
+            .and_then(|w| self.repo.change_message(w))
+    }
+
+    /// `loot new` under implicit snapshot (ADR 0030): capture any edits made
+    /// since the last command into the working change *first* — so `edit; new`
+    /// never loses work — then finalize. A snapshot that adds nothing over the
+    /// dock tip (an empty or tip-duplicate working change) is dropped rather
+    /// than finalized, so a bare `loot new` does not mint an empty signed
+    /// change. `--no-snapshot` skips the capture (`skip_snapshot`); the
+    /// demotion guard rides the capture via `allow_demote`.
+    pub fn finalize_capturing(
+        &mut self,
+        allow_demote: &[PathBuf],
+        skip_snapshot: bool,
+    ) -> Result<(), String> {
+        if !skip_snapshot {
+            let msg = self.working_message().unwrap_or_else(|| "(working change)".to_string());
+            let (id, _) = self.snapshot_allowing(&msg, allow_demote)?;
+            let anchor = self.anchor();
+            let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
+            let duplicate = empty
+                || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &id, self.now));
+            if duplicate {
+                self.repo.drop_working(&id);
+                self.working = None;
+                self.persist()?;
+            }
+        }
+        self.finalize_working()
+    }
+
     /// Finalize the working change and start fresh: the next snapshot appends a
     /// new change rather than rewriting this one.
     pub fn finalize_working(&mut self) -> Result<(), String> {
