@@ -5,6 +5,11 @@
   ferry the git side across the bridge, push to the relay, and log the day
   (evidence for map #54 section A).
 
+  NOTE: this is the *git-first* ritual (git leads, loot ingests). Its
+  loot-first successor is tools/loot-first.ps1 (map #148): loot leads, the PR
+  reviews projected WIP, and git main is projected downstream. Prefer that
+  for new work; see docs/agents/workflow.md.
+
 .DESCRIPTION
   Runs the daily ritual and records it:
     1. If git sees uncommitted work (or -ForceSnapshot):

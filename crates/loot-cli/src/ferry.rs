@@ -16,7 +16,7 @@
 use crate::workspace::Workspace;
 use loot_core::bridge::{
     self, FerryState, MarkMap, MarkOrigin, TRAILER_AUTHOR, TRAILER_CHANGE_ID, TRAILER_GIT_AUTHOR,
-    TRAILER_SIGNATURE,
+    TRAILER_PROVISIONAL, TRAILER_SIGNATURE,
 };
 use loot_core::{hex, MergeOutcome, Oid, Repo, RepoError, Visibility};
 use std::collections::BTreeMap;
@@ -38,14 +38,21 @@ pub struct FerryReport {
     pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
     /// Human-relevant events (baseline adoption, skipped main update, ...).
     pub notes: Vec<String>,
+    /// The WIP review projection this pass made (map #148), preformatted as a
+    /// stable machine-parsable line for the orchestrator.
+    pub review: Option<String>,
 }
 
 /// Run one bidirectional reconcile pass. `git_dir_flag`/`dock_flag` override
 /// (and persist to) the mirror config under `.loot/git-mirror/config`.
+/// `with_wip` additionally projects the ambient dock's *unfinalized* working
+/// change to `refs/heads/review/<dock>` as a provisional commit (map #148);
+/// provisional lifecycle reaping runs on every pass regardless of the flag.
 pub fn run(
     ws: &mut Workspace,
     git_dir_flag: Option<&str>,
     dock_flag: Option<&str>,
+    with_wip: bool,
 ) -> Result<FerryReport, String> {
     let mut report = FerryReport::default();
     let mirror_dir = ws.store().git_mirror_dir();
@@ -240,6 +247,142 @@ pub fn run(
         }
     }
 
+    // --- review lane: provisional WIP projection + lifecycle reap (#148) ---
+    //
+    // The lane is keyed by the *durable* change id (map #132) so it survives
+    // every re-snapshot; entries live in `.loot/git-mirror/wip`, deliberately
+    // outside the mark map — nothing provisional ever enters the round-trip
+    // spine. Reaping is lazy and runs on every pass: `loot new` stays
+    // git-quiet, and the next ferry notices the lane's change id is now
+    // signed (landed) or gone (abandoned/superseded) and retires the ref.
+    let wip_path = ws.store().git_wip();
+    let mut wip = WipState::parse(&read_or_empty(&wip_path));
+    let dock_sel_wip = |name: &str| if name == "main" { None } else { Some(name.to_string()) };
+    wip.entries.retain(|e| {
+        let landed = ws.repo().change_ids_topo().iter().any(|c| {
+            ws.repo().change_signature(c).is_some()
+                && wip_key(ws, c) == e.change
+                && ws.repo().change_author(c).is_some()
+        });
+        let current = ws
+            .store()
+            .read_working(dock_sel_wip(&e.dock).as_deref())
+            .map(|w| wip_key(ws, &w));
+        let live = !landed && current.as_deref() == Some(e.change.as_str());
+        if !live {
+            let ref_name = format!("refs/heads/review/{}", e.dock);
+            if let Ok(mut r) = git.find_reference(&ref_name) {
+                let _ = r.delete();
+            }
+            report.notes.push(format!(
+                "reaped review/{} (change {} {})",
+                e.dock,
+                &e.change[..8.min(e.change.len())],
+                if landed { "landed" } else { "abandoned or superseded" }
+            ));
+        }
+        live
+    });
+
+    if with_wip {
+        // Ferry is a mutating verb in this mode: capture the ambient tree
+        // first (tree-hash short-circuit makes an unchanged tree a no-op, and
+        // the demotion guard applies exactly as on any snapshot, #135).
+        let msg = ws.working_message().unwrap_or_else(|| "wip".to_string());
+        let _ = ws.snapshot(&msg)?;
+        match ws.working_id().cloned() {
+            None => {
+                report.review =
+                    Some("review: op=none (no working change to project)".to_string());
+            }
+            Some(wid) => {
+                let key = wip_key(ws, &wid);
+                let dock = ws.dock_name().to_string();
+                let version_hex = hex::encode(&wid.0);
+                let existing = wip
+                    .entries
+                    .iter()
+                    .find(|e| e.dock == dock && e.change == key)
+                    .cloned();
+                if existing.as_ref().is_some_and(|e| e.version == version_hex) {
+                    let e = existing.as_ref().unwrap();
+                    report.review = Some(format!(
+                        "review: dock={dock} branch=review/{dock} sha={} change={key} version={} round={} op=up-to-date",
+                        e.sha, &version_hex[..8], e.round
+                    ));
+                } else {
+                    // Round 1 parents = the working change's marked graph
+                    // parents (so the PR diffs against main); later rounds
+                    // append onto the previous provisional commit (#150).
+                    let (parent_shas, round) = match &existing {
+                        Some(e) => (vec![e.sha.clone()], e.round + 1),
+                        None => {
+                            let mut shas = Vec::new();
+                            for p in ws.repo().parents_of(&wid) {
+                                match marks.sha_for(&p) {
+                                    Some(s) => shas.push(s.to_string()),
+                                    None => {
+                                        return Err(format!(
+                                            "review: working parent {} has no mirrored commit — \
+                                             run a plain `loot ferry` first",
+                                            hex::short(&p.0, 8)
+                                        ))
+                                    }
+                                }
+                            }
+                            (shas, 1u64)
+                        }
+                    };
+                    // An empty first round is nothing reviewable yet.
+                    let parent_tree_same = ws
+                        .repo()
+                        .parents_of(&wid)
+                        .first()
+                        .and_then(|p| ws.repo().change_tree(p))
+                        == ws.repo().change_tree(&wid);
+                    if existing.is_none() && parent_tree_same {
+                        report.review = Some(
+                            "review: op=none (working tree matches the anchor — nothing to review)"
+                                .to_string(),
+                        );
+                    } else {
+                        let sha = project_wip(
+                            ws,
+                            &git,
+                            &wid,
+                            &parent_shas,
+                            &generations,
+                            last_clean_tree.as_ref(),
+                            &id_map,
+                        )?;
+                        let ref_name = format!("refs/heads/review/{dock}");
+                        git.reference(
+                            &ref_name,
+                            git2::Oid::from_str(&sha).map_err(|e| e.to_string())?,
+                            true,
+                            "loot ferry --with-wip",
+                        )
+                        .map_err(|e| format!("update {ref_name}: {e}"))?;
+                        wip.entries.retain(|e| !(e.dock == dock && e.change == key));
+                        wip.entries.push(WipEntry {
+                            change: key.clone(),
+                            dock: dock.clone(),
+                            sha: sha.clone(),
+                            version: version_hex.clone(),
+                            round,
+                        });
+                        report.review = Some(format!(
+                            "review: dock={dock} branch=review/{dock} sha={sha} change={key} version={} round={round} op={}",
+                            &version_hex[..8],
+                            if round == 1 { "opened" } else { "appended" }
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    std::fs::write(&wip_path, wip.encode()).map_err(|e| format!("write wip: {e}"))?;
+
     // --- persist the spine ---
     state.git_main = git
         .find_reference(MAIN_REF)
@@ -301,6 +444,17 @@ fn ingest_commit(
         .find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let message = String::from_utf8_lossy(commit.message_bytes()).to_string();
+
+    // A provisional review commit must never enter the round-trip (map #148):
+    // review/* sits outside ingest by construction, so meeting one on the
+    // mirrored branch means a review branch was merged on the git side.
+    if bridge::parse_trailer(&message, TRAILER_PROVISIONAL).is_some() {
+        return Err(format!(
+            "commit {}: carries {TRAILER_PROVISIONAL} — a provisional review commit reached the \
+             mirrored branch; review lanes land through loot, never a git merge",
+            &sha[..12]
+        ));
+    }
 
     // Trailer short-circuit: this commit *is* a loot change we projected.
     if let Some(id_hex) = bridge::parse_trailer(&message, TRAILER_CHANGE_ID) {
@@ -501,35 +655,7 @@ fn project_change(
     id_map: &BTreeMap<String, String>,
 ) -> Result<String, String> {
     let repo = ws.repo();
-    let change_tree = repo
-        .change_tree(id)
-        .ok_or_else(|| format!("unknown change {}", hex::short(&id.0, 8)))?;
-    let conflicts = repo.conflicts();
-
-    let mut entries: Vec<(String, git2::Oid)> = Vec::new();
-    for (path, (oid, _vis)) in &change_tree {
-        let rel = path.to_string_lossy().replace('\\', "/");
-        if conflicts.contains_key(path) {
-            // Held back: project the last clean content, or omit if it never
-            // reached git. The resolution change will carry the real content.
-            if let Some(tree) = last_clean {
-                if let Ok(entry) = tree.get_path(Path::new(&rel)) {
-                    entries.push((rel, entry.id()));
-                }
-            }
-            continue;
-        }
-        match repo.get(oid, ws.identity(), ws.now()) {
-            Ok(bytes) => {
-                let blob = git.blob(&bytes).map_err(|e| e.to_string())?;
-                entries.push((rel, blob));
-            }
-            Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => continue,
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    let tree_oid = write_git_tree(git, &entries)?;
-    let tree = git.find_tree(tree_oid).map_err(|e| e.to_string())?;
+    let tree = sealed_free_tree(ws, git, id, last_clean)?;
 
     let mut parent_commits = Vec::new();
     for p in repo.parents_of(id) {
@@ -577,6 +703,161 @@ fn project_change(
             .map_err(|e| e.to_string())?
     };
     Ok(oid.to_string())
+}
+
+/// The surfaced (readable) tree of a change as a git tree: sealed / embargoed
+/// paths omitted entirely (no filename, no bytes), unresolved conflicts held
+/// at their last clean git state (ADR 0028). Shared by the finalized and the
+/// provisional (WIP) projection lanes.
+fn sealed_free_tree<'g>(
+    ws: &Workspace,
+    git: &'g git2::Repository,
+    id: &Oid,
+    last_clean: Option<&git2::Tree>,
+) -> Result<git2::Tree<'g>, String> {
+    let repo = ws.repo();
+    let change_tree = repo
+        .change_tree(id)
+        .ok_or_else(|| format!("unknown change {}", hex::short(&id.0, 8)))?;
+    let conflicts = repo.conflicts();
+
+    let mut entries: Vec<(String, git2::Oid)> = Vec::new();
+    for (path, (oid, _vis)) in &change_tree {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        if conflicts.contains_key(path) {
+            // Held back: project the last clean content, or omit if it never
+            // reached git. The resolution change will carry the real content.
+            if let Some(tree) = last_clean {
+                if let Ok(entry) = tree.get_path(Path::new(&rel)) {
+                    entries.push((rel, entry.id()));
+                }
+            }
+            continue;
+        }
+        match repo.get(oid, ws.identity(), ws.now()) {
+            Ok(bytes) => {
+                let blob = git.blob(&bytes).map_err(|e| e.to_string())?;
+                entries.push((rel, blob));
+            }
+            Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let tree_oid = write_git_tree(git, &entries)?;
+    git.find_tree(tree_oid).map_err(|e| e.to_string())
+}
+
+/// Project the ambient dock's *unfinalized* working change as a provisional
+/// review commit (map #148): sealed-free tree, `Loot-Provisional` trailer and
+/// **no** `Loot-Signature` — unsigned in loot is the point, the missing
+/// trailer is what marks it not-finalized — while the git commit itself is
+/// still SSHSIG-signed so mirror history stays integrity-checked end to end.
+fn project_wip(
+    ws: &Workspace,
+    git: &git2::Repository,
+    id: &Oid,
+    parent_shas: &[String],
+    generations: &BTreeMap<Oid, u64>,
+    last_clean: Option<&git2::Tree>,
+    id_map: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let repo = ws.repo();
+    let tree = sealed_free_tree(ws, git, id, last_clean)?;
+
+    let mut parent_commits = Vec::new();
+    for sha in parent_shas {
+        parent_commits.push(
+            git.find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+
+    let (name, email) = author_name_email(ws, repo.change_author(id), id_map);
+    let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
+    let sig = git2::Signature::new(&name, &email, &when).map_err(|e| e.to_string())?;
+
+    let mut trailers: Vec<(&str, String)> = vec![
+        (TRAILER_CHANGE_ID, hex::encode(&id.0)),
+        (TRAILER_PROVISIONAL, "true".to_string()),
+    ];
+    if let Some(author) = repo.change_author(id) {
+        trailers.push((TRAILER_AUTHOR, hex::encode(&author)));
+    }
+    let message =
+        bridge::append_trailers(&repo.change_message(id).unwrap_or_default(), &trailers);
+
+    let oid = if ws.author_pubkey().is_some() {
+        let buf = git
+            .commit_create_buffer(&sig, &sig, &message, &tree, &parent_refs)
+            .map_err(|e| e.to_string())?;
+        let content =
+            std::str::from_utf8(&buf).map_err(|_| "commit buffer is not utf-8".to_string())?;
+        let ssh_sig = ws.ssh_sign(GIT_SIG_NAMESPACE, content.as_bytes())?;
+        git.commit_signed(content, &ssh_sig, None).map_err(|e| e.to_string())?
+    } else {
+        git.commit(None, &sig, &sig, &message, &tree, &parent_refs)
+            .map_err(|e| e.to_string())?
+    };
+    Ok(oid.to_string())
+}
+
+/// The durable review-lane key of a change: its `change_id` (map #132, stable
+/// across re-snapshots), falling back to the version id for legacy changes —
+/// a legacy lane then re-keys every snapshot and simply reaps as superseded.
+fn wip_key(ws: &Workspace, id: &Oid) -> String {
+    ws.repo()
+        .change_change_id(id)
+        .map(|cid| hex::encode(&cid))
+        .unwrap_or_else(|| hex::encode(&id.0))
+}
+
+/// One in-flight review lane (`.loot/git-mirror/wip`, local-only): durable
+/// change key -> its latest provisional projection. Deliberately not part of
+/// the mark map — provisional shas never enter the round-trip spine.
+#[derive(Clone)]
+struct WipEntry {
+    change: String,
+    dock: String,
+    sha: String,
+    version: String,
+    round: u64,
+}
+
+struct WipState {
+    entries: Vec<WipEntry>,
+}
+
+impl WipState {
+    fn parse(text: &str) -> Self {
+        let mut entries = Vec::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() == 5 {
+                if let Ok(round) = f[4].parse() {
+                    entries.push(WipEntry {
+                        change: f[0].into(),
+                        dock: f[1].into(),
+                        sha: f[2].into(),
+                        version: f[3].into(),
+                        round,
+                    });
+                }
+            }
+        }
+        WipState { entries }
+    }
+
+    fn encode(&self) -> String {
+        let mut out = String::new();
+        for e in &self.entries {
+            out.push_str(&format!(
+                "{} {} {} {} {}\n",
+                e.change, e.dock, e.sha, e.version, e.round
+            ));
+        }
+        out
+    }
 }
 
 /// Build a (possibly nested) git tree from flat `path -> blob` entries.
@@ -658,6 +939,10 @@ fn rebuild_marks(ws: &Workspace, git: &git2::Repository) -> Result<MarkMap, Stri
     for oid in rw.flatten() {
         let Ok(commit) = git.find_commit(oid) else { continue };
         let message = String::from_utf8_lossy(commit.message_bytes()).to_string();
+        // Provisional review commits never enter the spine (#148).
+        if bridge::parse_trailer(&message, TRAILER_PROVISIONAL).is_some() {
+            continue;
+        }
         match bridge::parse_trailer(&message, TRAILER_CHANGE_ID).and_then(|h| bridge::parse_oid_hex(&h)) {
             Some(id) if ws.repo().change_tree(&id).is_some() => {
                 marks.insert(oid.to_string(), id, MarkOrigin::Loot);
@@ -868,7 +1153,11 @@ mod tests {
     }
 
     fn ferry(ws: &mut Workspace, mirror: &Path) -> FerryReport {
-        run(ws, Some(mirror.to_str().unwrap()), None).unwrap()
+        run(ws, Some(mirror.to_str().unwrap()), None, false).unwrap()
+    }
+
+    fn ferry_wip(ws: &mut Workspace, mirror: &Path) -> FerryReport {
+        run(ws, Some(mirror.to_str().unwrap()), None, true).unwrap()
     }
 
     /// All blob paths in a commit's tree, recursively (unix-style).
@@ -1198,6 +1487,91 @@ mod tests {
         let resolved_tree = resolved_tip.tree().unwrap();
         let blob = resolved_tree.get_name("shared.txt").unwrap();
         assert_eq!(git.find_blob(blob.id()).unwrap().content(), b"resolved\n");
+    }
+
+    #[test]
+    fn with_wip_projects_provisional_review_lane_then_reaps_on_finalize() {
+        let (mut ws, dir, mirror) = setup("wip-review");
+        put_file(&dir, ".lootattributes", "secret/** restricted=bob\n");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // Round 1: unfinalized WIP (incl. a sealed path) -> a provisional
+        // commit on review/<dock>; main and the mark spine stay untouched.
+        put_file(&dir, "a.txt", "wip round 1\n");
+        put_file(&dir, "secret/pitch.md", "sealed wip\n");
+        let (wid, _) = ws.snapshot("feature wip").unwrap();
+        let marks_before = read_or_empty(&ws.store().git_marks());
+        let git = git2::Repository::open(&mirror).unwrap();
+        let main_before = main_commit(&git).id();
+
+        let r1 = ferry_wip(&mut ws, &mirror);
+        let line = r1.review.expect("review line");
+        assert!(line.contains("op=opened") && line.contains("round=1"), "{line}");
+        let dock = ws.dock_name().to_string();
+        let rev = git
+            .find_reference(&format!("refs/heads/review/{dock}"))
+            .expect("review ref exists");
+        let c1 = git.find_commit(rev.target().unwrap()).unwrap();
+        let msg = c1.message().unwrap();
+        assert_eq!(bridge::parse_trailer(msg, TRAILER_PROVISIONAL), Some("true".into()));
+        assert_eq!(bridge::parse_trailer(msg, TRAILER_CHANGE_ID), Some(hex::encode(&wid.0)));
+        assert!(
+            bridge::parse_trailer(msg, TRAILER_SIGNATURE).is_none(),
+            "provisional = no loot signature"
+        );
+        let paths = tree_paths(&git, &c1.tree().unwrap());
+        assert!(paths.contains(&"a.txt".to_string()));
+        assert!(
+            !paths.iter().any(|p| p.contains("secret")),
+            "review lane omits sealed paths too: {paths:?}"
+        );
+        assert_eq!(main_commit(&git).id(), main_before, "main untouched by WIP");
+        assert_eq!(
+            read_or_empty(&ws.store().git_marks()),
+            marks_before,
+            "mark spine untouched by WIP"
+        );
+
+        // Same tree again -> idempotent, no new round.
+        let r2 = ferry_wip(&mut ws, &mirror);
+        assert!(r2.review.unwrap().contains("op=up-to-date"));
+
+        // Revise -> round 2 appends onto round 1 (same durable lane, #150).
+        put_file(&dir, "a.txt", "wip round 2\n");
+        let r3 = ferry_wip(&mut ws, &mirror);
+        let line3 = r3.review.unwrap();
+        assert!(line3.contains("op=appended") && line3.contains("round=2"), "{line3}");
+        let rev = git.find_reference(&format!("refs/heads/review/{dock}")).unwrap();
+        let c2 = git.find_commit(rev.target().unwrap()).unwrap();
+        assert_eq!(c2.parent_ids().count(), 1);
+        assert_eq!(c2.parent_id(0).unwrap(), c1.id(), "append-per-round");
+
+        // Finalize (git-quiet), then the next plain ferry lands the signed
+        // change on main AND lazily reaps the provisional lane.
+        ws.finalize_working().unwrap();
+        let r4 = ferry(&mut ws, &mirror);
+        assert!(r4.projected >= 1, "signed change lands on main");
+        assert!(
+            r4.notes.iter().any(|n| n.contains("reaped review/") && n.contains("landed")),
+            "reap note missing: {:?}",
+            r4.notes
+        );
+        assert!(
+            git.find_reference(&format!("refs/heads/review/{dock}")).is_err(),
+            "review ref retired"
+        );
+        let landed = main_commit(&git);
+        assert!(
+            bridge::parse_trailer(landed.message().unwrap(), TRAILER_SIGNATURE).is_some(),
+            "landed commit is the signed projection"
+        );
+        assert!(bridge::parse_trailer(landed.message().unwrap(), TRAILER_PROVISIONAL).is_none());
+
+        // And the pass after that is a full no-op.
+        let r5 = ferry(&mut ws, &mirror);
+        assert_eq!((r5.ingested, r5.projected), (0, 0));
     }
 
     #[test]

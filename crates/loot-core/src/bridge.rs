@@ -19,6 +19,11 @@ pub const TRAILER_SIGNATURE: &str = "Loot-Signature";
 /// Trailer key preserving the original git author on an ingested git-native
 /// commit that did not resolve to the syncing identity (ADR 0028).
 pub const TRAILER_GIT_AUTHOR: &str = "Git-Author";
+/// Trailer marking a projected *unfinalized* working change on a `review/*`
+/// branch (map #148). A provisional commit carries no `Loot-Signature` — the
+/// missing signature is the machine-checkable "not finalized" marker — and it
+/// never enters the round-trip: ingest refuses it, mark rebuilds skip it.
+pub const TRAILER_PROVISIONAL: &str = "Loot-Provisional";
 
 /// Base of the deterministic commit-date scheme (loot changes carry no
 /// timestamp, ADR 0028): committer = author date = `BASE_EPOCH + generation`,
