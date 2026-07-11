@@ -28,7 +28,8 @@ use crate::manifest::Manifest;
 use crate::sealed::{self, ContentKey, Keyring, SealedObject, ANYONE};
 use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 pub(crate) use change_graph::ChangeNode;
-use change_graph::{compute_change_id, ChangeGraph};
+pub use change_graph::change_signing_message;
+use change_graph::{compute_change_id, mint_change_id, ChangeGraph};
 use crate::store::RepoStore;
 use object_store::{ObjectStore, Stored};
 use std::collections::{BTreeMap, BTreeSet};
@@ -896,6 +897,12 @@ impl DagRepo {
             )));
         }
 
+        // Carry the durable change id across this re-snapshot (ADR 0029): the
+        // version id will change, the change id must not. Read it BEFORE dropping
+        // the prior working node below. `None` (first snapshot of a fresh change)
+        // lets `record` mint one.
+        let carried_change_id = working.and_then(|w| self.graph.get(w).and_then(|n| n.change_id));
+
         // Drop the prior working change so we reconcile against finalized history,
         // not against our own last snapshot.
         if let Some(w) = working {
@@ -967,7 +974,7 @@ impl DagRepo {
             message: message.to_string(),
             tree,
         };
-        self.record(change)
+        self.record_carrying(change, carried_change_id)
     }
 
     /// Set this repo's author pubkey (S3, ADR 0018): the workspace calls this
@@ -1001,6 +1008,13 @@ impl DagRepo {
     /// authorship, reverse-resolved to a peer name.
     pub fn change_author(&self, id: &Oid) -> Option<[u8; 32]> {
         self.graph.get(id).and_then(|n| n.author)
+    }
+
+    /// The durable `change_id` recorded on a change (v6, ADR 0029), or `None`
+    /// for a legacy/unauthored change or an unknown id. Finalization reads it to
+    /// build the `version_id ‖ change_id` signing message.
+    pub fn change_change_id(&self, id: &Oid) -> Option<[u8; 16]> {
+        self.graph.get(id).and_then(|n| n.change_id)
     }
 
     /// The parents of a change, or empty if the id is unknown. Lets a caller find
@@ -1045,6 +1059,38 @@ impl DagRepo {
     /// whose author is not the syncing identity this way — loot never forges
     /// another identity's authorship (GB1, ADR 0028). Unauthored changes travel
     /// unsigned, exactly like pre-0018 history.
+    /// Record a change, optionally *carrying* an existing durable `change_id`
+    /// across a re-snapshot (ADR 0029): the version id is recomputed from content
+    /// as always, but the change id is preserved so a working change keeps one
+    /// stable handle while it is edited. `carried = None` begins a fresh change —
+    /// minting a new random change id when authored, or staying `None` for a
+    /// keyless repo (an unsigned change gets no durable handle, matching legacy).
+    fn record_carrying(
+        &mut self,
+        change: Change,
+        carried: Option<[u8; 16]>,
+    ) -> Result<Oid, RepoError> {
+        // Fold this repo's author pubkey (if set) into the id, so authorship is
+        // intrinsic (ADR 0018). The signature is attached later, at finalization
+        // (`attach_signature`), not on every working-change rewrite.
+        let id = compute_change_id(self.author.as_ref(), &change);
+        let change_id = match carried {
+            Some(cid) => Some(cid),
+            None => self.author.map(|_| mint_change_id()),
+        };
+        let node = ChangeNode {
+            id: id.clone(),
+            parents: change.parents,
+            message: change.message,
+            tree: change.tree,
+            author: self.author,
+            signature: None,
+            change_id,
+        };
+        self.graph.insert(node);
+        Ok(id)
+    }
+
     pub fn record_unauthored(&mut self, change: Change) -> Result<Oid, RepoError> {
         let id = compute_change_id(None, &change);
         let node = ChangeNode {
@@ -1054,6 +1100,10 @@ impl DagRepo {
             tree: change.tree,
             author: None,
             signature: None,
+            // Unauthored (bridge-ingested) changes carry no durable handle: an
+            // unsigned change gets none, and whether the git bridge should mint
+            // or map one is deferred fog (ADR 0028/0029).
+            change_id: None,
         };
         self.graph.insert(node);
         Ok(id)
@@ -1463,22 +1513,12 @@ impl Repo for DagRepo {
         sealed::open(obj, oid, reader, &self.keyring, now)
     }
 
-    /// Record a change over the current set of put() objects.
+    /// Record a change over the current set of put() objects, beginning a fresh
+    /// change: it mints a new durable `change_id` when this repo is authored
+    /// (ADR 0029). A re-snapshot that must *carry* an existing change id calls
+    /// the inherent `record_carrying` instead.
     fn record(&mut self, change: Change) -> Result<Oid, RepoError> {
-        // Fold this repo's author pubkey (if set) into the id, so authorship is
-        // intrinsic (ADR 0018). The signature is attached later, at finalization
-        // (`attach_signature`), not on every working-change rewrite.
-        let id = compute_change_id(self.author.as_ref(), &change);
-        let node = ChangeNode {
-            id: id.clone(),
-            parents: change.parents,
-            message: change.message,
-            tree: change.tree,
-            author: self.author,
-            signature: None,
-        };
-        self.graph.insert(node);
-        Ok(id)
+        self.record_carrying(change, None)
     }
 
     /// Materialize the tree of `change` to the working area, skipping
@@ -1755,7 +1795,12 @@ fn verify_authored_change(node: &ChangeNode) -> Result<(), RepoError> {
     };
     let vk = VerifyingKey::from_bytes(&author)
         .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))?;
-    vk.verify(&node.id.0, &Signature::from_bytes(&sig))
+    // The signature covers `version_id ‖ change_id` (ADR 0029), so a relay or
+    // peer cannot relabel signed content under a different change id. A legacy
+    // change (`change_id = None`) signs over the version id alone, so its pre-v6
+    // signature still verifies through the same call.
+    let message = change_signing_message(&node.id, &node.change_id);
+    vk.verify(&message, &Signature::from_bytes(&sig))
         .map_err(|_| RepoError::BadChangeSignature(node.id.clone()))
 }
 
@@ -2372,6 +2417,40 @@ mod tests {
         let tree = repo.graph.current_tree();
         let oid = &tree[&PathBuf::from("a.txt")].0;
         assert_eq!(repo.get(oid, "alice", 0).unwrap(), b"two");
+    }
+
+    #[test]
+    fn change_id_is_stable_across_resnapshots_while_version_id_changes() {
+        // ADR 0029 keystone: a working change keeps ONE durable change_id across
+        // every re-snapshot, even as its content-derived version id rewrites — the
+        // durable-name-while-you-edit property the rest of the trio builds on.
+        let (_, pk) = test_signer(3);
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        repo.set_author(pk);
+        let w1 = repo
+            .snapshot(None, None, &[entry("a.txt", b"one", Visibility::Public)], "wip", 0)
+            .unwrap();
+        let cid1 = repo.change_change_id(&w1).expect("an authored change mints a change id");
+        let w2 = repo
+            .snapshot(None, Some(&w1), &[entry("a.txt", b"two", Visibility::Public)], "wip", 0)
+            .unwrap();
+        assert_ne!(w1, w2, "the version id rewrites when content changes");
+        assert_eq!(
+            repo.change_change_id(&w2),
+            Some(cid1),
+            "the durable change id is carried across the re-snapshot"
+        );
+    }
+
+    #[test]
+    fn keyless_repo_mints_no_change_id() {
+        // A keyless (unauthored) repo gets no durable handle: an unsigned change
+        // matches legacy `None` (ADR 0029).
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let w = repo
+            .snapshot(None, None, &[entry("a.txt", b"x", Visibility::Public)], "wip", 0)
+            .unwrap();
+        assert!(repo.change_change_id(&w).is_none());
     }
 
     #[test]
@@ -3151,7 +3230,12 @@ mod tests {
         let add_id = alice
             .record(Change { id: Oid([0; 32]), parents: vec![], message: "add".into(), tree })
             .unwrap();
-        alice.attach_signature(&add_id, sk.sign(&add_id.0).to_bytes()).unwrap();
+        // Sign the finalize message (`version_id ‖ change_id`, ADR 0029), exactly
+        // as the workspace does — an authored change now carries a minted change id.
+        let add_cid = alice.change_change_id(&add_id);
+        alice
+            .attach_signature(&add_id, sk.sign(&change_signing_message(&add_id, &add_cid)).to_bytes())
+            .unwrap();
 
         let res = alice.maroon_hard(Path::new("s.txt"), "bob", 0).unwrap();
         assert!(
@@ -3160,7 +3244,13 @@ mod tests {
         );
 
         // Finalize exactly as `cmd_maroon` now does.
-        alice.attach_signature(&res.change_id, sk.sign(&res.change_id.0).to_bytes()).unwrap();
+        let res_cid = alice.change_change_id(&res.change_id);
+        alice
+            .attach_signature(
+                &res.change_id,
+                sk.sign(&change_signing_message(&res.change_id, &res_cid)).to_bytes(),
+            )
+            .unwrap();
         assert!(
             alice.offered_objects(&[]).contains(&res.new_oid),
             "after signing, the maroon re-seal must be offered so peers receive it"
@@ -3700,6 +3790,7 @@ mod tests {
             tree: BTreeMap::new(),
             author: Some(author),
             signature,
+            change_id: None,
         }
     }
 
@@ -3735,6 +3826,40 @@ mod tests {
         let node = authored_change(id.clone(), pk, Some(sk.sign(&id.0).to_bytes()));
         let mut bob = DagRepo::init(tmp(), "bob").unwrap();
         assert!(bob.apply(&bundle_of(node), 0).is_ok(), "a validly signed change must apply");
+    }
+
+    #[test]
+    fn v6_change_signed_over_both_ids_verifies_through_apply() {
+        // ADR 0029: a v6 change signs over `version_id ‖ change_id`. A signature
+        // built over that wider message must verify on apply.
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(7);
+        let id = Oid([5; 32]);
+        let cid = Some([0xAB; 16]);
+        let mut node = authored_change(id.clone(), pk, None);
+        node.change_id = cid;
+        node.signature = Some(sk.sign(&change_signing_message(&id, &cid)).to_bytes());
+        let mut bob = DagRepo::init(tmp(), "bob").unwrap();
+        assert!(bob.apply(&bundle_of(node), 0).is_ok(), "a change signed over both ids must apply");
+    }
+
+    #[test]
+    fn apply_rejects_change_id_relabelled_after_signing() {
+        // The signature binds the change id (ADR 0029): a peer that keeps the
+        // signed bytes but swaps the change_id (relabelling signed content under a
+        // different handle) must be rejected.
+        use ed25519_dalek::Signer;
+        let (sk, pk) = test_signer(7);
+        let id = Oid([5; 32]);
+        let signed_cid = Some([0xAB; 16]);
+        let mut node = authored_change(id.clone(), pk, None);
+        // Signed over change_id 0xAB…, but the node now carries a different one.
+        node.signature = Some(sk.sign(&change_signing_message(&id, &signed_cid)).to_bytes());
+        node.change_id = Some([0xCD; 16]);
+        assert!(matches!(
+            DagRepo::init(tmp(), "bob").unwrap().apply(&bundle_of(node), 0),
+            Err(RepoError::BadChangeSignature(_))
+        ));
     }
 
     #[test]
@@ -3859,6 +3984,7 @@ mod tests {
             tree: BTreeMap::new(),
             author: None,
             signature: None,
+            change_id: None,
         }
     }
 
