@@ -61,6 +61,26 @@ NB: loot has no standalone auto-snapshot op — S2 made `status` read-only, so
 every capture rides a mutating verb; that verb *is* the one op (jj's separate
 "snapshot" op has no loot analogue).
 
+**Divergent change** *(S3, ADR 0029/0030, #147)* — one durable **change id**
+carrying **more than one live version id**: two writers independently rewriting
+the same change id (the honest answer to a concurrent amend, not an error). It is
+per-change-id, *not* head-counting — two versions of one change id can sit under
+a single graph head (e.g. as the two parents of a merge) and may even have
+identical trees — so it is detected by scanning every node, never just the heads,
+and it is **not** a tree conflict (`resolve`/`dock merge` are untouched). `log`
+and `status` render it with a trailing **`!`** on the change id and list each
+version; a log whose only multi-head reason is one divergent change stays the
+flat listing (routing by *distinct change lines*, not head count, so the "run
+`loot apply` to converge" branch never mis-claims a divergence apply can't
+collapse). **`loot abandon <version-id>`** (jj-parity `jj abandon`) drops a
+version, leaving the other live version(s) under the change id: the node is never
+deleted — it stops being a live head and joins a **local-only `.loot/abandoned`**
+set the live view filters out. Abandon is one **undoable** operation ([[Operation
+log & undo]] captures both the heads and the abandoned set), and it refuses a
+non-divergent change so it can never hide a change's sole version. Genuine
+tree-*merge* of two versions stays the existing converge path (a different
+intent — it produces a new version).
+
 **Dock** *(CA1 shipped, 2026-07-06)* — an isolated working tree plus its own
 [[Working change]] tip, materialized cheaply over the *shared* `.loot/` object
 store and change graph. loot's answer to a git worktree, and the isolation unit
@@ -382,13 +402,16 @@ ciphertext — only this oracle.
 ## Deliberately out of scope (for now)
 
 - **jj-style ergonomics** (auto-snapshot working copy, stable change-ids,
-  oplog) — **specced** (map #132) and now **building** (map #142): stable
-  change-ids (ADR 0029, S0 #143), implicit auto-snapshot + demotion guard (ADR
-  0030, S1 #144), reconciled read-only verb surface (S2 #145), operation log &
-  undo (ADR 0031, S4 #146 — see [[Operation log & undo]]) have landed; the
-  divergent-change marker + collapse verb (S3 #147) remains. See
+  oplog) — **specced** (map #132) and **built** (map #142, all slices landed):
+  stable change-ids (ADR 0029, S0 #143), implicit auto-snapshot + demotion guard
+  (ADR 0030, S1 #144), reconciled read-only verb surface (S2 #145), operation log
+  & undo (ADR 0031, S4 #146 — see [[Operation log & undo]]), and the
+  divergent-change marker + `loot abandon` (S3 #147 — see [[Divergent change]]).
+  The trio is now part of loot's surface, not out of scope. See
   `docs/research/jj-ergonomics.md` (research) and
-  `docs/research/jj-ergonomics-prototype.md` (verb-surface proof).
+  `docs/research/jj-ergonomics-prototype.md` (verb-surface proof). Remaining fog
+  (map #142): lock-free divergent-*operations*, per-dock undo granularity, the
+  git-bridge change-id trailer.
 - **git interop bridge.** Important eventually; not part of the first slice.
 
 These are excluded from the *foundation* so the first slice ships fast and

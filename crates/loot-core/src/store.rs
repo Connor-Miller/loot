@@ -27,6 +27,7 @@
 //! next-change  eagerly-minted next change id (v6)       (Workspace, ADR 0029/0030)
 //! config       named remotes                            (Workspace, ADR 0013)
 //! ops          local-only operation log for undo (LOCAL) (oplog, ADR 0031)
+//! abandoned     local-only set of abandoned version ids (LOCAL) (S3, ADR 0029)
 //! id, id.pub   the ed25519 keypair                      (loot-identity, ADR 0014)
 //! peers        nickname -> pubkey registry              (loot-identity, ADR 0014)
 //! ```
@@ -59,6 +60,7 @@ const DOCKS: &str = "docks";
 const CONFIG: &str = "config";
 const GIT_MIRROR: &str = "git-mirror";
 const OPS: &str = "ops";
+const ABANDONED: &str = "abandoned";
 
 /// The default dock every repo starts on — the primary directory (ADR 0022
 /// physical model). Its process files are the root `.loot/working`/`tree-hash`/
@@ -150,6 +152,44 @@ impl RepoStore {
     // it is per-machine and **never enters a bundle** — losing it loses undo
     // history, not repo data.
     pub fn ops(&self) -> PathBuf { self.dot.join(OPS) }
+
+    // --- divergent-change abandonment (S3, ADR 0029/0030) ---
+    //
+    // Local-only set of **abandoned version ids** — versions dropped from a
+    // divergent change by `loot abandon`. A view-level filter (never deletes the
+    // node from the graph or object store), captured by the oplog so abandon is
+    // undoable. Never bundled, like `ops`/the git marks.
+    pub fn abandoned(&self) -> PathBuf { self.dot.join(ABANDONED) }
+
+    /// The set of abandoned version ids (each 32 raw bytes), or empty if none.
+    /// A malformed/short file reads as empty (best-effort; the oplog can rebuild).
+    pub fn read_abandoned(&self) -> std::collections::BTreeSet<Oid> {
+        match std::fs::read(self.abandoned()) {
+            Ok(b) if b.len() % 32 == 0 => b
+                .chunks_exact(32)
+                .map(|c| {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(c);
+                    Oid(a)
+                })
+                .collect(),
+            _ => std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Persist the abandoned-version set as concatenated 32-byte ids, or remove
+    /// the file when empty (best-effort removal keeps a pristine repo clean).
+    pub fn write_abandoned(&self, set: &std::collections::BTreeSet<Oid>) -> std::io::Result<()> {
+        if set.is_empty() {
+            let _ = std::fs::remove_file(self.abandoned());
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(set.len() * 32);
+        for id in set {
+            bytes.extend_from_slice(&id.0);
+        }
+        std::fs::write(self.abandoned(), bytes)
+    }
 
     /// Read the working-change id (32 raw bytes) for `dock` if one is in
     /// progress. An absent or malformed file means finalized history.
@@ -447,6 +487,25 @@ mod tests {
 
         assert_eq!(s.list_docks(), vec![HOME_DOCK.to_string(), "feat".to_string()]);
         assert!(s.dock_exists("feat") && s.dock_exists(HOME_DOCK) && !s.dock_exists("nope"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandoned_set_round_trips_and_clears() {
+        let dir = std::env::temp_dir().join(format!("loot-store-ab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = RepoStore::new(&dir);
+
+        assert!(s.read_abandoned().is_empty(), "no abandoned file yet");
+        let set = std::collections::BTreeSet::from([Oid([3; 32]), Oid([9; 32])]);
+        s.write_abandoned(&set).unwrap();
+        assert_eq!(s.read_abandoned(), set, "round-trips the version-id set");
+        // Empty writes remove the file (pristine repo stays clean).
+        s.write_abandoned(&std::collections::BTreeSet::new()).unwrap();
+        assert!(s.read_abandoned().is_empty());
+        assert!(!s.abandoned().exists(), "empty set removes the file");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

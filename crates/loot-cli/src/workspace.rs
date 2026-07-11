@@ -626,6 +626,62 @@ impl Workspace {
         Ok(())
     }
 
+    // --- divergent changes (S3, ADR 0029/0030) ---
+
+    /// The abandoned-version set for this repo — versions dropped from a
+    /// divergent change (`loot abandon`), filtered out of the live view.
+    pub fn abandoned_versions(&self) -> std::collections::BTreeSet<Oid> {
+        self.store.read_abandoned()
+    }
+
+    /// The change ids that are currently **divergent** — one change id, more than
+    /// one live version (ADR 0029). `log`/`status` mark these with a trailing `!`.
+    pub fn divergent_change_ids(&self) -> std::collections::BTreeSet<[u8; 16]> {
+        self.repo.divergent_change_ids(&self.store.read_abandoned())
+    }
+
+    /// `loot abandon <version>`: drop `version` from its divergent change, leaving
+    /// the other live version(s) under the change id (ADR 0030). Refuses a version
+    /// that is not a live member of a *divergent* change, so it only ever collapses
+    /// a fork and never hides a change's sole version. Nothing is deleted — the
+    /// version stops being a live head and joins the abandoned set — and the whole
+    /// step is one **undoable** operation (ADR 0031): the oplog captures both the
+    /// heads and the abandoned set, so `loot undo` brings the version back.
+    pub fn abandon(&mut self, version: &Oid) -> Result<(), String> {
+        let mut abandoned = self.store.read_abandoned();
+        if abandoned.contains(version) {
+            return Err("that version is already abandoned".into());
+        }
+        let cid = self
+            .repo
+            .change_change_id(version)
+            .ok_or("that version has no change id (a legacy/unsigned change is never divergent)")?;
+        let live = self.repo.versions_of_change(&cid, &abandoned);
+        if !live.contains(version) {
+            return Err("no such live version in this repo".into());
+        }
+        if live.len() < 2 {
+            return Err(
+                "that change is not divergent — nothing to abandon (it keeps its single version)"
+                    .into(),
+            );
+        }
+
+        // The "before" tree, so resurface can prune if we abandoned the very tip
+        // the ambient dock sits on (unusual, but keeps the working tree coherent).
+        let old_paths = self.ambient_visible_paths();
+        self.repo.abandon_head(version); // drop from live heads if it is one
+        abandoned.insert(version.clone());
+        self.store
+            .write_abandoned(&abandoned)
+            .map_err(|e| format!("write abandoned: {e}"))?;
+        self.persist()?;
+        self.record_op("abandon", &format!("abandon version {}", short_version(version)), false);
+        self.reload()?;
+        self.resurface(old_paths)?;
+        Ok(())
+    }
+
     /// Read the URL for a named remote (e.g. "origin") from `.loot/config`.
     /// Returns `None` if the remote is not set.
     pub fn remote_url(&self, name: &str) -> Option<String> {
@@ -1297,6 +1353,11 @@ fn read_to_string(path: &Path) -> Result<String, String> {
     String::from_utf8(std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+/// A short hex prefix of a version id, for operation-log descriptions.
+fn short_version(id: &Oid) -> String {
+    loot_core::hex::encode(&id.0).chars().take(8).collect()
+}
+
 /// Recursively list files under `dir`, skipping `.loot/`, `.git`, and paths
 /// matched by `.lootignore` (#64). Ignored directories are pruned without
 /// descending, so an ignored `target/` is never read — the pilot's 38 MB
@@ -1741,6 +1802,84 @@ mod tests {
         let redo = ws.restore_op(3).unwrap();
         assert_eq!(redo.restored_to, 3);
         assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"two", "redo restores the change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandon_collapses_a_divergent_change_and_is_undoable() {
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-s3-abandon-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+
+        // Seed a divergent change: record one finalized root, then two versions
+        // carrying the SAME change id on independent lines (the amend primitive,
+        // ADR 0029). Both become live heads under one change id.
+        let cid = [7u8; 16];
+        let (va, vb) = ws
+            .with_repo(|repo| {
+                let root = repo
+                    .record(Change {
+                        id: Oid([0; 32]),
+                        parents: vec![],
+                        message: "root".into(),
+                        tree: Default::default(),
+                    })
+                    .map_err(|e| e.to_string())?;
+                let va = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "A".into(), tree: Default::default() },
+                        Some(cid),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let vb = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root], message: "B".into(), tree: Default::default() },
+                        Some(cid),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok((va, vb))
+            })
+            .unwrap();
+        // Record the pre-abandon (divergent) view as the undo floor.
+        ws.record_op("seed", "seeded divergence", false);
+
+        assert!(ws.divergent_change_ids().contains(&cid), "the change is divergent");
+
+        // Abandon vb: divergence collapses, and it is one op in the log.
+        ws.abandon(&vb).unwrap();
+        assert!(!ws.divergent_change_ids().contains(&cid), "abandon collapsed the fork");
+        assert!(ws.abandoned_versions().contains(&vb));
+        assert!(!ws.repo().heads().contains(&vb), "vb stopped being a live head");
+        assert!(ws.repo().heads().contains(&va), "va survives");
+
+        // Undo restores the divergent state — nothing was deleted.
+        let r = ws.undo().unwrap();
+        let _ = r;
+        assert!(ws.divergent_change_ids().contains(&cid), "undo brought the version back");
+        assert!(!ws.abandoned_versions().contains(&vb), "undo cleared the abandoned mark");
+        assert!(ws.repo().heads().contains(&vb), "vb is a live head again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandon_refuses_a_non_divergent_change() {
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-s3-refuse-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let only = ws
+            .with_repo(|repo| {
+                repo.record_carrying(
+                    Change { id: Oid([0; 32]), parents: vec![], message: "solo".into(), tree: Default::default() },
+                    Some([1u8; 16]),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        // A change with a single version is not divergent — abandon must refuse
+        // rather than hide the change's only version.
+        let err = ws.abandon(&only).unwrap_err();
+        assert!(err.contains("not divergent"), "message explains the refusal: {err}");
+        assert!(ws.abandoned_versions().is_empty(), "nothing was abandoned");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
