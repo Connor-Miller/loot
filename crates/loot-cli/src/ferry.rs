@@ -214,7 +214,15 @@ pub fn run(
         if ws.repo().change_author(&id).is_some() && ws.repo().change_signature(&id).is_none() {
             continue;
         }
-        let sha = project_change(ws, &git, &id, &marks, &generations, last_clean_tree.as_ref(), &id_map)?;
+        let (sha, skipped) = project_change(ws, &git, &id, &marks, &generations, last_clean_tree.as_ref(), &id_map)?;
+        if !skipped.is_empty() {
+            report.notes.push(format!(
+                "publication of {} omitted {} sealed path(s): {}",
+                hex::short(&id.0, 8),
+                skipped.len(),
+                skipped.join(", ")
+            ));
+        }
         marks.insert(sha, id, MarkOrigin::Loot);
         report.projected += 1;
     }
@@ -346,7 +354,7 @@ pub fn run(
                                 .to_string(),
                         );
                     } else {
-                        let sha = project_wip(
+                        let (sha, skipped) = project_wip(
                             ws,
                             &git,
                             &wid,
@@ -355,6 +363,13 @@ pub fn run(
                             last_clean_tree.as_ref(),
                             &id_map,
                         )?;
+                        if !skipped.is_empty() {
+                            report.notes.push(format!(
+                                "review projection omitted {} sealed path(s): {}",
+                                skipped.len(),
+                                skipped.join(", ")
+                            ));
+                        }
                         let ref_name = format!("refs/heads/review/{dock}");
                         git.reference(
                             &ref_name,
@@ -641,10 +656,11 @@ fn ingest_commit(
 
 // --- project ---
 
-/// Project one loot change as a git commit: surfaced tree only (sealed paths
-/// omitted — no filename, no bytes), `Loot-*` trailers, deterministic dates,
-/// SSHSIG-signed when the repo has a keypair. A path with an unresolved
-/// conflict is held at its last clean git state (ADR 0028).
+/// Project one loot change as a git commit: **public-delta** tree (sealed
+/// paths never published — no filename, no bytes), `Loot-*` trailers,
+/// deterministic dates, SSHSIG-signed when the repo has a keypair. A path
+/// with an unresolved conflict is held at its last clean git state
+/// (ADR 0028). Returns the sha plus the sealed paths the delta omitted.
 fn project_change(
     ws: &Workspace,
     git: &git2::Repository,
@@ -653,9 +669,8 @@ fn project_change(
     generations: &BTreeMap<Oid, u64>,
     last_clean: Option<&git2::Tree>,
     id_map: &BTreeMap<String, String>,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let repo = ws.repo();
-    let tree = sealed_free_tree(ws, git, id, last_clean)?;
 
     let mut parent_commits = Vec::new();
     for p in repo.parents_of(id) {
@@ -672,6 +687,9 @@ fn project_change(
         );
     }
     let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+
+    let parent_git_tree = parent_commits.first().and_then(|c| c.tree().ok());
+    let (tree, skipped) = public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean)?;
 
     let (name, email) = author_name_email(ws, repo.change_author(id), id_map);
     let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
@@ -702,53 +720,100 @@ fn project_change(
         git.commit(None, &sig, &sig, &message, &tree, &parent_refs)
             .map_err(|e| e.to_string())?
     };
-    Ok(oid.to_string())
+    Ok((oid.to_string(), skipped))
 }
 
-/// The surfaced (readable) tree of a change as a git tree: sealed / embargoed
-/// paths omitted entirely (no filename, no bytes), unresolved conflicts held
-/// at their last clean git state (ADR 0028). Shared by the finalized and the
-/// provisional (WIP) projection lanes.
-fn sealed_free_tree<'g>(
+/// The **publication** tree of a change: the git first-parent tree plus this
+/// change's *delta*, restricted to `Public` paths. Everything projected by
+/// the bridge may end up pushed off-machine (review/*, the landed main), so
+/// the filter is visibility, **not readability** — the dev's own identity can
+/// read restricted content (the mirror's full-readable-tree contract,
+/// ADR 0028), and exactly that tree must never be what gets published. Found
+/// live on the #155 evidence run: the readable-tree projection put
+/// `docs/pitch/` into a public PR diff.
+///
+/// Delta semantics also keep published history *git-shaped*: paths loot
+/// tracks that git never carried (`.scratch/`, sealed paths) are untouched by
+/// the delta and so never appear. Unresolved conflicts are held at their last
+/// clean git state as before (ADR 0028). Returns the tree plus the sealed
+/// paths the delta had to omit.
+fn public_delta_tree<'g>(
     ws: &Workspace,
     git: &'g git2::Repository,
     id: &Oid,
+    git_parent: Option<&git2::Tree>,
     last_clean: Option<&git2::Tree>,
-) -> Result<git2::Tree<'g>, String> {
+) -> Result<(git2::Tree<'g>, Vec<String>), String> {
     let repo = ws.repo();
     let change_tree = repo
         .change_tree(id)
         .ok_or_else(|| format!("unknown change {}", hex::short(&id.0, 8)))?;
+    let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = repo
+        .parents_of(id)
+        .first()
+        .and_then(|p| repo.change_tree(p))
+        .unwrap_or_default();
     let conflicts = repo.conflicts();
 
-    let mut entries: Vec<(String, git2::Oid)> = Vec::new();
-    for (path, (oid, _vis)) in &change_tree {
+    // Start from the git parent's flat path -> blob map.
+    let mut flat: BTreeMap<String, git2::Oid> = BTreeMap::new();
+    if let Some(tree) = git_parent {
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                flat.insert(format!("{root}{}", entry.name().unwrap_or("")), entry.id());
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Deletions: a path the change dropped leaves the published tree too.
+    for (path, _) in parent_tree.iter().filter(|(p, _)| !change_tree.contains_key(*p)) {
+        flat.remove(&path.to_string_lossy().replace('\\', "/"));
+    }
+
+    // Additions / edits: public-only, unchanged paths untouched (#98 keeps
+    // (oid, visibility) stable for unchanged content, so equality is exact).
+    let mut skipped: Vec<String> = Vec::new();
+    for (path, entry) in &change_tree {
+        if parent_tree.get(path) == Some(entry) {
+            continue;
+        }
         let rel = path.to_string_lossy().replace('\\', "/");
-        if conflicts.contains_key(path) {
-            // Held back: project the last clean content, or omit if it never
-            // reached git. The resolution change will carry the real content.
+        if conflicts.contains_key(path.as_path()) {
+            // Held back: keep the last clean content until resolved.
             if let Some(tree) = last_clean {
-                if let Ok(entry) = tree.get_path(Path::new(&rel)) {
-                    entries.push((rel, entry.id()));
+                if let Ok(e) = tree.get_path(Path::new(&rel)) {
+                    flat.insert(rel, e.id());
                 }
             }
+            continue;
+        }
+        let (oid, vis) = entry;
+        if *vis != Visibility::Public {
+            skipped.push(rel);
             continue;
         }
         match repo.get(oid, ws.identity(), ws.now()) {
             Ok(bytes) => {
                 let blob = git.blob(&bytes).map_err(|e| e.to_string())?;
-                entries.push((rel, blob));
+                flat.insert(rel, blob);
             }
-            Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => continue,
+            Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => {
+                skipped.push(rel);
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
+
+    let entries: Vec<(String, git2::Oid)> = flat.into_iter().collect();
     let tree_oid = write_git_tree(git, &entries)?;
-    git.find_tree(tree_oid).map_err(|e| e.to_string())
+    let tree = git.find_tree(tree_oid).map_err(|e| e.to_string())?;
+    Ok((tree, skipped))
 }
 
 /// Project the ambient dock's *unfinalized* working change as a provisional
-/// review commit (map #148): sealed-free tree, `Loot-Provisional` trailer and
+/// review commit (map #148): **public-delta** tree, `Loot-Provisional` trailer and
 /// **no** `Loot-Signature` — unsigned in loot is the point, the missing
 /// trailer is what marks it not-finalized — while the git commit itself is
 /// still SSHSIG-signed so mirror history stays integrity-checked end to end.
@@ -760,9 +825,8 @@ fn project_wip(
     generations: &BTreeMap<Oid, u64>,
     last_clean: Option<&git2::Tree>,
     id_map: &BTreeMap<String, String>,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let repo = ws.repo();
-    let tree = sealed_free_tree(ws, git, id, last_clean)?;
 
     let mut parent_commits = Vec::new();
     for sha in parent_shas {
@@ -772,6 +836,9 @@ fn project_wip(
         );
     }
     let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+
+    let parent_git_tree = parent_commits.first().and_then(|c| c.tree().ok());
+    let (tree, skipped) = public_delta_tree(ws, git, id, parent_git_tree.as_ref(), last_clean)?;
 
     let (name, email) = author_name_email(ws, repo.change_author(id), id_map);
     let when = git2::Time::new(bridge::commit_timestamp(*generations.get(id).unwrap_or(&0)), 0);
@@ -799,7 +866,7 @@ fn project_wip(
         git.commit(None, &sig, &sig, &message, &tree, &parent_refs)
             .map_err(|e| e.to_string())?
     };
-    Ok(oid.to_string())
+    Ok((oid.to_string(), skipped))
 }
 
 /// The durable review-lane key of a change: its `change_id` (map #132, stable
@@ -1492,15 +1559,19 @@ mod tests {
     #[test]
     fn with_wip_projects_provisional_review_lane_then_reaps_on_finalize() {
         let (mut ws, dir, mirror) = setup("wip-review");
-        put_file(&dir, ".lootattributes", "secret/** restricted=bob\n");
+        // Two sealed classes: restricted to a peer (unreadable here) AND
+        // restricted to *alice herself* (readable — the #155 live-run leak:
+        // publication must filter on visibility, not readability).
+        put_file(&dir, ".lootattributes", "secret/** restricted=bob\npitch/** restricted=alice\n");
         put_file(&dir, "a.txt", "base\n");
         seal_change(&mut ws, "base");
         ferry(&mut ws, &mirror);
 
-        // Round 1: unfinalized WIP (incl. a sealed path) -> a provisional
+        // Round 1: unfinalized WIP (incl. both sealed paths) -> a provisional
         // commit on review/<dock>; main and the mark spine stay untouched.
         put_file(&dir, "a.txt", "wip round 1\n");
         put_file(&dir, "secret/pitch.md", "sealed wip\n");
+        put_file(&dir, "pitch/plan.md", "dev-readable sealed wip\n");
         let (wid, _) = ws.snapshot("feature wip").unwrap();
         let marks_before = read_or_empty(&ws.store().git_marks());
         let git = git2::Repository::open(&mirror).unwrap();
@@ -1525,7 +1596,16 @@ mod tests {
         assert!(paths.contains(&"a.txt".to_string()));
         assert!(
             !paths.iter().any(|p| p.contains("secret")),
-            "review lane omits sealed paths too: {paths:?}"
+            "review lane omits unreadable sealed paths: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("pitch")),
+            "review lane omits DEV-READABLE sealed paths (the #155 leak): {paths:?}"
+        );
+        assert!(
+            r1.notes.iter().any(|n| n.contains("omitted") && n.contains("pitch/plan.md")),
+            "omission surfaced as a note: {:?}",
+            r1.notes
         );
         assert_eq!(main_commit(&git).id(), main_before, "main untouched by WIP");
         assert_eq!(
@@ -1568,6 +1648,11 @@ mod tests {
             "landed commit is the signed projection"
         );
         assert!(bridge::parse_trailer(landed.message().unwrap(), TRAILER_PROVISIONAL).is_none());
+        let landed_paths = tree_paths(&git, &landed.tree().unwrap());
+        assert!(
+            !landed_paths.iter().any(|p| p.contains("secret") || p.contains("pitch")),
+            "landed main never publishes sealed paths either: {landed_paths:?}"
+        );
 
         // And the pass after that is a full no-op.
         let r5 = ferry(&mut ws, &mirror);
