@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted (spec; implementation pending as CA4)
+accepted — implemented (CA4, `097cb25`, PR #70; exercised by the map #119 evidence, `docs/evidence/concurrent-agents.md`)
 
 Amends ADR 0023 (see "Amendment to ADR 0023" below).
 

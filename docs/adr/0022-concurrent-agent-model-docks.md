@@ -2,7 +2,12 @@
 
 ## Status
 
-accepted
+accepted — implemented. Docks (CA1), `loot dock merge` + harbor (CA2,
+`588762d`), and porcelain verdicts (CA3) are on `main`; the physical-worktree
+dock model was reconciled in PR #69. Cross-identity convergence is proven
+end-to-end by the map #119 evidence (`docs/evidence/concurrent-agents.md`),
+whose run also fixed peer-side fork-collapse (#128) and `dock merge` machine
+output (#126).
 
 ## Context
 
