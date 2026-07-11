@@ -55,7 +55,7 @@ const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
     ("init", cmd_init),
     ("status", cmd_status),
     ("describe", cmd_describe),
-    ("new", |_| cmd_new()),
+    ("new", cmd_new),
     ("surface", |_| cmd_surface()),
     ("dock", cmd_dock),
     ("docks", |_| cmd_docks()),
@@ -91,8 +91,8 @@ usage:
   loot clone <url> <dir> [--identity <name>]  clone a relay into <dir>
   loot config [set <key> <val>] [unset <key>] [list]  manage global config (~/.config/loot/config)
   loot status [-m <message>] [--porcelain|--json] [--allow-demote <path>]...  snapshot the working tree into the working change
-  loot describe -m <message>                name the working change
-  loot new                                  finalize the working change; start a fresh one
+  loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
+  loot new [--no-snapshot]                  capture pending edits, finalize the working change; start a fresh one
   loot surface                              materialize what the current identity may see
   loot dock <name>                          create a dock (isolated working tree + tip), or switch to one
   loot docks                                list docks with their tip and visibility
@@ -128,7 +128,12 @@ usage:
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
   loot pull [<url>] [--remote <name>] [--porcelain|--json]  fetch, merge, and converge changes from a relay
-  loot ferry [--git-dir <path>] [--dock <name>] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028)";
+  loot ferry [--git-dir <path>] [--dock <name>] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028)
+
+mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
+first (ADR 0030) — no manual `loot status` needed. Two globals ride any of them:
+  --allow-demote <path>   permit this snapshot to re-seal <path> more readably (repeatable)
+  --no-snapshot           act on the last recorded working change; skip the implicit capture";
 
 fn print_help() {
     println!("loot — source control where privacy is per-content, not per-repo\n\n{USAGE}");
@@ -184,6 +189,64 @@ fn out_fmt(args: &[String]) -> OutFmt {
 /// most one positional.
 fn first_positional(args: &[String]) -> Option<&str> {
     args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
+}
+
+/// The two global controls every snapshotting (mutating) verb honors under
+/// implicit auto-snapshot (ADR 0030): the demotion allowlist and the
+/// skip-the-snapshot escape hatch.
+struct SnapshotOpts {
+    /// `--allow-demote <path>` (repeatable): paths permitted to re-seal more
+    /// readably on this snapshot (#62). The demotion guard aborts on any other.
+    allow_demote: Vec<std::path::PathBuf>,
+    /// `--no-snapshot` / `--ignore-working-copy`: skip the implicit capture for
+    /// this one invocation, acting on the last recorded working change as-is.
+    skip: bool,
+}
+
+impl SnapshotOpts {
+    fn parse(args: &[String]) -> Self {
+        Self {
+            allow_demote: flag_values(args, "--allow-demote").into_iter().map(Into::into).collect(),
+            skip: has_flag(args, "--no-snapshot") || has_flag(args, "--ignore-working-copy"),
+        }
+    }
+}
+
+/// A verb's positional arguments with flags removed — including the *value* of
+/// the one value-taking global, `--allow-demote <path>`, so a demotion
+/// allowlist entry is never mistaken for the verb's own positional (a path,
+/// identity, or file). Bare flags (`--no-snapshot`, `--hard`, …) are dropped
+/// too. Used by the snapshotting verbs that index positionals by position.
+fn positionals(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--allow-demote" {
+            i += 2; // skip the flag and its value
+        } else if a.starts_with('-') {
+            i += 1; // skip a bare flag
+        } else {
+            out.push(a);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The implicit snapshot that precedes a mutating verb (ADR 0030): capture the
+/// working tree into the working change so the verb acts on what is on disk,
+/// without a manual `loot status` first. Preserves the working change's name
+/// (an implicit capture must not clobber a message a prior `describe` set), and
+/// carries the demotion guard via `--allow-demote`. `--no-snapshot` /
+/// `--ignore-working-copy` skips it. Read-only verbs never call this.
+fn implicit_snapshot(ws: &mut Workspace, opts: &SnapshotOpts) -> Result<(), String> {
+    if opts.skip {
+        return Ok(());
+    }
+    let msg = ws.working_message().unwrap_or_else(|| "(working change)".to_string());
+    ws.snapshot_allowing(&msg, &opts.allow_demote)?;
+    Ok(())
 }
 
 /// Lift an apply/pull outcome map into the serializable verdict rows.
@@ -265,16 +328,24 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
 
 fn cmd_describe(args: &[String]) -> Result<(), String> {
     let message = message_flag(args).ok_or("describe requires -m <message>")?;
+    let allow_demote: Vec<std::path::PathBuf> =
+        flag_values(args, "--allow-demote").into_iter().map(Into::into).collect();
     let mut ws = Workspace::open()?;
-    let (id, _) = ws.snapshot(message)?;
+    // describe is the namer: it always records the tree (its whole job), so it
+    // snapshots-and-names in one step — `--no-snapshot` does not apply. The
+    // demotion guard still rides it via `--allow-demote`.
+    let (id, _) = ws.snapshot_allowing(message, &allow_demote)?;
     println!("described working change {} as \"{message}\"", short(&id));
     Ok(())
 }
 
-fn cmd_new() -> Result<(), String> {
+fn cmd_new(args: &[String]) -> Result<(), String> {
+    let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
-    ws.finalize_working()?;
-    println!("finalized working change; the next `status` starts a fresh one");
+    // Capture edits made since the last command before finalizing (ADR 0030),
+    // so `edit; loot new` cannot lose work — no manual `loot status` needed.
+    ws.finalize_capturing(&opts.allow_demote, opts.skip)?;
+    println!("finalized working change; the next mutating verb starts a fresh one");
     Ok(())
 }
 
@@ -509,14 +580,19 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--relay") {
         return cmd_grant_relay(args);
     }
-    if args.len() < 3 {
+    let pos = positionals(args);
+    if pos.len() < 3 {
         return Err("grant requires <path> <identity> <file>\n  or: grant --relay <remote> <path> <identity>".into());
     }
-    let path = &args[0];
-    let grantee = &args[1];
-    let out = &args[2];
+    let path = pos[0];
+    let grantee = pos[1];
+    let out = pos[2];
 
+    let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
+    // Capture the working tree first (ADR 0030) so the grant seals what is on
+    // disk now, not a stale last-`status` snapshot.
+    implicit_snapshot(&mut ws, &opts)?;
     let now = ws.now();
 
     let oid = ws
@@ -541,9 +617,11 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     // Usage: grant --relay <remote-name-or-url> <path> <identity>
     let relay_target = flag(args, "--relay")
         .ok_or("grant --relay requires a relay name or URL after --relay")?;
-    let positional: Vec<&str> = args.iter()
-        .filter(|a| !a.starts_with('-') && a.as_str() != relay_target)
-        .map(String::as_str)
+    // Drop flags (and `--allow-demote`'s value) and the `--relay` target, leaving
+    // the verb's own positionals.
+    let positional: Vec<&str> = positionals(args)
+        .into_iter()
+        .filter(|a| *a != relay_target)
         .collect();
     if positional.len() < 2 {
         return Err("grant --relay <remote> <path> <identity>".into());
@@ -551,7 +629,11 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
     let path = positional[0];
     let grantee = positional[1];
 
+    let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
+    // Capture the working tree first (ADR 0030) so the sealed grant covers the
+    // path's current on-disk content.
+    implicit_snapshot(&mut ws, &opts)?;
     let dot = ws.dot().to_owned();
 
     // Resolve the relay URL via the shared helper (consistent with push/pull).
@@ -680,18 +762,21 @@ fn cmd_config(args: &[String]) -> Result<(), String> {
 
 fn cmd_maroon(args: &[String]) -> Result<(), String> {
     let hard = args.iter().any(|a| a == "--hard");
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let positional = positionals(args);
     if positional.len() < 2 {
         return Err("maroon requires <path> <identity> [dir]".into());
     }
-    let path = std::path::Path::new(positional[0].as_str());
-    let marooned = positional[1].as_str();
+    let path = std::path::Path::new(positional[0]);
+    let marooned = positional[1];
     let out_dir = positional
         .get(2)
-        .map(|s| std::path::Path::new(s.as_str()))
+        .map(|s| std::path::Path::new(*s))
         .unwrap_or(std::path::Path::new("."));
 
+    let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
+    // Re-seal against the working tree as it is now (ADR 0030).
+    implicit_snapshot(&mut ws, &opts)?;
     let now = ws.now();
     let result: MaroonResult = ws.with_repo(|repo| {
         if hard {
@@ -760,17 +845,21 @@ fn parse_vis_spec(spec: &str) -> Result<Visibility, String> {
 }
 
 fn cmd_migrate(args: &[String]) -> Result<(), String> {
-    if args.len() < 2 {
+    let positional = positionals(args);
+    if positional.len() < 2 {
         return Err("migrate requires <path> <vis-spec> [dir]".into());
     }
-    let path = std::path::Path::new(args[0].as_str());
-    let new_vis = parse_vis_spec(&args[1])?;
-    let out_dir = args
+    let path = std::path::Path::new(positional[0]);
+    let new_vis = parse_vis_spec(positional[1])?;
+    let out_dir = positional
         .get(2)
-        .map(|s| std::path::Path::new(s.as_str()))
+        .map(|s| std::path::Path::new(*s))
         .unwrap_or(std::path::Path::new("."));
 
+    let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
+    // Re-classify against the current on-disk tree (ADR 0030).
+    implicit_snapshot(&mut ws, &opts)?;
     let now = ws.now();
     let result: MigrateResult = ws.with_repo(|repo| {
         repo.migrate(path, new_vis.clone(), now).map_err(|e| e.to_string())
@@ -2025,5 +2114,104 @@ mod tests {
             })
             .unwrap();
         assert_eq!(bob_repo.get(&due_oid, "bob", wall).unwrap(), b"due\n");
+    }
+
+    // --- S1: implicit auto-snapshot on mutating verbs (#144, ADR 0030) ---
+
+    fn no_opts() -> SnapshotOpts {
+        SnapshotOpts { allow_demote: vec![], skip: false }
+    }
+
+    /// `--allow-demote` is repeatable; either skip flag sets `skip`.
+    #[test]
+    fn snapshot_opts_parse_globals() {
+        let o = SnapshotOpts::parse(&args(&["--allow-demote", "a.txt", "--allow-demote", "b.txt"]));
+        assert_eq!(o.allow_demote, vec![std::path::PathBuf::from("a.txt"), std::path::PathBuf::from("b.txt")]);
+        assert!(!o.skip);
+        assert!(SnapshotOpts::parse(&args(&["--no-snapshot"])).skip);
+        assert!(SnapshotOpts::parse(&args(&["--ignore-working-copy"])).skip);
+        assert!(!SnapshotOpts::parse(&args(&["x"])).skip);
+    }
+
+    /// The verb's own positionals survive with the `--allow-demote <path>` pair
+    /// (flag *and* value) and bare flags stripped — so a demotion path is never
+    /// read as a positional, wherever the flag sits.
+    #[test]
+    fn positionals_strip_allow_demote_value_and_bare_flags() {
+        assert_eq!(positionals(&args(&["p", "id", "f", "--no-snapshot"])), vec!["p", "id", "f"]);
+        assert_eq!(
+            positionals(&args(&["--allow-demote", "secret.txt", "p", "id", "f"])),
+            vec!["p", "id", "f"]
+        );
+        assert_eq!(
+            positionals(&args(&["p", "--hard", "id", "--allow-demote", "x", "dir"])),
+            vec!["p", "id", "dir"]
+        );
+    }
+
+    /// A file written but never `status`-ed is captured by `loot new` and lands
+    /// in finalized history — the headline of the trigger moving to implicit.
+    #[test]
+    fn new_captures_pending_edits_without_a_manual_status() {
+        let dir = tmp("s1-new-capture");
+        init_repo(&dir, "alice").unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        ws.finalize_capturing(&[], false).unwrap();
+
+        // Finalized: no working change left, one change carrying a.txt.
+        assert!(ws.working_id().is_none());
+        let log = ws.repo().log();
+        assert_eq!(log.len(), 1, "exactly one finalized change");
+        let tree = ws.repo().change_tree(&log[0].0).unwrap();
+        assert!(tree.contains_key(std::path::Path::new("a.txt")), "a.txt captured: {tree:?}");
+    }
+
+    /// A bare `loot new` with nothing pending must not mint an empty signed
+    /// change — the duplicate/empty capture is dropped before finalize.
+    #[test]
+    fn bare_new_mints_no_empty_change() {
+        let dir = tmp("s1-new-empty");
+        init_repo(&dir, "alice").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        ws.finalize_capturing(&[], false).unwrap();
+        assert!(ws.repo().log().is_empty(), "no spurious empty change: {:?}", ws.repo().log());
+    }
+
+    /// An implicit capture re-records the tree without clobbering a name a
+    /// prior `describe` set (working_message is preserved).
+    #[test]
+    fn implicit_snapshot_preserves_describe_name() {
+        let dir = tmp("s1-preserve-name");
+        init_repo(&dir, "alice").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"v1\n").unwrap();
+        ws.snapshot_allowing("the intro", &[]).unwrap(); // like `describe -m`
+        assert_eq!(ws.working_message().as_deref(), Some("the intro"));
+
+        std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
+        implicit_snapshot(&mut ws, &no_opts()).unwrap();
+        assert_eq!(ws.working_message().as_deref(), Some("the intro"), "name survives implicit capture");
+    }
+
+    /// `--no-snapshot` acts on the last recorded working change: a later edit is
+    /// not captured, so the working change id is unchanged; without the flag the
+    /// same edit is captured and the id moves.
+    #[test]
+    fn no_snapshot_skips_the_implicit_capture() {
+        let dir = tmp("s1-skip");
+        init_repo(&dir, "alice").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"v1\n").unwrap();
+        ws.snapshot_allowing("(working change)", &[]).unwrap();
+        let before = ws.working_id().cloned();
+
+        std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
+        implicit_snapshot(&mut ws, &SnapshotOpts { allow_demote: vec![], skip: true }).unwrap();
+        assert_eq!(ws.working_id(), before.as_ref(), "skip leaves the working change untouched");
+
+        implicit_snapshot(&mut ws, &no_opts()).unwrap();
+        assert_ne!(ws.working_id(), before.as_ref(), "a real capture moves the working change");
     }
 }

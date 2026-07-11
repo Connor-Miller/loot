@@ -14,9 +14,13 @@ to a git commit). A Change carries a set of paths, each with its own
 visibility. Permissions attach here, not to the repo.
 
 **Working change** — the always-present change at the tip that the working tree
-*is* (JJ-style, ADR 0006). There is no separate "commit" step: `status`
-snapshots the tree into the working change; `describe` names it; `new` finalizes
-it and starts a fresh one on top. This kills git's add/commit ceremony.
+*is* (JJ-style, ADR 0006). There is no separate "commit" step: `describe` names
+the working change and `new` finalizes it and starts a fresh one on top. Under
+implicit auto-snapshot (ADR 0030, #144) every **mutating** verb (`new`,
+`describe`, `grant`, `maroon`, `migrate`) captures the tree first, so edits are
+never lost between commands and no manual `loot status` is needed; read-only
+verbs never snapshot. (`status` still snapshots today — turning it read-only is
+S2 #145.) This kills git's add/commit ceremony.
 
 **Snapshot (reconcile)** — turning the current working tree into the working
 change, *visibility-aware* (ADR 0006). Against the last change's full tree, at
@@ -221,9 +225,12 @@ safeguards (#62, 2026-07-09): the file is **versioned** like any other path
 (policy travels to peers and clones — a fresh keyholder clone without the
 rules would otherwise re-seal restricted content Public), and a snapshot that
 would **demote** a path's visibility (Restricted/Embargoed → wider than the
-tree already records) **refuses** unless that path is passed via
-`loot status --allow-demote <path>`. Widening a Restricted identity set is
-not guarded — `grant`/`maroon` own that audit trail.
+tree already records) **refuses** (a typed `RepoError::Demotion`) unless that
+path is passed via the global **`--allow-demote <path>`**. Under implicit
+auto-snapshot (ADR 0030, #144) the guard rides every mutating verb's capture,
+so `--allow-demote` is a global on any snapshotting verb (`new`, `describe`,
+`grant`, `maroon`, `migrate`, `status`), not a `status`-only flag. Widening a
+Restricted identity set is not guarded — `grant`/`maroon` own that audit trail.
 
 **`.lootignore`** *(#64, 2026-07-09)* — a gitignore-style file excluding paths
 from [[Snapshot (reconcile)]]: one glob per line, `#` comments, the **same

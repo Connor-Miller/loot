@@ -66,6 +66,12 @@ pub enum RepoError {
     UnsupportedFormat { found: u8, supported: u8 },
     #[error("change {0:?} has a missing or invalid author signature")]
     BadChangeSignature(Oid),
+    /// A snapshot would re-seal one or more paths *more readably* than the tree
+    /// already records (#62, ADR 0030). A typed, matchable outcome carrying the
+    /// offending paths so a driver can classify the abort (rather than scrape a
+    /// prose string) and re-run with `--allow-demote` for the ones it intends.
+    #[error("refusing to demote visibility of {}: an attributes change would re-seal private content more readably; restore the .lootattributes rule, or re-run with `--allow-demote <path>` to demote deliberately", .paths.join(", "))]
+    Demotion { paths: Vec<String> },
     #[error("backend error: {0}")]
     Backend(String),
 }
