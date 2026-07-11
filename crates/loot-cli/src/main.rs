@@ -127,7 +127,7 @@ usage:
   loot peer list                            show all known peers
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
-  loot pull [<url>] [--remote <name>]       fetch and merge changes from a relay
+  loot pull [<url>] [--remote <name>] [--porcelain|--json]  fetch, merge, and converge changes from a relay
   loot ferry [--git-dir <path>] [--dock <name>] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028)";
 
 fn print_help() {
@@ -1642,21 +1642,21 @@ fn deposit_embargo_grants(
 }
 
 fn cmd_pull(args: &[String]) -> Result<(), String> {
+    let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
     let now = ws.now();
     let identity = ws.identity().to_string();
     let have = ws.repo().heads();
+    // Our side before the pull — the tip the working directory reflects. After
+    // ingesting a peer's divergent tip we collapse onto this (#128).
+    let ours_before = have.first().cloned();
     // S5: negotiate object addresses before any object bytes move. The relay
     // offers the closure it would send; we reply with only the addresses we
     // lack; fetch returns a bundle limited to those. A re-pull with nothing new
     // transfers ~0 object bytes.
     let offered = loot_net::offer(&url, &have).map_err(|e| e.to_string())?;
     let wants = ws.repo().missing_objects(&offered);
-    if wants.is_empty() {
-        println!("pulled from {url}: nothing new (already up to date)");
-        return Ok(());
-    }
     // S6: fetch objects in batches. Each applied batch is persisted (with_repo
     // saves), so an interrupted pull resumes by re-negotiating and fetching
     // only what's left.
@@ -1689,14 +1689,33 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
             *slot = loot_core::converge::worst(slot.clone(), outcome);
         }
     }
-    if outcomes.is_empty() {
-        println!("pulled from {url}: nothing new (already up to date)");
-    } else {
-        println!("pulled from {url} as {identity}:");
-        for (path, outcome) in &outcomes {
-            println!("  {:<24} {}", path.display(), describe(outcome));
+
+    // Collapse any fork this pull (or a prior one) left us on into a single
+    // materialized tip — the keyholder fork-collapse of ADR 0011 (#128). apply
+    // only ingests + classifies; without this the peer sits on diverged heads
+    // and its working tree shows only its own side. Merge outcomes fold in with
+    // `worst`, so a relayed/conflicted path can't be masked by an earlier row.
+    let converged = ws.converge_heads(ours_before.as_ref())?;
+    for (path, outcome) in converged {
+        let slot = outcomes.entry(path).or_insert(MergeOutcome::Converged);
+        *slot = loot_core::converge::worst(slot.clone(), outcome);
+    }
+
+    match fmt {
+        OutFmt::Human => {
+            if outcomes.is_empty() {
+                println!("pulled from {url}: nothing new (already up to date)");
+            } else {
+                println!("pulled from {url} as {identity}:");
+                for (path, outcome) in &outcomes {
+                    println!("  {:<24} {}", path.display(), describe(outcome));
+                }
+                println!("converged onto one line; run `loot surface` to materialize what you may see");
+            }
         }
-        println!("run `loot surface` to materialize what you may see");
+        // Machine output: the merge verdict rows only, no prose (empty -> no lines).
+        OutFmt::Porcelain => print!("{}", verdict::porcelain(&verdicts_of(&outcomes))),
+        OutFmt::Json => println!("{}", verdict::json(&verdicts_of(&outcomes))),
     }
     Ok(())
 }

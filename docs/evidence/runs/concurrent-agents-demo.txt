@@ -1,0 +1,188 @@
+=== loot concurrent-agents demo (wayfinder map #119) ===
+run started (utc): 2026-07-10 23:45:55Z
+work dir:          C:\Users\conno\AppData\Local\Temp\loot-concurrent-1783727155
+
+>>> building loot (release)
+
+############################################################
+# ACT 1 -- local docks + harbor + conflict + buoy (ADR 0022)
+############################################################
+
+>>> init the repo (identity dev) and lay down a base change
+    initialized empty loot repo at ., identity = dev
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC0cI0PafymKKUFGsfX8QeK7anOU/NcFz+pGlhJ+wX5d dev@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=dev`
+
+>>> snapshot + finalize the base (both docks fork from here)
+    working change 6667d10b — "base"
+      shared.txt               public
+    finalized working change; the next `status` starts a fresh one
+
+>>> dock-a: fork, edit shared.txt + add a-only.txt
+    on dock 'dock-a' — re-materialized its working tree here
+
+>>> dock-a: snapshot + finalize
+    working change c153b37c — "dock-a work"
+      a-only.txt               public
+      shared.txt               public
+    finalized working change; the next `status` starts a fresh one
+
+>>> dock-b: fork from base, edit shared.txt differently + add b-only.txt
+    on dock 'main' — re-materialized its working tree here
+    on dock 'dock-b' — re-materialized its working tree here
+
+>>> dock-b: snapshot + finalize
+    working change 2d63b82c — "dock-b work"
+      b-only.txt               public
+      shared.txt               public
+    finalized working change; the next `status` starts a fresh one
+
+>>> harbor: create the integrator dock (forks from base, no work yet)
+    on dock 'main' — re-materialized its working tree here
+    on dock 'harbor' — re-materialized its working tree here
+
+>>> harbor <- dock-a: loot dock merge dock-a --porcelain
+    =	a-only.txt	-	-
+    M	shared.txt	-	-
+PASS: dock-a's disjoint file converges into the harbor (= row)
+
+>>> harbor <- dock-b: loot dock merge dock-b --porcelain (CONCURRENT same-line edit)
+    =	b-only.txt	-	-
+    C	shared.txt	7e6f95360315a03e45d18911891cca701950c3eae271334412d531132fcd5a0e	0f43d8dbbb933784441623442582148f16706f36bfeb9f525ba276c3b38d3b41
+PASS: the concurrent same-line edit surfaces as a Conflict (C) -- not silently dropped
+PASS: dock-b's disjoint file still converges (= row) alongside the conflict
+
+>>> loot conflicts --porcelain (the agent reads what needs resolving)
+    C	shared.txt	7e6f95360315a03e45d18911891cca701950c3eae271334412d531132fcd5a0e	0f43d8dbbb933784441623442582148f16706f36bfeb9f525ba276c3b38d3b41
+PASS: the conflict is enumerable in porcelain for an agent to act on
+
+>>> loot resolve shared.txt <- reconciled content (keeps both sides' intent)
+    resolved shared.txt (new oid: 58dc0944)
+    all conflicts resolved — dock tip advanced
+
+>>> loot conflicts --porcelain (expect empty -- resolved)
+PASS: after resolve, no conflicts remain (porcelain is empty)
+PASS: the integrated harbor tree carries BOTH docks' disjoint work + the resolved file (no side dropped)
+
+>>> finalize the integration as a change
+    finalized working change; the next `status` starts a fresh one
+
+>>> loot log (find the finalized integration change)
+    4 heads — diverged; run `loot apply` to converge
+    head 1 — 29943b7b
+      29943b7b  (working change)  [logged by 2d1c2343…]
+    head 2 — 7c724bb4
+      7c724bb4  (working change)  [logged by 2d1c2343…]
+    head 3 — 867694a6
+      867694a6  (working change)  [logged by 2d1c2343…]
+    head 4 — bcecfa79
+      bcecfa79  resolve conflict at shared.txt  [logged by 2d1c2343…]
+      efb0e0e2  merge dock 'dock-b' into 'harbor'  [logged by 2d1c2343…]
+      c0cc4786  merge dock 'dock-a' into 'harbor'  [logged by 2d1c2343…]
+    shared history
+      c153b37c  dock-a work  [logged by 2d1c2343…]
+      2d63b82c  dock-b work  [logged by 2d1c2343…]
+      6667d10b  base  [logged by 2d1c2343…]
+
+>>> loot attest 29943b7b base   (mark it a navigational landmark)
+    attested 29943b7b as "base"
+
+>>> loot buoy base   (resolve the landmark -- computed, not a mutable ref)
+    buoy (base): 29943b7b — attested by 2d1c2343…
+PASS: a buoy resolves the integration change as the 'base' landmark
+
+############################################################
+# ACT 2 -- concurrent convergence via the relay (ADR 0001/0026)
+############################################################
+
+>>> starting local relay: loot serve --dir <tmp> --addr 127.0.0.1:47463
+    relay is up.
+
+>>> dev: init + declare secret.txt restricted
+    initialized empty loot repo at ., identity = dev
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICJqwNh/KM4ggsTKViHna8/9Mby9ZPQImZdnygUW9tGU dev@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=dev`
+
+>>> dev: snapshot + finalize + push the initial changes
+    remote 'origin' → http://127.0.0.1:47463
+    working change dfab285c — "public notes + restricted secret"
+      .lootattributes          public
+      notes.txt                public
+      secret.txt               restricted=dev
+    finalized working change; the next `status` starts a fresh one
+    pushed 3 new object(s) to http://127.0.0.1:47463 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent: clone the relay as a DISTINCT identity 'agent'
+    initialized empty loot repo at C:\Users\conno\AppData\Local\Temp\loot-concurrent-1783727155\agent, identity = agent
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKf2hxRhtC1uiFLjY1lDsgfhqoP1dArVWqx95kMNH7xY agent@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=agent`
+    pulled 3 change(s) from http://127.0.0.1:47463
+    cloned http://127.0.0.1:47463 → C:\Users\conno\AppData\Local\Temp\loot-concurrent-1783727155\agent
+    run `loot status` to see the working tree
+PASS: on clone, agent holds ciphertext but not the restricted path (no key)
+
+>>> dev (concurrent): add dev-feature.txt, touch secret.txt, push
+    finalized working change; the next `status` starts a fresh one
+
+>>> dev: snapshot + finalize + push (tip 1)
+    working change 6fed0a93 — "dev feature + secret edit"
+      .lootattributes          public
+      dev-feature.txt          public
+      notes.txt                public
+      secret.txt               restricted=dev
+    finalized working change; the next `status` starts a fresh one
+    pushed 2 new object(s) to http://127.0.0.1:47463 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent (concurrent, before pulling dev): add agent-feature.txt, push
+    registered peer 'dev'
+
+>>> agent: snapshot + finalize + push (tip 2 -> relay DAG now forked)
+    working change e84bdd21 — "agent feature"
+      .lootattributes          public
+      agent-feature.txt        public
+      notes.txt                public
+    finalized working change; the next `status` starts a fresh one
+    pushed 1 new object(s) to http://127.0.0.1:47463 in 1 batch(es) — resumable (re-run to continue if interrupted)
+      this published your sealed content to the relay (it still cannot read it)
+
+>>> agent: loot pull + apply, read the collapse in porcelain
+    =	.lootattributes	-	-
+    =	dev-feature.txt	-	-
+    =	notes.txt	-	-
+    R	secret.txt	-	-
+PASS: agent's apply pulls in dev's concurrent file (fork collapses -- dev's side not dropped)
+PASS: the restricted path agent can't open surfaces as RelayedUnmerged (R) -- carried, not merged
+
+>>> agent: loot surface (materialize what agent may read)
+      .lootattributes                  public
+      agent-feature.txt                public
+      dev-feature.txt                  public
+      notes.txt                        public
+      (1 sealed path(s) skipped — request a grant to access them)
+    surfaced fc6ef0d2 as agent
+PASS: after convergence agent's tree carries BOTH concurrent features -- no side dropped
+PASS: the restricted content stays sealed to agent (relay + agent hold only ciphertext)
+
+================  RESULT  ================
+Two acts, one thesis: concurrent edits CONVERGE with no side dropped.
+  Act 1 (local docks): two docks integrate into the harbor; a genuine
+         same-line conflict surfaces (C), resolves, and a buoy landmarks
+         the integration -- every step driven by porcelain verdicts.
+  Act 2 (relay leg): two DISTINCT identities push concurrently, the
+         relay DAG forks, and a pull+apply collapses it -- public work
+         converges while a restricted path relays (R) as ciphertext the
+         non-keyholder cannot read. The per-path merger/relay split,
+         under concurrency (ADR 0001).
+
+Honesty (ADR 0026): one machine, one OS user. 'agent cannot read the
+restricted path' is key custody -- the key never reached agent's keyring
+or the keyless relay. Docks are the same-identity concurrency unit; the
+relay leg is the cross-identity one.
+
+ALL CHECKS PASSED -- concurrent convergence proven, both acts.
+run finished (utc): 2026-07-10 23:45:56Z

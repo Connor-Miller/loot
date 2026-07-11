@@ -638,6 +638,63 @@ impl Workspace {
         Ok((name.to_string(), outcomes))
     }
 
+    /// Collapse a fork the ambient dock is sitting on into one materialized tip
+    /// (#128). `pull`/`apply` ingest a peer's divergent tip as a *sibling head*
+    /// — engine `apply_sync` records + classifies but never merges tips — so a
+    /// keyholder that has also advanced its own line ends up on multiple heads
+    /// with a working tree showing only its own side (the other side's content
+    /// is in the graph but never materialized). This is the peer-side analogue
+    /// of `merge_dock` (ADR 0011: keyholders collapse forks on pull+apply): fold
+    /// every other head into our line via `merge_tips`, signing each merge so it
+    /// travels, then materialize the merged tree.
+    ///
+    /// `base` names our side — the tip the working directory already reflects
+    /// (the caller's pre-pull head); materialize is diffed from it so a stale
+    /// side's untouched paths are not disturbed. On the home dock `anchor()` is
+    /// ambiguous under divergence, which is why the caller must pass it. A single
+    /// head, or an in-progress working change (the caller's to finalize first —
+    /// `pull`/`apply` have none), is a no-op. Returns the per-path merge outcomes.
+    pub fn converge_heads(&mut self, base: Option<&Oid>) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        let heads = self.repo.heads();
+        if heads.len() <= 1 || self.working.is_some() {
+            return Ok(BTreeMap::new());
+        }
+        let ours = base
+            .cloned()
+            .filter(|b| heads.contains(b))
+            .or_else(|| self.anchor())
+            .or_else(|| heads.first().cloned())
+            .ok_or("nothing to converge onto")?;
+        let others: Vec<Oid> = heads.into_iter().filter(|h| h != &ours).collect();
+        if others.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let from = ours.clone();
+        let mut acc = ours;
+        let mut all: BTreeMap<PathBuf, MergeOutcome> = BTreeMap::new();
+        for h in others {
+            let msg = format!("converge diverged head into '{}'", self.dock);
+            let (merge_id, outcomes) = self
+                .repo
+                .merge_tips(&acc, &h, &msg, self.now)
+                .map_err(|e| e.to_string())?;
+            self.working = Some(merge_id.clone());
+            self.finalize_working()?;
+            acc = merge_id;
+            for (path, outcome) in outcomes {
+                let slot = all.entry(path).or_insert(MergeOutcome::Converged);
+                *slot = loot_core::converge::worst(slot.clone(), outcome);
+            }
+        }
+        // Reflect the merged tree in the working directory (visibility-aware:
+        // sealed paths the identity can't open are skipped, staying relayed).
+        self.repo
+            .materialize(Some(&from), &acc, &self.identity, self.now)
+            .map_err(|e| e.to_string())?;
+        self.persist()?;
+        Ok(all)
+    }
+
     /// Resolve a conflict at `path` with `resolution` bytes. On a dock the
     /// resolution is built on — and becomes — the dock's tip (its conflicted merge
     /// change), then is signed like any finalized change, so a later `status`
@@ -1765,6 +1822,45 @@ mod tests {
         ws.merge_dock("harbor").unwrap();
         assert!(dir.join("feat.txt").exists(), "home re-based from harbor");
         assert!(ws.repo().conflicts().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn converge_heads_collapses_a_two_writer_fork_no_side_dropped() {
+        // #128: after a peer's divergent tip is ingested (pull/apply), the graph
+        // has two heads and the working tree shows only our side — apply records +
+        // classifies but never merges tips. `converge_heads` collapses the fork
+        // into ONE head whose tree carries BOTH sides. Two lines stand in for the
+        // two independently-advanced writers (the exact shape a pull leaves).
+        let (dir, mut ws) = dock_repo("converge-fork");
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        // "Their" line, advanced independently.
+        ws.dock_goto("peer").unwrap();
+        std::fs::write(dir.join("their.txt"), b"T").unwrap();
+        ws.snapshot("theirs").unwrap();
+        ws.finalize_working().unwrap();
+
+        // "Our" line, back on main — now the graph is forked.
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("ours.txt"), b"O").unwrap();
+        ws.snapshot("ours").unwrap();
+        ws.finalize_working().unwrap();
+        assert!(ws.repo().heads().len() >= 2, "precondition: a real two-writer fork");
+
+        let ours = ws.anchor();
+        let outcomes = ws.converge_heads(ours.as_ref()).unwrap();
+
+        assert_eq!(ws.repo().heads().len(), 1, "the fork collapsed to a single head");
+        assert!(dir.join("ours.txt").exists(), "our side kept");
+        assert!(dir.join("their.txt").exists(), "the peer's side materialized — no side dropped");
+        assert!(dir.join("base.txt").exists(), "the shared base carried");
+        assert!(
+            outcomes.contains_key(&PathBuf::from("their.txt")),
+            "the collapse reports the peer's file as a merge outcome"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
