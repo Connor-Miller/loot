@@ -755,12 +755,18 @@ fn public_delta_tree<'g>(
         .unwrap_or_default();
     let conflicts = repo.conflicts();
 
-    // Start from the git parent's flat path -> blob map.
-    let mut flat: BTreeMap<String, git2::Oid> = BTreeMap::new();
+    // Start from the git parent's flat path -> (blob, filemode) map. Modes
+    // ride along untouched — loot does not track the executable bit, so the
+    // git side owns it and an untouched path must keep it (found live on
+    // #164: a rebuilt tree silently stripped 100755 from scripts).
+    let mut flat: BTreeMap<String, (git2::Oid, i32)> = BTreeMap::new();
     if let Some(tree) = git_parent {
         tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
             if entry.kind() == Some(git2::ObjectType::Blob) {
-                flat.insert(format!("{root}{}", entry.name().unwrap_or("")), entry.id());
+                flat.insert(
+                    format!("{root}{}", entry.name().unwrap_or("")),
+                    (entry.id(), entry.filemode()),
+                );
             }
             git2::TreeWalkResult::Ok
         })
@@ -784,7 +790,7 @@ fn public_delta_tree<'g>(
             // Held back: keep the last clean content until resolved.
             if let Some(tree) = last_clean {
                 if let Ok(e) = tree.get_path(Path::new(&rel)) {
-                    flat.insert(rel, e.id());
+                    flat.insert(rel, (e.id(), e.filemode()));
                 }
             }
             continue;
@@ -797,7 +803,9 @@ fn public_delta_tree<'g>(
         match repo.get(oid, ws.identity(), ws.now()) {
             Ok(bytes) => {
                 let blob = git.blob(&bytes).map_err(|e| e.to_string())?;
-                flat.insert(rel, blob);
+                // Content changed; a known mode carries over.
+                let mode = flat.get(&rel).map(|(_, m)| *m).unwrap_or(0o100644);
+                flat.insert(rel, (blob, mode));
             }
             Err(RepoError::Unauthorized(_)) | Err(RepoError::Embargoed(_)) => {
                 skipped.push(rel);
@@ -806,7 +814,8 @@ fn public_delta_tree<'g>(
         }
     }
 
-    let entries: Vec<(String, git2::Oid)> = flat.into_iter().collect();
+    let entries: Vec<(String, git2::Oid, i32)> =
+        flat.into_iter().map(|(p, (o, m))| (p, o, m)).collect();
     let tree_oid = write_git_tree(git, &entries)?;
     let tree = git.find_tree(tree_oid).map_err(|e| e.to_string())?;
     Ok((tree, skipped))
@@ -927,20 +936,27 @@ impl WipState {
     }
 }
 
-/// Build a (possibly nested) git tree from flat `path -> blob` entries.
-fn write_git_tree(git: &git2::Repository, entries: &[(String, git2::Oid)]) -> Result<git2::Oid, String> {
+/// Build a (possibly nested) git tree from flat `path -> (blob, filemode)`
+/// entries. Modes come from the caller so the git parent's executable bits
+/// survive the rebuild (loot does not track them).
+fn write_git_tree(
+    git: &git2::Repository,
+    entries: &[(String, git2::Oid, i32)],
+) -> Result<git2::Oid, String> {
     // Group this level's files and subdirectories.
-    let mut files: Vec<(&str, git2::Oid)> = Vec::new();
-    let mut dirs: BTreeMap<&str, Vec<(String, git2::Oid)>> = BTreeMap::new();
-    for (path, oid) in entries {
+    let mut files: Vec<(&str, git2::Oid, i32)> = Vec::new();
+    let mut dirs: BTreeMap<&str, Vec<(String, git2::Oid, i32)>> = BTreeMap::new();
+    for (path, oid, mode) in entries {
         match path.split_once('/') {
-            None => files.push((path, *oid)),
-            Some((dir, rest)) => dirs.entry(dir).or_default().push((rest.to_string(), *oid)),
+            None => files.push((path, *oid, *mode)),
+            Some((dir, rest)) => {
+                dirs.entry(dir).or_default().push((rest.to_string(), *oid, *mode))
+            }
         }
     }
     let mut builder = git.treebuilder(None).map_err(|e| e.to_string())?;
-    for (name, oid) in files {
-        builder.insert(name, oid, 0o100644).map_err(|e| e.to_string())?;
+    for (name, oid, mode) in files {
+        builder.insert(name, oid, mode).map_err(|e| e.to_string())?;
     }
     for (dir, children) in dirs {
         let sub = write_git_tree(git, &children)?;
@@ -1657,6 +1673,38 @@ mod tests {
         // And the pass after that is a full no-op.
         let r5 = ferry(&mut ws, &mirror);
         assert_eq!((r5.ingested, r5.projected), (0, 0));
+    }
+
+    #[test]
+    fn projection_preserves_git_filemodes() {
+        let (mut ws, dir, mirror) = setup("modes");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        ferry(&mut ws, &mirror);
+
+        // A git-native commit adds an executable script (100755).
+        let git = git2::Repository::open(&mirror).unwrap();
+        {
+            let parent = main_commit(&git);
+            let mut builder = git.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+            let blob = git.blob(b"#!/bin/sh\n").unwrap();
+            builder.insert("run.sh", blob, 0o100755).unwrap();
+            let tree = git.find_tree(builder.write().unwrap()).unwrap();
+            let sig = git2::Signature::now("Bob", "bob@example.com").unwrap();
+            git.commit(Some(MAIN_REF), &sig, &sig, "add exec script", &tree, &[&parent])
+                .unwrap();
+        }
+        ferry(&mut ws, &mirror);
+
+        // A loot edit of a DIFFERENT file projects on top; the untouched
+        // script must keep its executable bit (found live on PR #164).
+        put_file(&dir, "a.txt", "edited\n");
+        seal_change(&mut ws, "edit a");
+        ferry(&mut ws, &mirror);
+        let tip = main_commit(&git);
+        let tree = tip.tree().unwrap();
+        let entry = tree.get_name("run.sh").expect("script present");
+        assert_eq!(entry.filemode(), 0o100755, "exec bit survives projection");
     }
 
     #[test]
