@@ -24,6 +24,7 @@
 //! conflicts    unresolved merge conflicts              (engine, ADR 0001)
 //! working      the in-progress working-change id       (Workspace, ADR 0006)
 //! tree-hash    last snapshot's tree+message hash        (Workspace)
+//! next-change  eagerly-minted next change id (v6)       (Workspace, ADR 0029/0030)
 //! config       named remotes                            (Workspace, ADR 0013)
 //! id, id.pub   the ed25519 keypair                      (loot-identity, ADR 0014)
 //! peers        nickname -> pubkey registry              (loot-identity, ADR 0014)
@@ -50,6 +51,7 @@ const WORKING: &str = "working";
 const WORKING_CHANGE: &str = "working-change";
 const HEADS: &str = "heads";
 const TREE_HASH: &str = "tree-hash";
+const NEXT_CHANGE: &str = "next-change";
 const TIP: &str = "tip";
 const DOCK: &str = "dock";
 const DOCKS: &str = "docks";
@@ -114,6 +116,7 @@ impl RepoStore {
 
     pub fn working(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(WORKING) }
     pub fn tree_hash(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(TREE_HASH) }
+    pub fn next_change(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(NEXT_CHANGE) }
     pub fn tip(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(TIP) }
 
     /// The ambient-dock pointer: names the dock this workspace is currently on.
@@ -174,6 +177,32 @@ impl RepoStore {
     /// Forget the snapshot hash so the next snapshot always runs the engine.
     pub fn clear_tree_hash(&self, dock: Option<&str>) {
         let _ = std::fs::remove_file(self.tree_hash(dock));
+    }
+
+    /// The durable change id `loot new` minted eagerly for `dock`'s *next*
+    /// change (ADR 0029/0030), before any snapshot has recorded it. 16 raw
+    /// bytes; absent or malformed means none is pending.
+    pub fn read_next_change(&self, dock: Option<&str>) -> Option<[u8; 16]> {
+        match std::fs::read(self.next_change(dock)) {
+            Ok(b) if b.len() == 16 => {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(&b);
+                Some(a)
+            }
+            _ => None,
+        }
+    }
+
+    /// Record (or clear) the pending next change id for `dock`. Cleared once the
+    /// first snapshot has carried it onto the change (best-effort removal).
+    pub fn write_next_change(&self, dock: Option<&str>, id: Option<&[u8; 16]>) -> std::io::Result<()> {
+        match id {
+            Some(id) => std::fs::write(self.next_change(dock), id),
+            None => {
+                let _ = std::fs::remove_file(self.next_change(dock));
+                Ok(())
+            }
+        }
     }
 
     /// The name of the ambient dock, or [`HOME_DOCK`] when the pointer is absent

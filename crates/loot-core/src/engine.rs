@@ -869,6 +869,27 @@ impl DagRepo {
         now: u64,
         allow_demote: &[PathBuf],
     ) -> Result<Oid, RepoError> {
+        self.snapshot_assigning(base, working, entries, message, now, allow_demote, None)
+    }
+
+    /// `snapshot_allowing` with an explicit `assign` change id to mint the fresh
+    /// change under (ADR 0029/0030). When `working` is `Some`, its durable
+    /// change id is carried across the re-snapshot and `assign` is ignored — a
+    /// change keeps one handle while edited. When `working` is `None` (the first
+    /// snapshot of a change `loot new` already minted a handle for), `assign`
+    /// supplies that eagerly-minted id, so the durable handle printed at `new`
+    /// is the same one that lands on the change's first version. `assign = None`
+    /// with no working change mints a fresh id (or stays `None`, keyless).
+    pub fn snapshot_assigning(
+        &mut self,
+        base: Option<&Oid>,
+        working: Option<&Oid>,
+        entries: &[(PathBuf, Vec<u8>, Visibility)],
+        message: &str,
+        now: u64,
+        allow_demote: &[PathBuf],
+        assign: Option<[u8; 16]>,
+    ) -> Result<Oid, RepoError> {
         // Refuse implicit visibility demotion (#62) BEFORE mutating anything.
         // The "before" picture is the outgoing working tree when there is one —
         // it carries forward everything from base, and a working change is a
@@ -894,9 +915,13 @@ impl DagRepo {
 
         // Carry the durable change id across this re-snapshot (ADR 0029): the
         // version id will change, the change id must not. Read it BEFORE dropping
-        // the prior working node below. `None` (first snapshot of a fresh change)
-        // lets `record` mint one.
-        let carried_change_id = working.and_then(|w| self.graph.get(w).and_then(|n| n.change_id));
+        // the prior working node below. When there is no working node, fall back
+        // to `assign` — the handle `loot new` minted eagerly for this fresh
+        // change (ADR 0030) — so the printed handle survives to the first version.
+        // `None` on both lets `record` mint one.
+        let carried_change_id = working
+            .and_then(|w| self.graph.get(w).and_then(|n| n.change_id))
+            .or(assign);
 
         // Drop the prior working change so we reconcile against finalized history,
         // not against our own last snapshot.
@@ -1010,6 +1035,15 @@ impl DagRepo {
     /// build the `version_id ‖ change_id` signing message.
     pub fn change_change_id(&self, id: &Oid) -> Option<[u8; 16]> {
         self.graph.get(id).and_then(|n| n.change_id)
+    }
+
+    /// Mint a fresh durable change id for the *next* change — but only when this
+    /// repo is authored (has a keypair), matching `record`'s rule that an
+    /// unsigned change gets no durable handle (ADR 0029). `loot new` calls this
+    /// to eagerly hand the fresh change a handle from birth (ADR 0030); a keyless
+    /// repo gets `None` and stays legacy.
+    pub fn mint_next_change_id(&self) -> Option<[u8; 16]> {
+        self.author.map(|_| mint_change_id())
     }
 
     /// The parents of a change, or empty if the id is unknown. Lets a caller find
@@ -1255,6 +1289,61 @@ impl DagRepo {
                 (c.id.clone(), c.message.clone(), total, restricted, embargoed)
             })
             .collect()
+    }
+
+    /// The live, non-durable **version id** for a working tree, plus whether it
+    /// is **empty** (no delta vs `tip`) — the figure read-only `status`/`log`
+    /// show for the working change (ADR 0030). Computed WITHOUT sealing or
+    /// recording: the would-be tree addresses each path by the blake3 of its
+    /// *current plaintext*, so the id is deterministic and moves iff
+    /// content/visibility/message move, yet no object is written and the graph
+    /// is untouched. It deliberately does **not** equal the sealed version id a
+    /// later snapshot persists (sealing mints fresh keys per write, #98) — it is
+    /// a "content right now" fingerprint, and the only holdable handle for the
+    /// working change is its durable change id.
+    ///
+    /// Emptiness is judged against `tip`'s *openable* tree: the working change is
+    /// empty when every live entry matches a tip path by plaintext + visibility
+    /// and nothing openable was added or removed. Sealed tip paths this identity
+    /// cannot read carry forward untouched and are not this caller's pending
+    /// delta, so they are ignored. With no `tip`, empty means no files at all.
+    pub fn working_preview(
+        &self,
+        tip: Option<&Oid>,
+        entries: &[(PathBuf, Vec<u8>, Visibility)],
+        message: &str,
+        now: u64,
+    ) -> (Oid, bool) {
+        let plain = |bytes: &[u8]| Oid(*blake3::hash(bytes).as_bytes());
+        let mut tree: BTreeMap<PathBuf, (Oid, Visibility)> = BTreeMap::new();
+        for (path, bytes, vis) in entries {
+            tree.insert(path.clone(), (plain(bytes), vis.clone()));
+        }
+        let parents = match tip {
+            Some(t) => vec![t.clone()],
+            None => self.graph.heads(),
+        };
+        let change = Change {
+            id: Oid([0; 32]),
+            parents,
+            message: message.to_string(),
+            tree: tree.clone(),
+        };
+        let version = compute_change_id(self.author.as_ref(), &change);
+
+        let empty = match tip {
+            Some(t) => {
+                let mut openable: BTreeMap<PathBuf, (Oid, Visibility)> = BTreeMap::new();
+                for (path, (oid, vis)) in &self.graph.tree_at(t) {
+                    if let Ok(bytes) = self.get(oid, &self.identity, now) {
+                        openable.insert(path.clone(), (plain(&bytes), vis.clone()));
+                    }
+                }
+                openable == tree
+            }
+            None => entries.is_empty(),
+        };
+        (version, empty)
     }
 
     /// All ancestors of `id` (including `id` itself), by walking parent edges.
@@ -3967,6 +4056,70 @@ mod tests {
         assert!(repo.add_attestation(make_attestation(&sk, pk, id.clone(), "reviewed")));
         assert_eq!(repo.heads(), heads_before, "attesting must not touch the graph or ids");
         assert_eq!(repo.attestations_for(&id).len(), 1);
+    }
+
+    #[test]
+    fn mint_next_change_id_only_when_authored() {
+        // The eager-handle mint mirrors `record`'s rule: an unsigned change gets
+        // no durable handle (ADR 0029), so a keyless repo mints `None`.
+        let mut repo = DagRepo::init(tmp(), "connor").unwrap();
+        assert_eq!(repo.mint_next_change_id(), None, "keyless repo mints no handle");
+        let (_sk, pk) = test_signer(3);
+        repo.set_author(pk);
+        assert!(repo.mint_next_change_id().is_some(), "authored repo mints a handle");
+    }
+
+    #[test]
+    fn snapshot_assigns_eager_handle_then_carries_it_over_a_new_assign() {
+        // ADR 0029/0030: the handle `new` minted eagerly lands on the fresh
+        // change's first version; a re-snapshot carries the node's handle and
+        // ignores any new assign (a change keeps one handle while edited).
+        let (_sk, pk) = test_signer(7);
+        let mut repo = DagRepo::init(tmp(), "connor").unwrap();
+        repo.set_author(pk);
+        let handle = [0x5A; 16];
+        let entries = vec![(PathBuf::from("f"), b"one".to_vec(), Visibility::Public)];
+        let v1 = repo
+            .snapshot_assigning(None, None, &entries, "m", 0, &[], Some(handle))
+            .unwrap();
+        assert_eq!(repo.change_change_id(&v1), Some(handle), "assign lands on the fresh change");
+
+        let entries2 = vec![(PathBuf::from("f"), b"two".to_vec(), Visibility::Public)];
+        let v2 = repo
+            .snapshot_assigning(None, Some(&v1), &entries2, "m", 0, &[], Some([0x11; 16]))
+            .unwrap();
+        assert_ne!(v1, v2, "a content change moves the version id");
+        assert_eq!(
+            repo.change_change_id(&v2),
+            Some(handle),
+            "the carried handle wins over a fresh assign"
+        );
+    }
+
+    #[test]
+    fn working_preview_is_pure_and_detects_empty() {
+        // The read-only status/log figure (ADR 0030): deterministic, empty when
+        // the tree matches the tip, and moving with content — all without
+        // recording a node or advancing the graph.
+        let (_sk, pk) = test_signer(4);
+        let mut repo = DagRepo::init(tmp(), "connor").unwrap();
+        repo.set_author(pk);
+        let entries = vec![(PathBuf::from("f"), b"hello".to_vec(), Visibility::Public)];
+        let tip = repo
+            .snapshot_assigning(None, None, &entries, "m", 0, &[], Some([1; 16]))
+            .unwrap();
+        let heads_before = repo.heads();
+
+        let (v_a, empty_a) = repo.working_preview(Some(&tip), &entries, "m", 0);
+        let (v_b, empty_b) = repo.working_preview(Some(&tip), &entries, "m", 0);
+        assert_eq!(v_a, v_b, "preview is a pure function of content");
+        assert!(empty_a && empty_b, "no delta over the tip -> empty");
+
+        let changed = vec![(PathBuf::from("f"), b"hello world".to_vec(), Visibility::Public)];
+        let (v_c, empty_c) = repo.working_preview(Some(&tip), &changed, "m", 0);
+        assert!(!empty_c, "a delta over the tip is not empty");
+        assert_ne!(v_a, v_c, "the live version moves with content");
+        assert_eq!(repo.heads(), heads_before, "preview never advances the graph");
     }
 
     /// A legacy (unauthored) change with an arbitrary id — travels through a

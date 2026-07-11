@@ -90,9 +90,9 @@ usage:
   loot init [--identity <name>]             initialize a repo here (identity from global config if omitted)
   loot clone <url> <dir> [--identity <name>]  clone a relay into <dir>
   loot config [set <key> <val>] [unset <key>] [list]  manage global config (~/.config/loot/config)
-  loot status [-m <message>] [--porcelain|--json] [--allow-demote <path>]...  snapshot the working tree into the working change
+  loot status [--porcelain|--json]          show the working change read-only (live version id + durable change id; no snapshot)
   loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
-  loot new [--no-snapshot]                  capture pending edits, finalize the working change; start a fresh one
+  loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
   loot surface                              materialize what the current identity may see
   loot dock <name>                          create a dock (isolated working tree + tip), or switch to one
   loot docks                                list docks with their tip and visibility
@@ -287,11 +287,15 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
 /// Shared init logic: initialize a repo at `dir`, generate keypair, print summary.
 fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
     let ws = Workspace::init_at(dir, id_name)?;
-    let dot = ws.dot();
-    let keypair = identity::generate_and_save(dot, &format!("{id_name}@loot"))
+    let dot = ws.dot().to_path_buf();
+    let keypair = identity::generate_and_save(&dot, &format!("{id_name}@loot"))
         .map_err(|e| e.to_string())?;
     let pub_line = std::fs::read_to_string(dot.join("id.pub"))
         .map_err(|e| format!("read id.pub: {e}"))?;
+    // Re-open now that the keypair exists so the repo is authored, then mint the
+    // first change's durable handle (ADR 0029/0030) — the repo's first change,
+    // like every later one, has a name from birth that `status`/`log` can show.
+    Workspace::open_at(dir)?.start_fresh_change()?;
     println!("initialized empty loot repo at {}, identity = {id_name}", dir.display());
     println!("public key: {}", pub_line.trim());
     println!("tip: share your public key with peers via `loot whoami`");
@@ -303,25 +307,52 @@ fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
 fn cmd_status(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
-    // Snapshot first (JJ: the tree IS the change), then report it.
-    let message = message_flag(args).unwrap_or("(working change)");
-    let allow_demote: Vec<std::path::PathBuf> =
-        flag_values(args, "--allow-demote").into_iter().map(Into::into).collect();
-    let (id, entries) = ws.snapshot_allowing(message, &allow_demote)?;
+    // status is READ-ONLY (ADR 0030): it recomputes the pending delta live and
+    // never persists a snapshot, so scripts and parallel agents can call it
+    // freely. The version id it shows is live-computed and non-durable — the
+    // durable handle a caller holds is the change id. `-m` is gone (naming is
+    // `describe`'s job); a demotion can't happen without a mutating snapshot, so
+    // there is no `--allow-demote` here either.
+    let Some(row) = ws.live_working_row()? else {
+        // No in-progress change and no eagerly-minted handle (a keyless/legacy
+        // or freshly-initialized repo). Nothing pending to report.
+        match fmt {
+            OutFmt::Human => println!("no working change (run `loot new` to start one)"),
+            OutFmt::Porcelain => print!("{}", verdict::status_porcelain(None, None, &[])),
+            OutFmt::Json => println!("{}", verdict::status_json(None, None, &[])),
+        }
+        return Ok(());
+    };
+
+    // An empty working change (no delta over the tip) has no meaningful version
+    // id or pending path listing — the durable change id is the only holdable
+    // handle, so machine output emits just the `@` header, no `~` rows.
+    let version = if row.empty { None } else { Some(&row.version) };
+    let entries: &[(std::path::PathBuf, loot_core::Visibility)] =
+        if row.empty { &[] } else { &row.entries };
     match fmt {
         OutFmt::Human => {
-            if entries.is_empty() {
-                println!("working change {} is empty", short(&id));
+            let change = row.change_id.map(|c| short_change(&c)).unwrap_or_else(|| NO_ID.into());
+            if row.empty {
+                println!("working change {change} is empty (no changes since the last `new`)");
                 return Ok(());
             }
-            println!("working change {} — \"{message}\"", short(&id));
-            for (path, vis) in &entries {
+            println!(
+                "working change {change}  {}  \"{}\"",
+                short(&row.version),
+                row.message
+            );
+            for (path, vis) in &row.entries {
                 println!("  {:<24} {}", path.display(), mark(vis));
             }
         }
-        // status is not a merge: its own working-change shape (ADR 0023).
-        OutFmt::Porcelain => print!("{}", verdict::status_porcelain(&entries)),
-        OutFmt::Json => println!("{}", verdict::status_json(&entries)),
+        // status is not a merge: its own working-change shape (ADR 0023/0029).
+        OutFmt::Porcelain => {
+            print!("{}", verdict::status_porcelain(row.change_id, version, entries))
+        }
+        OutFmt::Json => {
+            println!("{}", verdict::status_json(row.change_id, version, entries))
+        }
     }
     Ok(())
 }
@@ -342,10 +373,25 @@ fn cmd_describe(args: &[String]) -> Result<(), String> {
 fn cmd_new(args: &[String]) -> Result<(), String> {
     let opts = SnapshotOpts::parse(args);
     let mut ws = Workspace::open()?;
+    // Convenience `new -m <msg>`: name the working change before finalizing, so
+    // finalize-and-name is one step (ADR 0030). It is a mutating snapshot, so it
+    // honors the demotion guard via `--allow-demote`.
+    if let Some(message) = message_flag(args) {
+        ws.snapshot_allowing(message, &opts.allow_demote)?;
+    }
     // Capture edits made since the last command before finalizing (ADR 0030),
     // so `edit; loot new` cannot lose work — no manual `loot status` needed.
-    ws.finalize_capturing(&opts.allow_demote, opts.skip)?;
-    println!("finalized working change; the next mutating verb starts a fresh one");
+    let finalized = ws.finalize_capturing(&opts.allow_demote, opts.skip)?;
+    // `new` is the finalize/sign boundary and eagerly mints the *next* change's
+    // durable handle (ADR 0029/0030), so the fresh change has a name from birth.
+    let next = ws
+        .next_change_id()
+        .map(|c| short_change(&c))
+        .unwrap_or_else(|| "a fresh change".to_string());
+    match finalized {
+        Some(id) => println!("finalized working change {}; started fresh change {next}", short(&id)),
+        None => println!("nothing to finalize; started fresh change {next}"),
+    }
     Ok(())
 }
 
@@ -423,57 +469,93 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn cmd_log() -> Result<(), String> {
-    let ws = Workspace::open()?;
+    let mut ws = Workspace::open()?;
+    // The live working row (ADR 0030): read-only, never persists — same figure
+    // `status` shows, so the two agree on the working change. Computed first,
+    // while the `&mut` borrow is free, then rendered last.
+    let working = ws.live_working_row()?;
+    // The in-progress working change is a graph head, so it appears in
+    // `log_detailed`; render it *once*, as the live working row below, not also
+    // as a finalized row (its persisted and live version ids differ, ADR 0030,
+    // and two rows under one change id would misread as divergence).
+    let working_node = ws.working_id().cloned();
+    let identity = ws.identity().to_string();
+
     let detailed = ws.repo().log_detailed();
-    if detailed.is_empty() {
+    if detailed.is_empty() && working.is_none() {
         println!("no changes yet");
         return Ok(());
     }
 
     // Resolve each change's author pubkey to a peer name (short-hex fallback),
     // reusing the peer registry (S3, ADR 0018). Author trust stays advisory —
-    // this is display only.
+    // this is display only. The change id (durable handle) rides its own column
+    // as reverse-hex letters; the version id is the hex short (ADR 0029).
     let reg = identity::PeerRegistry::load(ws.dot());
-    let author_of = |id: &loot_core::Oid| match ws.repo().change_author(id) {
-        Some(pk) => format!("  [logged by {}]", resolve_pubkey_name(&reg, &pk)),
+    let own = ws.identity_pubkey();
+    let change_of = |id: &Oid| match ws.repo().change_change_id(id) {
+        Some(cid) => short_change(&cid),
+        None => NO_ID.to_string(),
+    };
+    let author_of = |id: &Oid| match ws.repo().change_author(id) {
+        // A change this identity authored resolves to its own name — the peer
+        // registry holds peers, not self, so it would otherwise show hex.
+        Some(pk) if own == Some(pk) => identity.clone(),
+        Some(pk) => resolve_pubkey_name(&reg, &pk),
         None => String::new(),
     };
-    let print_attestations = |id: &loot_core::Oid| {
+    let print_attestations = |id: &Oid| {
         for a in ws.repo().attestations_for(id) {
-            println!("      + attested by {} ({})", resolve_pubkey_name(&reg, &a.attester), a.role);
+            println!("    + attested by {} ({})", resolve_pubkey_name(&reg, &a.attester), a.role);
         }
     };
+    let row_of = |id: &Oid, message: &str, total: usize, restricted: usize, embargoed: usize| {
+        log_row(
+            &change_of(id),
+            &short(id),
+            message,
+            &vis_col(total, restricted, embargoed),
+            &author_of(id),
+        )
+    };
 
-    // A single head keeps the flat, newest-first listing (unchanged). Only a
-    // diverged graph (2+ heads, e.g. after a pull) switches to a branch view.
+    // A single head keeps the flat, newest-first listing. Only a diverged graph
+    // (2+ heads, e.g. after a pull) switches to a branch view.
     if ws.repo().heads().len() <= 1 {
+        println!("{}", log_header());
         for (id, message, total, restricted, embargoed) in detailed.into_iter().rev() {
-            println!("{}  {}{}{}", short(&id), message, seal_hint(total, restricted, embargoed), author_of(&id));
+            if Some(&id) == working_node.as_ref() {
+                continue; // shown once, as the live working row below
+            }
+            println!("{}", row_of(&id, &message, total, restricted, embargoed));
             print_attestations(&id);
         }
-        if let Some(working) = ws.working_id() {
-            println!("{}  (working change)", short(&working));
+        if let Some(row) = &working {
+            print_working_row(&identity, row);
         }
         return Ok(());
     }
 
     // Multi-head: show each head's own lineage indented under a label, then the
     // shared ancestry once. Makes the divergence visible before `loot apply`.
-    let hints: std::collections::BTreeMap<Oid, String> = detailed
-        .iter()
-        .map(|(id, _m, total, restricted, embargoed)| {
-            (id.clone(), seal_hint(*total, *restricted, *embargoed))
-        })
+    // Per-change counts + message, keyed by version id, for the columnar rows.
+    let meta: std::collections::BTreeMap<Oid, (String, usize, usize, usize)> = detailed
+        .into_iter()
+        .map(|(id, m, total, restricted, embargoed)| (id, (m, total, restricted, embargoed)))
         .collect();
-    let hint_for = |id: &Oid| hints.get(id).map(String::as_str).unwrap_or("");
+    let node_row = |id: &Oid| match meta.get(id) {
+        Some((m, total, restricted, embargoed)) => row_of(id, m, *total, *restricted, *embargoed),
+        None => row_of(id, "", 0, 0, 0),
+    };
 
     let g = ws.repo().log_graph();
     println!("{} heads — diverged; run `loot apply` to converge", g.heads.len());
     for (hi, head) in g.heads.iter().enumerate() {
         println!();
         println!("head {} — {}", hi + 1, short(head));
+        println!("{}", log_header());
         for node in g.changes.iter().filter(|n| n.reachable_from == [hi]) {
-            println!("  {}  {}{}{}", short(&node.id), node.message, hint_for(&node.id), author_of(&node.id));
+            println!("{}", node_row(&node.id));
             print_attestations(&node.id);
         }
     }
@@ -483,12 +565,27 @@ fn cmd_log() -> Result<(), String> {
     if !shared.is_empty() {
         println!();
         println!("shared history");
+        println!("{}", log_header());
         for node in shared {
-            println!("  {}  {}{}{}", short(&node.id), node.message, hint_for(&node.id), author_of(&node.id));
+            println!("{}", node_row(&node.id));
             print_attestations(&node.id);
         }
     }
     Ok(())
+}
+
+/// Render the working-change row for `log` (ADR 0030): the durable change id
+/// (letters) + the live version id (hex, `—` when the change is empty), the
+/// message, and the current identity as author. Shares the columnar shape with
+/// the finalized rows so the two ids line up.
+fn print_working_row(identity: &str, row: &workspace::WorkingRow) {
+    let change = row.change_id.map(|c| short_change(&c)).unwrap_or_else(|| NO_ID.into());
+    let (version, message) = if row.empty {
+        (NO_ID.to_string(), "(working change, empty)".to_string())
+    } else {
+        (short(&row.version), row.message.clone())
+    };
+    println!("{}", log_row(&change, &version, &message, "", identity));
 }
 
 /// Annotate a change with its sealed/embargoed file counts, or "" if all public.
@@ -1834,6 +1931,42 @@ fn short(oid: &Oid) -> String {
 
 fn short_oid(oid: &Oid) -> String {
     short(oid)
+}
+
+/// A change id's short display: the first 4 bytes as reverse-hex **letters**
+/// (ADR 0029), e.g. `qsouzmpr` — the durable-handle twin of [`short`]'s hex
+/// **digits**. The two alphabets disambiguate the ids at a glance.
+fn short_change(cid: &[u8; 16]) -> String {
+    loot_core::hex::short_letters(cid, 4)
+}
+
+/// The em dash shown where an id is absent — a legacy change with no change id,
+/// or the empty working change's not-yet-computed version (ADR 0029/0030).
+const NO_ID: &str = "—";
+
+/// Header + one row of the columnar `log`/`status` display (ADR 0030): the two
+/// ids ride their own columns so a change can carry both legibly. Column order
+/// is **change · version · message · vis · author**.
+fn log_header() -> String {
+    log_row("change", "version", "message", "vis", "author")
+}
+
+fn log_row(change: &str, version: &str, message: &str, vis: &str, author: &str) -> String {
+    // Trailing whitespace trimmed so empty tail columns don't dangle.
+    format!("{change:<10} {version:<9} {message:<30} {vis:<12} {author}")
+        .trim_end()
+        .to_string()
+}
+
+/// The compact `vis` column for a finalized change: the count of sealed and/or
+/// embargoed paths, or empty when the change is fully public.
+fn vis_col(_total: usize, restricted: usize, embargoed: usize) -> String {
+    match (restricted, embargoed) {
+        (0, 0) => String::new(),
+        (r, 0) => format!("{r} sealed"),
+        (0, e) => format!("{e} embargoed"),
+        (r, e) => format!("{r} sealed, {e} emb"),
+    }
 }
 
 /// A pubkey prefix for display: first 4 bytes as hex, plus an ellipsis.

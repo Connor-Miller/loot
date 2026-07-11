@@ -36,6 +36,13 @@ pub struct Workspace {
     /// selects the pre-dock behavior (fork from all heads) and keeps existing
     /// repos byte-for-byte unchanged.
     tip: Option<Oid>,
+    /// The durable change id `loot new` minted eagerly for the *next* change
+    /// (ADR 0029/0030), before any snapshot has recorded it. The fresh working
+    /// change already has a handle to print and show in `status`/`log`; the
+    /// first snapshot carries this id onto the change (then clears it). `None`
+    /// on a keyless repo (unsigned changes get no durable handle) or once
+    /// consumed.
+    next_change_id: Option<[u8; 16]>,
     /// The loaded signing keypair, if this repo has one. Stamps the author on new
     /// changes and signs at finalization (S3, ADR 0018). `None` for a keyless
     /// repo, which then produces unauthored (legacy) changes.
@@ -103,6 +110,7 @@ impl Workspace {
         let dock_opt = opt(&dock);
         let working = store.read_working(dock_opt);
         let tip = store.read_tip(dock_opt);
+        let next_change_id = store.read_next_change(dock_opt);
         // Load the signing keypair if present and stamp its pubkey as the author,
         // so new changes are attributable and signable (S3, ADR 0018). A keyless
         // repo stays unauthored (legacy ids), which keeps older repos working.
@@ -113,11 +121,43 @@ impl Workspace {
         } else {
             None
         };
-        Ok(Workspace { dot, store, root, identity, repo, dock, working, tip, signer, now: real_now() })
+        Ok(Workspace {
+            dot,
+            store,
+            root,
+            identity,
+            repo,
+            dock,
+            working,
+            tip,
+            next_change_id,
+            signer,
+            now: real_now(),
+        })
     }
 
     pub fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// Begin the repo's first change with an eagerly-minted durable handle (ADR
+    /// 0029/0030) when nothing is in progress and none is pending — called right
+    /// after `init` generates the keypair, so the very first change has a name
+    /// from birth just as `new` gives every later one. No-op once a change or a
+    /// pending handle exists, and on a keyless repo (mints `None`).
+    pub fn start_fresh_change(&mut self) -> Result<(), String> {
+        if self.working.is_none() && self.next_change_id.is_none() {
+            self.next_change_id = self.repo.mint_next_change_id();
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// This repo's own signing pubkey, if it has a keypair (S3, ADR 0018). Lets
+    /// `log` resolve a change *this* identity authored to its own name rather
+    /// than a bare hex prefix — the peer registry holds peers, not self.
+    pub fn identity_pubkey(&self) -> Option<[u8; 32]> {
+        self.signer.as_ref().map(|s| s.public_key_bytes())
     }
 
     /// The `.loot/` directory for this repo (used by identity keypair commands).
@@ -171,15 +211,13 @@ impl Workspace {
         self.snapshot_from(tip.as_ref(), message, allow_demote)
     }
 
-    /// `snapshot_allowing` with an explicit fork base instead of the ambient
-    /// dock tip — the bridge captures against its pinned pre-ingest anchor so
-    /// a pre-dock home capture never folds a freshly ingested head in.
-    fn snapshot_from(
+    /// Read the working tree + `.lootattributes` into engine entries `(path,
+    /// bytes, vis)` plus a sorted `(path, vis)` report — the shared front half of
+    /// a snapshot and of the read-only `status`/`log` working-row preview. Reads
+    /// only (bar an in-memory escrow flush); the caller decides whether to record.
+    fn read_working_tree(
         &mut self,
-        base: Option<&Oid>,
-        message: &str,
-        allow_demote: &[PathBuf],
-    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+    ) -> Result<(Vec<(PathBuf, Vec<u8>, Visibility)>, Vec<(PathBuf, Visibility)>), String> {
         // Promote any embargoed keys whose reveal time has passed before reading
         // content — `sealed::open` will then find them in the Keyring (ADR 0007).
         self.repo.flush_escrow(self.now);
@@ -202,6 +240,19 @@ impl Workspace {
             entries.push((rel, bytes, vis));
         }
         reported.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((entries, reported))
+    }
+
+    /// `snapshot_allowing` with an explicit fork base instead of the ambient
+    /// dock tip — the bridge captures against its pinned pre-ingest anchor so
+    /// a pre-dock home capture never folds a freshly ingested head in.
+    fn snapshot_from(
+        &mut self,
+        base: Option<&Oid>,
+        message: &str,
+        allow_demote: &[PathBuf],
+    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+        let (entries, reported) = self.read_working_tree()?;
 
         // Hash the current working tree content + message. Skip the engine
         // snapshot if nothing changed — running `loot status` repeatedly is safe.
@@ -213,21 +264,32 @@ impl Workspace {
             }
         }
 
+        // When starting a fresh change (no working node), assign the durable
+        // handle `loot new` minted eagerly (ADR 0029/0030) so the id printed at
+        // `new` and shown in `status`/`log` is the one that lands on the first
+        // version. A re-snapshot (working `Some`) carries the node's own handle
+        // and ignores this.
+        let assign = if self.working.is_none() { self.next_change_id } else { None };
+
         // Fork the working change from `base` — the ambient dock's tip (ADR
         // 0022) on the normal path. `None` (the pre-dock home dock) preserves
         // the original fork-from-all-heads behavior exactly.
         let id = self
             .repo
-            .snapshot_allowing(
+            .snapshot_assigning(
                 base,
                 self.working.as_ref(),
                 &entries,
                 message,
                 self.now,
                 allow_demote,
+                assign,
             )
             .map_err(|e| e.to_string())?;
         self.working = Some(id.clone());
+        // The pending next-change handle is now recorded on the working node,
+        // so it is no longer pending — clear it before persisting.
+        self.next_change_id = None;
         // Persist the new tree hash before persisting the rest of state.
         let _ = self.store.write_tree_hash(self.dock_opt(), &tree_hash);
         self.persist()?;
@@ -250,11 +312,15 @@ impl Workspace {
     /// than finalized, so a bare `loot new` does not mint an empty signed
     /// change. `--no-snapshot` skips the capture (`skip_snapshot`); the
     /// demotion guard rides the capture via `allow_demote`.
+    /// Returns the finalized change's **version id**, or `None` when there was
+    /// nothing to finalize (a bare `new` whose capture added nothing over the
+    /// tip) — so `loot new` can name the finalized version alongside the freshly
+    /// minted next change id.
     pub fn finalize_capturing(
         &mut self,
         allow_demote: &[PathBuf],
         skip_snapshot: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Oid>, String> {
         if !skip_snapshot {
             let msg = self.working_message().unwrap_or_else(|| "(working change)".to_string());
             let (id, _) = self.snapshot_allowing(&msg, allow_demote)?;
@@ -268,7 +334,9 @@ impl Workspace {
                 self.persist()?;
             }
         }
-        self.finalize_working()
+        let finalized = self.working.clone();
+        self.finalize_working()?;
+        Ok(finalized)
     }
 
     /// Finalize the working change and start fresh: the next snapshot appends a
@@ -302,6 +370,11 @@ impl Workspace {
         }
         // Clear the tree-hash so the next snapshot always runs the engine.
         self.store.clear_tree_hash(self.dock_opt());
+        // Eagerly mint the fresh change's durable handle (ADR 0029/0030): the
+        // change that begins now has a name from birth, printed by `new` and
+        // shown in `status`/`log`, and the first snapshot carries it onto the
+        // change's first version. Keyless repos mint `None` and stay legacy.
+        self.next_change_id = self.repo.mint_next_change_id();
         self.persist()
     }
 
@@ -381,6 +454,56 @@ impl Workspace {
         self.working.as_ref()
     }
 
+    /// The durable change id `loot new` minted eagerly for the next change (ADR
+    /// 0029/0030), if one is pending and unrecorded. `loot new` prints it.
+    pub fn next_change_id(&self) -> Option<[u8; 16]> {
+        self.next_change_id
+    }
+
+    /// The live working-change row for read-only `status`/`log` (ADR 0030): the
+    /// durable change id (the working node's handle, or the eagerly-minted next
+    /// handle when no snapshot exists yet) paired with the **live, non-durable**
+    /// version id + emptiness the engine computes from the current tree. Never
+    /// persists. `None` when there is no working change to show — a keyless or
+    /// pre-`new` repo with no pending handle and no in-progress change.
+    pub fn live_working_row(&mut self) -> Result<Option<WorkingRow>, String> {
+        if self.working.is_none() && self.next_change_id.is_none() {
+            return Ok(None);
+        }
+        let change_id = match &self.working {
+            Some(w) => self.repo.change_change_id(w),
+            None => self.next_change_id,
+        };
+        let (entries, reported) = self.read_working_tree()?;
+        let message = self.working_message().unwrap_or_else(|| "(working change)".to_string());
+        let base = self.anchor();
+
+        // When a working node exists AND the tree on disk still matches its last
+        // snapshot, show that node's *recorded* version id — the sealed id
+        // `describe`/`new` printed — so the read-only views agree with the
+        // mutating verbs. Only genuine un-snapshotted drift (a save with no loot
+        // command since) falls through to the live plaintext fingerprint
+        // (Seam #1, ADR 0030), which by construction differs from a sealed id.
+        if let Some(w) = &self.working {
+            let up_to_date = self.store.read_tree_hash(self.dock_opt()) == hash_tree(&entries, &message);
+            if up_to_date {
+                let empty = self.repo.change_tree(w).is_none_or(|t| t.is_empty())
+                    || base.as_ref().is_some_and(|a| self.repo.same_tree_content(a, w, self.now));
+                return Ok(Some(WorkingRow {
+                    change_id,
+                    version: w.clone(),
+                    message,
+                    entries: reported,
+                    empty,
+                }));
+            }
+        }
+
+        let (version, empty) =
+            self.repo.working_preview(base.as_ref(), &entries, &message, self.now);
+        Ok(Some(WorkingRow { change_id, version, message, entries: reported, empty }))
+    }
+
     /// Run a closure that mutates the repo, then persist. The single path for
     /// "mutation ⇒ save" — callers can't forget to persist (e.g. `apply`).
     pub fn with_repo<T>(
@@ -441,6 +564,7 @@ impl Workspace {
             dock: HOME_DOCK.to_string(),
             working: None,
             tip: None,
+            next_change_id: None,
             // A freshly-initialized repo has no keypair yet (`loot keygen` adds one);
             // its early changes are unauthored until then (S3, ADR 0018).
             signer: None,
@@ -937,7 +1061,10 @@ impl Workspace {
         self.repo.save(&self.dot).map_err(|e| e.to_string())?;
         self.store
             .write_working(self.dock_opt(), self.working.as_ref())
-            .map_err(|e| format!("write working: {e}"))
+            .map_err(|e| format!("write working: {e}"))?;
+        self.store
+            .write_next_change(self.dock_opt(), self.next_change_id.as_ref())
+            .map_err(|e| format!("write next-change: {e}"))
     }
 }
 
@@ -969,6 +1096,19 @@ pub enum DockAction {
     Already,
     Switched,
     Created,
+}
+
+/// The live working-change row `status`/`log` render (ADR 0030). `change_id` is
+/// the durable handle (`None` only for a keyless/legacy working change);
+/// `version` is the live, non-durable content fingerprint; `empty` is true when
+/// the working tree has no delta over the tip, so callers show `—` for the
+/// version and omit the per-path listing.
+pub struct WorkingRow {
+    pub change_id: Option<[u8; 16]>,
+    pub version: Oid,
+    pub message: String,
+    pub entries: Vec<(PathBuf, Visibility)>,
+    pub empty: bool,
 }
 
 /// A dock's summary for `loot docks`: its head change, visibility counts
@@ -1354,6 +1494,63 @@ fn glob_match(pat: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An authored workspace at `dir` with a generated keypair, so its changes
+    /// carry a durable change id (S2/ADR 0029) — `init_at` alone stays keyless.
+    fn authored_ws(dir: &Path) -> Workspace {
+        let _ = std::fs::remove_dir_all(dir);
+        Workspace::init_at(dir, "connor").unwrap();
+        loot_identity::generate_and_save(&dir.join(DOT), "connor@loot").unwrap();
+        let mut ws = Workspace::open_at(dir).unwrap();
+        ws.start_fresh_change().unwrap();
+        ws
+    }
+
+    #[test]
+    fn new_mints_next_handle_and_first_snapshot_carries_it() {
+        let dir = std::env::temp_dir().join(format!("loot-s2-new-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        // `init`/`start_fresh_change` eagerly minted the first change's handle.
+        let first = ws.next_change_id();
+        assert!(first.is_some(), "authored repo mints the first handle");
+
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("m").unwrap();
+        let working = ws.working_id().cloned().unwrap();
+        assert_eq!(
+            ws.repo().change_change_id(&working),
+            first,
+            "the first snapshot carries the eagerly-minted handle onto the change"
+        );
+        assert!(ws.next_change_id().is_none(), "handle is consumed once recorded");
+
+        // Finalize (`new`) signs and mints a *fresh* next handle.
+        ws.finalize_working().unwrap();
+        let next = ws.next_change_id();
+        assert!(next.is_some() && next != first, "new mints a fresh next handle");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_working_row_never_advances_the_graph() {
+        let dir = std::env::temp_dir().join(format!("loot-s2-ro-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("m").unwrap();
+        ws.finalize_working().unwrap(); // working -> tip; a fresh handle is pending
+
+        let heads_before = ws.repo().heads();
+        let nodes_before = ws.repo().log_detailed().len();
+
+        // An on-disk edit with no mutating verb: the read-only row reports the
+        // pending delta live, but records nothing.
+        std::fs::write(dir.join("a.txt"), b"changed").unwrap();
+        let row = ws.live_working_row().unwrap().expect("a pending working change");
+        assert!(!row.empty, "an un-snapshotted edit is a pending delta");
+        assert_eq!(ws.repo().heads(), heads_before, "status/log never advance heads");
+        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "no node is recorded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn config_round_trips_remotes() {
