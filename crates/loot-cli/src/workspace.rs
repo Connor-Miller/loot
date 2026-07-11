@@ -8,7 +8,10 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
-use loot_core::{valid_dock_name, DagRepo, MergeOutcome, Oid, Repo, RepoStore, Visibility, HOME_DOCK};
+use loot_core::{
+    oplog, valid_dock_name, DagRepo, MergeOutcome, Oid, Operation, Repo, RepoStore, Visibility,
+    HOME_DOCK,
+};
 use loot_identity::Identity;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -513,6 +516,114 @@ impl Workspace {
         let out = f(&mut self.repo)?;
         self.persist()?;
         Ok(out)
+    }
+
+    // --- operation log + undo (S4, ADR 0031) ---
+
+    /// Record one view-changing command in the local operation log. Capture the
+    /// resulting on-disk view, so call this *after* the command's own persist.
+    /// `barrier` marks a one-way op (push/grant/maroon/pull-grants) that `undo`
+    /// must refuse to cross. Best-effort: a log-write failure never fails the
+    /// command it records (undo history is a convenience layer, not repo data).
+    pub fn record_op(&self, command: &str, description: &str, barrier: bool) {
+        let _ = oplog::record(&self.store, command, &self.dock, description, barrier, self.now);
+    }
+
+    /// The full operation log, oldest first (`loot op log`).
+    pub fn op_log(&self) -> Result<Vec<Operation>, String> {
+        oplog::read(&self.store).map_err(|e| e.to_string())
+    }
+
+    /// `loot undo`: step the view back one operation, refusing across a barrier.
+    pub fn undo(&mut self) -> Result<StepReport, String> {
+        self.step(oplog::undo)
+    }
+
+    /// `loot op restore <n>`: jump the view to operation `n` (redo included).
+    pub fn restore_op(&mut self, target: u32) -> Result<StepReport, String> {
+        self.step(move |s, dock, now| oplog::restore(s, dock, target, now))
+    }
+
+    /// Shared driver for `undo`/`restore_op`: note the paths currently on disk,
+    /// perform the pointer-level view step (which appends a compensating op),
+    /// reload from the restored files, then re-materialize the ambient dock —
+    /// writing the restored tree and pruning whatever the step removed. The graph
+    /// and object store are never touched, so no change is ever deleted.
+    fn step(
+        &mut self,
+        f: impl FnOnce(&RepoStore, &str, u64) -> Result<oplog::Stepped, oplog::StepError>,
+    ) -> Result<StepReport, String> {
+        let old_paths = self.ambient_visible_paths();
+        let stepped = f(&self.store, &self.dock, self.now).map_err(step_error)?;
+        self.reload()?;
+        self.resurface(old_paths)?;
+        Ok(StepReport {
+            description: stepped.appended.description.clone(),
+            restored_to: stepped.restored_to,
+            heads: stepped.appended.heads(),
+            working: self.working.clone(),
+        })
+    }
+
+    /// The paths the ambient dock currently materializes — the "before" picture a
+    /// view step prunes against.
+    fn ambient_visible_paths(&self) -> Vec<PathBuf> {
+        let tip = self
+            .working
+            .clone()
+            .or_else(|| self.tip.clone())
+            .or_else(|| self.repo.heads().into_iter().next());
+        tip.map(|t| self.repo.visible_paths_at(&t, &self.identity, self.now))
+            .unwrap_or_default()
+    }
+
+    /// Rebuild in-memory state (engine, pointers, ambient dock) from the on-disk
+    /// files a view restore just rewrote. Re-runs the full open path so a `--at`
+    /// worktree resolves its dock from its pointer, not the shared ambient one.
+    /// Preserves the injected clock.
+    fn reload(&mut self) -> Result<(), String> {
+        let now = self.now;
+        let root = self.root.clone();
+        *self = Self::open_at(&root)?;
+        self.now = now;
+        Ok(())
+    }
+
+    /// Materialize the (reloaded) ambient dock's tree to disk and prune any path
+    /// in `old_paths` the restored tree no longer contains, so `undo` leaves a
+    /// working tree the next auto-snapshot won't silently re-capture.
+    fn resurface(&mut self, old_paths: Vec<PathBuf>) -> Result<(), String> {
+        self.repo.flush_escrow(self.now);
+        let to = self
+            .working
+            .clone()
+            .or_else(|| self.tip.clone())
+            .or_else(|| self.repo.heads().into_iter().next());
+        let written = match &to {
+            Some(to) => self
+                .repo
+                .surface_with_report(to, &self.identity, self.now)
+                .map_err(|e| e.to_string())?
+                .0,
+            // Restored to an empty view: nothing to write, prune everything.
+            None => Vec::new(),
+        };
+        let keep: std::collections::BTreeSet<&PathBuf> = written.iter().map(|(p, _)| p).collect();
+        for p in &old_paths {
+            if keep.contains(p) {
+                continue;
+            }
+            let dest = self.root.join(p);
+            let _ = std::fs::remove_file(&dest);
+            let mut dir = dest.parent().map(Path::to_path_buf);
+            while let Some(d) = dir {
+                if d == self.root || std::fs::remove_dir(&d).is_err() {
+                    break;
+                }
+                dir = d.parent().map(Path::to_path_buf);
+            }
+        }
+        Ok(())
     }
 
     /// Read the URL for a named remote (e.g. "origin") from `.loot/config`.
@@ -1111,6 +1222,50 @@ pub struct WorkingRow {
     pub empty: bool,
 }
 
+/// What a completed `undo`/`op restore` did, for CLI reporting (ADR 0031).
+#[derive(Debug)]
+pub struct StepReport {
+    /// Its human description (e.g. `undid op 7 (new)`).
+    pub description: String,
+    /// The 1-based ordinal of the op whose view is now current.
+    pub restored_to: u32,
+    /// The change-graph heads the view now sits on.
+    pub heads: Vec<Oid>,
+    /// The working change now in progress, if any.
+    pub working: Option<Oid>,
+}
+
+/// Flatten an [`oplog::StepError`] into a CLI message. A barrier refusal is
+/// expanded into the "why + real remedy" prose ADR 0031 mandates.
+fn step_error(e: oplog::StepError) -> String {
+    match e {
+        oplog::StepError::Nothing(m) | oplog::StepError::Io(m) => m,
+        oplog::StepError::Barrier(b) => barrier_message(&b),
+    }
+}
+
+/// The refusal `undo` prints at a one-way barrier: it names the op, states *why*
+/// the act cannot be retracted, and points at the real remedy (ADR 0031). The
+/// keyring/manifest/escrow are never touched by undo, so the guidance is always
+/// "reverse it forward," never "undo it."
+fn barrier_message(b: &oplog::BarrierRefusal) -> String {
+    let remedy = match b.command.as_str() {
+        "push" => "a push discloses; it cannot be retracted by undo. to reverse a \
+                   published change, record a new change or `loot maroon` the path.",
+        "grant" => "a grant hands a content key to a peer; undo cannot recall it. to cut \
+                    off access going forward, `loot maroon` the path from that identity.",
+        "maroon" => "a maroon is an audited, one-way revocation; undo cannot reinstate a \
+                     key. re-grant explicitly to restore access.",
+        "pull-grants" => "pull-grants filed keys into your keyring; undo only moves view \
+                          pointers, never keys, so there is nothing for it to reverse.",
+        _ => "this operation changed permission or key state that undo cannot retract.",
+    };
+    format!(
+        "refusing to undo across a barrier (op {}, {}).\n      {remedy}",
+        b.index, b.description
+    )
+}
+
 /// A dock's summary for `loot docks`: its head change, visibility counts
 /// `(total, restricted, embargoed)`, and whether it's the ambient dock.
 pub struct DockInfo {
@@ -1549,6 +1704,60 @@ mod tests {
         assert!(!row.empty, "an un-snapshotted edit is a pending delta");
         assert_eq!(ws.repo().heads(), heads_before, "status/log never advance heads");
         assert_eq!(ws.repo().log_detailed().len(), nodes_before, "no node is recorded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_walks_the_view_back_and_prunes_disk() {
+        let dir = std::env::temp_dir().join(format!("loot-s4-undo-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        ws.record_op("init", "init", false); // op 1
+
+        // op 2: record a.txt and finalize it as a signed change.
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("first").unwrap();
+        ws.finalize_working().unwrap();
+        ws.record_op("new", "finalize a", false);
+
+        // op 3: add b.txt and finalize.
+        std::fs::write(dir.join("b.txt"), b"two").unwrap();
+        ws.snapshot("second").unwrap();
+        ws.finalize_working().unwrap();
+        ws.record_op("new", "finalize b", false);
+        assert!(dir.join("b.txt").exists());
+
+        // Undo op 3: the view returns to op 2 and the working tree is
+        // re-materialized — b.txt pruned, a.txt kept.
+        let r = ws.undo().unwrap();
+        assert_eq!(r.restored_to, 2);
+        assert!(!dir.join("b.txt").exists(), "undo prunes the file the reverted op added");
+        assert!(dir.join("a.txt").exists(), "the earlier file survives");
+
+        // The oplog grew (undo is itself an op), so redo has a landing spot.
+        assert_eq!(ws.op_log().unwrap().len(), 4, "undo appends a compensating op");
+
+        // Nothing was deleted: redoing forward to op 3 recovers the "b" change
+        // in full — undo only ever moved pointers over an append-only graph.
+        let redo = ws.restore_op(3).unwrap();
+        assert_eq!(redo.restored_to, 3);
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"two", "redo restores the change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_refuses_to_cross_a_barrier_op() {
+        let dir = std::env::temp_dir().join(format!("loot-s4-barrier-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("first").unwrap();
+        ws.finalize_working().unwrap();
+        ws.record_op("new", "finalize a", false); // op 1
+        ws.record_op("push", "push → origin", true); // op 2 — a barrier
+
+        let err = ws.undo().unwrap_err();
+        assert!(err.contains("barrier"), "message names the barrier: {err}");
+        assert!(err.contains("push"), "message names the offending op: {err}");
+        assert_eq!(ws.op_log().unwrap().len(), 2, "a refused undo appends no op");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -16,6 +16,7 @@ pub mod escrow;
 pub mod format;         // format version markers + compatibility gate (S1, ADR 0019)
 pub mod hex;            // shared byte<->hex conversion (one home for all crates)
 pub mod manifest;
+pub mod oplog;          // operation log + undo (S4, ADR 0031)
 pub mod sealed;
 pub mod store;          // the .loot/ on-disk layout (single source of truth)
 pub mod verdict;        // machine-facing reconciliation output (CA3, ADR 0023)
@@ -24,6 +25,7 @@ pub use attestation::{Attestation, AttestationLog};
 pub use engine::{
     change_signing_message, DagRepo, GcReport, LogGraph, LogNode, MaroonResult, MigrateResult,
 };
+pub use oplog::{BarrierRefusal, Operation, StepError, Stepped, View};
 pub use store::{valid_dock_name, RepoStore, HOME_DOCK};
 pub use verdict::{PathVerdict, VERDICT_CONTRACT};
 

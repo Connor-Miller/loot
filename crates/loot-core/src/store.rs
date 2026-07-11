@@ -26,6 +26,7 @@
 //! tree-hash    last snapshot's tree+message hash        (Workspace)
 //! next-change  eagerly-minted next change id (v6)       (Workspace, ADR 0029/0030)
 //! config       named remotes                            (Workspace, ADR 0013)
+//! ops          local-only operation log for undo (LOCAL) (oplog, ADR 0031)
 //! id, id.pub   the ed25519 keypair                      (loot-identity, ADR 0014)
 //! peers        nickname -> pubkey registry              (loot-identity, ADR 0014)
 //! ```
@@ -57,6 +58,7 @@ const DOCK: &str = "dock";
 const DOCKS: &str = "docks";
 const CONFIG: &str = "config";
 const GIT_MIRROR: &str = "git-mirror";
+const OPS: &str = "ops";
 
 /// The default dock every repo starts on — the primary directory (ADR 0022
 /// physical model). Its process files are the root `.loot/working`/`tree-hash`/
@@ -140,6 +142,14 @@ impl RepoStore {
     pub fn git_allowed_signers(&self) -> PathBuf { self.git_mirror_dir().join("allowed-signers") }
     pub fn git_config(&self) -> PathBuf { self.git_mirror_dir().join("config") }
     pub fn git_wip(&self) -> PathBuf { self.git_mirror_dir().join("wip") }
+
+    // --- operation log (S4, ADR 0031) ---
+    //
+    // Local-only, repo-wide, append-only history of view-changing operations
+    // backing `loot undo` / `loot op`. Like `keyring`/`escrow`/the git mark map
+    // it is per-machine and **never enters a bundle** — losing it loses undo
+    // history, not repo data.
+    pub fn ops(&self) -> PathBuf { self.dot.join(OPS) }
 
     /// Read the working-change id (32 raw bytes) for `dock` if one is in
     /// progress. An absent or malformed file means finalized history.
