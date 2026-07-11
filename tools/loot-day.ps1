@@ -108,7 +108,9 @@ try {
         Write-Host ">>> loot ferry"
         $ferryOut = (& $Loot ferry --git-dir .loot/git-mirror/mirror.git 2>&1 | Out-String)
         Write-Host $ferryOut
-        $ferryLine = (($ferryOut -split "`r?`n") | Where-Object { $_ -match "^ferry:" } | Select-Object -First 1)
+        # loot's own line already starts "ferry:"; strip it so the log template's
+        # "- ferry: $ferryLine" prefix is not doubled.
+        $ferryLine = ((($ferryOut -split "`r?`n") | Where-Object { $_ -match "^ferry:" } | Select-Object -First 1) -replace '^ferry:\s*', '')
         if (-not $ferryLine) { $ferryLine = "see ferry output" }
     } else {
         Write-Host ">>> $ferryLine" -ForegroundColor Yellow
