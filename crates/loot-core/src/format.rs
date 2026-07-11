@@ -85,13 +85,20 @@ impl<'a> Cursor<'a> {
 /// - v5 (ADR 0027, #14) removed the plaintext bundle escrow section (it shipped
 ///   raw embargoed `ContentKey` bytes to every peer and relay — the exact bypass
 ///   hard embargo closes) and added `reveal_at` to the SealedGrant frame header.
+/// - v6 (ADR 0029, #143) added the durable per-change `change_id` (a random
+///   16-byte handle stable across a working change's re-snapshots) beside the
+///   change body, and widened the finalize signature to cover
+///   `version_id ‖ change_id`. Additive: a legacy change decodes as
+///   `change_id = None`, and its signature — over the 32-byte version id alone —
+///   still verifies, because the signed message only grows when a change id is
+///   present.
 ///
 /// Each was a change an older reader cannot parse, so each bumped the major. A
-/// v5 reader still reads v1–v4 artifacts (missing fields default to absent;
+/// v6 reader still reads v1–v5 artifacts (missing fields default to absent;
 /// a v4 escrow section is parsed for cursor correctness but its plaintext keys
 /// are DROPPED, never filed); an older reader cleanly rejects a newer major
 /// rather than mis-parsing.
-pub const FORMAT_MAJOR: u8 = 5;
+pub const FORMAT_MAJOR: u8 = 6;
 /// The compatible revision this build writes.
 pub const FORMAT_MINOR: u8 = 0;
 /// Bytes the version marker occupies at the front of an artifact.
@@ -175,6 +182,37 @@ pub fn read_author_sig(
         None
     };
     Ok((author, signature))
+}
+
+/// Write a change's optional durable `change_id` (v6, ADR 0029) as a presence
+/// byte followed by its 16 bytes when present. Rides after the author+signature,
+/// so the two-term (version id + change id) layout stays identical on disk and
+/// on the wire.
+pub fn put_change_id(out: &mut Vec<u8>, change_id: &Option<[u8; 16]>) {
+    match change_id {
+        Some(c) => {
+            out.push(1);
+            out.extend_from_slice(c);
+        }
+        None => out.push(0),
+    }
+}
+
+/// Read a change's optional durable `change_id`. From v6 on it follows the
+/// author+signature; an older `major` predates it, so the change loads as a
+/// legacy change with no durable handle (`None`) — the "newer reads older" path
+/// (ADR 0019/0029), with no backfill.
+pub fn read_change_id(c: &mut Cursor, major: u8) -> Result<Option<[u8; 16]>, RepoError> {
+    if major < 6 {
+        return Ok(None);
+    }
+    if c.take(1)?[0] != 0 {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(c.take(16)?);
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

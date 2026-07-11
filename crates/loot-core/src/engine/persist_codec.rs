@@ -39,6 +39,8 @@ fn put_change(out: &mut Vec<u8>, c: &ChangeNode) {
     }
     // v3: author pubkey + signature ride beside the change body (ADR 0018).
     format::put_author_sig(out, &c.author, &c.signature);
+    // v6: the durable change_id follows (ADR 0029).
+    format::put_change_id(out, &c.change_id);
 }
 
 fn encode_object(obj: &SealedObject) -> Vec<u8> {
@@ -220,6 +222,7 @@ pub fn decode_nodes(b: &[u8]) -> Result<Vec<ChangeNode>, RepoError> {
             tree.insert(path, (oid, vis));
         }
         let (author, signature) = format::read_author_sig(&mut c, major)?;
+        let change_id = format::read_change_id(&mut c, major)?;
         nodes.push(ChangeNode {
             id,
             parents,
@@ -227,6 +230,7 @@ pub fn decode_nodes(b: &[u8]) -> Result<Vec<ChangeNode>, RepoError> {
             tree,
             author,
             signature,
+            change_id,
         });
     }
     Ok(nodes)
@@ -462,6 +466,7 @@ mod tests {
             tree,
             author: None,
             signature: None,
+            change_id: None,
         });
         g
     }
@@ -512,13 +517,49 @@ mod tests {
     }
 
     #[test]
-    fn golden_v4_graph_matches_and_round_trips() {
-        // v5 changed only the bundle body (ADR 0027); the durable graph layout
-        // is byte-identical to v4 apart from the marker.
-        let mut golden_v5 = GOLDEN_GRAPH_V4.to_vec();
-        golden_v5[0] = format::FORMAT_MAJOR;
-        assert_eq!(encode_graph(&one_change_graph()), golden_v5, "v5 graph layout must not drift");
-        assert_eq!(decode_graph(&GOLDEN_GRAPH_V4).unwrap().in_order().len(), 1);
+    fn v4_graph_still_decodes_as_legacy() {
+        // v5 changed only the bundle body (ADR 0027), so the v5 durable graph is
+        // byte-identical to v4 apart from the marker; a v6 build reads both, and
+        // their pre-v6 changes load with no durable change id.
+        for marker in [4u8, 5u8] {
+            let mut golden = GOLDEN_GRAPH_V4.to_vec();
+            golden[0] = marker;
+            let g = decode_graph(&golden).unwrap();
+            assert_eq!(g.in_order().len(), 1);
+            assert!(g.in_order()[0].change_id.is_none(), "pre-v6 change has no change id");
+        }
+    }
+
+    #[test]
+    fn golden_v6_graph_matches_and_round_trips() {
+        // v6 adds the durable change_id (ADR 0029). For this unauthored sample it
+        // appends a single change_id-absent byte after the author+signature bytes,
+        // so the expected v6 golden is the v4 body with the marker bumped and one
+        // trailing zero.
+        let mut golden_v6 = GOLDEN_GRAPH_V4.to_vec();
+        golden_v6[0] = format::FORMAT_MAJOR;
+        golden_v6.push(0); // change_id absent
+        assert_eq!(encode_graph(&one_change_graph()), golden_v6, "v6 graph layout must not drift");
+        assert_eq!(decode_graph(&golden_v6).unwrap().in_order().len(), 1);
+    }
+
+    #[test]
+    fn durable_change_id_round_trips() {
+        // A present durable change_id survives encode/decode on disk (ADR 0029).
+        let mut tree = BTreeMap::new();
+        tree.insert(PathBuf::from("a.txt"), (Oid([2; 32]), Visibility::Public));
+        let mut g = ChangeGraph::new();
+        g.insert(ChangeNode {
+            id: Oid([1; 32]),
+            parents: vec![],
+            message: "first".into(),
+            tree,
+            author: Some([7; 32]),
+            signature: None,
+            change_id: Some([0xAB; 16]),
+        });
+        let back = decode_graph(&encode_graph(&g)).unwrap();
+        assert_eq!(back.in_order()[0].change_id, Some([0xAB; 16]));
     }
 
     #[test]
@@ -556,9 +597,12 @@ mod tests {
 
     #[test]
     fn golden_v4_object_matches_and_round_trips() {
-        let mut golden_v5 = GOLDEN_OBJECT_V4.to_vec();
-        golden_v5[0] = format::FORMAT_MAJOR;
-        assert_eq!(encode_object(&sample_object()), golden_v5, "v5 object layout must not drift");
+        // The sealed-object layout is unchanged v4→v6 (only the change/graph
+        // layout gained the change_id, ADR 0029), so the current marker over the
+        // v4 body is the golden.
+        let mut golden = GOLDEN_OBJECT_V4.to_vec();
+        golden[0] = format::FORMAT_MAJOR;
+        assert_eq!(encode_object(&sample_object()), golden, "object layout must not drift");
         assert_eq!(decode_object(&GOLDEN_OBJECT_V4).unwrap(), sample_object());
     }
 
@@ -620,9 +664,9 @@ mod tests {
 
     #[test]
     fn golden_v4_keyring_matches_and_round_trips() {
-        let mut golden_v5 = GOLDEN_KEYRING_V4.to_vec();
-        golden_v5[0] = format::FORMAT_MAJOR;
-        assert_eq!(encode_keyring(&sample_keyring()), golden_v5, "v5 keyring layout must not drift");
+        let mut golden = GOLDEN_KEYRING_V4.to_vec();
+        golden[0] = format::FORMAT_MAJOR;
+        assert_eq!(encode_keyring(&sample_keyring()), golden, "keyring layout must not drift");
         assert!(decode_keyring(&GOLDEN_KEYRING_V4).unwrap().holds(&Oid([4; 32])));
     }
 
@@ -646,9 +690,9 @@ mod tests {
     fn golden_v4_escrow_matches_and_round_trips() {
         // The DURABLE escrow file (originator-side staging) survives v5; only
         // the bundle's escrow *section* was removed (ADR 0027).
-        let mut golden_v5 = GOLDEN_ESCROW_V4.to_vec();
-        golden_v5[0] = format::FORMAT_MAJOR;
-        assert_eq!(encode_escrow(&sample_escrow()), golden_v5, "v5 escrow layout must not drift");
+        let mut golden = GOLDEN_ESCROW_V4.to_vec();
+        golden[0] = format::FORMAT_MAJOR;
+        assert_eq!(encode_escrow(&sample_escrow()), golden, "escrow layout must not drift");
         assert!(decode_escrow(&GOLDEN_ESCROW_V4).unwrap().holds(&Oid([5; 32])));
     }
 

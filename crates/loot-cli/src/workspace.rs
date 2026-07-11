@@ -278,7 +278,10 @@ impl Workspace {
         // working change is ephemeral until now (rewritten on each `status`), so
         // we sign exactly once, here. A keyless repo finalizes unsigned (legacy).
         if let (Some(signer), Some(working)) = (&self.signer, self.working.clone()) {
-            let sig = signer.sign(&working.0);
+            // Sign over `version_id ‖ change_id` (ADR 0029) so the durable handle
+            // is bound to this exact version and cannot be relabelled on the wire.
+            let change_id = self.repo.change_change_id(&working);
+            let sig = signer.sign(&loot_core::change_signing_message(&working, &change_id));
             self.repo
                 .attach_signature(&working, sig)
                 .map_err(|e| e.to_string())?;
@@ -309,7 +312,10 @@ impl Workspace {
     /// travels, so this is a no-op there.
     pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), String> {
         if let Some(signer) = &self.signer {
-            let sig = signer.sign(&change_id.0);
+            // Same finalize signature as `finalize_working`: over
+            // `version_id ‖ change_id` (ADR 0029).
+            let cid = self.repo.change_change_id(change_id);
+            let sig = signer.sign(&loot_core::change_signing_message(change_id, &cid));
             self.repo
                 .attach_signature(change_id, sig)
                 .map_err(|e| e.to_string())?;
@@ -751,7 +757,10 @@ impl Workspace {
         // nothing to sign and the resolution (and every descendant) was
         // stranded as untravelable working history.
         if let Some(signer) = &self.signer {
-            let sig = signer.sign(&change_id.0);
+            // Finalize over `version_id ‖ change_id` (ADR 0029), like every other
+            // finalize path — `resolve` mints a durable change id for the change.
+            let cid = self.repo.change_change_id(&change_id);
+            let sig = signer.sign(&loot_core::change_signing_message(&change_id, &cid));
             self.repo
                 .attach_signature(&change_id, sig)
                 .map_err(|e| e.to_string())?;

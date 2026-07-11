@@ -134,6 +134,9 @@ pub fn encode(
         }
         // v3: author pubkey + signature ride beside the change body (ADR 0018).
         format::put_author_sig(&mut out, &c.author, &c.signature);
+        // v6: the durable change_id travels with the change (ADR 0029), so peers
+        // agree on it by receipt — no id-allocation protocol.
+        format::put_change_id(&mut out, &c.change_id);
     }
 
     // v4: detachable attestations ride after the changes (S4, ADR 0018).
@@ -231,6 +234,7 @@ pub fn decode(
             tree.insert(path, (oid, vis));
         }
         let (author, signature) = format::read_author_sig(&mut c, major)?;
+        let change_id = format::read_change_id(&mut c, major)?;
         changes.push(ChangeNode {
             id,
             parents,
@@ -238,6 +242,7 @@ pub fn decode(
             tree,
             author,
             signature,
+            change_id,
         });
     }
 
@@ -431,6 +436,10 @@ mod tests {
     // [5][0][tag=0][purges=0][objs=0][keys=0][changes=0][attestations=0].
     const GOLDEN_SYNC_V5: [u8; 23] =
         [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // v6 (ADR 0029) added the durable change_id, but it rides *per change*, so an
+    // empty bundle is byte-identical to v5 apart from the marker — still 23 bytes.
+    const GOLDEN_SYNC_V6: [u8; 23] =
+        [6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     // v4 bundle with one authored+signed change (no tree, no objects, no attestations).
     // Kept as a decode-compat fixture: a v5 reader must still read it (and drop
     // its empty escrow section). Pins the put_author_sig layout.
@@ -506,17 +515,25 @@ mod tests {
     }
 
     #[test]
-    fn golden_v5_sync_bundle_matches_and_round_trips() {
+    fn golden_v6_sync_bundle_matches_and_round_trips() {
         let bytes = Frame::Sync { purges: vec![], body: empty_body() }.encode();
-        assert_eq!(bytes, GOLDEN_SYNC_V5, "v5 wire layout must not drift");
+        assert_eq!(bytes, GOLDEN_SYNC_V6, "v6 wire layout must not drift");
+        assert!(matches!(Frame::decode(&GOLDEN_SYNC_V6).unwrap(), Frame::Sync { .. }));
+        // A v6 build still reads the committed v5 empty bundle (newer reads older).
         assert!(matches!(Frame::decode(&GOLDEN_SYNC_V5).unwrap(), Frame::Sync { .. }));
     }
 
     #[test]
-    fn golden_v5_authored_change_layout_matches_and_round_trips() {
-        // Pins the put_author_sig wire layout (presence-byte + 32-byte pubkey,
-        // presence-byte + 64-byte sig). A field-ordering regression in that path
-        // must break this test before it breaks interop with peers.
+    fn golden_v6_authored_change_layout_matches_and_round_trips() {
+        // Pins the wire layout for a change: author+sig (put_author_sig) then the
+        // durable change_id (put_change_id, v6/ADR 0029). A field-ordering
+        // regression must break this test before it breaks interop with peers.
+        // The expected v6 bytes are the v5 authored golden with the marker bumped
+        // and a change_id-absent byte inserted after the signature, i.e. right
+        // before the trailing 4-byte attestation count.
+        let mut expected = GOLDEN_SYNC_V5_AUTHORED.to_vec();
+        expected[0] = format::FORMAT_MAJOR;
+        expected.insert(expected.len() - 4, 0); // change_id absent
         let node = ChangeNode {
             id: Oid([5; 32]),
             parents: vec![],
@@ -524,6 +541,7 @@ mod tests {
             tree: BTreeMap::new(),
             author: Some([7; 32]),
             signature: Some([9; 64]),
+            change_id: None,
         };
         let body = BundleBody {
             changes: vec![node],
@@ -532,12 +550,21 @@ mod tests {
             attestations: vec![],
         };
         let bytes = Frame::Sync { purges: vec![], body }.encode();
-        assert_eq!(bytes, GOLDEN_SYNC_V5_AUTHORED, "v5 authored-change wire layout must not drift");
-        match Frame::decode(&GOLDEN_SYNC_V5_AUTHORED).unwrap() {
+        assert_eq!(bytes, expected, "v6 authored-change wire layout must not drift");
+        match Frame::decode(&expected).unwrap() {
             Frame::Sync { body, .. } => {
                 assert_eq!(body.changes.len(), 1);
                 assert_eq!(body.changes[0].author, Some([7; 32]));
                 assert_eq!(body.changes[0].signature, Some([9; 64]));
+                assert_eq!(body.changes[0].change_id, None);
+            }
+            _ => panic!("expected Sync"),
+        }
+        // A v6 build still reads the committed v5 authored bundle as legacy.
+        match Frame::decode(&GOLDEN_SYNC_V5_AUTHORED).unwrap() {
+            Frame::Sync { body, .. } => {
+                assert_eq!(body.changes[0].author, Some([7; 32]));
+                assert!(body.changes[0].change_id.is_none(), "pre-v6 change has no change id");
             }
             _ => panic!("expected Sync"),
         }
@@ -612,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_change_author_and_signature_round_trip() {
+    fn bundle_change_author_signature_and_change_id_round_trip() {
         let node = ChangeNode {
             id: Oid([5; 32]),
             parents: vec![],
@@ -620,6 +647,7 @@ mod tests {
             tree: BTreeMap::new(),
             author: Some([7; 32]),
             signature: Some([9; 64]),
+            change_id: Some([0xAB; 16]),
         };
         let body = BundleBody {
             changes: vec![node],
@@ -632,6 +660,11 @@ mod tests {
                 let c = &body.changes[0];
                 assert_eq!(c.author, Some([7; 32]), "author must survive the bundle");
                 assert_eq!(c.signature, Some([9; 64]), "signature must survive the bundle");
+                assert_eq!(
+                    c.change_id,
+                    Some([0xAB; 16]),
+                    "durable change_id must survive the bundle (ADR 0029)"
+                );
             }
             _ => panic!("expected Sync"),
         }

@@ -13,6 +13,9 @@ use std::path::PathBuf;
 /// A node in the change DAG.
 #[derive(Clone)]
 pub struct ChangeNode {
+    /// The **version id** (ADR 0029): `compute_change_id(author ‖ message ‖
+    /// parents ‖ tree)`. Content-and-author-derived, so it rewrites on every
+    /// snapshot; carries dedup, DAG parent edges, and sync addressing.
     pub id: Oid,
     pub parents: Vec<Oid>,
     pub message: String,
@@ -21,9 +24,17 @@ pub struct ChangeNode {
     /// changes — the pubkey is folded into `id`, so authorship is intrinsic.
     /// `None` for legacy/unauthored changes read under an older format version.
     pub author: Option<[u8; 32]>,
-    /// The author's signature over `id`, attached at finalization (`loot new`).
-    /// `None` for an in-progress working change, or a legacy/unauthored change.
+    /// The author's signature over the finalize message (`version_id ‖
+    /// change_id`, ADR 0029; just `version_id` for a legacy change whose
+    /// `change_id` is `None`), attached at finalization (`loot new`). `None` for
+    /// an in-progress working change, or a legacy/unauthored change.
     pub signature: Option<[u8; 64]>,
+    /// The **change id** (v6, ADR 0029): a random 16-byte durable handle minted
+    /// when the change begins and carried unchanged across every re-snapshot, so
+    /// a working change has a stable name *while you edit it*. Never folded into
+    /// `id` — it is a label, not a graph edge. `None` for a legacy (pre-v6) or
+    /// unauthored change.
+    pub change_id: Option<[u8; 16]>,
 }
 
 /// Content-and-author-derived change id: hash of the author pubkey (when
@@ -49,6 +60,34 @@ pub fn compute_change_id(author: Option<&[u8; 32]>, change: &Change) -> Oid {
         h.update(&oid.0);
     }
     Oid(*h.finalize().as_bytes())
+}
+
+/// Mint a fresh random 16-byte durable change id (v6, ADR 0029), called when a
+/// change begins. Random — not derived from content — so it survives the
+/// rewrite churn that content-addressed ids cannot, and two peers creating "the
+/// same" change get distinct handles unless one travels to the other.
+pub fn mint_change_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    // Same OS CSPRNG the sealed module draws nonces/keys from; a mint failure is
+    // an environment fault, so surface it loudly rather than degrade to a weak id.
+    getrandom::getrandom(&mut id).expect("OS RNG unavailable while minting a change id");
+    id
+}
+
+/// The message the finalize signature covers (ADR 0029): the **version id**,
+/// followed by the **change id** when one is present. A legacy change (`change_id
+/// = None`) signs over the 32-byte version id alone, so its pre-v6 signature
+/// still verifies unchanged; a v6 change binds "(this change id → this exact
+/// version, by this author)" by widening the signed message 16 bytes. The change
+/// id is never folded into the version-id hash — the signature is a proof *over*
+/// both ids, sitting beside the node.
+pub fn change_signing_message(version_id: &Oid, change_id: &Option<[u8; 16]>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(48);
+    msg.extend_from_slice(&version_id.0);
+    if let Some(cid) = change_id {
+        msg.extend_from_slice(cid);
+    }
+    msg
 }
 
 #[derive(Default)]
@@ -297,6 +336,7 @@ mod tests {
             tree,
             author: None,
             signature: None,
+            change_id: None,
         }
     }
 
