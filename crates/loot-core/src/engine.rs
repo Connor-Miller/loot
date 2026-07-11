@@ -1046,6 +1046,60 @@ impl DagRepo {
         self.author.map(|_| mint_change_id())
     }
 
+    /// The **divergent** change ids in this dock's graph (S3, ADR 0029): a change
+    /// id carried by more than one **live** version node — where a version is
+    /// live iff it is in the graph and not in `abandoned`. Divergence is per
+    /// change id, *not* head-counting: two versions of one change id can sit under
+    /// a single graph head (e.g. as the two parents of a merge), and their trees
+    /// may even be identical — so this scans every node, never just the heads.
+    /// Legacy/keyless nodes (`change_id = None`) can never be divergent.
+    pub fn divergent_change_ids(
+        &self,
+        abandoned: &std::collections::BTreeSet<Oid>,
+    ) -> std::collections::BTreeSet<[u8; 16]> {
+        let mut by_change: BTreeMap<[u8; 16], usize> = BTreeMap::new();
+        for node in self.graph.in_order() {
+            if abandoned.contains(&node.id) {
+                continue;
+            }
+            if let Some(cid) = node.change_id {
+                *by_change.entry(cid).or_default() += 1;
+            }
+        }
+        by_change.into_iter().filter(|(_, n)| *n > 1).map(|(cid, _)| cid).collect()
+    }
+
+    /// The live version ids (graph nodes) carrying `change_id`, skipping any in
+    /// `abandoned`. `loot abandon` resolves its target among these, and refuses to
+    /// touch a change that is not divergent (would leave zero live versions).
+    pub fn versions_of_change(
+        &self,
+        change_id: &[u8; 16],
+        abandoned: &std::collections::BTreeSet<Oid>,
+    ) -> Vec<Oid> {
+        self.graph
+            .in_order()
+            .into_iter()
+            .filter(|n| n.change_id.as_ref() == Some(change_id) && !abandoned.contains(&n.id))
+            .map(|n| n.id.clone())
+            .collect()
+    }
+
+    /// Drop a divergent version from this dock's **live heads** (S3, `loot
+    /// abandon`): if `version` is a head, remove it and restore its parents as
+    /// heads (reusing the working-change rewrite path). The node is *not* deleted
+    /// from the object store or the shared graph file — it stops being a live head
+    /// (and the caller also records it in the abandoned set for the case where it
+    /// is a reachable non-head, e.g. a merge parent). Returns whether it was a
+    /// head. Undo restores the head pointer and the abandoned set (ADR 0031).
+    pub fn abandon_head(&mut self, version: &Oid) -> bool {
+        let was_head = self.graph.heads().contains(version);
+        if was_head {
+            self.graph.remove_head(version);
+        }
+        was_head
+    }
+
     /// The parents of a change, or empty if the id is unknown. Lets a caller find
     /// the finalized change a working change forks from — the anchor a dock sits
     /// on when its working change is finalized away (ADR 0022).
@@ -1094,7 +1148,13 @@ impl DagRepo {
     /// stable handle while it is edited. `carried = None` begins a fresh change —
     /// minting a new random change id when authored, or staying `None` for a
     /// keyless repo (an unsigned change gets no durable handle, matching legacy).
-    fn record_carrying(
+    ///
+    /// Public because it is the **amend primitive**: recording two versions that
+    /// carry the same `change_id` on independent lines is exactly how a divergent
+    /// change (S3, ADR 0029) comes to exist — two writers rewriting one change id.
+    /// The snapshot path uses it to carry a working change's handle; a future
+    /// edit-a-published-change flow (and today's divergence tests) use it directly.
+    pub fn record_carrying(
         &mut self,
         change: Change,
         carried: Option<[u8; 16]>,
@@ -2295,6 +2355,49 @@ mod tests {
 
     fn empty_change(parents: Vec<Oid>, message: &str) -> Change {
         Change { id: Oid([0; 32]), parents, message: message.into(), tree: BTreeMap::new() }
+    }
+
+    #[test]
+    fn divergent_change_detected_and_abandon_collapses_it() {
+        use std::collections::BTreeSet;
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let root = repo.record(empty_change(vec![], "root")).unwrap();
+
+        // Two writers rewrite ONE change id onto two independent versions (S3):
+        // same carried change id, different content -> different version ids, both
+        // heads. This is exactly what a cross-repo amend of a shared change yields.
+        let cid = [7u8; 16];
+        let va = repo
+            .record_carrying(empty_change(vec![root.clone()], "reworded A"), Some(cid))
+            .unwrap();
+        let vb = repo
+            .record_carrying(empty_change(vec![root.clone()], "reworded B"), Some(cid))
+            .unwrap();
+        assert_ne!(va, vb, "different content -> different version ids");
+        assert_eq!(repo.change_change_id(&va), Some(cid));
+        assert_eq!(repo.change_change_id(&vb), Some(cid));
+
+        let none: BTreeSet<Oid> = BTreeSet::new();
+        assert_eq!(
+            repo.divergent_change_ids(&none),
+            BTreeSet::from([cid]),
+            "one change id with two live versions is divergent"
+        );
+        assert_eq!(repo.versions_of_change(&cid, &none).len(), 2);
+
+        // Abandoning one version collapses the divergence — over the abandoned
+        // filter it is no longer counted, and it drops out of the live heads.
+        let abandoned = BTreeSet::from([vb.clone()]);
+        assert!(
+            repo.divergent_change_ids(&abandoned).is_empty(),
+            "abandoned version no longer makes the change divergent"
+        );
+        assert_eq!(repo.versions_of_change(&cid, &abandoned), vec![va.clone()]);
+        assert!(repo.abandon_head(&vb), "vb was a live head");
+        assert!(!repo.heads().contains(&vb), "abandon drops it from the live heads");
+        assert!(repo.heads().contains(&va), "the surviving version stays a head");
+        // Legacy/unauthored root has no change id, so it is never divergent.
+        assert!(repo.change_change_id(&root).is_none());
     }
 
     #[test]

@@ -52,6 +52,9 @@ pub struct View {
     /// The ambient-dock pointer (`.loot/dock`), so undoing a `dock` switch
     /// returns to the dock you were on. Absent means the home dock.
     dock_pointer: Option<Vec<u8>>,
+    /// The abandoned-version set (`.loot/abandoned`, S3), so undoing a `loot
+    /// abandon` brings the dropped version back as a live divergent version.
+    abandoned: Option<Vec<u8>>,
     docks: Vec<DockView>,
 }
 
@@ -80,6 +83,7 @@ impl View {
             working_change: read(store.working_change()),
             conflicts: read(store.conflicts()),
             dock_pointer: read(store.dock_pointer()),
+            abandoned: read(store.abandoned()),
             docks,
         }
     }
@@ -93,6 +97,7 @@ impl View {
         put_file(&store.working_change(), self.working_change.as_deref())?;
         put_file(&store.conflicts(), self.conflicts.as_deref())?;
         put_file(&store.dock_pointer(), self.dock_pointer.as_deref())?;
+        put_file(&store.abandoned(), self.abandoned.as_deref())?;
         for d in &self.docks {
             let sel = dock_selector(&d.name);
             if sel.is_some() {
@@ -358,6 +363,7 @@ fn encode_view(out: &mut Vec<u8>, v: &View) {
     put_opt(out, v.working_change.as_deref());
     put_opt(out, v.conflicts.as_deref());
     put_opt(out, v.dock_pointer.as_deref());
+    put_opt(out, v.abandoned.as_deref());
     put_u32(out, v.docks.len());
     for d in &v.docks {
         put_bytes(out, d.name.as_bytes());
@@ -403,6 +409,7 @@ fn decode_view(c: &mut Cursor) -> Result<View, RepoError> {
     let working_change = take_opt(c)?;
     let conflicts = take_opt(c)?;
     let dock_pointer = take_opt(c)?;
+    let abandoned = take_opt(c)?;
     let n = c.u32()?;
     let mut docks = Vec::with_capacity(n);
     for _ in 0..n {
@@ -413,7 +420,7 @@ fn decode_view(c: &mut Cursor) -> Result<View, RepoError> {
         let next_change = take_opt(c)?;
         docks.push(DockView { name, working, tip, tree_hash, next_change });
     }
-    Ok(View { heads, working_change, conflicts, dock_pointer, docks })
+    Ok(View { heads, working_change, conflicts, dock_pointer, abandoned, docks })
 }
 
 fn take_opt(c: &mut Cursor) -> Result<Option<Vec<u8>>, RepoError> {

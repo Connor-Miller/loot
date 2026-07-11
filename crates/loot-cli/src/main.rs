@@ -56,6 +56,7 @@ const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
     ("status", cmd_status),
     ("describe", cmd_describe),
     ("new", cmd_new),
+    ("abandon", cmd_abandon),
     ("undo", |_| cmd_undo()),
     ("op", cmd_op),
     ("surface", |_| cmd_surface()),
@@ -95,6 +96,7 @@ usage:
   loot status [--porcelain|--json]          show the working change read-only (live version id + durable change id; no snapshot)
   loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
+  loot abandon <version-id>                 drop a version from a divergent change (marked `!` in log), leaving one; undoable
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
@@ -341,7 +343,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         if row.empty { &[] } else { &row.entries };
     match fmt {
         OutFmt::Human => {
-            let change = row.change_id.map(|c| short_change(&c)).unwrap_or_else(|| NO_ID.into());
+            // A working change whose change id has another live version renders
+            // with a trailing `!` here too (S3, ADR 0030).
+            let change = change_col(row.change_id, &ws.divergent_change_ids());
             if row.empty {
                 println!("working change {change} is empty (no changes since the last `new`)");
                 return Ok(());
@@ -408,6 +412,46 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
     }
     ws.record_op("new", &desc, false);
     Ok(())
+}
+
+/// `loot abandon <version-id>` — drop a version from a **divergent** change (S3,
+/// ADR 0029/0030): jj-parity `jj abandon`. Leaves the other live version(s) under
+/// the change id; nothing is deleted from the object store — the version stops
+/// being a live head — and the step is one undoable operation (ADR 0031).
+fn cmd_abandon(args: &[String]) -> Result<(), String> {
+    let prefix = first_positional(args).ok_or("usage: loot abandon <version-id>")?;
+    let mut ws = Workspace::open()?;
+    let version = resolve_version(&ws, prefix)?;
+    ws.abandon(&version)?;
+    println!(
+        "abandoned version {} — its change id keeps the remaining live version(s)",
+        short(&version)
+    );
+    println!("  nothing was deleted; `loot undo` brings it back (see `loot op log`)");
+    Ok(())
+}
+
+/// Resolve a **version-id** hex prefix among this dock's live version nodes
+/// (skipping abandoned ones and the still-changing working change), the way
+/// [`resolve_change`] resolves a finalized change. `loot abandon` targets a
+/// version by this id.
+fn resolve_version(ws: &Workspace, prefix: &str) -> Result<Oid, String> {
+    let abandoned = ws.abandoned_versions();
+    let working = ws.working_id().cloned();
+    let matches: Vec<Oid> = ws
+        .repo()
+        .log_detailed()
+        .into_iter()
+        .map(|(id, ..)| id)
+        .filter(|id| !abandoned.contains(id))
+        .filter(|id| Some(id) != working.as_ref())
+        .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no live version matching '{prefix}'")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => Err(format!("ambiguous version prefix '{prefix}' — matches {n} versions")),
+    }
 }
 
 /// `loot undo` — step the view back one operation (ADR 0031). Refuses across a
@@ -564,6 +608,12 @@ fn cmd_log() -> Result<(), String> {
     let working_node = ws.working_id().cloned();
     let identity = ws.identity().to_string();
 
+    // Divergent change ids get a trailing `!`; abandoned versions are dropped
+    // from the listing entirely (S3, ADR 0029/0030) — a version `loot abandon`
+    // removed is no longer live, though it survives in the object store.
+    let divergent = ws.divergent_change_ids();
+    let abandoned = ws.abandoned_versions();
+
     let detailed = ws.repo().log_detailed();
     if detailed.is_empty() && working.is_none() {
         println!("no changes yet");
@@ -576,10 +626,7 @@ fn cmd_log() -> Result<(), String> {
     // as reverse-hex letters; the version id is the hex short (ADR 0029).
     let reg = identity::PeerRegistry::load(ws.dot());
     let own = ws.identity_pubkey();
-    let change_of = |id: &Oid| match ws.repo().change_change_id(id) {
-        Some(cid) => short_change(&cid),
-        None => NO_ID.to_string(),
-    };
+    let change_of = |id: &Oid| change_col(ws.repo().change_change_id(id), &divergent);
     let author_of = |id: &Oid| match ws.repo().change_author(id) {
         // A change this identity authored resolves to its own name — the peer
         // registry holds peers, not self, so it would otherwise show hex.
@@ -602,19 +649,37 @@ fn cmd_log() -> Result<(), String> {
         )
     };
 
-    // A single head keeps the flat, newest-first listing. Only a diverged graph
-    // (2+ heads, e.g. after a pull) switches to a branch view.
-    if ws.repo().heads().len() <= 1 {
+    // A diverged *graph* (heads on ≥2 distinct change lines, e.g. after a pull)
+    // switches to the branch view; a single line — including a **divergent
+    // change** whose several heads share one change id (S3) — stays the flat,
+    // newest-first listing, where the `!` marker tells the divergence apart from
+    // a genuine fork. Head-counting alone would mis-route a divergent change into
+    // the "run `loot apply` to converge" view, but apply can't collapse it (its
+    // versions share a change id, sometimes an identical tree) — `loot abandon`
+    // does. So route by *distinct change lines*, not head count (ADR 0029).
+    let head_lines: std::collections::BTreeSet<Vec<u8>> = ws
+        .repo()
+        .heads()
+        .iter()
+        .map(|h| match ws.repo().change_change_id(h) {
+            Some(cid) => cid.to_vec(),
+            None => h.0.to_vec(),
+        })
+        .collect();
+    if head_lines.len() <= 1 {
         println!("{}", log_header());
         for (id, message, total, restricted, embargoed) in detailed.into_iter().rev() {
             if Some(&id) == working_node.as_ref() {
                 continue; // shown once, as the live working row below
             }
+            if abandoned.contains(&id) {
+                continue; // dropped from a divergent change (S3)
+            }
             println!("{}", row_of(&id, &message, total, restricted, embargoed));
             print_attestations(&id);
         }
         if let Some(row) = &working {
-            print_working_row(&identity, row);
+            print_working_row(&identity, row, &divergent);
         }
         return Ok(());
     }
@@ -637,14 +702,17 @@ fn cmd_log() -> Result<(), String> {
         println!();
         println!("head {} — {}", hi + 1, short(head));
         println!("{}", log_header());
-        for node in g.changes.iter().filter(|n| n.reachable_from == [hi]) {
+        for node in g.changes.iter().filter(|n| n.reachable_from == [hi] && !abandoned.contains(&n.id)) {
             println!("{}", node_row(&node.id));
             print_attestations(&node.id);
         }
     }
 
-    let shared: Vec<&loot_core::LogNode> =
-        g.changes.iter().filter(|n| n.reachable_from.len() > 1).collect();
+    let shared: Vec<&loot_core::LogNode> = g
+        .changes
+        .iter()
+        .filter(|n| n.reachable_from.len() > 1 && !abandoned.contains(&n.id))
+        .collect();
     if !shared.is_empty() {
         println!();
         println!("shared history");
@@ -661,8 +729,12 @@ fn cmd_log() -> Result<(), String> {
 /// (letters) + the live version id (hex, `—` when the change is empty), the
 /// message, and the current identity as author. Shares the columnar shape with
 /// the finalized rows so the two ids line up.
-fn print_working_row(identity: &str, row: &workspace::WorkingRow) {
-    let change = row.change_id.map(|c| short_change(&c)).unwrap_or_else(|| NO_ID.into());
+fn print_working_row(
+    identity: &str,
+    row: &workspace::WorkingRow,
+    divergent: &std::collections::BTreeSet<[u8; 16]>,
+) {
+    let change = change_col(row.change_id, divergent);
     let (version, message) = if row.empty {
         (NO_ID.to_string(), "(working change, empty)".to_string())
     } else {
@@ -2056,6 +2128,18 @@ fn short_change(cid: &[u8; 16]) -> String {
     loot_core::hex::short_letters(cid, 4)
 }
 
+/// The change-id column for `log`/`status` (ADR 0029/0030): the reverse-hex
+/// letters, with a trailing **`!`** when the change is **divergent** — one change
+/// id carrying more than one live version (S3). `None` (a legacy/unsigned change)
+/// renders as the absent-id dash and can never be divergent.
+fn change_col(cid: Option<[u8; 16]>, divergent: &std::collections::BTreeSet<[u8; 16]>) -> String {
+    match cid {
+        Some(c) if divergent.contains(&c) => format!("{}!", short_change(&c)),
+        Some(c) => short_change(&c),
+        None => NO_ID.to_string(),
+    }
+}
+
 /// The em dash shown where an id is absent — a legacy change with no change id,
 /// or the empty working change's not-yet-computed version (ADR 0029/0030).
 const NO_ID: &str = "—";
@@ -2122,6 +2206,21 @@ mod tests {
         assert_eq!(describe(&MergeOutcome::Merged), "merged");
         assert!(describe(&MergeOutcome::RelayedUnmerged).contains("sealed"));
         assert!(describe(&MergeOutcome::Conflict { ours: loot_core::Oid([0; 32]), theirs: loot_core::Oid([1; 32]) }).contains("conflict"));
+    }
+
+    #[test]
+    fn change_col_marks_divergence_with_a_bang() {
+        use std::collections::BTreeSet;
+        let cid = [7u8; 16];
+        let plain: BTreeSet<[u8; 16]> = BTreeSet::new();
+        let diverged: BTreeSet<[u8; 16]> = BTreeSet::from([cid]);
+
+        // Non-divergent: bare letters. Divergent: same letters + trailing `!`.
+        let base = change_col(Some(cid), &plain);
+        assert!(!base.ends_with('!'), "a settled change carries no marker: {base}");
+        assert_eq!(change_col(Some(cid), &diverged), format!("{base}!"));
+        // A legacy/unsigned change (no change id) is the dash and never divergent.
+        assert_eq!(change_col(None, &diverged), NO_ID);
     }
 
     #[test]
