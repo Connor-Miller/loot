@@ -136,6 +136,7 @@ impl RepoStore {
     pub fn git_identity_map(&self) -> PathBuf { self.git_mirror_dir().join("identity") }
     pub fn git_allowed_signers(&self) -> PathBuf { self.git_mirror_dir().join("allowed-signers") }
     pub fn git_config(&self) -> PathBuf { self.git_mirror_dir().join("config") }
+    pub fn git_wip(&self) -> PathBuf { self.git_mirror_dir().join("wip") }
 
     /// Read the working-change id (32 raw bytes) for `dock` if one is in
     /// progress. An absent or malformed file means finalized history.

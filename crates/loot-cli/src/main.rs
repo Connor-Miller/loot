@@ -128,7 +128,7 @@ usage:
   loot serve [--dir <path>] [--addr <host:port>] [--allow <pubkey>]...  run a relay
   loot push [<url>] [--remote <name>]       publish changes to a relay (uses 'origin' if no url given)
   loot pull [<url>] [--remote <name>] [--porcelain|--json]  fetch, merge, and converge changes from a relay
-  loot ferry [--git-dir <path>] [--dock <name>] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028)
+  loot ferry [--git-dir <path>] [--dock <name>] [--with-wip] [--porcelain|--json]  one bidirectional loot <-> git mirror pass (GB1, ADR 0028); --with-wip also projects the ambient dock's unfinalized WIP to review/<dock> (map #148)
 
 mutating verbs (new, describe, grant, maroon, migrate) snapshot the working tree
 first (ADR 0030) — no manual `loot status` needed. Two globals ride any of them:
@@ -549,8 +549,9 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     let git_dir = flag(args, "--git-dir");
     let dock = flag(args, "--dock");
+    let with_wip = args.iter().any(|a| a == "--with-wip");
     let mut ws = Workspace::open()?;
-    let report = ferry::run(&mut ws, git_dir, dock)?;
+    let report = ferry::run(&mut ws, git_dir, dock, with_wip)?;
 
     match fmt {
         OutFmt::Human => {
@@ -567,6 +568,9 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
                 for (path, outcome) in &report.outcomes {
                     println!("  {:<24} {}", path.display(), describe(outcome));
                 }
+            }
+            if let Some(line) = &report.review {
+                println!("{line}");
             }
         }
         // Machine output: the merge verdict rows only (empty -> no lines).
