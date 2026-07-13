@@ -669,7 +669,15 @@ impl Workspace {
         // fork-from-all-heads behavior) is unchanged (ADR 0022). With no working
         // change (e.g. `loot new` right after a clean dock merge already sealed the
         // tip) there is nothing to finalize — leave the dock's tip intact.
-        if self.docks_active() {
+        //
+        // A lane (ADR 0034) is on the home dock but is *born with a seeded tip*
+        // (spawn pins it at the finalized anchor over the shared store), so
+        // `docks_active()` is false yet the tip is real and must advance — else
+        // it stays stuck at the spawn anchor while `heads` moves on, and a land
+        // from the lane aims git-main at the parent, moving nothing (caught live
+        // by the #195 guard while dogfooding ADR 0036). Advance the tip for a
+        // lane too.
+        if self.docks_active() || self.lane_id.is_some() {
             if self.working.is_some() {
                 self.tip = self.working.take();
                 let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
@@ -4019,6 +4027,30 @@ mod tests {
         let lw2 = Workspace::open_at(&spawned.dir).unwrap();
         assert_eq!(lw2.heads(), lane_tip, "the lane keeps its own frontier");
 
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn lane_finalize_advances_the_tip_to_the_signed_change() {
+        // Regression (ADR 0036 dogfood): a lane sits on the home dock but is born
+        // with a *seeded* tip, so `docks_active()` is false; finalize must still
+        // advance the tip. Before the fix it stayed pinned at the spawn anchor
+        // while `heads` moved on, so a land aimed git-main at the change's parent
+        // and moved nothing — the #195 guard caught it live.
+        let (area, _dir, mut ws) = lane_setup("tip-advance");
+        let spawned = ws.spawn_lane(None, Some(&area.join("l1"))).unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        let spawn_anchor = lw.finalized_anchor();
+
+        std::fs::write(spawned.dir.join("lane.txt"), b"L").unwrap();
+        lw.snapshot("lane work").unwrap();
+        let finalized = lw.finalize_capturing(&[], false).unwrap();
+
+        assert!(finalized.is_some(), "the lane change was finalized");
+        assert_ne!(lw.finalized_anchor(), spawn_anchor, "tip must leave the spawn anchor");
+        assert_eq!(lw.finalized_anchor(), finalized, "the finalized change is the new tip");
+        // And it is the lane's single head — tip and frontier agree.
+        assert_eq!(lw.heads(), finalized.into_iter().collect::<Vec<_>>(), "tip == the head");
         let _ = std::fs::remove_dir_all(&area);
     }
 
