@@ -103,6 +103,7 @@ usage:
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
   loot abandon <version-id>                 drop a version from a divergent change (marked `!` in log), leaving one; undoable
+  loot abandon --head <version-id>          drop an independent live head (a whole fork tip); undoable
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
@@ -419,15 +420,30 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
 /// ADR 0029/0030): jj-parity `jj abandon`. Leaves the other live version(s) under
 /// the change id; nothing is deleted from the object store — the version stops
 /// being a live head — and the step is one undoable operation (ADR 0031).
+///
+/// `loot abandon --head <version-id>` drops an independent live **head** (a whole
+/// fork tip), the non-divergent counterpart used to walk a drifted dock off a
+/// stale line before a re-ferry (#243). Same undoable machinery; refuses a
+/// non-head and refuses emptying the dock of its last live head.
 fn cmd_abandon(args: &[String]) -> Result<(), String> {
-    let prefix = first_positional(args).ok_or("usage: loot abandon <version-id>")?;
+    let head_mode = has_flag(args, "--head");
+    let prefix = first_positional(args).ok_or(if head_mode {
+        "usage: loot abandon --head <version-id>"
+    } else {
+        "usage: loot abandon <version-id>"
+    })?;
     let mut ws = Workspace::open()?;
     let version = ws.resolve_live_version(prefix)?;
-    ws.abandon(&version)?;
-    println!(
-        "abandoned version {} — its change id keeps the remaining live version(s)",
-        short(&version)
-    );
+    if head_mode {
+        ws.abandon_fork(&version)?;
+        println!("abandoned fork head {} — the dock keeps its other live line(s)", short(&version));
+    } else {
+        ws.abandon(&version)?;
+        println!(
+            "abandoned version {} — its change id keeps the remaining live version(s)",
+            short(&version)
+        );
+    }
     println!("  nothing was deleted; `loot undo` brings it back (see `loot op log`)");
     Ok(())
 }

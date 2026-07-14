@@ -1129,6 +1129,64 @@ impl Workspace {
         Ok(())
     }
 
+    /// `loot abandon --head <version>`: drop an independent live **head** (a whole
+    /// fork tip), the non-divergent counterpart to [`abandon`](Self::abandon).
+    /// Where `abandon` collapses one version of a *divergent* change, this
+    /// discards a stale *fork* — a head that is the sole version of its change id,
+    /// which `abandon` refuses ("it keeps its single version"). The reconcile use
+    /// (#243): walk a drifted dock back off a stale line so a re-ferry
+    /// fast-forwards onto landed git main instead of *merging* the stale tree.
+    ///
+    /// Same undoable machinery as `abandon`: the node is union-preserved on disk
+    /// (the shared graph is an immutable node store, [`DagRepo::save_to`]), the
+    /// abandoned set keeps it out of the live view, and `loot undo` restores it.
+    /// Refuses a version that is not a live head, and refuses dropping the dock's
+    /// *last* live head so the operation can never leave the dock with no line.
+    pub fn abandon_fork(&mut self, version: &Oid) -> Result<(), String> {
+        let mut abandoned = self.store.read_abandoned();
+        if abandoned.contains(version) {
+            return Err("that version is already abandoned".into());
+        }
+        let live_heads = self.repo.heads();
+        if !live_heads.contains(version) {
+            return Err(
+                "that version is not a live head — `--head` drops a whole fork tip; \
+                 use `loot abandon` (no flag) for a divergent co-version"
+                    .into(),
+            );
+        }
+        if live_heads.len() < 2 {
+            return Err(
+                "that is the dock's only live head — abandoning it would leave the dock \
+                 with no live line; nothing to fork-drop"
+                    .into(),
+            );
+        }
+        // Same shape as `abandon`, minus the divergence gate: drop from live
+        // heads (parents re-surface as heads only if now childless), record the
+        // abandoned mark, and hop the dock's tip off the dropped head.
+        let old_paths = self.ambient_visible_paths();
+        self.repo.abandon_head(version);
+        abandoned.insert(version.clone());
+        self.store
+            .write_abandoned(&abandoned)
+            .map_err(|e| format!("write abandoned: {e}"))?;
+        if self.tip.as_ref() == Some(version) {
+            let survivor = self
+                .repo
+                .heads()
+                .into_iter()
+                .find(|v| v != version && !abandoned.contains(v));
+            self.tip = survivor;
+            let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        }
+        self.persist()?;
+        self.record_op("abandon", &format!("abandon fork head {}", short_version(version)), false);
+        self.reload()?;
+        self.resurface(old_paths)?;
+        Ok(())
+    }
+
     /// `loot edit <change-id>`: reopen a finalized change as the working change,
     /// **superseding** it (ADR 0032). The reopened change is a *sibling* of the
     /// edited version — parents = its parents, tree = its tree, durable handle
@@ -3528,6 +3586,82 @@ mod tests {
         // rather than hide the change's only version.
         let err = ws.abandon(&only).unwrap_err();
         assert!(err.contains("not divergent"), "message explains the refusal: {err}");
+        assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandon_head_drops_a_fork_and_is_undoable() {
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-243-forkdrop-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        // Two INDEPENDENT heads off one root — distinct change ids, so this is a
+        // fork, not a divergent change. `loot abandon` refuses them (each is the
+        // sole version of its change id); `--head` is the tool that drops one.
+        let (a, b) = ws
+            .with_repo(|repo| {
+                let root = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![], message: "root".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                let a = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "A".into(), tree: Default::default() },
+                        Some([1u8; 16]),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let b = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root], message: "B".into(), tree: Default::default() },
+                        Some([2u8; 16]),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok((a, b))
+            })
+            .unwrap();
+        ws.record_op("seed", "seeded a fork", false);
+
+        assert!(ws.repo().heads().contains(&a) && ws.repo().heads().contains(&b), "two live heads");
+        // Not divergent → plain abandon refuses; this is exactly the gap.
+        assert!(ws.abandon(&b).is_err(), "abandon refuses a non-divergent fork head");
+
+        ws.abandon_fork(&b).unwrap();
+        assert!(ws.store().read_abandoned().contains(&b), "b recorded abandoned");
+        assert!(!ws.repo().heads().contains(&b), "b stopped being a live head");
+        assert!(ws.repo().heads().contains(&a), "a survives as the live line");
+
+        // Undoable: nothing is deleted, the abandoned mark clears (append-only graph).
+        ws.undo().unwrap();
+        assert!(!ws.store().read_abandoned().contains(&b), "undo cleared the mark");
+        assert!(ws.repo().heads().contains(&b), "b is a live head again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandon_head_refuses_non_head_and_last_head() {
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-243-forkguard-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (root, only) = ws
+            .with_repo(|repo| {
+                let root = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![], message: "root".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                let only = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "only".into(), tree: Default::default() },
+                        Some([1u8; 16]),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok((root, only))
+            })
+            .unwrap();
+        ws.record_op("seed", "seeded", false);
+        // The root is not a head (`only` descends from it) → refuse.
+        let err = ws.abandon_fork(&root).unwrap_err();
+        assert!(err.contains("not a live head"), "{err}");
+        // The sole live head is refused — never empty the dock.
+        let err = ws.abandon_fork(&only).unwrap_err();
+        assert!(err.contains("only live head"), "{err}");
         assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
         let _ = std::fs::remove_dir_all(&dir);
     }
