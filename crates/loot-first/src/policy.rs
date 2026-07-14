@@ -115,6 +115,57 @@ pub fn interpret_landing(main_fast_forwarded: bool, polled_state: PrState) -> La
     }
 }
 
+/// How the loot mirror's projected `main` stands against the checkout's real
+/// `origin/main` (#243, Deliverable 2). The mirror pushes its `main` to *become*
+/// `origin/main`, so on the happy path the two are the same commit ([`Same`]);
+/// any other relation is drift the guard surfaces loudly:
+///
+/// - [`MirrorBehind`] — `origin/main` has commits the mirror never ingested (a
+///   break-glass git land): reconcile before landing, or a lane spawned now
+///   projects backward over that work.
+/// - [`Diverged`] — neither is an ancestor of the other: the mirror projected a
+///   `main` that never reached origin (the #241 backward projection). The
+///   loudest case — the guard warns hardest, though it stays advisory
+///   (break-glass is never blocked, per loot's philosophy).
+///
+/// There is deliberately no "mirror ahead" variant: an unpushed-ahead mirror's
+/// tip is not an object the *checkout* holds, so it cannot be told apart from a
+/// divergence there and folds into [`Diverged`] — still drift worth surfacing.
+///
+/// [`Same`]: Ancestry::Same
+/// [`MirrorBehind`]: Ancestry::MirrorBehind
+/// [`Diverged`]: Ancestry::Diverged
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    Same,
+    MirrorBehind,
+    Diverged,
+}
+
+/// Render the operator warning for a mirror/origin comparison, or `None` when
+/// the two agree ([`Ancestry::Same`]). Pure over the two shas and the ancestry
+/// the caller reads from git, so the exact wording — the message that would have
+/// stopped PR #241 before projection — is unit-tested without a repo.
+pub fn mirror_drift_warning(mirror: &str, origin: &str, ancestry: Ancestry) -> Option<String> {
+    let (m, o) = (short(mirror), short(origin));
+    Some(match ancestry {
+        Ancestry::Same => return None,
+        Ancestry::MirrorBehind => format!(
+            "loot mirror is behind origin/main ({m} vs {o}) — reconcile before landing (#243)."
+        ),
+        Ancestry::Diverged => format!(
+            "loot mirror has DIVERGED from origin/main ({m} vs {o}) — do NOT land: a lane off \
+             this mirror would project backward over landed work. Reconcile the mirror to \
+             origin/main first (#243)."
+        ),
+    })
+}
+
+/// First 12 chars of a sha for a warning line (git's default short length).
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
 /// A parsed `review:` line from `ferry`'s `FerryReport`. Once in-process this is
 /// the typed contract the orchestrator consumes instead of a regex over stdout;
 /// the string is kept as `ferry`'s stable machine line so the ps1 shadow-run
@@ -171,6 +222,35 @@ pub fn parse_review_line(line: &str) -> Result<ReviewOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drift_same_is_quiet() {
+        // Mirror main == origin/main (the happy path right after a land+push):
+        // no warning at all.
+        assert_eq!(mirror_drift_warning("abc123", "abc123", Ancestry::Same), None);
+    }
+
+    #[test]
+    fn drift_behind_warns_reconcile() {
+        // origin/main advanced past the mirror (a break-glass git land the
+        // mirror never ingested) — the #243 case the guard exists to catch.
+        let w = mirror_drift_warning("bbbbbbbbbbbb", "aaaaaaaaaaaa", Ancestry::MirrorBehind)
+            .expect("behind must warn");
+        assert!(w.contains("behind origin/main"), "{w}");
+        assert!(w.contains("bbbbbbbbbbbb") && w.contains("aaaaaaaaaaaa"), "{w}");
+        assert!(w.contains("reconcile"), "{w}");
+    }
+
+    #[test]
+    fn drift_diverged_warns_do_not_land() {
+        // The actual #243 shape: the mirror projected a `main` that never
+        // reached origin (the #241 backward projection), so neither is an
+        // ancestor of the other. This is the loudest, land-blocking case.
+        let w = mirror_drift_warning("bc282ff", "e2cb01e", Ancestry::Diverged)
+            .expect("diverged must warn");
+        assert!(w.to_uppercase().contains("DIVERGED"), "{w}");
+        assert!(w.contains("do NOT land") || w.contains("DO NOT LAND"), "{w}");
+    }
 
     #[test]
     fn approval_takes_explicit_approved() {

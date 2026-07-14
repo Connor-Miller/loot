@@ -11,8 +11,9 @@ use crate::forge::{Forge, PrState};
 use crate::harbor::HarborLock;
 use loot_cli::ledger::{PrLane, PrMap};
 use crate::policy::{
-    approval, dock_targeting, interpret_landing, parse_review_line, pre_land, review_currency,
-    Approval, Currency, DockTarget, LandingStatus, PreLand, ReviewOutcome,
+    approval, dock_targeting, interpret_landing, mirror_drift_warning, parse_review_line, pre_land,
+    review_currency, Ancestry, Approval, Currency, DockTarget, LandingStatus, PreLand,
+    ReviewOutcome,
 };
 use loot_cli::ferry::{self, WipState};
 use loot_cli::workspace::Workspace;
@@ -90,6 +91,10 @@ pub fn review(
     dry_run: bool,
 ) -> Result<(), String> {
     let p = paths(ws);
+    // Surface mirror drift before projecting anything: a review opened while the
+    // mirror has diverged from origin/main is exactly how PR #241 projected a
+    // revert of landed work (#243).
+    warn_if_drifted(ws);
 
     let report = ferry::run(ws, None, None, /* with_wip */ true)?;
     for note in &report.notes {
@@ -311,6 +316,10 @@ pub fn land(
     dry_run: bool,
 ) -> Result<(), String> {
     let p = paths(ws);
+    // A land onto a drifted mirror would project this change over a `main` that
+    // is not origin's — the #243 hazard. Warn loudly up front (break-glass stays
+    // open per loot's philosophy; the operator decides).
+    warn_if_drifted(ws);
     let mut map = read_pr_map(&p.pr_map);
     let lane = map
         .lane_for_pr(pr)
@@ -466,6 +475,79 @@ fn landing_word(s: LandingStatus) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// mirror drift guard (#243, Deliverable 2)
+// ---------------------------------------------------------------------------
+
+/// Compare the mirror's projected `main` against the checkout's real
+/// `origin/main` and return the loud operator warning if they have drifted
+/// (#243). Best-effort and side-effect-free: an unbound mirror, a missing
+/// `origin/main`, or any git error yields `None` (nothing to warn about) rather
+/// than failing the surrounding command. Reads the local remote-tracking ref
+/// only — no network — so `status` / `review` stay cheap; a stale `origin/main`
+/// just means a `git fetch` would sharpen the check.
+pub fn mirror_drift(ws: &Workspace) -> Option<String> {
+    let p = paths(ws);
+    let mirror = git_rev_parse(&p.mirror, "refs/heads/main")?;
+    let origin = git_rev_parse(&p.root, "refs/remotes/origin/main")?;
+    let ancestry = mirror_ancestry(&p.root, &mirror, &origin);
+    mirror_drift_warning(&mirror, &origin, ancestry)
+}
+
+/// Print the drift warning to stderr if the mirror has drifted — the loud
+/// surface `status` / `review` / `land` share. Never fails the caller (a guard
+/// must not itself become a reason a command can't run).
+fn warn_if_drifted(ws: &Workspace) {
+    if let Some(w) = mirror_drift(ws) {
+        eprintln!("!! {w}");
+    }
+}
+
+/// Resolve `refname` in `repo` to a full sha, or `None` if the ref is absent or
+/// git errors. `--verify -q` keeps a missing ref quiet.
+fn git_rev_parse(repo: &Path, refname: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "-q", refname])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Classify how `mirror` stands against `origin`, using `repo` (the checkout,
+/// which holds `origin/main` and — in the common drift — the mirror commit too)
+/// as the ancestry oracle. Equal shas are [`Ancestry::Same`]; a mirror that is a
+/// strict ancestor of origin is [`Ancestry::MirrorBehind`]; anything else is
+/// [`Ancestry::Diverged`] — including a mirror commit `repo` does not have (a
+/// never-pushed projection, or a genuine unpushed-ahead mirror), which makes the
+/// ancestry probe fail and reads as the safe, loud divergence answer.
+fn mirror_ancestry(repo: &Path, mirror: &str, origin: &str) -> Ancestry {
+    if mirror == origin {
+        Ancestry::Same
+    } else if is_ancestor(repo, mirror, origin) {
+        Ancestry::MirrorBehind
+    } else {
+        Ancestry::Diverged
+    }
+}
+
+/// `git merge-base --is-ancestor a b`: true iff `a` is an ancestor of `b`. Any
+/// error (including an object `repo` does not have) reads as false.
+fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", a, b])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// The mirror's main tip after ferry — a local read on the bare mirror.
 fn mirror_main_sha(mirror: &Path) -> Result<String, String> {
     let out = std::process::Command::new("git")
@@ -520,6 +602,7 @@ fn relay_push(root: &Path) -> Result<(), String> {
 /// Show the in-flight review lanes and their PRs.
 pub fn status(ws: &Workspace) -> Result<(), String> {
     let p = paths(ws);
+    warn_if_drifted(ws);
     let map = read_pr_map(&p.pr_map);
     if map.lanes.is_empty() {
         println!("no in-flight review lanes");
