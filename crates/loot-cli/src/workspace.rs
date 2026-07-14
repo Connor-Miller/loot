@@ -2202,15 +2202,27 @@ impl Workspace {
                 .attach_signature(&change_id, sig)
                 .map_err(|e| e.to_string())?;
         }
-        // On a dock, the resolution also advances the dock's tip so it isn't
-        // orphaned and the next snapshot builds on it.
-        if self.docks_active() {
-            // Reflect the resolved tree on disk (writing the resolution over the
-            // still-conflicted working copy) so a later `status` captures the
-            // resolution, not the pre-resolution content.
-            self.repo
-                .materialize(base.as_ref(), &change_id, &self.identity, self.now)
-                .map_err(|e| e.to_string())?;
+        // On a dock or lane, the resolution also advances the tip so it isn't
+        // orphaned and the next snapshot builds on it. (A lane is a home dock
+        // with a seeded tip, so gate on `lane_id` too — the same class of
+        // stuck-tip bug #229 fixed in `finalize_working`.)
+        if self.docks_active() || self.lane_id.is_some() {
+            // Reflect ONLY the resolved path on disk (#233). The rest of the
+            // merged tree is already materialized — the merge that produced the
+            // conflicts wrote it — and the operator may be holding uncommitted
+            // edits to *other* files (unresolved sibling conflicts, or unrelated
+            // work). A whole-tree `materialize` here re-writes every file at the
+            // resolution change and so reverts those edits — the very clobber
+            // capture-first (#219) exists to prevent, and the reason reconciling
+            // a multi-conflict bounce used to demand "resolve one at a time" plus
+            // manual git surgery. `resolve` touches exactly one path in the tree
+            // (engine `resolve` inserts just `path`), so write exactly that one
+            // path and leave every other file on disk untouched.
+            let dest = self.root.join(path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&dest, resolution).map_err(|e| e.to_string())?;
             self.tip = Some(change_id);
             let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
         }
@@ -4345,6 +4357,72 @@ mod tests {
             "dock line carries the resolution, not the conflicted merge"
         );
         assert!(dir.join("b.txt").exists(), "new work sits on the resolved tip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_does_not_clobber_unrelated_uncommitted_edits() {
+        // Regression (#233): resolving one conflicted path used to re-materialize
+        // the *whole* resolution tree onto disk, reverting the operator's
+        // uncommitted edits to unrelated files (and forcing the "resolve one
+        // conflict at a time, then do manual git surgery" reconcile workaround
+        // when a harbor bounce left several conflicts). `resolve` touches exactly
+        // one path, so it must write exactly that path and leave every other file
+        // — unrelated edits and still-unresolved sibling conflicts — untouched.
+        let (dir, mut ws) = dock_repo("resolve-no-clobber");
+        // Base carries the two files that will conflict plus an unrelated file.
+        std::fs::write(dir.join("a.txt"), b"base a\n").unwrap();
+        std::fs::write(dir.join("d.txt"), b"base d\n").unwrap();
+        std::fs::write(dir.join("c.txt"), b"base c\n").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("feature").unwrap();
+        std::fs::write(dir.join("a.txt"), b"feature a\n").unwrap();
+        std::fs::write(dir.join("d.txt"), b"feature d\n").unwrap();
+        ws.snapshot("feat").unwrap();
+        ws.finalize_working().unwrap();
+
+        ws.dock_goto("main").unwrap();
+        std::fs::write(dir.join("a.txt"), b"home a\n").unwrap();
+        std::fs::write(dir.join("d.txt"), b"home d\n").unwrap();
+        ws.snapshot("home").unwrap();
+        ws.finalize_working().unwrap();
+
+        // Merge produces two conflicts (a.txt and d.txt); the merge leaves ours
+        // on disk and c.txt at its base content.
+        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
+        assert!(matches!(outcomes[&PathBuf::from("d.txt")], MergeOutcome::Conflict { .. }));
+
+        // The operator makes an uncommitted edit to the unrelated file c.txt
+        // while working through the conflicts — nothing captures it.
+        std::fs::write(dir.join("c.txt"), b"uncommitted work\n").unwrap();
+
+        // Resolve only a.txt.
+        ws.resolve_conflict(Path::new("a.txt"), b"resolved a\n", Visibility::Public).unwrap();
+
+        // The resolved path landed on disk...
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"resolved a\n");
+        // ...the unrelated uncommitted edit survived (the clobber #233 kills)...
+        assert_eq!(
+            std::fs::read(dir.join("c.txt")).unwrap(),
+            b"uncommitted work\n",
+            "resolving a.txt must not revert the uncommitted edit to c.txt"
+        );
+        // ...and the sibling conflict is still open, its ours-content undisturbed,
+        // so the operator resolves it next in the same pass — no manual surgery.
+        assert!(
+            ws.repo().conflicts().contains_key(&PathBuf::from("d.txt")),
+            "d.txt stays conflicted until its own resolve"
+        );
+        assert_eq!(std::fs::read(dir.join("d.txt")).unwrap(), b"home d\n");
+
+        // Resolving the second conflict clears it and, again, leaves c.txt alone.
+        ws.resolve_conflict(Path::new("d.txt"), b"resolved d\n", Visibility::Public).unwrap();
+        assert!(ws.repo().conflicts().is_empty(), "all conflicts resolved in one pass");
+        assert_eq!(std::fs::read(dir.join("d.txt")).unwrap(), b"resolved d\n");
+        assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"uncommitted work\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
