@@ -8,6 +8,7 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
+use loot_core::bridge::{FerryState, MarkMap};
 use loot_core::{
     oplog, valid_dock_name, DagRepo, LaneEntry, MergeOutcome, Oid, Operation, Repo, RepoStore,
     Visibility, HOME_DOCK,
@@ -1185,6 +1186,173 @@ impl Workspace {
         self.reload()?;
         self.resurface(old_paths)?;
         Ok(())
+    }
+
+    /// `loot adopt <version>`: settle this dock **wholesale** onto a landed change
+    /// `T`, discarding its divergent local line (#244, spec `loot-adopt-target.md`,
+    /// amends ADR 0034). Where the no-arg `adopt` *merges* the harbor lineage in,
+    /// the explicit-target arm **replaces** the dock's line: it abandons every
+    /// competing live head down to the shared anchor and materializes `T`'s tree,
+    /// with **no content merge** at any point — the whole point, since a merge
+    /// against a stale fork resurrects files deleted upstream (the live #243
+    /// hazard). It is the mechanical core of a re-baseline; after adopt the
+    /// mirror's `main` can be reset to `origin/main` and the drift guard goes
+    /// quiet.
+    ///
+    /// The primitive is a composition of shipped, tested parts — [`abandon_head`]
+    /// per competing head, [`drop_working`] for the WIP, the `resurface`
+    /// checkout, and one undoable op (ADR 0031) — so `loot undo` restores the
+    /// pre-adopt view exactly (no node is deleted; the graph is an append-only
+    /// union store).
+    ///
+    /// Guards (§4): the target must be a live, finalized change (never the
+    /// unsigned working change), and it must lie on the harbor/main lineage — the
+    /// same fence ADR 0034 draws. A dirty dock is refused unless `discard_wip`,
+    /// which is the sanctioned override of the #219 tree-write chokepoint (adopt
+    /// is the one verb whose *intent* is to replace the tree).
+    ///
+    /// [`abandon_head`]: DagRepo::abandon_head
+    /// [`drop_working`]: DagRepo::drop_working
+    pub fn adopt(&mut self, prefix: &str, discard_wip: bool) -> Result<AdoptReport, String> {
+        // The unsigned working change is never a target: adopt settles a dock on
+        // *landed* work (§4). Name that precisely before the generic resolver's
+        // "no live version" — the operator pointed at their own WIP.
+        if let Some(w) = &self.working {
+            if loot_core::hex::encode(&w.0).starts_with(prefix) {
+                return Err(
+                    "cannot adopt onto an unsigned working change — adopt settles a dock on \
+                     landed work; finalize it (`loot new`) to make it a target"
+                        .into(),
+                );
+            }
+        }
+        // Resolve among live, finalized versions (the working change is excluded).
+        let target = self.resolve_live_version(prefix)?;
+
+        // Harbor/main lineage fence (§4): T must be reachable from the change the
+        // mirror's `main` projects — never an arbitrary signed change in the graph.
+        self.assert_on_mirror_main_lineage(&target)?;
+
+        // WIP gate (§3): a live working change or uncaptured disk edits are work
+        // adopt would silently eat. Refuse unless the operator opts to discard.
+        let dirty = {
+            let (entries, _) = self.read_working_tree()?;
+            let anchor = self.anchor();
+            let (_, clean) = self.repo.working_preview(anchor.as_ref(), &entries, "", self.now);
+            !clean
+        };
+        let has_wip = self.working.is_some() || dirty;
+        if has_wip && !discard_wip {
+            return Err(
+                "the dock has work adopt would discard — finalize it (`loot new`) or walk it \
+                 back (`loot undo`) first, or pass `--discard-wip` to drop it and take the target"
+                    .into(),
+            );
+        }
+
+        // Already settled: T is the sole live head and nothing is dirty (§4 — a
+        // no-op with a note, not an error).
+        let heads = self.repo.heads();
+        if !has_wip && heads.len() == 1 && heads[0] == target {
+            return Ok(AdoptReport { target, abandoned: vec![], discarded_wip: false, already_there: true });
+        }
+
+        // T must be reachable from some live line, or there is nothing to settle
+        // onto (guards against emptying the dock — checked before any mutation).
+        let reachable = heads.iter().any(|h| h == &target || self.graph().is_ancestor(&target, h));
+        if !reachable {
+            return Err(format!(
+                "{} is not on any live line of this dock — nothing to settle onto",
+                short_version(&target)
+            ));
+        }
+
+        let old_paths = self.ambient_visible_paths();
+
+        // Drop the WIP first so the working node stops being a competing head.
+        let discarded_wip = has_wip;
+        if let Some(w) = self.working.clone() {
+            self.repo.drop_working(&w);
+            self.working = None;
+        }
+
+        // Abandon every competing head to a fixpoint: dropping a merge head
+        // resurfaces its parents (both the target's line and the stale fork), so
+        // one pass is not enough — walk the whole divergent line into the
+        // abandoned set until only T (and its ancestors, never heads) remains.
+        let mut abandoned = self.store.read_abandoned();
+        let mut competing_all: Vec<Oid> = Vec::new();
+        loop {
+            let competing: Vec<Oid> = self
+                .repo
+                .heads()
+                .into_iter()
+                .filter(|h| h != &target && !self.graph().is_ancestor(h, &target))
+                .collect();
+            if competing.is_empty() {
+                break;
+            }
+            for h in &competing {
+                self.repo.abandon_head(h);
+                abandoned.insert(h.clone());
+                competing_all.push(h.clone());
+            }
+        }
+        self.store
+            .write_abandoned(&abandoned)
+            .map_err(|e| format!("write abandoned: {e}"))?;
+
+        // Settle the dock on T with a fresh (empty) working change, ADR 0006.
+        self.tip = Some(target.clone());
+        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
+        self.persist()?;
+        self.record_op(
+            "adopt",
+            &format!("adopt {} (settle dock, discard divergent line)", short_version(&target)),
+            false,
+        );
+        self.reload()?;
+        self.resurface(old_paths)?;
+        Ok(AdoptReport { target, abandoned: competing_all, discarded_wip, already_there: false })
+    }
+
+    /// The harbor/main lineage fence for [`adopt`](Self::adopt) (§4): `target`
+    /// must be reachable (ancestor-or-equal) from the loot change the git
+    /// mirror's `main` projects — the same "harbor lineage only" invariant
+    /// ADR 0034 draws, so adopt can never settle a dock on an unreviewed signed
+    /// change and violate the after-it-lands premise.
+    ///
+    /// Reads only the local ferry spine (`.loot/git-mirror/{state,marks}`, the
+    /// plain files ferry writes at the end of every pass): `state.git_main` is
+    /// the mirror's `refs/heads/main` tip sha, mapped through the mark map to its
+    /// loot change. No network and no git process — a pure graph reachability
+    /// check over data already on disk.
+    fn assert_on_mirror_main_lineage(&self, target: &Oid) -> Result<(), String> {
+        let main_change = self.mirror_main_change().ok_or(
+            "no mirror main to settle onto — bind and `loot ferry` a mirror first; \
+             `adopt <version>` settles a dock onto landed git-main work",
+        )?;
+        if target == &main_change || self.graph().is_ancestor(target, &main_change) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} is not on the mirror's main lineage — adopt settles only on landed work \
+                 reachable from git-main (the ADR 0034 harbor-lineage fence)",
+                short_version(target)
+            ))
+        }
+    }
+
+    /// The loot change the git mirror's `main` currently projects, via the local
+    /// ferry spine: `state.git_main` (the main tip sha ferry records at the end
+    /// of each pass) mapped through the mark map. `None` when no mirror is bound,
+    /// the spine is absent, or the sha has no mark yet.
+    fn mirror_main_change(&self) -> Option<Oid> {
+        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+        let state = FerryState::parse(&read(self.store.git_state())).ok()?;
+        let sha = state.git_main?;
+        let marks = MarkMap::parse(&read(self.store.git_marks())).ok()?;
+        marks.change_for(&sha).map(|(id, _)| id.clone())
     }
 
     /// `loot edit <change-id>`: reopen a finalized change as the working change,
@@ -2935,6 +3103,20 @@ pub struct EditReport {
     pub superseded: Oid,
 }
 
+/// What `loot adopt <version>` did, for CLI reporting (#244).
+#[derive(Debug)]
+pub struct AdoptReport {
+    /// The landed change the dock now sits on.
+    pub target: Oid,
+    /// The competing heads (the discarded divergent line) abandoned to settle.
+    pub abandoned: Vec<Oid>,
+    /// Whether a live working change or uncaptured disk edits were dropped
+    /// (`--discard-wip`).
+    pub discarded_wip: bool,
+    /// The dock was already on `target` with a clean tree — a no-op with a note.
+    pub already_there: bool,
+}
+
 /// The outcome of a pull (#219). Carries the folded per-path merge outcomes,
 /// plus the working change id when capture-first *deferred* convergence — a
 /// dirty tree was captured and the working-change guard left the freshly
@@ -3664,6 +3846,242 @@ mod tests {
         assert!(err.contains("only live head"), "{err}");
         assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- loot adopt <version> (#244) ---
+
+    /// Seed the local ferry spine so `change` reads as the loot change the git
+    /// mirror's `main` projects (the §4 harbor-lineage fence's oracle): a mark
+    /// map entry `sha -> change` and a `state` naming `sha` as `git-main`.
+    fn seed_mirror_main(ws: &Workspace, sha: &str, change: &loot_core::Oid) {
+        use loot_core::bridge::{FerryState, MarkMap, MarkOrigin};
+        std::fs::create_dir_all(ws.store().git_mirror_dir()).unwrap();
+        let mut marks = MarkMap::new();
+        marks.insert(sha.to_string(), change.clone(), MarkOrigin::Git);
+        std::fs::write(ws.store().git_marks(), marks.encode()).unwrap();
+        let state = FerryState { git_main: Some(sha.to_string()), loot_heads: vec![] };
+        std::fs::write(ws.store().git_state(), state.encode()).unwrap();
+    }
+
+    /// Seed a two-head fork off one root — `a` and `b`, distinct change ids, each
+    /// the sole version of its id (independent lines, not a divergent change).
+    fn seed_fork(ws: &mut Workspace) -> (loot_core::Oid, loot_core::Oid) {
+        use loot_core::{Change, Oid};
+        let (a, b) = ws
+            .with_repo(|repo| {
+                let root = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![], message: "root".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                let a = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "A".into(), tree: Default::default() },
+                        Some([1u8; 16]),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let b = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root], message: "B".into(), tree: Default::default() },
+                        Some([2u8; 16]),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok((a, b))
+            })
+            .unwrap();
+        ws.record_op("seed", "seeded a fork", false);
+        (a, b)
+    }
+
+    #[test]
+    fn adopt_settles_on_target_and_abandons_forks() {
+        let dir = std::env::temp_dir().join(format!("loot-244-settle-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (a, b) = seed_fork(&mut ws);
+        // Mirror main projects `a`: it is on the harbor lineage, `b` a fork off it.
+        seed_mirror_main(&ws, &"a".repeat(40), &a);
+
+        let a_hex = loot_core::hex::encode(&a.0);
+        let report = ws.adopt(&a_hex, false).unwrap();
+        assert_eq!(report.target, a, "settled on the target");
+        assert!(report.abandoned.contains(&b), "the fork is the discarded line");
+        assert_eq!(ws.repo().heads(), vec![a.clone()], "a is the sole live head — no merge");
+        assert!(ws.store().read_abandoned().contains(&b), "b joined the abandoned set");
+
+        // Undoable: nothing deleted, both heads live again (append-only graph).
+        ws.undo().unwrap();
+        let heads = ws.repo().heads();
+        assert!(heads.contains(&a) && heads.contains(&b), "undo restores both heads");
+        assert!(!ws.store().read_abandoned().contains(&b), "undo cleared the mark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_refuses_dirty_without_discard() {
+        let dir = std::env::temp_dir().join(format!("loot-244-dirty-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (a, _b) = seed_fork(&mut ws);
+        seed_mirror_main(&ws, &"a".repeat(40), &a);
+        // An uncaptured disk edit is work adopt would silently eat → refuse.
+        std::fs::write(dir.join("dirty.txt"), b"uncaptured").unwrap();
+
+        let a_hex = loot_core::hex::encode(&a.0);
+        let err = ws.adopt(&a_hex, false).unwrap_err();
+        assert!(err.contains("discard-wip"), "message names the remedy: {err}");
+        assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
+        assert!(dir.join("dirty.txt").exists(), "the edit was left intact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_discard_wip_drops_the_working_change() {
+        let dir = std::env::temp_dir().join(format!("loot-244-discard-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (a, _b) = seed_fork(&mut ws);
+        seed_mirror_main(&ws, &"a".repeat(40), &a);
+        // A live working change on top of the fork.
+        std::fs::write(dir.join("wip.txt"), b"wip").unwrap();
+        ws.snapshot("wip").unwrap();
+        assert!(ws.working_id().is_some(), "a working change is in progress");
+
+        let a_hex = loot_core::hex::encode(&a.0);
+        let report = ws.adopt(&a_hex, true).unwrap();
+        assert!(report.discarded_wip, "the WIP was discarded");
+        assert!(ws.working_id().is_none(), "the working change was dropped");
+        assert_eq!(ws.repo().heads(), vec![a.clone()], "settled on the target");
+        assert!(!dir.join("wip.txt").exists(), "the target tree materialized over the WIP file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_refuses_a_non_lineage_target() {
+        let dir = std::env::temp_dir().join(format!("loot-244-nolineage-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (a, b) = seed_fork(&mut ws);
+        // Mirror main projects `a`; `b` is a signed change off the lineage.
+        seed_mirror_main(&ws, &"a".repeat(40), &a);
+
+        let b_hex = loot_core::hex::encode(&b.0);
+        let err = ws.adopt(&b_hex, false).unwrap_err();
+        assert!(err.contains("lineage"), "refuses an off-lineage target: {err}");
+        assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_refuses_an_unsigned_target() {
+        let dir = std::env::temp_dir().join(format!("loot-244-unsigned-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        // The only unsigned thing that could be pointed at is the working change.
+        std::fs::write(dir.join("w.txt"), b"w").unwrap();
+        ws.snapshot("wip").unwrap();
+        let w = ws.working_id().cloned().unwrap();
+
+        let w_hex = loot_core::hex::encode(&w.0);
+        let err = ws.adopt(&w_hex, false).unwrap_err();
+        assert!(err.contains("working change"), "refuses adopting onto WIP: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_walks_a_merge_over_a_stale_fork_down_to_the_landed_change() {
+        // The §6 shape: a re-ferry produced a transient MERGE head folding the
+        // landed line `e` with a stale two-commit fork. Adopting `e` must walk the
+        // *whole* divergent line — the merge and both stale commits — into the
+        // abandoned set (the merge resurfaces its parents, so one pass is not
+        // enough), leaving `e` the sole clean head: no merge, no resurrection.
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-244-walk-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (e, s1, s2, m) = ws
+            .with_repo(|repo| {
+                let root = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![], message: "root".into(), tree: Default::default() })
+                    .map_err(|err| err.to_string())?;
+                let e = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "landed E".into(), tree: Default::default() },
+                        Some([9u8; 16]),
+                    )
+                    .map_err(|err| err.to_string())?;
+                let s1 = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root], message: "stale S1".into(), tree: Default::default() },
+                        Some([3u8; 16]),
+                    )
+                    .map_err(|err| err.to_string())?;
+                let s2 = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![s1.clone()], message: "stale S2".into(), tree: Default::default() },
+                        Some([4u8; 16]),
+                    )
+                    .map_err(|err| err.to_string())?;
+                let m = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![e.clone(), s2.clone()], message: "ferry merge".into(), tree: Default::default() },
+                        Some([7u8; 16]),
+                    )
+                    .map_err(|err| err.to_string())?;
+                Ok((e, s1, s2, m))
+            })
+            .unwrap();
+        ws.record_op("seed", "seeded a merge over a stale fork", false);
+        assert_eq!(ws.repo().heads(), vec![m.clone()], "the merge is the only head after ferry");
+        seed_mirror_main(&ws, &"e".repeat(40), &e);
+
+        let e_hex = loot_core::hex::encode(&e.0);
+        let report = ws.adopt(&e_hex, false).unwrap();
+        assert_eq!(ws.repo().heads(), vec![e.clone()], "e is the sole clean head — no merge survives");
+        let abandoned = ws.store().read_abandoned();
+        for (name, v) in [("merge", &m), ("stale S2", &s2), ("stale S1", &s1)] {
+            assert!(abandoned.contains(v), "{name} was walked into the abandoned set");
+        }
+        assert_eq!(report.abandoned.len(), 3, "the whole divergent line was discarded");
+
+        // One op, fully undoable: the merge head is live again.
+        ws.undo().unwrap();
+        assert_eq!(ws.repo().heads(), vec![m.clone()], "undo restores the pre-adopt view");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_settles_a_dock_so_a_re_ferry_projects_nothing() {
+        // The §6 payoff, end-to-end over a real mirror: once adopt settles the
+        // dock exactly on the change git-main projects, a re-ferry ingests
+        // nothing and — crucially — **projects nothing** (the §6.4/§6.5 "projects
+        // nothing … Nothing reached GitHub" guarantee, upheld by the #195/#201
+        // no-backward-projection guards). Here the dock had drifted *ahead* of
+        // main (a divergent local line); adopting main's change discards it, and
+        // the subsequent ferry is a genuine no-op on the git side.
+        let base = std::env::temp_dir().join(format!("loot-244-noproj-{}", std::process::id()));
+        let dir = base.join("repo");
+        let mirror = base.join("mirror.git");
+        let mut ws = authored_ws(&dir);
+
+        // c1: the landed change. Ferry projects it and writes the spine.
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("c1").unwrap();
+        ws.finalize_working().unwrap();
+        let c1 = ws.repo().heads()[0].clone();
+        let r1 = crate::ferry::run(&mut ws, Some(mirror.to_str().unwrap()), None, false).unwrap();
+        assert_eq!(r1.projected, 1, "c1 projects to git-main");
+
+        // Drift the dock ahead of main with a divergent c2.
+        std::fs::write(dir.join("a.txt"), b"two").unwrap();
+        ws.snapshot("c2").unwrap();
+        ws.finalize_working().unwrap();
+        assert_ne!(ws.repo().heads(), vec![c1.clone()], "the dock has moved off main");
+
+        // Adopt main's change: the dock settles back on c1, discarding c2.
+        let c1_hex = loot_core::hex::encode(&c1.0);
+        let report = ws.adopt(&c1_hex, false).unwrap();
+        assert_eq!(report.target, c1);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"one", "disk materialized to c1");
+
+        // The re-ferry is a no-op on the git side: nothing to ingest, and c1 is
+        // already main, so nothing projects backward.
+        let r2 = crate::ferry::run(&mut ws, None, None, false).unwrap();
+        assert_eq!(r2.ingested, 0, "no git-native commits to ingest");
+        assert_eq!(r2.projected, 0, "the dock is on main — nothing projects (§6.5)");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

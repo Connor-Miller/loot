@@ -152,14 +152,23 @@ ticket-derived handle (`t<n>`, suffixed until free); wayfinder's claim ritual
 Distinct from a *review lane* (a `pr-map` entry, ADR 0033): a lane opens a
 review lane when it ferries for review. _Avoid_: worktree, sandbox, session.
 
-**Adopt** *(ADR 0034 accepted 2026-07-12; build pending)* — `loot adopt`:
-catch a [[Lane]] up to everything landed, by extending its view frontier with
-the [[Harbor]]'s heads and running the existing in-process converge — no
-network, objects already in the shared store. Defined against the harbor
-lineage *only* (never "whatever is in the shared graph"), all-or-nothing on
-purpose (per-change adoption is refused — it would reintroduce divergence).
-Spawn is the degenerate case (a lane is born adopted); bounce-back reconcile
-is adopt → resolve → re-land. _Avoid_: rebase, sync, cherry-pick.
+**Adopt** *(ADR 0034 accepted 2026-07-12; `<version>` arm shipped #244,
+2026-07-14; no-arg arm build pending)* — `loot adopt` settles a dock/[[Lane]]
+onto landed work, in **two arms** that share the harbor-lineage fence but split
+on *how*. **No-arg** `loot adopt` (build pending): catch a lane up to everything
+landed, by extending its view frontier with the [[Harbor]]'s heads and running
+the existing in-process converge — a **merge** that folds the local line in; no
+network (objects already in the shared store); all-or-nothing (per-change
+adoption is refused — it would reintroduce divergence). **`loot adopt
+<version>`** (shipped): settle the dock **wholesale** onto one landed change,
+**discarding** the divergent local line — abandon every competing head down to
+the shared anchor and materialize the target's tree, with *no content merge*
+(the merge is what resurrects files deleted upstream). `--discard-wip` drops a
+dirty tree (the sanctioned override of the #219 tree-write chokepoint). Both are
+defined against the harbor/main lineage *only* (never "whatever is in the shared
+graph"). Spawn is the degenerate case (a lane is born adopted); bounce-back
+reconcile is adopt → resolve → re-land; a break-glass git land is caught up with
+`loot adopt <landed>`. _Avoid_: rebase, sync, cherry-pick.
 
 **Dock** *(CA1 shipped, 2026-07-06)* — an isolated working tree plus its own
 [[Working change]] tip, materialized cheaply over the *shared* `.loot/` object

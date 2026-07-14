@@ -60,6 +60,7 @@ const COMMANDS: &[(&str, fn(&[String]) -> Result<(), String>)] = &[
     ("new", cmd_new),
     ("edit", cmd_edit),
     ("abandon", cmd_abandon),
+    ("adopt", cmd_adopt),
     ("undo", |_| cmd_undo()),
     ("op", cmd_op),
     ("surface", |_| cmd_surface()),
@@ -104,6 +105,7 @@ usage:
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
   loot abandon <version-id>                 drop a version from a divergent change (marked `!` in log), leaving one; undoable
   loot abandon --head <version-id>          drop an independent live head (a whole fork tip); undoable
+  loot adopt <version-id> [--discard-wip]   settle this dock onto a landed change, discarding the divergent line (no merge); undoable
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
@@ -445,6 +447,41 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
         );
     }
     println!("  nothing was deleted; `loot undo` brings it back (see `loot op log`)");
+    Ok(())
+}
+
+/// `loot adopt <version-id> [--discard-wip]` — settle this dock **wholesale**
+/// onto a landed change, discarding its divergent local line with no merge
+/// (#244, amends ADR 0034). The re-baseline primitive #243 needs: `apply` /
+/// converge would *merge* a stale fork and resurrect files deleted upstream;
+/// adopt abandons every competing head down to the shared anchor and
+/// materializes the target's tree. One undoable op — `loot undo` restores the
+/// pre-adopt view. `--discard-wip` drops a dirty working tree (the sanctioned
+/// override of the #219 tree-write chokepoint).
+fn cmd_adopt(args: &[String]) -> Result<(), String> {
+    let discard_wip = has_flag(args, "--discard-wip");
+    let prefix =
+        first_positional(args).ok_or("usage: loot adopt <version-id> [--discard-wip]")?;
+    let mut ws = Workspace::open()?;
+    let report = ws.adopt(prefix, discard_wip)?;
+    if report.already_there {
+        println!("already on {} — nothing to settle", short(&report.target));
+        return Ok(());
+    }
+    println!(
+        "adopted {} — the dock now sits on it, no merge",
+        short(&report.target)
+    );
+    if !report.abandoned.is_empty() {
+        println!(
+            "  discarded the divergent line ({} head(s) abandoned)",
+            report.abandoned.len()
+        );
+    }
+    if report.discarded_wip {
+        println!("  dropped the dock's working-tree changes (`--discard-wip`)");
+    }
+    println!("  nothing was deleted; `loot undo` brings the line back (see `loot op log`)");
     Ok(())
 }
 

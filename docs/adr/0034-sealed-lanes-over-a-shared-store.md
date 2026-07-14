@@ -141,6 +141,38 @@ may read the harbor's heads).
   harbor's tip. **Bounce-back reconcile** (map premise) is compositionally
   free: adopt → resolve → re-land.
 
+#### Amendment (#244, 2026-07-14): `loot adopt <version>` — the take-wholesale arm
+
+The no-arg `loot adopt` above **merges** the harbor lineage in. A dock can also
+end up on a **divergent local line that must be discarded** in favour of a
+landed change (the state #243 found: the primary's `main` dock on a stale fork
+while `origin/main` had moved on). Merging that fork is exactly wrong — it
+*resurrects files deleted upstream*. So `loot adopt` gains an optional
+`<version>` argument for the **discard-and-settle** case:
+
+| arm | target | mechanism | keeps local line? |
+|---|---|---|---|
+| `loot adopt` (no arg) | harbor lineage **as a whole** | **merge** (converge onto WIP) | yes — folds it in |
+| `loot adopt <version>` | one **landed** change | **take-wholesale** (abandon competing heads) | **no** — replaces it |
+
+This does **not** contradict the "per-change adoption is refused on purpose"
+rule above. That refusal guards a lane *merging a partial slice and continuing
+to build on its own line* — reintroducing divergence. `adopt <version>` does the
+opposite: it **discards** the local line entirely, so no divergence can survive
+it. The invariant that makes both safe is the same one — **the target must be on
+the harbor/main lineage** (reachable from the mirror's `main` projection), never
+"any signed change in the shared graph."
+
+Mechanically it is a `loot-cli` composition of shipped parts (no new engine
+machinery): abandon every competing head to a fixpoint (`abandon_head`, dropping
+a transient ferry merge resurfaces its parents, so the whole divergent line is
+walked into the abandoned set), settle the dock's tip on the target, and
+materialize its tree via the existing `resurface` checkout — one undoable op
+(ADR 0031). WIP is refused by default (mirrors `loot edit`); **`--discard-wip`**
+drops a dirty tree and is the sanctioned override of the #219 tree-write
+chokepoint (adopt is the one verb whose *intent* is to replace the tree). Full
+spec: [`docs/specs/loot-adopt-target.md`](../specs/loot-adopt-target.md).
+
 ### The registry: `.loot/lanes/<id>/`, per-entry single-writer
 
 The shared store carries one entry directory per live lane —
