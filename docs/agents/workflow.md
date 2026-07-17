@@ -139,6 +139,10 @@ loot — all absorb through the same converge+ingest path:
   change (or authored-self if the git author maps to the dev).
 - **An external contributor's PR** merged on GitHub the normal way — ingested
   unauthored, preserving their git author.
+- **A loot PR merged with GitHub's own button** instead of `loot-first land` — the
+  content originated in loot, but the squash mints a *new* commit the mirror has
+  never seen, so it ingests like any other break-glass land (#297). It is the
+  commit, not the content, that must be ingested.
 - **A break-glass local commit** (see guard rails) — same ingest.
 
 When one of these lands while you have local work, the ferry folds your line in
@@ -185,7 +189,12 @@ surfaced by `loot conflicts`; that change can't land until you resolve it in loo
 - **Don't commit straight to git `main`.** git `main` is a projection of loot. A
   direct commit is **break-glass**, not routine: a pre-commit hook warns you (it
   does *not* hard-block — break-glass must stay possible), and the next ferry
-  ingests the commit. Prefer the dock → PR flow.
+  ingests the commit. **GitHub's own merge/squash-merge button is break-glass
+  too** — it mints a commit on GitHub `main` that the remoteless mirror never sees,
+  so run `loot ferry` after one *even when the content originated in loot* (it is
+  the commit, not the content, that must be ingested — #297). Recovery from a
+  skipped ferry is in [concurrent.md](concurrent.md#a-break-glass-git-commit-landed-on-main--loot-ferry).
+  Prefer the dock → PR flow.
 - **Never give the mirror a remote.** `.loot/git-mirror/mirror.git` is local-only
   and holds sealed `docs/pitch/` in **plaintext** (ADR 0028). No `git remote add`,
   no `--all`/`--mirror` push, ever. Publishing to GitHub is always a **single-ref

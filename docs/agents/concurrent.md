@@ -175,14 +175,57 @@ question for a future ticket.
 
 ### A break-glass git commit landed on `main` → `loot ferry`
 
-git `main` is a projection of loot (workflow.md). A direct commit to git `main`
-is **break-glass**, not routine — but when it happens (a browser typo fix, an
-external PR merged on GitHub, or a deliberate raw-git land), loot must ingest it
-or it drifts behind. **After any break-glass git land, run `loot ferry`.** The
-ferry ingests the git-origin commit *before* it projects anything, absorbing it as
-a loot change and converging the dock. Skipping this step is exactly how the #243
-drift started: #230, #233, and the loot-site docs were landed with raw git and
-never ferried, so the loot mirror fell behind `origin/main`.
+git `main` is a projection of loot (workflow.md). A commit that reaches git `main`
+any way *other than* a `loot-first land` is **break-glass**, not routine — a
+browser typo fix, an external PR merged on GitHub, a deliberate raw-git land, **or
+a GitHub merge/squash-merge button press**. Whatever the source, loot must ingest
+the commit or it drifts behind. **After any break-glass git land, run `loot
+ferry`.** The ferry ingests the git-origin commit *before* it projects anything,
+absorbing it as a loot change and converging the dock. Skipping this step is
+exactly how the #243 drift started: #230, #233, and the loot-site docs were landed
+with raw git and never ferried, so the loot mirror fell behind `origin/main`.
+
+**The ferry is mandatory even when the content originated in loot.** The mirror
+(`.loot/git-mirror/mirror.git`) is **remoteless** by construction (never give it a
+remote, ADR 0028), so it never learns of a commit that appears on GitHub `main` on
+its own — only a ferry's fetch pulls one in. It is the **commit** that must be
+ingested, not the content: a loot change squash-merged on GitHub mints a *new*
+commit — different sha, different git tree — that the mirror has never seen, even
+though loot already holds the same edits. That is the trap in #297: because the
+content looked already-ingested, the ferry step looked skippable; but the ferry
+never saw the *squash commit*, and every projection after built on the loot-only
+line.
+
+#### Divergence signature and recovery (#297)
+
+Skip that ferry and the mirror's `main` keeps advancing along the loot-only
+projection while GitHub's `main` sits on a commit the mirror cannot name. The
+symptom: **every `loot-first review`/`land` fails the drift guard with `DIVERGED
+— do NOT land`**, and any land's `refs/heads/main` push would be non-fast-forward.
+Confirm GitHub's tip is genuinely absent from the mirror:
+
+```
+git --git-dir=.loot/git-mirror/mirror.git cat-file -t <github-main-sha>
+# "Not a valid commit name" == the divergence is real
+```
+
+Recover from the **primary**, with post-fix binaries (a pre-fix binary can
+re-pollute the merge):
+
+1. **Fetch GitHub's `main` into the mirror, recording the rollback sha first.**
+   Ingest only walks `refs/heads/main`, so the missing commit must land *under*
+   that ref:
+   ```
+   # rollback sha = the mirror's current main (note it before you move it)
+   git --git-dir=.loot/git-mirror/mirror.git fetch <checkout> "+refs/heads/main:refs/heads/main"
+   ```
+2. **Primary `loot ferry`** — ingests the now-present commit (unauthored) and
+   reconciles it against the loot line. Near-identical content merges clean or
+   trivially (expect one #275 `describe` stop, no conflicts); the mirror's `main`
+   is a fast-forward over GitHub's again.
+3. **Land the parked work.** The PR the divergence blocked now lands; if it
+   conflicts with the freshly-ingested `main` it **bounces** through the harbor —
+   resolve to `main`'s blobs (git is the source of truth) and re-run `land`.
 
 **Name your work first if you have any.** Folding the ingested commit in means
 merging, and a merge **signs your working change** as its parent — so an
