@@ -121,6 +121,23 @@ pub fn review(
     for note in &report.notes {
         println!("  {note}");
     }
+    // Defect 2 of #292: the review runs its catch-up ferry in-process, so the
+    // reconcile it makes never passed through `cmd_ferry`'s op record — a
+    // position change (an ingest/adopt/merge) with no op-log entry to undo.
+    // Record it here, exactly as `cmd_ferry` does, so any view-changing catch-up
+    // this review made is walkable by `loot undo`. (The #292 fold itself now
+    // refuses in `reconcile_onto` before it can change the view, so this covers
+    // the remaining honest catch-ups: a clean fast-forward onto landed main.)
+    if report.ingested > 0 || report.projected > 0 || !report.outcomes.is_empty() {
+        ws.record_op(
+            "ferry",
+            &format!(
+                "review catch-up ferry (+{} ingested, +{} projected)",
+                report.ingested, report.projected
+            ),
+            false,
+        );
+    }
     let line = report
         .review
         .as_deref()
