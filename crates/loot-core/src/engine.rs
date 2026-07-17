@@ -918,31 +918,105 @@ impl DagRepo {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
         let dir = store.dot();
         std::fs::create_dir_all(dir).map_err(io)?;
-        std::fs::write(store.identity(), self.identity.as_bytes()).map_err(io)?;
-        // Objects: loose, content-addressed, incremental (ADR 0012); the
-        // directory comes from the store — the layout's single owner (ADR 0017).
+        // Objects: loose, content-addressed, immutable, atomically written
+        // (ADR 0012). Disjoint filenames make concurrent object writes lock-free,
+        // so they persist outside the shared-metadata lock below.
         persist_codec::save_objects_loose(&store.objects_dir(), &self.objects)?;
 
-        // Shared finalized graph: union of what is already on disk (other docks'
-        // lineages) with our finalized nodes; working changes are excluded and
-        // stored per-dock instead. Immutable nodes make the union safe (a node
-        // present under the same id is byte-identical).
-        let mut finalized = ChangeGraph::new();
-        if let Ok(bytes) = std::fs::read(store.graph()) {
-            for node in persist_codec::decode_nodes(&bytes)? {
-                if !is_working_change(&node) {
-                    finalized.insert(node);
+        // --- shared append-only surface: serialize the read-modify-write (#293).
+        //
+        // Every file here is persisted by reading the whole on-disk version,
+        // MERGING our in-memory state into it, and writing the whole file back.
+        // The merge is what makes it safe for two lanes to append concurrently
+        // (ADR 0034: the shared store is append-only) — a blind overwrite of our
+        // *stale* in-memory copy would drop a change another lane just finalized
+        // ("reports success but doesn't stick") or a key it just filed (visible
+        // content reading back as "content you can't see"). The store lock closes
+        // the read-modify-write race window so the merge sees the other writer's
+        // already-persisted append; every write is atomic (temp+rename) so a
+        // concurrent reader never observes a torn file (#252/#293).
+        {
+            let _guard = store.lock_shared();
+
+            atomic_write(&store.identity(), self.identity.as_bytes()).map_err(io)?;
+
+            // Finalized graph: union on-disk finalized nodes (other lanes'
+            // lineages) with ours; working changes are excluded and stored
+            // per-lane. Immutable nodes make the union safe (same id ⇒ same bytes).
+            let mut finalized = ChangeGraph::new();
+            if let Ok(bytes) = std::fs::read(store.graph()) {
+                for node in persist_codec::decode_nodes(&bytes)? {
+                    if !is_working_change(&node) {
+                        finalized.insert(node);
+                    }
                 }
             }
-        }
-        for node in self.graph.in_order() {
-            if !is_working_change(node) {
-                finalized.insert(node.clone());
+            for node in self.graph.in_order() {
+                if !is_working_change(node) {
+                    finalized.insert(node.clone());
+                }
             }
-        }
-        std::fs::write(store.graph(), persist_codec::encode_graph(&finalized)).map_err(io)?;
+            atomic_write(&store.graph(), &persist_codec::encode_graph(&finalized)).map_err(io)?;
 
-        // Per-dock working change (at most one in practice — this dock's tip).
+            // Keyring: union on-disk keys (a concurrent lane may have filed a key
+            // for content it sealed) into ours, then RE-HONOR our purges so a
+            // hard-maroon key removal (ADR 0009) is never resurrected by the union.
+            let mut keyring = self.keyring.clone();
+            if let Ok(bytes) = std::fs::read(store.keyring()) {
+                for (oid, key) in persist_codec::decode_keyring(&bytes)?.iter() {
+                    if !keyring.holds(&oid) {
+                        keyring.insert(oid, key);
+                    }
+                }
+            }
+            for (purge_oid, marooned) in &self.purges {
+                if marooned == &self.identity {
+                    keyring.remove(purge_oid);
+                }
+            }
+            atomic_write(&store.keyring(), &persist_codec::encode_keyring(&keyring)).map_err(io)?;
+
+            // Escrow / manifest / purges / attestations: the same append-only
+            // union, so a stale writer never clobbers another's entry.
+            let mut escrow = self.escrow.clone();
+            if let Ok(bytes) = std::fs::read(store.escrow()) {
+                for (oid, entry) in persist_codec::decode_escrow(&bytes)?.iter() {
+                    if !escrow.holds(oid) {
+                        escrow.insert(oid.clone(), entry.key, entry.reveal_at);
+                    }
+                }
+            }
+            atomic_write(&store.escrow(), &persist_codec::encode_escrow(&escrow)).map_err(io)?;
+
+            let mut manifest = self.manifest.clone();
+            if let Ok(bytes) = std::fs::read(store.manifest()) {
+                manifest.merge(&decode_manifest(&bytes)?);
+            }
+            atomic_write(&store.manifest(), &encode_manifest(&manifest)).map_err(io)?;
+
+            let mut purges = self.purges.clone();
+            if let Ok(bytes) = std::fs::read(store.purges()) {
+                for p in decode_purges(&bytes)? {
+                    if !purges.contains(&p) {
+                        purges.push(p);
+                    }
+                }
+            }
+            atomic_write(&store.purges(), &encode_purges(&purges)).map_err(io)?;
+
+            let mut attestations = self.attestations.clone();
+            if let Ok(bytes) = std::fs::read(store.attestations()) {
+                attestations.merge(&decode_attestations(&bytes)?);
+            }
+            atomic_write(&store.attestations(), &encode_attestations(&attestations))
+                .map_err(io)?;
+        }
+
+        // --- lane-owned state (single-writer; ADR 0034). Not under the lock, but
+        // written atomically so a concurrent *reader* (another lane's `status` or
+        // `loot lanes`) never sees a torn file (#293).
+
+        // This lane's working change (at most one — its tip), out of the shared graph.
         let working: Vec<&ChangeNode> = self
             .graph
             .in_order()
@@ -955,18 +1029,9 @@ impl DagRepo {
             .write_working_change(working_blob.as_deref())
             .map_err(io)?;
 
-        // Per-dock heads: this dock's lineage tips (git's per-worktree ref).
+        // This lane's lineage tips (git's per-worktree ref) and its conflict set.
         store.write_heads(&self.graph.heads()).map_err(io)?;
-
-        // Custody + advisory metadata: shared, whole-file. RepoStore names them.
-        // Each goes through atomic_write (temp+rename) so a crash or a
-        // concurrent writer never tears a reader's view of the file (#252).
-        atomic_write(&store.keyring(), &persist_codec::encode_keyring(&self.keyring)).map_err(io)?;
-        atomic_write(&store.escrow(), &persist_codec::encode_escrow(&self.escrow)).map_err(io)?;
-        atomic_write(&store.manifest(), &encode_manifest(&self.manifest)).map_err(io)?;
-        atomic_write(&store.purges(), &encode_purges(&self.purges)).map_err(io)?;
         atomic_write(&store.conflicts(), &encode_conflicts(&self.conflicts)).map_err(io)?;
-        atomic_write(&store.attestations(), &encode_attestations(&self.attestations)).map_err(io)?;
         Ok(())
     }
 }

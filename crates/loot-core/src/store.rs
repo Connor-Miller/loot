@@ -52,6 +52,102 @@
 
 use crate::Oid;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
+
+static STORE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `bytes` to `path` atomically: stage to a unique sibling temp file, then
+/// rename over `path`. A crash mid-write or a concurrent reader therefore never
+/// observes a torn or truncated file — a reader always sees the whole
+/// prior-or-next version, never a partial one (#252, extended to the lane-owned
+/// process files in #293). The temp name is unique per (process, call) so two
+/// writers never clobber each other's staging file; staging in the *same*
+/// directory keeps the rename atomic.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let n = STORE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), n));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// A short-lived exclusive lock over a shared store's mutable metadata files
+/// (`graph`, `keyring`, `manifest`, …). ADR 0034 makes the shared store
+/// append-only, but `save_to` persists it by a **read-modify-write of whole
+/// files**; two concurrent writers that both read the same on-disk version and
+/// then both write lose one another's appended change/key (#293 — a finalize
+/// that "reports success but doesn't stick", and a keyring drop that makes
+/// visible content read as "content you can't see"). Holding this lock across
+/// that critical section serializes the read-modify-write so each writer merges
+/// against the other's already-persisted state.
+///
+/// The file's *existence* is the lock (we do not keep the handle open), mirroring
+/// the harbor lock (ADR 0036). RAII: [`Drop`] removes it. A lock left by a
+/// crashed writer past [`Self::STALE`] is broken on sight so the store can never
+/// wedge permanently.
+#[derive(Debug)]
+pub struct StoreLock {
+    path: PathBuf,
+    held: bool,
+}
+
+impl StoreLock {
+    /// A lock older than this is treated as a crashed writer's and broken. The
+    /// critical section is a handful of small file writes (milliseconds), so a
+    /// live lock is never anywhere near this old.
+    const STALE: Duration = Duration::from_secs(30);
+    const POLL: Duration = Duration::from_millis(2);
+
+    /// Acquire the lock at `path`, spinning until the holder releases (or its
+    /// lock goes stale). Never fails: a permanently stuck lock is broken once it
+    /// passes [`Self::STALE`], because proceeding un-serialized is worse than the
+    /// rare stale-break race, and the caller has no meaningful recovery besides
+    /// retrying anyway.
+    fn acquire(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Self { path, held: true },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Break a stale lock from a crashed writer, then retry at once.
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .is_none_or(|age| age >= Self::STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(Self::POLL);
+                }
+                // A transient error (e.g. a racing stale-break removing the temp)
+                // — back off and retry rather than proceed unlocked.
+                Err(_) => std::thread::sleep(Self::POLL),
+            }
+        }
+    }
+
+    fn remove(&mut self) {
+        if self.held {
+            let _ = std::fs::remove_file(&self.path);
+            self.held = false;
+        }
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
 
 const IDENTITY: &str = "identity";
 const GRAPH: &str = "graph";
@@ -73,6 +169,12 @@ const CONFIG: &str = "config";
 const GIT_MIRROR: &str = "git-mirror";
 const OPS: &str = "ops";
 const ABANDONED: &str = "abandoned";
+/// The shared-store metadata lock (#293). `save_to` persists the append-only
+/// shared surface (graph, keyring, …) by a read-modify-write of whole files;
+/// without serialization two concurrent writers lose one another's appends. A
+/// process holds this briefly across that critical section. Local-only, like the
+/// harbor lock — never bundled.
+const STORE_LOCK: &str = "store.lock";
 
 /// The default dock every repo starts on — the primary directory (ADR 0022
 /// physical model). Its process files are the root `.loot/working`/`tree-hash`/
@@ -127,6 +229,14 @@ impl RepoStore {
     /// Whether this store views the repo through a spawned lane (distinct roots).
     pub fn is_lane(&self) -> bool {
         self.dot != self.lane
+    }
+
+    /// Acquire the shared-store metadata lock (#293), serializing the
+    /// read-modify-write of the append-only shared files in `save_to`. The lock
+    /// lives at the *shared* root (`self.dot`), so every lane over one store
+    /// contends on the same file. RAII — released when the returned guard drops.
+    pub fn lock_shared(&self) -> StoreLock {
+        StoreLock::acquire(self.dot.join(STORE_LOCK))
     }
 
     // --- engine-owned artifacts ---
@@ -241,7 +351,7 @@ impl RepoStore {
         for id in set {
             bytes.extend_from_slice(&id.0);
         }
-        std::fs::write(self.abandoned(), bytes)
+        atomic_write(&self.abandoned(), &bytes)
     }
 
     /// Read the working-change id (32 raw bytes) for `dock` if one is in
@@ -275,7 +385,7 @@ impl RepoStore {
 
     /// Record the snapshot hash used for idempotent re-`status`.
     pub fn write_tree_hash(&self, dock: Option<&str>, hash: &[u8]) -> std::io::Result<()> {
-        std::fs::write(self.tree_hash(dock), hash)
+        atomic_write(&self.tree_hash(dock), hash)
     }
 
     /// Forget the snapshot hash so the next snapshot always runs the engine.
@@ -301,7 +411,7 @@ impl RepoStore {
     /// first snapshot has carried it onto the change (best-effort removal).
     pub fn write_next_change(&self, dock: Option<&str>, id: Option<&[u8; 16]>) -> std::io::Result<()> {
         match id {
-            Some(id) => std::fs::write(self.next_change(dock), id),
+            Some(id) => atomic_write(&self.next_change(dock), id),
             None => {
                 let _ = std::fs::remove_file(self.next_change(dock));
                 Ok(())
@@ -402,7 +512,7 @@ impl RepoStore {
         for h in heads {
             bytes.extend_from_slice(&h.0);
         }
-        std::fs::write(self.heads(), bytes)
+        atomic_write(&self.heads(), &bytes)
     }
 
     /// The encoded working-change node blob if one is in progress, else `None`.
@@ -414,7 +524,7 @@ impl RepoStore {
     /// is none (best-effort removal).
     pub fn write_working_change(&self, blob: Option<&[u8]>) -> std::io::Result<()> {
         match blob {
-            Some(b) => std::fs::write(self.working_change(), b),
+            Some(b) => atomic_write(&self.working_change(), b),
             None => {
                 let _ = std::fs::remove_file(self.working_change());
                 Ok(())
@@ -619,7 +729,7 @@ fn read_oid_file(path: &Path) -> Option<Oid> {
 /// Write a 32-byte Oid, or remove the file when `None` (best-effort removal).
 fn write_oid_file(path: &Path, oid: Option<&Oid>) -> std::io::Result<()> {
     match oid {
-        Some(oid) => std::fs::write(path, oid.0),
+        Some(oid) => atomic_write(path, &oid.0),
         None => {
             let _ = std::fs::remove_file(path);
             Ok(())
