@@ -10,7 +10,8 @@ millerbyte `docs/adr/0010-millerbyte-ui-design-system-package.md` (`@millerbyte/
 
 ## 0. What we are building
 
-A fully static (SSG) product front door for loot at **loot.millerbyte.com** —
+A fully static (SSG) product front door for loot at **loot.millerbyte.com**
+(static but for the two install-proxy server routes — see the §2 amendment) —
 five surfaces (Landing · Install · Docs · Why loot · Evidence) — served as a
 second Vercel project rooted at a new `site/` directory **in this repo**,
 consuming the published **`@millerbyte/ui`** design system, and fronting a
@@ -51,6 +52,19 @@ pipeline. No gateway, no auth, no CORS surface.
   - `/install.ps1` → `…/releases/latest/download/loot-cli-installer.ps1`
   This is astral's exact production architecture for uv. The proxy fronts the
   **script only** — the binary archive is fetched GitHub-direct (see §5).
+  > **Amendment (2026-07-17, #257 live-fire):** the `vercel.json` external
+  > rewrite was **falsified live** — Vercel proxies GitHub's response *as-is*,
+  > and `releases/latest/download/…` always answers with a 302 to the
+  > versioned asset (which itself 302s to GitHub's CDN), so the client saw the
+  > 302 the hero command cannot follow. This was exactly the "one live-fire
+  > confirmation" §2's research deferred, and it failed. The shipped mechanism
+  > is a **TanStack Start server route** per script (`site/src/routes/`
+  > `install[.]sh.ts` / `install[.]ps1.ts` → `site/src/lib/installerProxy.ts`):
+  > a nitro function `fetch()`es the `releases/latest/download` URL (fetch
+  > follows the redirect chain server-side) and streams the bytes back as a
+  > 200 with `cache-control: public, max-age=300, s-maxage=300` — still
+  > always-latest, still decoupled from releases. `site/vercel.json` carries
+  > **no rewrites**; the "no `redirects` block" rule stands.
 - **Interim deploy = manual `vercel --prod`** (inherits millerbyte's ritual; its
   GitHub→Vercel auto-deploy is broken — a shared fast-follow, not this spec's).
 - **VPS relay (`api.→72.60.231.231`) is untouched** — never a download host.
