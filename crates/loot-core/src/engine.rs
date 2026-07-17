@@ -3481,6 +3481,114 @@ mod tests {
     }
 
     #[test]
+    fn merge_tips_honors_a_one_side_deletion_since_the_fork() {
+        // #295: doomed.txt exists at the fork point. One line deletes it since
+        // the fork; the other never touches it. The reconcile merge must keep
+        // it DELETED — not re-adopt it from the untouched side. This is the gap
+        // the #288 fix (full manifests) left open in the converge classifier.
+        let vis = Visibility::Public;
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let keep = repo.put(b"keep\n", vis.clone()).unwrap();
+        let doomed = repo.put(b"doomed\n", vis.clone()).unwrap();
+        // Fork point holds both files.
+        let mut t0 = BTreeMap::new();
+        t0.insert(PathBuf::from("keep.txt"), (keep.clone(), vis.clone()));
+        t0.insert(PathBuf::from("doomed.txt"), (doomed.clone(), vis.clone()));
+        let fork = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "fork".into(), tree: t0 })
+            .unwrap();
+
+        // Line A deletes doomed.txt (full manifest omits it), adds a.txt.
+        let a = repo.put(b"a\n", vis.clone()).unwrap();
+        let mut ta = BTreeMap::new();
+        ta.insert(PathBuf::from("keep.txt"), (keep.clone(), vis.clone()));
+        ta.insert(PathBuf::from("a.txt"), (a, vis.clone()));
+        let tip_a = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![fork.clone()],
+                message: "delete doomed.txt".into(),
+                tree: ta,
+            })
+            .unwrap();
+
+        // Line B leaves doomed.txt untouched (same address), adds b.txt.
+        let b = repo.put(b"b\n", vis.clone()).unwrap();
+        let mut tb = BTreeMap::new();
+        tb.insert(PathBuf::from("keep.txt"), (keep.clone(), vis.clone()));
+        tb.insert(PathBuf::from("doomed.txt"), (doomed.clone(), vis.clone()));
+        tb.insert(PathBuf::from("b.txt"), (b, vis.clone()));
+        let tip_b = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![fork],
+                message: "unrelated edit".into(),
+                tree: tb,
+            })
+            .unwrap();
+
+        // Deletion must win regardless of merge order.
+        let (merge_ab, _) = repo.merge_tips(&tip_a, &tip_b, "merge a<-b", 0).unwrap();
+        let tree_ab = repo.graph.get(&merge_ab).unwrap().tree.clone();
+        assert!(
+            !tree_ab.contains_key(&PathBuf::from("doomed.txt")),
+            "one-side deletion silently undone (ours=A): {:?}",
+            tree_ab.keys().collect::<Vec<_>>()
+        );
+        assert!(tree_ab.contains_key(&PathBuf::from("a.txt")));
+        assert!(tree_ab.contains_key(&PathBuf::from("b.txt")));
+        assert!(repo.conflicts.is_empty(), "an untouched-vs-deleted merge is clean");
+
+        let (merge_ba, _) = repo.merge_tips(&tip_b, &tip_a, "merge b<-a", 0).unwrap();
+        let tree_ba = repo.graph.get(&merge_ba).unwrap().tree.clone();
+        assert!(
+            !tree_ba.contains_key(&PathBuf::from("doomed.txt")),
+            "one-side deletion silently undone (ours=B): {:?}",
+            tree_ba.keys().collect::<Vec<_>>()
+        );
+        assert!(repo.conflicts.is_empty());
+    }
+
+    #[test]
+    fn merge_tips_surfaces_a_delete_vs_edit_conflict() {
+        // #295: one line deletes a path since the fork, the other edits it. That
+        // is a genuine conflict — it must surface (bounce), never silently pick
+        // a winner.
+        let vis = Visibility::Public;
+        let mut repo = DagRepo::init(std::env::temp_dir(), "alice").unwrap();
+        let orig = repo.put(b"orig\n", vis.clone()).unwrap();
+        let mut t0 = BTreeMap::new();
+        t0.insert(PathBuf::from("contested.txt"), (orig.clone(), vis.clone()));
+        let fork = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![], message: "fork".into(), tree: t0 })
+            .unwrap();
+
+        // Line A deletes contested.txt.
+        let tip_a = repo
+            .record(Change {
+                id: Oid([0; 32]),
+                parents: vec![fork.clone()],
+                message: "delete".into(),
+                tree: BTreeMap::new(),
+            })
+            .unwrap();
+
+        // Line B edits contested.txt since the fork.
+        let edited = repo.put(b"edited\n", vis.clone()).unwrap();
+        let mut tb = BTreeMap::new();
+        tb.insert(PathBuf::from("contested.txt"), (edited.clone(), vis.clone()));
+        let tip_b = repo
+            .record(Change { id: Oid([0; 32]), parents: vec![fork], message: "edit".into(), tree: tb })
+            .unwrap();
+
+        let (_merge, _) = repo.merge_tips(&tip_a, &tip_b, "merge", 0).unwrap();
+        assert!(
+            repo.conflicts.contains_key(&PathBuf::from("contested.txt")),
+            "a delete/edit collision must surface as a conflict, not silently resolve"
+        );
+    }
+
+    #[test]
     fn snapshot_with_base_forks_isolated_lines_over_one_store() {
         // The dock primitive (ADR 0022, CA1): two snapshots forked from a common
         // base tip produce independent heads that do NOT see each other's writes,

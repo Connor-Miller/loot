@@ -159,8 +159,43 @@ manifest.
 
 The fix makes the graph agree with what its recorders write: `tree_at` returns
 the change's own manifest; `current_tree` unions the **head** manifests only
-(the pre-dock multi-head view), never the ancestry. One classifier gap remains
-out of scope here: the converge rule has no deletion-vs-base case, so a path
-freshly deleted on *one* side since the fork is still re-adopted from the other
+(the pre-dock multi-head view), never the ancestry. One classifier gap remained
+out of scope here: the converge rule had no deletion-vs-base case, so a path
+freshly deleted on *one* side since the fork was still re-adopted from the other
 (the same shape concurrent.md warns about for the adopt merge) — tracked
-separately.
+separately as **#295 and now closed (see the amendment below)**.
+
+## Amendment (#295): converge honors a since-fork deletion against the base
+
+The #288 fix above stopped *pre-fork* resurrection (a path both lines already
+deleted). It left the narrower gap open, and it fired twice while landing #288
+(2026-07-17): lane t288 deleted `tools/loot-first.ps1` and
+`crates/loot-first/src/ledger.rs`, and the very next reconcile merge (minted by
+the fixed binary) re-adopted both from the sibling line, because
+`converge::merge_trees` had no deletion-vs-base rule. A path present in *theirs*
+but absent in *ours* was always `AdoptTheirs`; a path present in *ours* but
+absent in *theirs* was never even visited (the walk only iterated `theirs`), so
+it always survived. Either way a one-side deletion since the fork was silently
+undone.
+
+The rule now applied is the standard 3-way one, judged against the merge base
+`merge_tips` already computes (`common_ancestor_tree`):
+
+- **one side deleted, the other unchanged from the base → the deletion wins**
+  (both directions — the ours-only case is a symmetric second pass over
+  `merge_trees`);
+- **one side deleted, the other edited since the base → a delete/edit
+  conflict**, recorded like any other so it surfaces through the harbor
+  conflict-bounce (ADR 0036) — never a silent resurrection or silent deletion.
+  The deleted side has no oid, so the base content stands in for it in the
+  recorded `(ours, theirs)` conflict pair (the resolve/bounce path keys on the
+  path, not the oids);
+- **base lacks the path → a genuine add**, adopted as before.
+
+Unchanged-ness is judged by address equality first, then plaintext equality via
+the key oracle (a re-seal mints a fresh address for identical bytes, #65/#98);
+an unopenable side cannot be judged, so the pre-#295 conservative keep/adopt
+stands (never delete or conflict blind). This retires the "the merge is what
+resurrects files deleted upstream" warning for the no-arg adopt/reconcile merge:
+that merge now honors deletions. `adopt <version>`'s no-content-merge behavior
+keeps its own, independent rationale (discard a divergent line wholesale).

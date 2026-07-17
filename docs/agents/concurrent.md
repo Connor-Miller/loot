@@ -130,8 +130,10 @@ loot adopt <landed-version>     # take-wholesale onto the landed change (#244)
 ```
 
 `loot adopt <version>` abandons the primary's competing heads down to the shared
-anchor and materializes the landed tree — no content merge (the merge is what
-resurrects files deleted upstream). Use it when the primary sits on a **divergent**
+anchor and materializes the landed tree — no content merge, because the point is
+to *replace* a divergent line, not fold it in. (The no-arg catch-up below *does*
+merge, and since #295 that merge honors a one-side deletion instead of
+resurrecting it.) Use `adopt <version>` when the primary sits on a **divergent**
 head that must be discarded. When the primary is merely *behind* landed main, the
 no-arg **`loot adopt`** catches it up by folding the harbor lineage in — a clean
 fast-forward when there is no local work, a merge when there is (#250). Reach for
