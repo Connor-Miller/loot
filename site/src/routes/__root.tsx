@@ -6,6 +6,7 @@ import {
 	createRootRoute,
 } from '@tanstack/react-router';
 import type { ReactNode } from 'react';
+import { INSTALL_SH_ONELINER } from '../lib/install';
 import appCss from '../styles.css?url';
 
 // Nav = the five surfaces (spec §4): loot (home) · Install · Docs · Why loot ·
@@ -53,7 +54,7 @@ function RootDocument({ children }: { children: ReactNode }) {
 				</header>
 				<main className="site-main">{children}</main>
 				<footer className="site-footer">
-					<code>curl -sSf https://loot.millerbyte.com/install.sh | sh</code>
+					<code>{INSTALL_SH_ONELINER}</code>
 					<div className="links">
 						<a href={GITHUB_URL} target="_blank" rel="noreferrer">
 							GitHub

@@ -18,8 +18,12 @@ export async function proxyInstaller(asset: string): Promise<Response> {
 		headers: {
 			'content-type': 'text/plain; charset=utf-8',
 			// Short shared cache: a new release becomes the served installer
-			// within minutes without a site redeploy.
-			'cache-control': 'public, max-age=300, s-maxage=300',
+			// within minutes without a site redeploy. Only cache success — a
+			// transient GitHub failure must not be served to installers for
+			// 5 minutes.
+			'cache-control': upstream.ok
+				? 'public, max-age=300, s-maxage=300'
+				: 'no-store',
 		},
 	});
 }

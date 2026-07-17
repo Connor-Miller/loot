@@ -16,8 +16,11 @@ export default defineConfig({
 		external: ['lucide-react'],
 	},
 	plugins: [
-		// Fully static site: every route prerenders, no ssr:false islands, so no
-		// prerender deny-list (docs/research/deploy-chain-loot-site.md, Link 1).
+		// Every page route prerenders — no ssr:false islands, so no prerender
+		// deny-list (docs/research/deploy-chain-loot-site.md, Link 1). The two
+		// install[.]{sh,ps1} server routes are the deliberate exception to
+		// "fully static": nitro functions proxying the installer scripts (see
+		// the spec §2 amendment).
 		tanstackStart({
 			srcDirectory: 'src',
 			prerender: {

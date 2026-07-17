@@ -10,7 +10,8 @@ millerbyte `docs/adr/0010-millerbyte-ui-design-system-package.md` (`@millerbyte/
 
 ## 0. What we are building
 
-A fully static (SSG) product front door for loot at **loot.millerbyte.com** —
+A fully static (SSG) product front door for loot at **loot.millerbyte.com**
+(static but for the two install-proxy server routes — see the §2 amendment) —
 five surfaces (Landing · Install · Docs · Why loot · Evidence) — served as a
 second Vercel project rooted at a new `site/` directory **in this repo**,
 consuming the published **`@millerbyte/ui`** design system, and fronting a
