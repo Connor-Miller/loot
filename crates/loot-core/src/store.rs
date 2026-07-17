@@ -76,6 +76,26 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Read a file that is replaced via [`atomic_write`]. On Windows the
+/// rename-replace leaves a brief delete-pending window in which opening the
+/// destination transiently fails with `PermissionDenied` — so a reader racing a
+/// writer would error even though the file is never torn (#293 tail). Retry
+/// briefly on `PermissionDenied` only: `NotFound` keeps meaning "absent", and a
+/// persistent permission error still propagates after the retries.
+pub(crate) fn read_replaced(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut delay = Duration::from_millis(1);
+    for _ in 0..8 {
+        match std::fs::read(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            other => return other,
+        }
+    }
+    std::fs::read(path)
+}
+
 /// A short-lived exclusive lock over a shared store's mutable metadata files
 /// (`graph`, `keyring`, `manifest`, …). ADR 0034 makes the shared store
 /// append-only, but `save_to` persists it by a **read-modify-write of whole
@@ -327,7 +347,7 @@ impl RepoStore {
     /// The set of abandoned version ids (each 32 raw bytes), or empty if none.
     /// A malformed/short file reads as empty (best-effort; the oplog can rebuild).
     pub fn read_abandoned(&self) -> std::collections::BTreeSet<Oid> {
-        match std::fs::read(self.abandoned()) {
+        match read_replaced(&self.abandoned()) {
             Ok(b) if b.len() % 32 == 0 => b
                 .chunks_exact(32)
                 .map(|c| {
@@ -380,7 +400,7 @@ impl RepoStore {
 
     /// The last snapshot's tree+message hash for `dock`, or empty if never written.
     pub fn read_tree_hash(&self, dock: Option<&str>) -> Vec<u8> {
-        std::fs::read(self.tree_hash(dock)).unwrap_or_default()
+        read_replaced(&self.tree_hash(dock)).unwrap_or_default()
     }
 
     /// Record the snapshot hash used for idempotent re-`status`.
@@ -397,7 +417,7 @@ impl RepoStore {
     /// change (ADR 0029/0030), before any snapshot has recorded it. 16 raw
     /// bytes; absent or malformed means none is pending.
     pub fn read_next_change(&self, dock: Option<&str>) -> Option<[u8; 16]> {
-        match std::fs::read(self.next_change(dock)) {
+        match read_replaced(&self.next_change(dock)) {
             Ok(b) if b.len() == 16 => {
                 let mut a = [0u8; 16];
                 a.copy_from_slice(&b);
@@ -490,7 +510,7 @@ impl RepoStore {
     /// (the loader then derives them from the whole graph). An empty or malformed
     /// file is treated the same as absent.
     pub fn read_heads(&self) -> Option<Vec<Oid>> {
-        let bytes = std::fs::read(self.heads()).ok()?;
+        let bytes = read_replaced(&self.heads()).ok()?;
         if bytes.is_empty() || bytes.len() % 32 != 0 {
             return None;
         }
@@ -517,7 +537,7 @@ impl RepoStore {
 
     /// The encoded working-change node blob if one is in progress, else `None`.
     pub fn read_working_change(&self) -> Option<Vec<u8>> {
-        std::fs::read(self.working_change()).ok()
+        read_replaced(&self.working_change()).ok()
     }
 
     /// Persist the encoded working-change node blob, or remove the file when there
@@ -716,7 +736,7 @@ fn read_trimmed(path: &Path) -> Option<String> {
 
 /// Read a 32-byte Oid file, or `None` if absent/malformed.
 fn read_oid_file(path: &Path) -> Option<Oid> {
-    match std::fs::read(path) {
+    match read_replaced(path) {
         Ok(b) if b.len() == 32 => {
             let mut a = [0u8; 32];
             a.copy_from_slice(&b);

@@ -30,7 +30,7 @@ use crate::{Change, MergeOutcome, Oid, Repo, RepoError, SyncBundle, Visibility};
 pub(crate) use change_graph::ChangeNode;
 pub use change_graph::change_signing_message;
 use change_graph::{compute_change_id, mint_change_id, ChangeGraph};
-use crate::store::RepoStore;
+use crate::store::{read_replaced, RepoStore};
 use object_store::{ObjectStore, Stored};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -820,7 +820,7 @@ impl DagRepo {
             // but an unreadable or torn blob must FAIL the gc — treating it as
             // empty silently shrinks the root set, and gc then over-prunes:
             // the exact loss class this walk exists to prevent.
-            let blob = match std::fs::read(store.lane_view(&entry).working_change()) {
+            let blob = match read_replaced(&store.lane_view(&entry).working_change()) {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
@@ -1868,14 +1868,14 @@ impl DagRepo {
     /// treat the whole shared graph as the default dock's lineage (back-compat).
     pub fn load_from(store: &RepoStore, root: PathBuf) -> Result<Self, RepoError> {
         let io = |e: std::io::Error| RepoError::Backend(e.to_string());
-        let identity = String::from_utf8(std::fs::read(store.identity()).map_err(io)?)
+        let identity = String::from_utf8(read_replaced(&store.identity()).map_err(io)?)
             .map_err(|e| RepoError::Backend(e.to_string()))?;
         let objects = persist_codec::load_objects_loose(&store.objects_dir())?;
 
         // Build the candidate node pool: shared finalized nodes plus this dock's
         // own working change (which lives outside the shared graph).
         let mut pool: BTreeMap<Oid, ChangeNode> = BTreeMap::new();
-        for node in persist_codec::decode_nodes(&std::fs::read(store.graph()).map_err(io)?)? {
+        for node in persist_codec::decode_nodes(&read_replaced(&store.graph()).map_err(io)?)? {
             pool.insert(node.id.clone(), node);
         }
         if let Some(blob) = store.read_working_change() {
@@ -1890,26 +1890,26 @@ impl DagRepo {
             .unwrap_or_else(|| ChangeGraph::derive_all_heads(&pool));
         let graph = ChangeGraph::reachable_from(&pool, &heads);
 
-        let keyring = persist_codec::decode_keyring(&std::fs::read(store.keyring()).map_err(io)?)?;
+        let keyring = persist_codec::decode_keyring(&read_replaced(&store.keyring()).map_err(io)?)?;
         // Escrow file may not exist in repos created before ADR 0007 — default empty.
-        let escrow = match std::fs::read(store.escrow()) {
+        let escrow = match read_replaced(&store.escrow()) {
             Ok(b) => persist_codec::decode_escrow(&b)?,
             Err(_) => Escrow::new(),
         };
-        let manifest = match std::fs::read(store.manifest()) {
+        let manifest = match read_replaced(&store.manifest()) {
             Ok(b) => decode_manifest(&b)?,
             Err(_) => Manifest::new(),
         };
-        let purges = match std::fs::read(store.purges()) {
+        let purges = match read_replaced(&store.purges()) {
             Ok(b) => decode_purges(&b)?,
             Err(_) => Vec::new(),
         };
-        let conflicts = match std::fs::read(store.conflicts()) {
+        let conflicts = match read_replaced(&store.conflicts()) {
             Ok(b) => decode_conflicts(&b)?,
             Err(_) => BTreeMap::new(),
         };
         // Attestations file may not exist in repos created before S4 — default empty.
-        let attestations = match std::fs::read(store.attestations()) {
+        let attestations = match read_replaced(&store.attestations()) {
             Ok(b) => decode_attestations(&b)?,
             Err(_) => AttestationLog::new(),
         };
@@ -2290,7 +2290,7 @@ fn is_working_change(node: &ChangeNode) -> bool {
 /// callers decide what is *safe to prune* or *known to exist* from this, so a
 /// torn read must fail loudly, never read as empty.
 fn read_shared_graph(store: &RepoStore) -> Result<Vec<ChangeNode>, RepoError> {
-    match std::fs::read(store.graph()) {
+    match read_replaced(&store.graph()) {
         Ok(bytes) => persist_codec::decode_nodes(&bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(RepoError::Backend(format!("read shared graph: {e}"))),
