@@ -194,7 +194,8 @@ adoption is refused — it would reintroduce divergence). **`loot adopt
 <version>`** (shipped): settle the dock **wholesale** onto one landed change,
 **discarding** the divergent local line — abandon every competing head down to
 the shared anchor and materialize the target's tree, with *no content merge*
-(the merge is what resurrects files deleted upstream). `--discard-wip` drops a
+(the point is to *replace* a divergent line, not fold it in — distinct from the
+no-arg catch-up, whose merge now honors deletions since #295). `--discard-wip` drops a
 dirty tree (the sanctioned override of the #219 tree-write chokepoint). Both are
 defined against the harbor/main lineage *only* (never "whatever is in the shared
 graph"). Spawn is the degenerate case (a lane is born adopted); bounce-back
@@ -497,7 +498,18 @@ change), address inequality does *not* mean both sides edited — a side
 whose plaintext equals the base is untouched since the fork and the other
 side simply wins. Only genuinely double-edited content reaches the line-set
 heuristic (and, when undecidable, *Conflict*). No base known (disjoint
-history, unopenable base) falls back to the two-way comparison.
+history, unopenable base) falls back to the two-way comparison. The base also
+carries the **deletion-vs-base rule** (#295, 2026-07-17): because a change's
+tree is a full manifest, an absent path *is* a deletion (#288). When one side
+deleted a path since the fork and the other left it unchanged from the base,
+the deletion wins in the merged tree (both directions — `merge_trees` adds a
+symmetric ours-only pass for the path `theirs` dropped); when the other side
+edited it since the base, that is a delete/edit *Conflict* that surfaces
+through the harbor bounce (ADR 0036), never a silent resurrection or deletion.
+A base that merely lacks the path is a genuine add, adopted as before; an
+unopenable side keeps the conservative pre-#295 keep/adopt. This retired the
+"the merge is what resurrects files deleted upstream" caveat for the
+reconcile/adopt merge.
 
 **Key oracle** — the narrow seam the classifier uses to ask the repo for
 plaintext: `open(oid, now) -> Option<bytes>`. `None` *is* the relay role (this

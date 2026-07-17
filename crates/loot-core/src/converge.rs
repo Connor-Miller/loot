@@ -65,6 +65,10 @@ enum MergeDecision {
     /// A path only `theirs` has — adopt it wholesale. Reported as `Converged`:
     /// there is no divergence to resolve.
     AdoptTheirs,
+    /// A path one side deleted since the fork, the other side left untouched
+    /// from the base — the deletion wins over the stale copy (standard 3-way).
+    /// The merged tree omits the path; reported as `Converged` (no human needed).
+    DeleteWins,
     /// One side's line set subsumes the other; `winner` is that superset side's
     /// content address, which a tree-building merge adopts. Reported as `Merged`.
     Merged { winner: Oid },
@@ -81,7 +85,9 @@ impl MergeDecision {
     /// Project down to the public per-path [`MergeOutcome`] label.
     fn outcome(&self) -> MergeOutcome {
         match self {
-            MergeDecision::Converged | MergeDecision::AdoptTheirs => MergeOutcome::Converged,
+            MergeDecision::Converged
+            | MergeDecision::AdoptTheirs
+            | MergeDecision::DeleteWins => MergeOutcome::Converged,
             MergeDecision::Merged { .. } => MergeOutcome::Merged,
             MergeDecision::Conflict { ours, theirs } => MergeOutcome::Conflict {
                 ours: ours.clone(),
@@ -103,9 +109,45 @@ fn reconcile_path(
     now: u64,
 ) -> MergeDecision {
     match ours {
-        None => MergeDecision::AdoptTheirs,
+        // A path `theirs` holds that `ours` lacks. With no base entry it is a
+        // genuine add — adopt it. When the base *does* hold it, `ours` deleted
+        // it since the fork (#295): a full manifest's absence is a deletion, so
+        // apply the standard 3-way deletion-vs-base rule rather than blindly
+        // re-adopting the stale copy.
+        None => match base_oid {
+            None => MergeDecision::AdoptTheirs,
+            Some(base) => match same_content(their_oid, base, oracle, now) {
+                // Theirs is the base untouched — our deletion wins.
+                Some(true) => MergeDecision::DeleteWins,
+                // Theirs edited it since the fork — delete/edit conflict. There
+                // is no `ours` oid (we deleted it), so the base content stands
+                // in for the deleted side in the recorded conflict.
+                Some(false) => MergeDecision::Conflict {
+                    ours: base.clone(),
+                    theirs: their_oid.clone(),
+                },
+                // Can't open a side — cannot tell untouched from edited, so keep
+                // the content conservatively (never delete or conflict blind).
+                None => MergeDecision::AdoptTheirs,
+            },
+        },
         Some((our_oid, _)) if our_oid == their_oid => MergeDecision::Converged,
         Some((our_oid, _)) => merge_pair(our_oid, their_oid, base_oid, oracle, now),
+    }
+}
+
+/// Are two content addresses the same content? Address equality first (the
+/// #98 unchanged-path fast path), then plaintext equality via the oracle —
+/// a re-seal mints a fresh address for identical bytes (#65). `None` when a
+/// side cannot be opened: the caller cannot decide untouched-vs-edited and
+/// must fall back to conservative behavior.
+fn same_content(a: &Oid, b: &Oid, oracle: &dyn KeyOracle, now: u64) -> Option<bool> {
+    if a == b {
+        return Some(true);
+    }
+    match (oracle.open(a, now), oracle.open(b, now)) {
+        (Some(x), Some(y)) => Some(x == y),
+        _ => None,
     }
 }
 
@@ -175,9 +217,17 @@ fn line_set_merge(ours: &Oid, theirs: &Oid, a: &[u8], b: &[u8]) -> MergeDecision
 ///   - a genuine `Conflict` -> keep *ours* in the tree and record it in
 ///     `conflicts` (the `theirs` side is never dropped: it stays reachable
 ///     through the merge change's second parent, for `loot resolve`);
-///   - a sealed path we cannot open (`RelayedUnmerged`) -> keep ours untouched.
+///   - a sealed path we cannot open (`RelayedUnmerged`) -> keep ours untouched;
+///   - a **since-fork deletion** judged against the `base` (#295): when one
+///     side deleted a path (a full manifest's absence is a deletion) and the
+///     other left it untouched from the base, the deletion wins and the path
+///     is dropped from the tree; when the other side *edited* it since the
+///     fork, that is a delete/edit conflict, recorded like any other. Without a
+///     base, or when a side can't be opened, the pre-#295 keep/adopt stands.
 ///
-/// `ours` is the base; `theirs` is the line being merged in.
+/// The theirs-only walk cannot see a path *`ours` still holds but `theirs`
+/// deleted*, so a symmetric second pass covers that direction. `ours` is the
+/// base; `theirs` is the line being merged in.
 pub struct Merge {
     /// The tree the merge change carries.
     pub tree: Tree,
@@ -204,6 +254,11 @@ pub fn merge_trees(
         let decision = reconcile_path(ours.get(path), &their_entry.0, base_oid, oracle, now);
         match &decision {
             MergeDecision::Converged | MergeDecision::Relayed => {} // keep ours untouched
+            MergeDecision::DeleteWins => {
+                // Ours deleted a path theirs left untouched from the base — the
+                // deletion wins. Ours already lacks it, so the path is absent
+                // from `tree`; keep it that way (don't re-adopt theirs).
+            }
             MergeDecision::AdoptTheirs => {
                 tree.insert(path.clone(), their_entry.clone());
             }
@@ -214,12 +269,50 @@ pub fn merge_trees(
                 }
             }
             MergeDecision::Conflict { ours: o, theirs: t } => {
-                // Keep ours in the tree; theirs survives via the merge's 2nd parent.
+                // Keep ours in the tree (a deletion stays deleted); theirs
+                // survives via the merge's 2nd parent, for `loot resolve`.
                 conflicts.insert(path.clone(), (o.clone(), t.clone()));
             }
         }
         outcomes.insert(path.clone(), decision.outcome());
     }
+
+    // Symmetric pass for paths `ours` still holds but `theirs` deleted since the
+    // fork (#295) — the theirs-only walk above cannot see them. Only paths the
+    // base holds are deletions here; a path base lacks is a genuine ours-only
+    // add and stays. Address equality first, then the oracle (a re-seal mints a
+    // fresh address, #65/#98); an unopenable side keeps ours conservatively.
+    if let Some(base) = base {
+        for (path, (our_oid, _vis)) in ours {
+            if theirs.contains_key(path) {
+                continue; // already reconciled in the theirs walk
+            }
+            let Some((base_oid, _)) = base.get(path) else {
+                continue; // base lacks it -> a genuine ours-only add, keep it
+            };
+            match same_content(our_oid, base_oid, oracle, now) {
+                // Ours is the base untouched -> theirs' deletion wins.
+                Some(true) => {
+                    tree.remove(path);
+                    outcomes.insert(path.clone(), MergeOutcome::Converged);
+                }
+                // Ours edited it since the fork -> delete/edit conflict. There is
+                // no `theirs` oid (they deleted it), so the base content stands
+                // in for the deleted side. Keep ours' edit in the tree; theirs'
+                // deletion is the merge's 2nd parent.
+                Some(false) => {
+                    conflicts.insert(path.clone(), (our_oid.clone(), base_oid.clone()));
+                    outcomes.insert(
+                        path.clone(),
+                        MergeOutcome::Conflict { ours: our_oid.clone(), theirs: base_oid.clone() },
+                    );
+                }
+                // Can't open a side — keep ours conservatively, no verdict.
+                None => {}
+            }
+        }
+    }
+
     Merge { tree, conflicts, outcomes }
 }
 
@@ -474,5 +567,151 @@ mod tests {
         let m = merge_trees(&ours, &theirs, None, &FakeOracle(BTreeMap::new()), 0);
         assert_eq!(m.tree[&p("a.txt")].0, oid(1));
         assert_eq!(m.outcomes[&p("a.txt")], MergeOutcome::Converged);
+    }
+
+    // --- three-way deletion rule (#295): a since-fork deletion vs. the base ---
+
+    #[test]
+    fn delete_vs_untouched_ours_deleted_theirs_kept_deletion_wins() {
+        // OURS deleted del.txt since the fork; THEIRS carries the base bytes
+        // untouched (same address). The deletion must win — theirs must not
+        // silently re-adopt it.
+        let base = tree(&[("keep.txt", oid(1)), ("del.txt", oid(2))]);
+        let ours = tree(&[("keep.txt", oid(1))]); // ours deleted del.txt
+        let theirs = tree(&[("keep.txt", oid(1)), ("del.txt", oid(2))]); // untouched
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(BTreeMap::new()), 0);
+        assert!(!m.tree.contains_key(&p("del.txt")), "ours' deletion of an untouched path wins");
+        assert!(m.conflicts.is_empty(), "a clean deletion is not a conflict");
+        assert_eq!(m.outcomes[&p("del.txt")], MergeOutcome::Converged);
+    }
+
+    #[test]
+    fn delete_vs_untouched_survives_a_reseal_address_via_the_oracle() {
+        // THEIRS re-sealed the base bytes to a fresh address (#65/#98), so
+        // address equality can't see "untouched" — the oracle's plaintext
+        // equality must. Deletion still wins.
+        let base = tree(&[("keep.txt", oid(1)), ("del.txt", oid(2))]);
+        let ours = tree(&[("keep.txt", oid(1))]); // deleted del.txt
+        let theirs = tree(&[("keep.txt", oid(1)), ("del.txt", oid(3))]); // reseal, addr differs
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(2), b"content\n".to_vec()); // base bytes
+        plain.insert(oid(3), b"content\n".to_vec()); // theirs = same bytes, fresh seal
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(plain), 0);
+        assert!(!m.tree.contains_key(&p("del.txt")), "reseal of untouched base still deletes");
+        assert!(m.conflicts.is_empty());
+    }
+
+    #[test]
+    fn delete_vs_untouched_theirs_deleted_ours_kept_deletion_wins() {
+        // Mirror: THEIRS deleted del.txt; OURS carries the base bytes untouched.
+        // The ours-only pass must drop it from the merged tree.
+        let base = tree(&[("keep.txt", oid(1)), ("del.txt", oid(2))]);
+        let ours = tree(&[("keep.txt", oid(1)), ("del.txt", oid(2))]); // untouched
+        let theirs = tree(&[("keep.txt", oid(1))]); // theirs deleted del.txt
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(BTreeMap::new()), 0);
+        assert!(!m.tree.contains_key(&p("del.txt")), "theirs' deletion of an untouched path wins");
+        assert!(m.conflicts.is_empty());
+        assert_eq!(m.outcomes[&p("del.txt")], MergeOutcome::Converged);
+    }
+
+    #[test]
+    fn delete_vs_modified_ours_deleted_theirs_edited_conflicts() {
+        // OURS deleted del.txt; THEIRS edited it since the fork. A genuine
+        // delete/edit conflict — surface it, never silently resurrect. The
+        // deleted side is represented by the base content (there is no ours oid).
+        let base = tree(&[("del.txt", oid(2))]);
+        let ours = tree(&[("keep.txt", oid(1))]); // del.txt deleted
+        let theirs = tree(&[("keep.txt", oid(1)), ("del.txt", oid(3))]); // edited
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(2), b"orig\n".to_vec());
+        plain.insert(oid(3), b"edited\n".to_vec());
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(plain), 0);
+        assert!(!m.tree.contains_key(&p("del.txt")), "ours' deletion kept in the tree; theirs via 2nd parent");
+        assert_eq!(m.conflicts[&p("del.txt")], (oid(2), oid(3)), "base stands in for the deleted side");
+        assert_eq!(
+            m.outcomes[&p("del.txt")],
+            MergeOutcome::Conflict { ours: oid(2), theirs: oid(3) }
+        );
+    }
+
+    #[test]
+    fn delete_vs_modified_theirs_deleted_ours_edited_conflicts() {
+        // Mirror: THEIRS deleted del.txt; OURS edited it. Conflict; ours' edit
+        // stays in the tree, theirs' deletion is the second parent.
+        let base = tree(&[("del.txt", oid(2))]);
+        let ours = tree(&[("keep.txt", oid(1)), ("del.txt", oid(4))]); // edited
+        let theirs = tree(&[("keep.txt", oid(1))]); // del.txt deleted
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(2), b"orig\n".to_vec());
+        plain.insert(oid(4), b"edited\n".to_vec());
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(plain), 0);
+        assert_eq!(m.tree[&p("del.txt")].0, oid(4), "our edit kept in the tree");
+        assert_eq!(m.conflicts[&p("del.txt")], (oid(4), oid(2)), "base stands in for the deleted side");
+        assert_eq!(
+            m.outcomes[&p("del.txt")],
+            MergeOutcome::Conflict { ours: oid(4), theirs: oid(2) }
+        );
+    }
+
+    #[test]
+    fn delete_vs_delete_is_clean() {
+        // Both sides deleted del.txt since the fork — no resurrection, no
+        // conflict. (Neither loop visits the path; it stays absent.)
+        let base = tree(&[("keep.txt", oid(1)), ("del.txt", oid(2))]);
+        let ours = tree(&[("keep.txt", oid(1))]);
+        let theirs = tree(&[("keep.txt", oid(1))]);
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(BTreeMap::new()), 0);
+        assert!(!m.tree.contains_key(&p("del.txt")), "delete-vs-delete stays deleted");
+        assert!(m.conflicts.is_empty());
+    }
+
+    #[test]
+    fn add_when_base_lacks_the_path_is_still_adopted() {
+        // Base-present rules must not swallow a genuine add: base lacks new.txt,
+        // theirs adds it → adopt (today's correct behavior, unchanged).
+        let base = tree(&[("keep.txt", oid(1))]);
+        let ours = tree(&[("keep.txt", oid(1))]);
+        let theirs = tree(&[("keep.txt", oid(1)), ("new.txt", oid(5))]);
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(BTreeMap::new()), 0);
+        assert_eq!(m.tree[&p("new.txt")].0, oid(5), "a genuine add is adopted");
+        assert!(m.conflicts.is_empty());
+        assert_eq!(m.outcomes[&p("new.txt")], MergeOutcome::Converged);
+    }
+
+    #[test]
+    fn delete_vs_unopenable_side_keeps_conservatively() {
+        // OURS deleted del.txt, but neither the base nor theirs can be opened
+        // (sealed to us) — we cannot judge untouched-vs-edited, so keep the
+        // content conservatively rather than delete or conflict.
+        let base = tree(&[("del.txt", oid(9))]); // oid(9) not in the oracle
+        let ours = tree(&[("keep.txt", oid(1))]); // deleted del.txt
+        let theirs = tree(&[("keep.txt", oid(1)), ("del.txt", oid(3))]); // oid(3) also sealed
+        let m = merge_trees(&ours, &theirs, Some(&base), &FakeOracle(BTreeMap::new()), 0);
+        assert_eq!(m.tree[&p("del.txt")].0, oid(3), "unopenable → conservative keep/adopt");
+        assert!(m.conflicts.is_empty(), "an unopenable side never manufactures a conflict");
+    }
+
+    #[test]
+    fn classify_reports_theirs_side_deletion_cases() {
+        // classify shares the per-path rule: a path theirs kept but ours
+        // deleted (theirs untouched) is Converged; if theirs edited it, Conflict.
+        let base = tree(&[("del.txt", oid(2))]);
+        let local = tree(&[("keep.txt", oid(1))]); // ours deleted del.txt
+
+        // untouched theirs → deletion wins → Converged
+        let inc_untouched = tree(&[("del.txt", oid(2))]);
+        let out = classify(&local, &inc_untouched, Some(&base), &FakeOracle(BTreeMap::new()), 0);
+        assert_eq!(out[&p("del.txt")], MergeOutcome::Converged);
+
+        // edited theirs → delete/edit → Conflict
+        let inc_edited = tree(&[("del.txt", oid(3))]);
+        let mut plain = BTreeMap::new();
+        plain.insert(oid(2), b"orig\n".to_vec());
+        plain.insert(oid(3), b"edited\n".to_vec());
+        let out = classify(&local, &inc_edited, Some(&base), &FakeOracle(plain), 0);
+        assert_eq!(
+            out[&p("del.txt")],
+            MergeOutcome::Conflict { ours: oid(2), theirs: oid(3) }
+        );
     }
 }
