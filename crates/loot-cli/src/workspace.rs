@@ -2804,12 +2804,23 @@ impl Workspace {
     /// review of un-described WIP is never asked for a name when `main` sits
     /// where we left it).
     ///
+    /// `preserve_wip` (set only by the review projection, `loot ferry
+    /// --with-wip`) forbids folding a **live working change** into the reconcile
+    /// merge: review's job is to project the *unfinalized* WIP, so if `main`
+    /// moved under the lane and real local work is on the tree, capturing +
+    /// finalizing it here would sign the WIP into a merge and leave the empty
+    /// minted change as the thing to "review" — nothing (#292). Under
+    /// `preserve_wip` that path refuses instead, leaving the WIP captured and
+    /// unfinalized. The no-ops (main where we left it) never reach the capture,
+    /// so an ordinary review still projects un-described WIP untouched.
+    ///
     /// Returns the per-path outcomes (empty on adopt/no-op).
     pub fn reconcile_onto(
         &mut self,
         target: Option<&Oid>,
         pinned: Option<&Oid>,
         label: &str,
+        preserve_wip: bool,
     ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
         // The incoming change may have landed from a lane this dock never
         // adopted — outside the lineage-filtered load (#265). Pull its line in
@@ -2859,7 +2870,7 @@ impl Workspace {
         // captured working change. `reconcile_capture` drops a capture that is
         // empty or duplicates `pinned`/`target` (the co-located checkout after a
         // `git pull`), so the fast-forward path still costs nothing.
-        let wip = self.reconcile_capture(pinned, Some(target))?;
+        let wip = self.reconcile_capture(pinned, Some(target), preserve_wip)?;
         match (wip, pinned) {
             (Some(w), _) => self.reconcile_merge(&w, target, label),
             (None, None) => {
@@ -2896,12 +2907,24 @@ impl Workspace {
         &mut self,
         base: Option<&Oid>,
         target: Option<&Oid>,
+        preserve_wip: bool,
     ) -> Result<Option<Oid>, String> {
         let msg = self.working_message_or_placeholder();
         let (id, _) = self.snapshot_from(base, &msg, &[])?;
         let against: Vec<&Oid> = [base, target].into_iter().flatten().collect();
         if self.drop_capture_if_redundant(&id, &against)? {
             Ok(None)
+        } else if preserve_wip {
+            // Review's catch-up ferry (#292): git `main` moved under this lane
+            // while a live working change carries real work. Finalizing it as a
+            // merge parent — the fold below — is what stranded #257's work:
+            // signed into a "ferry: reconcile git main" merge, with the empty
+            // minted change left as the thing to review (nothing), unlandable
+            // (land finalizes a *working* change), and no op-log entry to undo.
+            // Refuse instead. The snapshot above persisted the edits, so the WIP
+            // survives as a live, UNFINALIZED working change — only the signature
+            // is withheld — and the pass records nothing to walk back.
+            Err(REFUSE_REVIEW_STALE_ANCHOR.to_string())
         } else {
             // Real local work, about to be signed as our merge parent — it needs
             // a name (#275). Below the duplicate drop above, so the common
@@ -3045,6 +3068,27 @@ const REFUSE_UNDESCRIBED_PARENT: &str =
      your local work into signed history, and its message becomes the permanent subject on \
      git `main`\n  name it:  loot describe -m \"<subject>\"\n  then re-run the same command\n  \
      (your edits are captured and safe — only the merge waits for the name)";
+
+/// The review-only refusal (#292): `loot-first review` / `loot ferry --with-wip`
+/// caught up over a git `main` that moved *under this lane* while a live working
+/// change carried real work. Folding it into the catch-up merge would finalize
+/// the WIP and leave the empty minted change as the thing to review — the silent
+/// dead end #257 hit (unreviewable, unlandable, no op to undo). We refuse before
+/// the fold, so the described WIP stays a live, unfinalized working change.
+///
+/// Like [`REFUSE_UNDESCRIBED_PARENT`], it promises only that the capture
+/// survives the erroring process (`snapshot_from` persists; the refused pass's
+/// ingest does not, so it is simply redone on the re-run). The root cause is a
+/// lane spawned from an anchor already behind git `main`.
+const REFUSE_REVIEW_STALE_ANCHOR: &str =
+    "git `main` moved under this lane while your work is described but unfinalized, so \
+     `loot-first review` would have to fold your WIP into a reconcile merge to catch up — \
+     which finalizes it and leaves nothing to review (issue #292). Refusing so your work is \
+     never silently stranded.\n  Nothing was finalized; your working change is intact on \
+     disk.\n  This lane was spawned from an anchor already behind git `main`. To land this \
+     work, re-spawn a lane from current main and re-apply it there (`loot lane new` from the \
+     primary once it has caught up), or reconcile deliberately with `loot adopt` — aware that \
+     the adopt signs your WIP into a merge (it stops being a reviewable working change).";
 
 /// Resolve visibility for `path` under an explicit `.lootattributes` text.
 /// The bridge classifies ingested files under the *ingested commit's own*
@@ -4720,7 +4764,7 @@ mod tests {
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
 
         let err = ws
-            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", /* preserve_wip */ false)
             .unwrap_err();
         assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
         assert!(ws.working_id().is_some(), "the local work is captured, not dropped");
@@ -4736,10 +4780,62 @@ mod tests {
         std::fs::write(dir.join("local.txt"), b"my work").unwrap();
         ws.snapshot("feat: my local line").unwrap();
 
-        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", /* preserve_wip */ false)
             .expect("described work reconciles");
         let tip = ws.anchor().expect("the dock advanced onto a merge");
         assert!(ws.graph().is_ancestor(&c2, &tip), "the landed side is folded in");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn review_catch_up_refuses_to_fold_a_described_wip_when_main_moved() {
+        // #292 — the review fold. A lane spawned from an anchor already behind
+        // git `main` (`landed_from_lane` moves main past the dock via a lane
+        // land), then real described work on the tree. `loot-first review` runs
+        // its catch-up ferry with `--with-wip` (`preserve_wip = true`). Before
+        // this fix the reconcile CAPTURED + FINALIZED the described WIP into a
+        // "ferry: reconcile git main" merge and minted an empty working change —
+        // so review then reported "nothing to review", the work unlandable, with
+        // no op-log entry to undo. The catch-up must refuse the fold instead.
+        let (area, dir, c2) = landed_from_lane("292-review-fold");
+
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let ours = ws.finalized_anchor();
+        std::fs::write(dir.join("local.txt"), b"my reviewable work").unwrap();
+        ws.snapshot("feat: my local line").unwrap();
+        let wip = ws.working_id().cloned().expect("a live, described working change");
+
+        let err = ws
+            .reconcile_onto(
+                Some(&c2),
+                ours.as_ref(),
+                "ferry: reconcile git main",
+                /* preserve_wip */ true,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("moved under this lane") && err.contains("#292"),
+            "a clear, actionable refusal — not a silent fold: {err}"
+        );
+
+        // The described WIP is intact and still UNFINALIZED: nothing was signed,
+        // the dock did not advance, and the landed side was NOT folded in.
+        assert_eq!(
+            ws.working_id(),
+            Some(&wip),
+            "the described WIP survives as the live working change"
+        );
+        assert_eq!(ws.finalized_anchor(), ours, "nothing was finalized onto the line");
+        assert!(
+            !ws.graph().is_ancestor(&c2, &wip),
+            "the landed main was not folded into the WIP"
+        );
+        // And the edits are still on disk — the refusal cost only the signature.
+        assert_eq!(
+            std::fs::read(dir.join("local.txt")).unwrap(),
+            b"my reviewable work",
+            "the refusal did not clobber the working tree",
+        );
         let _ = std::fs::remove_dir_all(&area);
     }
 
@@ -4774,7 +4870,7 @@ mod tests {
         // The reconcile a `had_new == false` ferry makes: main is the marked
         // lane-landed c2, and our line is its ancestor. Pre-#280 this hit the
         // `(None, Some(o)) if is_ancestor(o, target)` adopt arm and clobbered.
-        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", /* preserve_wip */ false)
             .expect("the working change reconciles — it is not clobbered");
 
         assert_eq!(

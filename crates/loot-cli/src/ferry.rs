@@ -176,10 +176,15 @@ pub fn run(
         // `git pull` — is recognized and dropped), adopt-vs-merge, which tip
         // advances — lives in Workspace::reconcile_onto (R2, #178); the bridge
         // only supplies the incoming line and its pinned anchor.
+        // `with_wip` is the review projection: it must not fold a live working
+        // change into this catch-up merge (that finalizes the WIP and leaves the
+        // empty minted change to "review" — #292). `preserve_wip` refuses that
+        // fold; a plain ferry/land (with_wip=false) keeps the fold.
         report.outcomes = ws.reconcile_onto(
             target.as_ref(),
             ours.as_ref(),
             "ferry: reconcile git main",
+            /* preserve_wip */ with_wip,
         )?;
     }
 
@@ -1851,8 +1856,12 @@ mod tests {
         put_file(&dir, "d.txt", "local\n");
         ws.snapshot("local work").unwrap();
 
-        // The pass ingests the git commit and reconciles by merging.
-        let report = ferry_wip(&mut ws, &mirror);
+        // The pass ingests the git commit and reconciles by merging. A plain
+        // ferry (not `--with-wip`): the review path now refuses to fold a live
+        // WIP into a catch-up merge (#292), so the merge-manifest property #288
+        // guards is exercised on the ordinary reconcile-merge path, which is
+        // where a described line still folds.
+        let report = ferry(&mut ws, &mirror);
         assert_eq!(report.ingested, 1);
 
         // The merged loot manifest must NOT re-raise b.txt…
@@ -2064,20 +2073,33 @@ mod tests {
         let report = ferry_wip(&mut ws, &mirror);
         assert!(report.review.is_some(), "un-described WIP still projects a review lane");
 
-        // But when git `main` has moved under it, the pass must reconcile — which
-        // means *signing* our side as a merge parent. That is the one thing a name
-        // is required for, review or not (#275).
+        // But when git `main` has moved under it, review must NOT fold the WIP
+        // into a reconcile merge to catch up — that finalizes the working change
+        // and leaves the empty minted change as the thing to review (nothing),
+        // unlandable, with no op to undo (#292). It refuses instead, leaving the
+        // WIP intact — and naming it does not change that, because the fold is
+        // the problem, not the name.
         let git = git2::Repository::open(&mirror).unwrap();
         git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
         let refused = match run(&mut ws, Some(mirror.to_str().unwrap()), None, true) {
             Err(e) => e,
-            Ok(_) => panic!("a review that must merge has to name its merge parent (#275)"),
+            Ok(_) => panic!("a review whose lane fell behind git main must refuse, not fold (#292)"),
         };
-        assert!(refused.contains("describe"), "and it says so: {refused}");
+        assert!(
+            refused.contains("moved under this lane") && refused.contains("#292"),
+            "and it says why: {refused}"
+        );
 
-        // Named, it projects again — the review lane is not lost, just deferred.
-        ws.snapshot("wip: named for the merge").unwrap();
-        assert!(ferry_wip(&mut ws, &mirror).review.is_some(), "review resumes once named");
+        // The WIP survived, unfinalized: the edit is still on disk, nothing was
+        // signed. Naming it still refuses — a review off a stale anchor stays
+        // refused until the lane is reconciled (re-spawned from current main).
+        assert_eq!(std::fs::read(dir.join("wip.txt")).unwrap(), b"unnamed\n");
+        ws.snapshot("wip: named work").unwrap();
+        let still = match run(&mut ws, Some(mirror.to_str().unwrap()), None, true) {
+            Err(e) => e,
+            Ok(_) => panic!("naming the WIP must not unlock the fold (#292)"),
+        };
+        assert!(still.contains("#292"), "naming does not unlock the fold: {still}");
     }
 
     #[test]
