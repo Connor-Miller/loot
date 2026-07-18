@@ -571,17 +571,17 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
 /// non-head and refuses emptying the dock of its last live head.
 fn cmd_abandon(args: &[String]) -> Result<(), String> {
     let head_mode = has_flag(args, "--head");
-    let prefix = first_positional(args).ok_or(if head_mode {
-        "usage: loot abandon --head <version-id>"
+    let selector = first_positional(args).ok_or(if head_mode {
+        "usage: loot abandon --head <selector>"
     } else {
-        "usage: loot abandon <version-id>"
+        "usage: loot abandon <selector>"
     })?;
     let mut ws = Workspace::open()?;
     // Route through the one #305 selector grammar (@ / HEAD / HEAD~n /
     // hex-or-change prefix, #315) rather than the bare live-version-prefix
     // match this used to hand-roll — `loot abandon @` and `loot abandon
     // HEAD~2` now resolve the same way `loot diff` already does.
-    let version = ws.resolve_selector(prefix)?;
+    let version = ws.resolve_selector(selector)?;
     if head_mode {
         ws.abandon_fork(&version)?;
         println!("abandoned fork head {} — the dock keeps its other live line(s)", short(&version));
