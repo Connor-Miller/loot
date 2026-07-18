@@ -252,6 +252,11 @@ pub struct LandFacts<'a> {
     pub reviewed_version: Option<&'a str>,
     /// The live working-change version now (`None` when the change is empty).
     pub current_version: Option<&'a str>,
+    /// The live working-change message now (`None` when the change is empty).
+    /// [`land_gate`] checks this for the `loot resolve` placeholder subject
+    /// (#316) — the version alone can't distinguish a change that's been
+    /// re-described after a bounce from one still carrying the placeholder.
+    pub current_subject: Option<&'a str>,
 }
 
 /// The outcome of the pre-finalize gate.
@@ -263,8 +268,19 @@ pub enum Gate {
     Refuse(String),
 }
 
+/// The auto-minted message `loot resolve` gives the change it creates when a
+/// same-path conflict bounces a land (`crates/loot-core/src/engine.rs`:
+/// `format!("resolve conflict at {}", path.display())`). [`land_gate`] refuses
+/// to finalize a working change still carrying it (#316) — landing it
+/// verbatim would publish the placeholder as git main's permanent commit
+/// subject instead of the change's real described subject. Kept local rather
+/// than shared from loot-core to avoid a cross-crate string coupling; if
+/// engine.rs's format ever changes, this prefix needs to follow it.
+const RESOLVE_PLACEHOLDER_PREFIX: &str = "resolve conflict at ";
+
 /// Run every pre-finalize guard against the forge and the read facts: PR is
-/// OPEN, approval (#152), dock-targeting (#153), review-currency (ADR 0033).
+/// OPEN, approval (#152), dock-targeting (#153), review-currency (ADR 0033),
+/// resolve-placeholder subject (#316).
 pub fn land_gate(forge: &dyn Forge, f: &LandFacts) -> Result<Gate, String> {
     let view = forge.pr_view(f.pr)?;
     if view.state != PrState::Open {
@@ -310,6 +326,23 @@ pub fn land_gate(forge: &dyn Forge, f: &LandFacts) -> Result<Gate, String> {
              from the primary: `loot lane merge {}`, then land from '{}'.",
             f.pr, f.lane_dock, f.tracked_dock, f.lane_dock, f.tracked_dock
         )));
+    }
+    // #316: a same-path conflict bounce is resolved via `loot resolve`, which
+    // mints the change's message as the placeholder above — describing what
+    // happened at resolve time, not the change's actual subject. Landing it
+    // as-is would carry that placeholder onto git main's permanent log rather
+    // than the subject the operator originally gave the change (the audit
+    // trail survives via the PR pointer either way, but the human subject on
+    // main would be lost). Refuse and name the fix.
+    if let Some(subject) = f.current_subject {
+        if subject.starts_with(RESOLVE_PLACEHOLDER_PREFIX) {
+            return Ok(Gate::Refuse(format!(
+                "working change carries the auto-minted resolve placeholder subject \
+                 (\"{subject}\") — a land would publish that as git main's commit \
+                 subject. Run 'loot describe -m \"<subject>\"' to restore the change's \
+                 real subject, then land again."
+            )));
+        }
     }
     if review_currency(f.reviewed_version, f.current_version) == Currency::Stale {
         return Ok(Gate::Refuse(format!(
@@ -418,9 +451,12 @@ pub fn land(
     let reviewed = WipState::parse(&std::fs::read_to_string(&p.wip).unwrap_or_default())
         .reviewed_version(&lane.change, &lane.dock, &lane.owner)
         .map(str::to_string);
-    let current = ws
-        .live_working_row()?
-        .and_then(|r| (!r.empty).then(|| r.version_hex()));
+    // Bound once so `current_version` and `current_subject` (#316) read the
+    // same row instead of two separate `live_working_row()` calls disagreeing
+    // under a race.
+    let row = ws.live_working_row()?;
+    let current = row.as_ref().and_then(|r| (!r.empty).then(|| r.version_hex()));
+    let current_subject = row.as_ref().and_then(|r| (!r.empty).then(|| r.message.as_str()));
 
     let facts = LandFacts {
         pr,
@@ -431,6 +467,7 @@ pub fn land(
         tracked_dock: &tracked,
         reviewed_version: reviewed.as_deref(),
         current_version: current.as_deref(),
+        current_subject,
     };
     match land_gate(forge, &facts)? {
         Gate::Refuse(why) => return Err(why),
@@ -1265,6 +1302,7 @@ mod tests {
             tracked_dock: lane_dock,
             reviewed_version: reviewed,
             current_version: current,
+            current_subject: None,
         }
     }
 
@@ -1328,6 +1366,7 @@ mod tests {
             tracked_dock: "main",
             reviewed_version: None,
             current_version: None,
+            current_subject: None,
         };
         let Gate::Refuse(why) = land_gate(&f, &facts).unwrap() else {
             panic!("expected refuse");
@@ -1344,6 +1383,37 @@ mod tests {
             panic!("expected refuse");
         };
         assert!(why.contains("amended since"), "{why}");
+    }
+
+    #[test]
+    fn gate_refuses_resolve_placeholder_subject() {
+        // #316: a bounced land resolved via `loot resolve` mints "resolve
+        // conflict at <path>" (engine.rs) as the change's message. Landing it
+        // as-is would carry that placeholder onto git main's permanent log
+        // instead of the change's real described subject — refuse and name
+        // the fix, mirroring the #174 `(working change)` precedent.
+        let f = FakeForge::new().with_view(view(ReviewDecision::Approved, "someone", PrState::Open));
+        let facts = LandFacts {
+            current_subject: Some("resolve conflict at crates/loot-cli/src/main.rs"),
+            ..facts("ferry", "ferry", None, None)
+        };
+        let Gate::Refuse(why) = land_gate(&f, &facts).unwrap() else {
+            panic!("expected refuse");
+        };
+        assert!(why.contains("loot describe"), "{why}");
+        assert!(why.contains("resolve conflict at crates/loot-cli/src/main.rs"), "{why}");
+    }
+
+    #[test]
+    fn gate_proceeds_on_a_real_described_subject() {
+        // A normal subject — even one that happens to be about a "resolve" —
+        // must not trip the #316 guard; only the exact auto-minted prefix does.
+        let f = FakeForge::new().with_view(view(ReviewDecision::Approved, "someone", PrState::Open));
+        let facts = LandFacts {
+            current_subject: Some("loot status: show ambient dock and pending PR (#7)"),
+            ..facts("ferry", "ferry", None, None)
+        };
+        assert_eq!(land_gate(&f, &facts).unwrap(), Gate::Proceed { self_fast_path: false });
     }
 
     fn no_sleep() -> impl FnMut() {
