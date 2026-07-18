@@ -302,3 +302,12 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-smoke-install:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/smoke-install.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit

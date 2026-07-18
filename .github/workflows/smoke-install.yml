@@ -1,13 +1,23 @@
-# Standalone smoke test — kept OUT of the dist-generated release.yml on purpose,
-# so `dist generate` never clobbers it (#258). Proves the published Linux
-# `curl | sh` one-liner actually installs and resolves `loot` on a clean runner.
+# Standalone smoke test — its BODY is kept OUT of the dist-generated release.yml
+# on purpose, so `dist generate` never clobbers it (#258). dist only adds a *call*
+# to this file (via `post-announce-jobs` in dist-workspace.toml, #271), so the job
+# body below stays hand-owned. Proves the published Linux `curl | sh` one-liner
+# actually installs and resolves `loot` on a clean runner.
 name: Smoke — Linux install
 
 on:
-  # Fire once cargo-dist's release.yml publishes the GitHub Release, so the
-  # installer + binaries exist at releases/latest to fetch.
-  release:
-    types: [published]
+  # Called by cargo-dist's release.yml as a post-announce job, once the GitHub
+  # Release (installer + binaries at releases/latest) has been published (#271).
+  # A plain `release: [published]` trigger does NOT work: release.yml publishes
+  # with the built-in GITHUB_TOKEN, and GitHub's recursion guard refuses to start
+  # new workflow runs from GITHUB_TOKEN-raised events — so the gate silently never
+  # fired. dist passes every custom job a single required `plan` input.
+  workflow_call:
+    inputs:
+      plan:
+        description: The dist-manifest plan JSON (passed by dist; unused here).
+        required: true
+        type: string
   # And on demand, to re-check an existing release without cutting a new one.
   # The default installer URL is the site's hero one-liner (#260): the proxy at
   # loot.millerbyte.com must serve the real installer, not just GitHub-direct.

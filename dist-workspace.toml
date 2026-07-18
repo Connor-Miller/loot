@@ -10,17 +10,14 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax).
-# aarch64-pc-windows-msvc (Windows ARM64) is deliberately NOT here for v0.1.0.
-# dist 0.32 cross-builds that triple in a Linux container via cargo-xwin, where
-# ring's ARM assembly fails to compile: cc-rs hands clang MSVC-style `/imsvc`
-# include flags, which clang reads as a positional path
-# (`clang: error: no such file or directory: '/imsvc'`), so the build dies before
-# loot.exe exists. Not a loot defect — an upstream cc-rs/xwin interaction. The
-# v0.1.0 tag's first run proved the other five triples build clean, so we ship
-# those rather than block the release on the least-critical desktop target.
-# Windows ARM64 users are NOT stranded: dist maps that triple onto the x64 zip in
-# the ps1 installer, so the one-liner still installs and runs under x64 emulation.
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# aarch64-pc-windows-msvc (Windows ARM64) is built on a NATIVE arm64 Windows
+# runner (see github-custom-runners below), NOT dist 0.32's default Linux
+# cargo-xwin cross-build. That cross-build failed on v0.1.0: cc-rs handed clang
+# MSVC-style `/imsvc` include flags, which clang read as a positional path
+# (`clang: error: no such file or directory: '/imsvc'`), so ring's ARM assembly
+# died before loot.exe existed (#270). Building on native Windows lets MSVC (not
+# xwin/clang) assemble ring, and yields a native — not x64-emulated — binary.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
 # Path that installers should place binaries in. NOT CARGO_HOME (dist's default):
 # that silently assumes a Rust dev (~/.cargo/bin) and is already on PATH for them,
 # so it never exercises the installer's PATH-edit path — wrong for a
@@ -39,3 +36,17 @@ github-attestations = true
 # Emit a SHA-256 digest alongside every artifact (a unified `sha256.sum` on the
 # Release), so the Install page's manual-verify path has a checksum to check.
 checksum = "sha256"
+# Run the Linux `curl | sh` smoke test after the Release is announced (#271). dist
+# adds a *call* to ./.github/workflows/smoke-install.yml in the generated
+# release.yml, gated on `announce`, so publishing a release auto-fires the install
+# gate. This works where `release: [published]` did not: the call rides the same
+# workflow run rather than depending on a GITHUB_TOKEN-raised event that GitHub's
+# recursion guard suppresses. The job body stays hand-owned in its own file.
+post-announce-jobs = ["./smoke-install"]
+
+# Build aarch64-pc-windows-msvc on a native ARM64 Windows runner instead of dist's
+# default Linux cargo-xwin cross-build (see the targets comment above for why that
+# cross-build fails, #270). host==target here, so it is a native build, not a
+# cross-compile — and yields a native binary rather than an x64-emulated one.
+[dist.github-custom-runners.aarch64-pc-windows-msvc]
+runner = "windows-11-arm"
