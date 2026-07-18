@@ -116,7 +116,7 @@ const COMMANDS: &[Verb] = &[
     verb("surface", &[], &[], |_| cmd_surface()),
     verb("lane", &["--ticket", "--name", "--at", "--stale-hours"], OUT, cmd_lane),
     verb("lanes", &[], OUT, cmd_lane_list),
-    verb("log", &[], &[], |_| cmd_log()),
+    verb("log", &[], &[], cmd_log),
     verb("gc", &[], &["--dry-run", "-n"], cmd_gc),
     verb("bundle", &[], &[], cmd_bundle),
     verb("apply", &[], OUT, cmd_apply),
@@ -162,15 +162,15 @@ usage:
   loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
-  loot abandon <version-id>                 drop a version from a divergent change (marked `!` in log), leaving one; undoable
-  loot abandon --head <version-id>          drop an independent live head (a whole fork tip); undoable
+  loot abandon <selector>                   drop a version from a divergent change (marked `!` in log), leaving one; undoable; selectors: @, HEAD, HEAD~<n>, id prefix
+  loot abandon --head <selector>            drop an independent live head (a whole fork tip); undoable
   loot adopt                                catch this position up to landed main by merging it in (keeps the local line); undoable
   loot adopt <version-id> [--discard-wip]   settle this position onto a landed change, discarding the divergent line (no merge); undoable
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
   loot surface                              materialize what the current identity may see
-  loot log                                  show change history
+  loot log [<selector>]                     show change history, or the ancestry of one point in it; selectors: @, HEAD, HEAD~<n>, id prefix
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
   loot apply <file> [--porcelain|--json]    merge a peer's bundle (idempotent; machine output for agents)
@@ -187,7 +187,7 @@ usage:
   loot lane rm <id-or-name>                 reap a lane: delete its directory + registry entry (NOT undoable)
   loot lane gc [--stale-hours <h>]          sweep unnamed lanes that landed or went stale (default 24h)
   loot manifest                             show the grant audit trail (and attestations)
-  loot attest <change-id> [role]            attest a change (advisory sign-off, ADR 0018)
+  loot attest <change-id> [role]            attest a change (advisory sign-off, ADR 0018); selectors: @ (refused — finalize first), HEAD, HEAD~<n>, id prefix
   loot buoy [role] [--verbose] [--porcelain|--json]  resolve the newest trusted role-attested change (CA4, ADR 0025)
   loot conflicts [--porcelain|--json]       list paths that need human resolution
   loot resolve <path> <file>                resolve a conflict at <path> using the content of <file>
@@ -557,12 +557,15 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `loot abandon <version-id>` — drop a version from a **divergent** change (S3,
+/// `loot abandon <selector>` — drop a version from a **divergent** change (S3,
 /// ADR 0029/0030): jj-parity `jj abandon`. Leaves the other live version(s) under
 /// the change id; nothing is deleted from the object store — the version stops
-/// being a live head — and the step is one undoable operation (ADR 0031).
+/// being a live head — and the step is one undoable operation (ADR 0031). The
+/// target is the #305/#315 selector grammar (`@`, `HEAD`, `HEAD~<n>`, a version
+/// or change-id prefix — see [`Workspace::resolve_selector`]), the same one
+/// `loot diff`/`loot log`/`loot attest` speak.
 ///
-/// `loot abandon --head <version-id>` drops an independent live **head** (a whole
+/// `loot abandon --head <selector>` drops an independent live **head** (a whole
 /// fork tip), the non-divergent counterpart used to walk a drifted dock off a
 /// stale line before a re-ferry (#243). Same undoable machinery; refuses a
 /// non-head and refuses emptying the dock of its last live head.
@@ -574,7 +577,11 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
         "usage: loot abandon <version-id>"
     })?;
     let mut ws = Workspace::open()?;
-    let version = ws.resolve_live_version(prefix)?;
+    // Route through the one #305 selector grammar (@ / HEAD / HEAD~n /
+    // hex-or-change prefix, #315) rather than the bare live-version-prefix
+    // match this used to hand-roll — `loot abandon @` and `loot abandon
+    // HEAD~2` now resolve the same way `loot diff` already does.
+    let version = ws.resolve_selector(prefix)?;
     if head_mode {
         ws.abandon_fork(&version)?;
         println!("abandoned fork head {} — the dock keeps its other live line(s)", short(&version));
@@ -793,14 +800,46 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn cmd_log() -> Result<(), String> {
+/// `loot log [<selector>]` — with no argument, unchanged: the full history
+/// (rows newest-first, abandoned versions dropped, the working node rendered
+/// once as the live row, routed flat-vs-branch by distinct change lines, ADR
+/// 0029). With a selector (#305/#315 — `@`, `HEAD`, `HEAD~<n>`, a version or
+/// change-id prefix, the same grammar `loot diff`/`loot attest`/`loot abandon`
+/// speak), the view scopes to that version's **ancestry**
+/// ([`Workspace::ancestors_of`], a full multi-parent walk): rows and, in the
+/// diverged case, each head's lane and the shared section are filtered down to
+/// ids reachable from the selector. The live working row only survives the
+/// filter when the selector names it directly (`loot log @`) — otherwise it is
+/// "now", not history up to the selector, and is dropped.
+///
+/// This is deliberately the minimal honest scoping, not a general revision-walk
+/// subsystem (#315 scope note): a selector picks the *point*, ancestry answers
+/// "what came before it", and nothing here re-derives divergence or head
+/// membership — `g.heads` still lists every live head exactly as the unscoped
+/// view would, even if a head's own lane renders empty because none of its
+/// rows are in the requested ancestry.
+fn cmd_log(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let identity = ws.identity().to_string();
     // The whole read lives behind the Workspace (R1, #177): rows newest-first
     // with abandoned versions dropped and the working node excluded (rendered
     // once, as the live row), routed flat-vs-branch by distinct change lines
     // (ADR 0029). This function only renders.
-    let view = ws.history()?;
+    let mut view = ws.history()?;
+    if let Some(sel) = first_positional(args) {
+        let target = ws.resolve_selector(sel)?;
+        let ancestry = ws.ancestors_of(&target);
+        view.rows.retain(|r| ancestry.contains(&r.version));
+        if let Some(g) = &mut view.graph {
+            for lane in &mut g.per_head {
+                lane.retain(|r| ancestry.contains(&r.version));
+            }
+            g.shared.retain(|r| ancestry.contains(&r.version));
+        }
+        if view.working.as_ref().map(|w| &w.version) != Some(&target) {
+            view.working = None;
+        }
+    }
     if view.is_empty() {
         println!("no changes yet");
         return Ok(());
@@ -1557,42 +1596,38 @@ fn cmd_manifest() -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve a change-id hex prefix (as shown by `loot log`) to a full change id.
-/// The ephemeral working change is excluded: its id is rewritten on every
-/// snapshot, so an attestation over it would be orphaned the next time the tree
-/// changes — finalize it with `loot new` first (S4, ADR 0018).
-fn resolve_change(ws: &Workspace, prefix: &str) -> Result<loot_core::Oid, String> {
-    let working = ws.working_id().cloned();
-    if let Some(w) = &working {
-        if loot_core::hex::encode(&w.0).starts_with(prefix) {
-            return Err(
-                "cannot attest the working change — its id is still changing; finalize it with `loot new` first"
-                    .into(),
-            );
-        }
-    }
-    let matches: Vec<loot_core::Oid> = ws
-        .version_ids()
-        .into_iter()
-        .filter(|id| Some(id) != working.as_ref())
-        .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
-        .collect();
-    match matches.len() {
-        0 => Err(format!("no change matching '{prefix}'")),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        n => Err(format!("ambiguous change prefix '{prefix}' — matches {n} changes")),
-    }
-}
-
 fn cmd_attest(args: &[String]) -> Result<(), String> {
+    // `args[0]` is always the selector and `args[1]` (if present) the role —
+    // both read by fixed position, not `first_positional`'s flag-skipping
+    // scan, so a selector like `HEAD~1` in `args[0]` is never mistaken for a
+    // role and vice versa.
     let change_ref = args
         .first()
         .ok_or("usage: loot attest <change-id> [role]")?;
     let role = args.get(1).map(String::as_str).unwrap_or("reviewed");
     let mut ws = Workspace::open()?;
-    let change_id = resolve_change(&ws, change_ref)?;
-    ws.attest(&change_id, role)?;
-    println!("attested {} as \"{}\"", short(&change_id), role);
+    // Route through the one #305 selector grammar (@ / HEAD / HEAD~n / prefix,
+    // #315) rather than the verb's own hand-rolled version-prefix match. The
+    // id `resolve_selector` returns is a version's `Oid` — exactly what
+    // `Attestation` records under its `change_id` field throughout the engine
+    // (see `attestations_for`/`buoy_resolution`, both keyed by version id, and
+    // this verb's own former body, which matched hex prefixes against
+    // `version_ids()`). So no separate version->change-id remap is needed —
+    // and `Workspace::change_id` (`Option<[u8; 16]>`, the *durable* handle)
+    // would be the wrong type to feed `attest` even if one were attempted.
+    let version = ws.resolve_selector(change_ref)?;
+    // `@` legitimately resolves (it is the working change, and `diff` wants
+    // exactly that) — but attest still must refuse it: the working change's
+    // id is rewritten on every snapshot, so an attestation over it would be
+    // orphaned the moment the tree changes again (S4, ADR 0018).
+    if Some(&version) == ws.working_id() {
+        return Err(
+            "cannot attest the working change — its id is still changing; finalize it with `loot new` first"
+                .into(),
+        );
+    }
+    ws.attest(&version, role)?;
+    println!("attested {} as \"{}\"", short(&version), role);
     Ok(())
 }
 

@@ -1316,6 +1316,25 @@ impl Workspace {
         }
     }
 
+    /// The ancestor closure of `start`, `start` included (#315): `loot log
+    /// <selector>`'s "scope to here", one #305 selector resolution feeding a
+    /// second, independent walk. Unlike [`walk_single_parent`](Self::walk_single_parent)'s
+    /// `HEAD~n` rule — which *refuses* at a merge, because "~n" has no meaning
+    /// across several parents — this follows every parent edge, so a selector
+    /// on a merge scopes to its whole ancestry rather than erroring. A plain
+    /// stack walk over [`parents_of`](loot_core::DagRepo::parents_of); the
+    /// object graph is a DAG so `seen` also bounds the walk against repeats.
+    pub fn ancestors_of(&self, start: &Oid) -> std::collections::BTreeSet<Oid> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![start.clone()];
+        while let Some(id) = stack.pop() {
+            if seen.insert(id.clone()) {
+                stack.extend(self.repo.parents_of(&id));
+            }
+        }
+        seen
+    }
+
     /// Compute the path-level delta between two versions' trees (`loot diff`,
     /// #1): the [`render::PathDelta`] per changed path, ordered by path. `from`
     /// is the old side, `to` the new — a path only in `to` is added, only in
@@ -7271,6 +7290,124 @@ mod tests {
         // 'g'..'j' are in neither alphabet (hex is 0-9a-f, change is k-z).
         let err = ws.resolve_selector("ghij").unwrap_err();
         assert!(err.contains("not a valid selector"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #315: log/attest/abandon retrofitted onto the #305 grammar ---------
+    //
+    // `loot diff` already spoke `resolve_selector`; these prove the other
+    // selector-taking verbs compose with it the same way, at the `Workspace`
+    // level — `cmd_*` in main.rs stays a thin wrapper untested directly (the
+    // CLI test module only pins flag specs; a full `cmd_*` invocation would
+    // walk cwd up to a REAL `.loot`, the hazard noted in the loot-cli test
+    // idiom).
+
+    #[test]
+    fn ancestors_of_walks_every_parent_edge_inclusive() {
+        // `loot log <selector>`'s scoping (#315) is this closure: a full
+        // multi-parent walk, `start` included, that never refuses at a merge
+        // the way `walk_single_parent`'s `HEAD~n` rule does.
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-315-ancestors-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (root, a, b, merge) = ws
+            .with_repo(|repo| {
+                let root = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![], message: "root".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                let a = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "a".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                let b = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "b".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                let merge = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![a.clone(), b.clone()], message: "merge".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                Ok((root, a, b, merge))
+            })
+            .unwrap();
+
+        let ancestry = ws.ancestors_of(&merge);
+        assert_eq!(
+            ancestry,
+            [root.clone(), a.clone(), b.clone(), merge.clone()].into_iter().collect(),
+            "the merge's ancestry is every node behind it, once each"
+        );
+        // A leaf off the root: just its own single-parent chain.
+        assert_eq!(ws.ancestors_of(&a), [root.clone(), a.clone()].into_iter().collect());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attest_composes_with_a_head_selector_not_just_a_bare_prefix() {
+        // #315: `cmd_attest` used to hand-roll its own version-hex-prefix match
+        // (`resolve_change`, since retired); it now shares `resolve_selector`
+        // with `diff`/`log`/`abandon`, so `HEAD` names the dock tip without the
+        // caller ever typing its hex id. `resolve_selector` returns a version
+        // `Oid`, and that composes directly with `attest` — `Attestation`
+        // records under exactly that id throughout the engine (`attestations_for`
+        // is keyed by version id, matching `resolve_change`'s old body, which
+        // also matched hex prefixes against `version_ids()`); no separate
+        // version->change-id remap belongs on this path.
+        let dir = std::env::temp_dir().join(format!("loot-315-attest-head-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("m").unwrap();
+        ws.finalize_working().unwrap();
+        let head = ws.heads()[0].clone();
+
+        let version = ws.resolve_selector("HEAD").expect("HEAD resolves through the selector grammar");
+        assert_eq!(version, head);
+        ws.attest(&version, "reviewed").unwrap();
+        let recorded = ws.repo().attestations_for(&version);
+        assert_eq!(recorded.len(), 1, "the attestation is recorded under the resolved version id");
+        assert_eq!(recorded[0].role, "reviewed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandon_fork_composes_with_a_change_id_selector_not_just_a_bare_hex_prefix() {
+        // #315: `cmd_abandon` used to call `resolve_live_version` directly
+        // (bare hex only); it now goes through `resolve_selector`, so a
+        // change-id (letters k-z) prefix resolves too, exactly like `loot
+        // diff`/`loot attest` already accept it.
+        use loot_core::{Change, Oid};
+        let dir = std::env::temp_dir().join(format!("loot-315-abandon-sel-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        let (a, b) = ws
+            .with_repo(|repo| {
+                let root = repo
+                    .record(Change { id: Oid([0; 32]), parents: vec![], message: "root".into(), tree: Default::default() })
+                    .map_err(|e| e.to_string())?;
+                let a = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root.clone()], message: "A".into(), tree: Default::default() },
+                        Some([1u8; 16]),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let b = repo
+                    .record_carrying(
+                        Change { id: Oid([0; 32]), parents: vec![root], message: "B".into(), tree: Default::default() },
+                        Some([2u8; 16]),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok((a, b))
+            })
+            .unwrap();
+        ws.record_op("seed", "seeded a fork", false);
+
+        // b's full change-id, spelled as letters — the alphabet resolve_selector
+        // routes to resolve_change_to_version (ADR 0029).
+        let letters = loot_core::hex::letters(&[2u8; 16]);
+        let version = ws
+            .resolve_selector(&letters)
+            .expect("a change-id prefix resolves through the selector grammar");
+        assert_eq!(version, b, "resolves to b's live version");
+
+        ws.abandon_fork(&version).unwrap();
+        assert!(!ws.repo().heads().contains(&b), "b stopped being a live head");
+        assert!(ws.repo().heads().contains(&a), "a survives");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
