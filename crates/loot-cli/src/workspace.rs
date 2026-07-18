@@ -1165,6 +1165,194 @@ impl Workspace {
         }
     }
 
+    /// Resolve a change **selector** (#305 "git-lite" grammar) to a **version
+    /// id** — a tree, since the verbs that take a selector (`loot diff`, and any
+    /// future change-taking verb) compare trees. The grammar, and its refusals,
+    /// which never guess: every failure names the exact ids to paste next.
+    ///
+    /// | `@`        | the working change                                       |
+    /// | `HEAD`     | the dock's tip — errors, listing the heads, if diverged  |
+    /// | `HEAD~n`   | the n-th ancestor on a single-parent chain — errors, naming the parents, at a merge |
+    /// | `<prefix>` | an id prefix; the **alphabet self-selects the namespace** (ADR 0029) — hex digits → a version id ([`resolve_live_version`]), letters `k–z` → a change id resolved *through liveness* to its live version (a divergent change errors, naming the versions) |
+    ///
+    /// [`resolve_live_version`]: Workspace::resolve_live_version
+    pub fn resolve_selector(&self, sel: &str) -> Result<Oid, String> {
+        // `@` — the working change (its live version's tree).
+        if sel == "@" {
+            return self.working.clone().ok_or_else(|| {
+                "@ names the working change, but there is none \
+                 (run `loot describe -m \"<subject>\"` to start one)"
+                    .to_string()
+            });
+        }
+        // `HEAD` / `HEAD~n` — the dock tip and its single-parent ancestors.
+        if sel == "HEAD" {
+            return self.resolve_head();
+        }
+        if let Some(rest) = sel.strip_prefix("HEAD~") {
+            let n: usize = rest
+                .parse()
+                .map_err(|_| format!("HEAD~<n>: '{rest}' is not a number"))?;
+            return self.walk_single_parent(self.resolve_head()?, n);
+        }
+        // `<prefix>` — the alphabet self-selects the namespace (ADR 0029). The
+        // version alphabet (`0–9a–f`) and the change alphabet (`k–z`) are
+        // disjoint, so a prefix is never ambiguous about *which* namespace.
+        if !sel.is_empty() && sel.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+            return self.resolve_live_version(sel);
+        }
+        if !sel.is_empty() && sel.chars().all(|c| ('k'..='z').contains(&c)) {
+            return self.resolve_change_to_version(sel);
+        }
+        Err(format!(
+            "'{sel}' is not a valid selector — use @ (working change), HEAD, HEAD~<n>, \
+             a version-id prefix (hex digits), or a change-id prefix (letters k–z)"
+        ))
+    }
+
+    /// The dock's tip for `HEAD` (see [`resolve_selector`](Self::resolve_selector)):
+    /// the finalized change the dock sits on — [`anchor`](Self::anchor), which is
+    /// the pinned tip (dock/lane), else the working change's finalized *parent*
+    /// (never the working node itself — that is `@`), else the sole head.
+    /// Refuses honestly when the dock has diverged onto several heads with no
+    /// working change or pinned tip to disambiguate — naming them to paste.
+    fn resolve_head(&self) -> Result<Oid, String> {
+        if self.tip.is_none() && self.working.is_none() {
+            let heads = self.heads();
+            if heads.len() > 1 {
+                let ids: Vec<String> = heads.iter().map(short_version).collect();
+                return Err(format!(
+                    "HEAD is ambiguous — the dock has diverged onto {} heads; name one: {}",
+                    heads.len(),
+                    ids.join(", ")
+                ));
+            }
+        }
+        self.anchor().ok_or_else(|| "HEAD: this dock has no finalized change yet".to_string())
+    }
+
+    /// Walk `n` parent edges from `start` for `HEAD~n`, one parent at a time.
+    /// A merge (a node with several parents) has no single `~` ancestor, and a
+    /// walk that reaches a root before `n` steps has none either — both refuse
+    /// with the ids to use instead, never a guess.
+    fn walk_single_parent(&self, start: Oid, n: usize) -> Result<Oid, String> {
+        let mut cur = start;
+        for step in 0..n {
+            let parents = self.repo.parents_of(&cur);
+            match parents.len() {
+                0 => {
+                    return Err(format!(
+                        "HEAD~{n}: reached the root after {step} step(s) — {} has no parent",
+                        short_version(&cur)
+                    ))
+                }
+                1 => cur = parents.into_iter().next().unwrap(),
+                _ => {
+                    let ids: Vec<String> = parents.iter().map(short_version).collect();
+                    return Err(format!(
+                        "HEAD~{n}: {} is a merge with {} parents — no single ~ ancestor; name one: {}",
+                        short_version(&cur),
+                        parents.len(),
+                        ids.join(", ")
+                    ))
+                }
+            }
+        }
+        Ok(cur)
+    }
+
+    /// Resolve a change-id letter prefix to its live version, *through liveness*
+    /// (#305): the durable handle names a change, but a selector must land on a
+    /// tree, so this walks to the change's single live version. A divergent
+    /// change (several live versions) refuses, naming them. Parallels the
+    /// prefix half of [`edit`](Self::edit), which additionally gates on
+    /// finalized/childless — a selector only needs the live version.
+    fn resolve_change_to_version(&self, prefix: &str) -> Result<Oid, String> {
+        let mut cids: std::collections::BTreeSet<[u8; 16]> = std::collections::BTreeSet::new();
+        for v in self.version_ids() {
+            if let Some(cid) = self.repo.change_change_id(&v) {
+                if loot_core::hex::letters(&cid).starts_with(prefix) {
+                    cids.insert(cid);
+                }
+            }
+        }
+        let cid = match cids.len() {
+            0 => return Err(format!("no change matching '{prefix}'")),
+            1 => cids.into_iter().next().unwrap(),
+            n => return Err(format!("ambiguous change prefix '{prefix}' — matches {n} changes")),
+        };
+        let handle = loot_core::hex::short_letters(&cid, 4);
+        let live = self.liveness().live_of(&cid);
+        match live.len() {
+            0 => Err(format!("change {handle} has no live version (abandoned or superseded)")),
+            1 => Ok(live.into_iter().next().unwrap()),
+            _ => {
+                let ids: Vec<String> = live.iter().map(short_version).collect();
+                Err(format!(
+                    "change {handle} is divergent (!) — name a version: {}",
+                    ids.join(", ")
+                ))
+            }
+        }
+    }
+
+    /// Compute the path-level delta between two versions' trees (`loot diff`,
+    /// #1): the [`render::PathDelta`] per changed path, ordered by path. `from`
+    /// is the old side, `to` the new — a path only in `to` is added, only in
+    /// `from` deleted, in both with a different content address or visibility
+    /// modified; an identical pair is dropped. A path the ambient identity can't
+    /// read on its side is marked **sealed** so the renderer degrades it to the
+    /// content address (never the plaintext name), per the #306 contract.
+    pub fn diff(&self, from: &Oid, to: &Oid) -> Result<Vec<PathDelta>, String> {
+        let tree_from = self.repo.change_tree(from).unwrap_or_default();
+        let tree_to = self.repo.change_tree(to).unwrap_or_default();
+        let visible_from: std::collections::BTreeSet<PathBuf> =
+            self.repo.visible_paths_at(from, &self.identity, self.now).into_iter().collect();
+        let visible_to: std::collections::BTreeSet<PathBuf> =
+            self.repo.visible_paths_at(to, &self.identity, self.now).into_iter().collect();
+
+        let mut paths: std::collections::BTreeSet<&PathBuf> = tree_from.keys().collect();
+        paths.extend(tree_to.keys());
+
+        let mut out = Vec::new();
+        for path in paths {
+            let delta = match (tree_from.get(path), tree_to.get(path)) {
+                (None, Some((oid, vis))) => PathDelta {
+                    class: DeltaClass::Added,
+                    path: path.clone(),
+                    oid: oid.clone(),
+                    sealed: !visible_to.contains(path),
+                    visibility: vis.clone(),
+                    prev_visibility: None,
+                },
+                (Some((oid, vis)), None) => PathDelta {
+                    class: DeltaClass::Deleted,
+                    path: path.clone(),
+                    oid: oid.clone(),
+                    sealed: !visible_from.contains(path),
+                    visibility: vis.clone(),
+                    prev_visibility: None,
+                },
+                (Some((from_oid, from_vis)), Some((to_oid, to_vis))) => {
+                    if from_oid == to_oid && from_vis == to_vis {
+                        continue; // unchanged — diff shows only what moved
+                    }
+                    PathDelta {
+                        class: DeltaClass::Modified,
+                        path: path.clone(),
+                        oid: to_oid.clone(),
+                        sealed: !visible_to.contains(path),
+                        visibility: to_vis.clone(),
+                        prev_visibility: (from_vis != to_vis).then(|| from_vis.clone()),
+                    }
+                }
+                (None, None) => unreachable!("path came from the union of the two trees"),
+            };
+            out.push(delta);
+        }
+        Ok(out)
+    }
+
     /// `loot abandon <version>`: drop `version` from its divergent change, leaving
     /// the other live version(s) under the change id (ADR 0030). Refuses a version
     /// that is not a live member of a *divergent* change, so it only ever collapses
@@ -3501,6 +3689,43 @@ pub struct EditReport {
     /// The finalized version that was reopened — superseded when the amend
     /// finalizes (`loot new`).
     pub superseded: Oid,
+}
+
+/// The delta class of one path across two trees: added, modified, or deleted
+/// (#306). `#7`'s first-change-in-repo case renders every path `Added`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaClass {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl DeltaClass {
+    /// The frozen gutter char (#306): `+` added · `M` modified · `-` deleted.
+    pub fn gutter(self) -> char {
+        match self {
+            DeltaClass::Added => '+',
+            DeltaClass::Modified => 'M',
+            DeltaClass::Deleted => '-',
+        }
+    }
+}
+
+/// One path's computed delta — the value [`diff`](Workspace::diff) produces and
+/// [`crate::render::delta_line`] renders (#1/#306). `path` and `oid` are the
+/// same tree entry's two faces: the name and its content address. When `sealed`
+/// the caller lacks the key, so the renderer shows the address in place of the
+/// name (which they cannot read) and degrades the token to the visibility
+/// *class*. `prev_visibility` is `Some` only when the visibility differs across
+/// the two sides (a transition) — the demotion/mis-seal signal #63 builds on;
+/// it is always `None` for `#7` (a working change has one side).
+pub struct PathDelta {
+    pub class: DeltaClass,
+    pub path: PathBuf,
+    pub oid: Oid,
+    pub sealed: bool,
+    pub visibility: Visibility,
+    pub prev_visibility: Option<Visibility>,
 }
 
 /// What `loot adopt <version>` did, for CLI reporting (#244).
@@ -7019,6 +7244,210 @@ mod tests {
             "the live amend resolves"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- resolve_selector: the #305 "git-lite" grammar ----------------------
+
+    #[test]
+    fn selector_at_names_the_working_change() {
+        let dir = std::env::temp_dir().join(format!("loot-sel-at-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("m").unwrap();
+        let working = ws.working_id().cloned().unwrap();
+        assert_eq!(ws.resolve_selector("@").unwrap(), working);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selector_at_without_a_working_change_refuses() {
+        let dir = std::env::temp_dir().join(format!("loot-sel-noat-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("m").unwrap();
+        ws.finalize_working().unwrap(); // finalize clears the working change
+        let err = ws.resolve_selector("@").unwrap_err();
+        assert!(err.contains("no working change") || err.contains("there is none"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selector_head_and_tilde_walk_the_single_parent_chain() {
+        let dir = std::env::temp_dir().join(format!("loot-sel-head-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("first").unwrap();
+        ws.finalize_working().unwrap();
+        let first = ws.heads()[0].clone();
+        std::fs::write(dir.join("a.txt"), b"two").unwrap();
+        ws.snapshot("second").unwrap();
+        ws.finalize_working().unwrap();
+        let second = ws.heads()[0].clone();
+
+        assert_eq!(ws.resolve_selector("HEAD").unwrap(), second, "HEAD is the tip");
+        assert_eq!(ws.resolve_selector("HEAD~1").unwrap(), first, "HEAD~1 is its parent");
+        assert_eq!(ws.resolve_selector("HEAD~0").unwrap(), second, "HEAD~0 is HEAD");
+        // Walking past the root refuses, naming the id it stalled on.
+        let err = ws.resolve_selector("HEAD~5").unwrap_err();
+        assert!(err.contains("root") && err.contains("HEAD~5"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selector_head_with_a_working_change_is_the_finalized_parent_not_working() {
+        // The e2e trap: with an in-progress working change, HEAD must be the
+        // change it forks from (`@`'s parent), so `loot diff` (HEAD vs @) shows
+        // the working edits rather than diffing a change against itself.
+        let dir = std::env::temp_dir().join(format!("loot-sel-hw-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let base = ws.heads()[0].clone();
+        // Start a working change over the finalized base.
+        std::fs::write(dir.join("a.txt"), b"two").unwrap();
+        ws.snapshot("wip").unwrap();
+        let working = ws.working_id().cloned().unwrap();
+
+        assert_eq!(ws.resolve_selector("HEAD").unwrap(), base, "HEAD is the finalized parent");
+        assert_eq!(ws.resolve_selector("@").unwrap(), working, "@ is the working node");
+        let deltas = ws.diff(&base, &working).unwrap();
+        assert!(
+            deltas.iter().any(|d| d.path == Path::new("a.txt")),
+            "HEAD vs @ shows the working edit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selector_prefix_alphabet_self_selects_the_namespace() {
+        let dir = std::env::temp_dir().join(format!("loot-sel-prefix-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        ws.snapshot("m").unwrap();
+        ws.finalize_working().unwrap();
+        let head = ws.heads()[0].clone();
+        let cid = ws.repo().change_change_id(&head).unwrap();
+
+        // Hex digits -> a version id.
+        let hex = loot_core::hex::encode(&head.0);
+        assert_eq!(ws.resolve_selector(&hex[..8]).unwrap(), head, "hex prefix -> version");
+        // Letters k-z -> a change id, resolved through liveness to its version.
+        let letters = loot_core::hex::letters(&cid);
+        assert_eq!(ws.resolve_selector(&letters[..8]).unwrap(), head, "letter prefix -> change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selector_rejects_a_non_selector() {
+        let dir = std::env::temp_dir().join(format!("loot-sel-bad-{}", std::process::id()));
+        let ws = authored_ws(&dir);
+        // 'g'..'j' are in neither alphabet (hex is 0-9a-f, change is k-z).
+        let err = ws.resolve_selector("ghij").unwrap_err();
+        assert!(err.contains("not a valid selector"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- diff: the #1 path-level delta over two trees -----------------------
+
+    #[test]
+    fn diff_reports_added_modified_and_deleted_paths() {
+        let dir = std::env::temp_dir().join(format!("loot-diff-amd-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("keep.txt"), b"same").unwrap();
+        std::fs::write(dir.join("edit.txt"), b"v1").unwrap();
+        std::fs::write(dir.join("gone.txt"), b"bye").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        let base = ws.heads()[0].clone();
+
+        std::fs::write(dir.join("edit.txt"), b"v2").unwrap(); // modified
+        std::fs::remove_file(dir.join("gone.txt")).unwrap(); // deleted
+        std::fs::write(dir.join("new.txt"), b"hello").unwrap(); // added
+        ws.snapshot("next").unwrap();
+        ws.finalize_working().unwrap();
+        let next = ws.heads()[0].clone();
+
+        let deltas = ws.diff(&base, &next).unwrap();
+        let by_path = |name: &str| {
+            deltas
+                .iter()
+                .find(|d| d.path == Path::new(name))
+                .unwrap_or_else(|| panic!("no delta for {name}"))
+                .class
+        };
+        assert_eq!(by_path("new.txt"), DeltaClass::Added);
+        assert_eq!(by_path("edit.txt"), DeltaClass::Modified);
+        assert_eq!(by_path("gone.txt"), DeltaClass::Deleted);
+        assert!(
+            !deltas.iter().any(|d| d.path == Path::new("keep.txt")),
+            "an unchanged path is not in the delta"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_records_a_visibility_transition() {
+        let dir = std::env::temp_dir().join(format!("loot-diff-vis-{}", std::process::id()));
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("f.txt"), b"body").unwrap();
+        ws.snapshot("public").unwrap();
+        ws.finalize_working().unwrap();
+        let base = ws.heads()[0].clone();
+        // Re-seal the same path restricted: content address moves, and the
+        // visibility transition is recorded old -> new.
+        std::fs::write(dir.join(".lootattributes"), "f.txt restricted=connor\n").unwrap();
+        ws.snapshot("seal").unwrap();
+        ws.finalize_working().unwrap();
+        let sealed = ws.heads()[0].clone();
+
+        let deltas = ws.diff(&base, &sealed).unwrap();
+        let d = deltas.iter().find(|d| d.path == Path::new("f.txt")).unwrap();
+        assert!(matches!(d.visibility, Visibility::Restricted(_)), "new side is restricted");
+        assert!(
+            matches!(d.prev_visibility, Some(Visibility::Public)),
+            "the old public side is carried as a transition"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_marks_a_path_sealed_when_the_key_is_not_held() {
+        // #1 acceptance: a caller who lacks the restricted key sees the delta as
+        // sealed (the renderer then shows the address, never the name).
+        let dir_a = std::env::temp_dir().join(format!("loot-diff-seal-a-{}", std::process::id()));
+        let mut alice = authored_ws(&dir_a);
+        std::fs::write(dir_a.join("doc.txt"), b"public").unwrap();
+        alice.snapshot("public base").unwrap();
+        alice.finalize_working().unwrap();
+        let base = alice.heads()[0].clone();
+        // A path sealed to alice alone: bob will hold the ciphertext, not the key.
+        std::fs::write(dir_a.join(".lootattributes"), "secret.txt restricted=alice\n").unwrap();
+        std::fs::write(dir_a.join("secret.txt"), b"top secret").unwrap();
+        alice.snapshot("seal a path").unwrap();
+        alice.finalize_working().unwrap();
+        let sealed_head = alice.heads()[0].clone();
+
+        let (relay_dir, relay) = relay_holding("diffseal", &alice);
+        let dir_b = std::env::temp_dir().join(format!("loot-diff-seal-b-{}", std::process::id()));
+        let mut bob = authored_ws(&dir_b);
+        bob.pull_via(&relay).unwrap();
+
+        let deltas = bob.diff(&base, &sealed_head).unwrap();
+        let d = deltas
+            .iter()
+            .find(|d| d.path == Path::new("secret.txt"))
+            .expect("bob sees the sealed path in the manifest");
+        assert!(d.sealed, "bob lacks the key, so the path is sealed to him");
+        assert!(matches!(d.visibility, Visibility::Restricted(_)), "the class survives");
+        // The two seams composed (diff -> render) — the rendered line the CLI
+        // prints never leaks the name, shows the address + class + tag (#306).
+        let line = crate::render::delta_line(d);
+        assert!(!line.contains("secret.txt"), "the sealed name never renders: {line}");
+        assert!(line.contains("restricted") && line.ends_with("(sealed — no key)"), "{line}");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&relay_dir);
     }
 
     #[test]

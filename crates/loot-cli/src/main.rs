@@ -12,7 +12,8 @@ use loot_core::{
 };
 use loot_identity as identity;
 use render::{
-    change_col, outcome_rows, render_buoy_human, render_history, seal_hint, short, short_change,
+    change_col, delta_line, outcome_rows, render_buoy_human, render_history, seal_hint, short,
+    short_change,
 };
 use std::process::ExitCode;
 use workspace::{
@@ -104,6 +105,7 @@ const OUT: &[&str] = &["--porcelain", "--json"];
 const COMMANDS: &[Verb] = &[
     verb("init", &["--identity"], &[], cmd_init),
     verb("status", &[], OUT, cmd_status),
+    verb("diff", &[], &[], cmd_diff),
     verb("describe", &["-m", "--message", "--allow-demote"], &[], cmd_describe),
     verb("new", &["-m", "--message", "--allow-demote"], SKIP, cmd_new),
     verb("edit", &[], &[], cmd_edit),
@@ -157,6 +159,7 @@ usage:
   loot clone <url> <dir> [--identity <name>]  clone a relay into <dir>
   loot config [set <key> <val>] [unset <key>] [list]  manage global config (~/.config/loot/config)
   loot status [--porcelain|--json]          show the working change read-only (live version id + durable change id; no snapshot)
+  loot diff [<from>] [<to>]                 show which paths changed between two changes (defaults: HEAD vs @ working); selectors: @, HEAD, HEAD~<n>, id prefix
   loot describe -m <message> [--allow-demote <path>]...  record the tree and name the working change
   loot new [-m <message>] [--no-snapshot]   finalize the working change (sign) and start a fresh one; prints the next change id
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
@@ -440,6 +443,33 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         OutFmt::Json => {
             println!("{}", verdict::status_json(row.change_id, version, entries))
         }
+    }
+    Ok(())
+}
+
+/// `loot diff [<from>] [<to>]` (#1): the path-level delta between two changes.
+/// Selectors are the #305 grammar (`@`, `HEAD`, `HEAD~n`, an id prefix); the
+/// defaults are command-specific — no arg diffs HEAD vs the working change, one
+/// arg diffs that change vs the working change, two diffs the pair. Output is
+/// the #306 shared path-delta line, one row per changed path.
+fn cmd_diff(args: &[String]) -> Result<(), String> {
+    let pos = positionals(args);
+    let (from, to) = match pos.as_slice() {
+        [] => ("HEAD", "@"),
+        [a] => (*a, "@"),
+        [a, b] => (*a, *b),
+        _ => return Err("usage: loot diff [<from>] [<to>]".into()),
+    };
+    let ws = Workspace::open()?;
+    let from_oid = ws.resolve_selector(from)?;
+    let to_oid = ws.resolve_selector(to)?;
+    let deltas = ws.diff(&from_oid, &to_oid)?;
+    if deltas.is_empty() {
+        println!("no changes");
+        return Ok(());
+    }
+    for d in &deltas {
+        println!("{}", delta_line(d));
     }
     Ok(())
 }

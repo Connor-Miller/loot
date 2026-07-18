@@ -11,8 +11,8 @@
 //! Anything registry-coupled (resolving a pubkey to a peer name) stays with
 //! the caller and arrives as a closure — rendering knows names, not keyrings.
 
-use crate::workspace::{EditReport, HistoryRow, HistoryView, WorkingRow};
-use loot_core::{MergeOutcome, Oid};
+use crate::workspace::{EditReport, HistoryRow, HistoryView, PathDelta, WorkingRow};
+use loot_core::{verdict, MergeOutcome, Oid, Visibility};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -198,6 +198,92 @@ pub fn outcome_rows(outcomes: &BTreeMap<std::path::PathBuf, MergeOutcome>) -> St
     out
 }
 
+// --- the shared path-delta line (#306, Variant A) ---------------------------
+//
+// The one human-format seam every delta-rendering verb shares — `loot diff`
+// (#1) lands it, `loot status` (#7) and `loot diff --conflict` (#13) consume
+// it. Machine output stays on the `verdict` porcelain/json encoders; this is
+// only the human line. The contract (#306):
+//
+//     {X}  {label}    {visibility}
+//
+// a 2-space git-style gutter carrying the delta class (`+`/`M`/`-`), the path
+// left-padded so the visibility token trails, and the token itself with two
+// human refinements: an embargo humanized to a date, and a visibility change
+// shown inline as `was → now`. When the path is sealed to the caller the label
+// degrades to the content address and the token to its bare class, tagged
+// `(sealed — no key)` — you learn *that* a restricted path changed and its
+// class, never its name.
+
+// The computed value — [`PathDelta`] and its [`DeltaClass`] — lives in
+// `workspace.rs` beside the other compute-value types (`HistoryView`,
+// `WorkingRow`), the direction this module's header describes: the verb
+// computes, rendering turns the value into bytes.
+
+/// Min-width of the label column so the visibility token lines up; a longer
+/// path (or a sealed address) just pushes the token right, git-style (#306).
+const LABEL_WIDTH: usize = 22;
+
+/// The human path-delta line (#306 Variant A). See the section comment for the
+/// contract; `#7`/`#13` call this per row rather than re-deriving the shape.
+pub fn delta_line(d: &PathDelta) -> String {
+    let (label, token) = if d.sealed {
+        // The caller can't read a sealed path's name: show the content address
+        // and keep only the visibility *class*, tagged so the fallback is legible.
+        (format!("{}…", short(&d.oid)), vis_class(&d.visibility).to_string())
+    } else {
+        let token = match &d.prev_visibility {
+            Some(prev) if prev != &d.visibility => {
+                format!("{} → {}", vis_human(prev), vis_human(&d.visibility))
+            }
+            _ => vis_human(&d.visibility),
+        };
+        (d.path.display().to_string(), token)
+    };
+    let mut line = format!("  {}  {:<width$} {}", d.class.gutter(), label, token, width = LABEL_WIDTH);
+    if d.sealed {
+        line.push_str("   (sealed — no key)");
+    }
+    line
+}
+
+/// The visibility token for the human delta line: reuses the `verdict` token
+/// (`public` / `restricted=a,b`) but humanizes an embargo to a calendar date
+/// (`embargoed until 2027-01-15`) — porcelain/json keep the raw `embargoed@<ts>`.
+fn vis_human(vis: &Visibility) -> String {
+    match vis {
+        Visibility::Embargoed { reveal_at } => format!("embargoed until {}", civil_date(*reveal_at)),
+        other => verdict::visibility_token(other),
+    }
+}
+
+/// The bare visibility *class* — what a sealed path shows when the caller can't
+/// read its recipients: `public` / `restricted` / `embargoed`.
+fn vis_class(vis: &Visibility) -> &'static str {
+    match vis {
+        Visibility::Public => "public",
+        Visibility::Restricted(_) => "restricted",
+        Visibility::Embargoed { .. } => "embargoed",
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) for a unix timestamp, so an embargo reveal reads as a
+/// date. Howard Hinnant's `civil_from_days` (epoch 1970-01-01) — no date crate,
+/// keeping the CLI dependency-light (ADR 0005).
+fn civil_date(unix_secs: u64) -> String {
+    let z = (unix_secs / 86_400) as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// The human buoy report (CA4, ADR 0025) — the machine shapes live in
 /// `loot_core::verdict::BuoyVerdict`; this is only the prose.
 pub fn render_buoy_human(
@@ -234,7 +320,9 @@ pub fn render_buoy_human(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::DeltaClass;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     fn oid(b: u8) -> Oid {
         Oid([b; 32])
@@ -329,6 +417,85 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("  a.txt") && lines[0].ends_with("merged"));
         assert!(lines[1].contains("conflict (needs resolution)"));
+    }
+
+    fn delta(class: DeltaClass, path: &str, vis: Visibility) -> PathDelta {
+        PathDelta {
+            class,
+            path: PathBuf::from(path),
+            oid: oid(0x3f),
+            sealed: false,
+            visibility: vis,
+            prev_visibility: None,
+        }
+    }
+
+    #[test]
+    fn delta_line_renders_added_modified_deleted_gutters() {
+        let added = delta_line(&delta(DeltaClass::Added, "README.md", Visibility::Public));
+        let modified = delta_line(&delta(
+            DeltaClass::Modified,
+            "src/main.rs",
+            Visibility::Restricted(vec!["alice".into(), "bob".into()]),
+        ));
+        let deleted = delta_line(&delta(DeltaClass::Deleted, "docs/old-notes.md", Visibility::Public));
+        assert_eq!(added, "  +  README.md              public");
+        assert!(modified.starts_with("  M  src/main.rs") && modified.ends_with("restricted=alice,bob"));
+        assert!(deleted.starts_with("  -  docs/old-notes.md") && deleted.ends_with("public"));
+    }
+
+    #[test]
+    fn delta_line_humanizes_an_embargo_to_a_date() {
+        // 1799971200 = 2027-01-15 00:00:00 UTC (the #306 sample).
+        let line = delta_line(&delta(
+            DeltaClass::Added,
+            "RELEASE.md",
+            Visibility::Embargoed { reveal_at: 1_799_971_200 },
+        ));
+        assert!(line.ends_with("embargoed until 2027-01-15"), "{line}");
+    }
+
+    #[test]
+    fn delta_line_shows_a_visibility_transition_inline() {
+        let mut d = delta(
+            DeltaClass::Modified,
+            ".env",
+            Visibility::Restricted(vec!["alice".into()]),
+        );
+        d.prev_visibility = Some(Visibility::Public);
+        let line = delta_line(&d);
+        assert!(line.ends_with("public → restricted=alice"), "{line}");
+    }
+
+    #[test]
+    fn delta_line_with_equal_visibility_shows_no_transition() {
+        let mut d = delta(DeltaClass::Modified, "a.txt", Visibility::Public);
+        d.prev_visibility = Some(Visibility::Public);
+        let line = delta_line(&d);
+        assert!(line.ends_with("public") && !line.contains('→'), "{line}");
+    }
+
+    #[test]
+    fn delta_line_seals_the_name_when_the_key_is_not_held() {
+        let mut d = delta(
+            DeltaClass::Modified,
+            "secret/plan.md",
+            Visibility::Restricted(vec!["alice".into()]),
+        );
+        d.sealed = true;
+        let line = delta_line(&d);
+        // The path name never leaks; the address stands in, class kept, tag added.
+        assert!(!line.contains("secret/plan.md"), "{line}");
+        assert!(line.contains(&short(&oid(0x3f))) && line.contains('…'), "{line}");
+        assert!(line.contains("restricted") && !line.contains("alice"), "{line}");
+        assert!(line.ends_with("(sealed — no key)"), "{line}");
+    }
+
+    #[test]
+    fn civil_date_maps_known_timestamps() {
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(1_735_689_600), "2025-01-01");
+        assert_eq!(civil_date(1_799_971_200), "2027-01-15");
     }
 
     #[test]
