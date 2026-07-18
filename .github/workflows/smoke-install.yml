@@ -9,7 +9,14 @@ on:
   release:
     types: [published]
   # And on demand, to re-check an existing release without cutting a new one.
+  # The default installer URL is the site's hero one-liner (#260): the proxy at
+  # loot.millerbyte.com must serve the real installer, not just GitHub-direct.
   workflow_dispatch:
+    inputs:
+      installer_url:
+        description: Installer script URL to pipe to sh
+        required: false
+        default: https://loot.millerbyte.com/install.sh
 
 jobs:
   linux-curl-sh:
@@ -21,7 +28,7 @@ jobs:
         shell: bash
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/Connor-Miller/loot/releases/latest/download/loot-cli-installer.sh | sh
+            "${{ inputs.installer_url || 'https://github.com/Connor-Miller/loot/releases/latest/download/loot-cli-installer.sh' }}" | sh
 
       - name: Put the install dir on PATH for the next step
         # The installer targets ~/.loot/bin and edits the shell rc, which does not
