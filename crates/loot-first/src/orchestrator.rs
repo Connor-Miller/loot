@@ -306,9 +306,9 @@ pub fn land_gate(forge: &dyn Forge, f: &LandFacts) -> Result<Gate, String> {
     if f.lane_dock != f.tracked_dock {
         return Ok(Gate::Refuse(format!(
             "PR #{}'s review lane is on dock '{}', but git-main tracks '{}' — a \
-             side-lane change can't project to main directly. Merge it in first: \
-             `loot dock {}` then `loot dock merge {}`, and land from '{}'.",
-            f.pr, f.lane_dock, f.tracked_dock, f.tracked_dock, f.lane_dock, f.tracked_dock
+             side-lane change can't project to main directly. Merge it in first \
+             from the primary: `loot lane merge {}`, then land from '{}'.",
+            f.pr, f.lane_dock, f.tracked_dock, f.lane_dock, f.tracked_dock
         )));
     }
     if review_currency(f.reviewed_version, f.current_version) == Currency::Stale {

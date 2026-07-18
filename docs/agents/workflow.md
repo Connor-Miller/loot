@@ -147,7 +147,7 @@ loot — all absorb through the same converge+ingest path:
 
 When one of these lands while you have local work, the ferry folds your line in
 with a merge — which **signs your work** to make it a merge parent. So it needs a
-name first: an un-described working change makes `ferry` (and `dock merge`, and
+name first: an un-described working change makes `ferry` (and `lane merge`, and
 the `adopt` catch-up) refuse, pointing at `describe -m` (#275). Nothing is lost —
 the capture happens, the disk is untouched, and re-running after naming completes
 the pass. Edits you never captured take two passes, because naming *is* capturing.

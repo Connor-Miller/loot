@@ -12,7 +12,7 @@ use loot_core::{
 };
 use loot_identity as identity;
 use render::{
-    change_col, delta_line, outcome_rows, render_buoy_human, render_history, seal_hint, short,
+    change_col, delta_line, outcome_rows, render_buoy_human, render_history, short,
     short_change,
 };
 use std::process::ExitCode;
@@ -114,8 +114,6 @@ const COMMANDS: &[Verb] = &[
     verb("undo", &[], &[], |_| cmd_undo()),
     verb("op", &[], &[], cmd_op),
     verb("surface", &[], &[], |_| cmd_surface()),
-    verb("dock", &["--at"], OUT, cmd_dock),
-    verb("docks", &[], &[], |_| cmd_docks()),
     verb("lane", &["--ticket", "--name", "--at", "--stale-hours"], OUT, cmd_lane),
     verb("lanes", &[], OUT, cmd_lane_list),
     verb("log", &[], &[], |_| cmd_log()),
@@ -165,14 +163,12 @@ usage:
   loot edit <change-id>                     reopen a finalized tip change as the working change, superseding it on finalize (amend, ADR 0032); refuses on uncaptured edits
   loot abandon <version-id>                 drop a version from a divergent change (marked `!` in log), leaving one; undoable
   loot abandon --head <version-id>          drop an independent live head (a whole fork tip); undoable
-  loot adopt                                catch this dock/lane up to landed main by merging it in (keeps the local line); undoable
-  loot adopt <version-id> [--discard-wip]   settle this dock onto a landed change, discarding the divergent line (no merge); undoable
+  loot adopt                                catch this position up to landed main by merging it in (keeps the local line); undoable
+  loot adopt <version-id> [--discard-wip]   settle this position onto a landed change, discarding the divergent line (no merge); undoable
   loot undo                                 step the view back one operation (refuses across a push/grant/maroon barrier)
   loot op log                               list the operation log (newest first; barriers flagged)
   loot op restore <n>                       jump the view to operation <n> (redo lands here after an undo)
   loot surface                              materialize what the current identity may see
-  loot dock <name> --at <dir>               bind a separate worktree over the shared store (in-place switch retired — use `loot lane new`)
-  loot docks                                list docks with their tip and visibility
   loot log                                  show change history
   loot gc [--dry-run]                       prune loose objects no change references (--dry-run reports only)
   loot bundle <file>                        write a sync bundle (ciphertext, no private keys)
@@ -183,13 +179,9 @@ usage:
   loot pull-grants [<url>] [--remote <name>]   fetch, verify, and apply sealed grants from relay
   loot maroon [--hard] <path> <identity> [dir]  cut off <identity> from future access; --hard adds a purge event
   loot migrate <path> <vis-spec> [dir]      change a path's visibility (public | restricted=a,b | embargoed=<ts>)
-  loot dock <name> --at <dir>               bind a separate worktree over the shared store (ADR 0022; in-place switch retired #3b)
-  loot dock merge <name> [--porcelain|--json]  merge another dock's finalized tip into the current dock (local, CA2)
-  loot dock rm <name>                       remove a dock: drop its parked unsigned WIP + pointers; undoable (#212)
-  loot docks                                list docks with their working tip
-                                            (convention: a dock named `harbor` is the shared integration dock)
   loot lane new [--ticket <n>] [--name <n>] [--at <dir>] [--porcelain|--json]  spawn a sealed ephemeral lane over the shared store (primary-only, keyed repos; ADR 0034); --ticket derives the handle (t<n>) for the claim-to-lane flow (#232)
   loot lanes [--porcelain|--json]           lane observability: id, name, path, tip, in-flight PR, dirty/clean, heartbeat, landed/stale — check before acting on shared state (alias: loot lane list)
+  loot lane merge <id-or-name> [--porcelain|--json]  fold a named lane's finalized line into the primary (local, CA2; ADR 0034 — a dock is a named lane)
   loot lane name <n>                        (inside a lane) promote it to a dock — persists until removed
   loot lane rm <id-or-name>                 reap a lane: delete its directory + registry entry (NOT undoable)
   loot lane gc [--stale-hours <h>]          sweep unnamed lanes that landed or went stale (default 24h)
@@ -715,20 +707,6 @@ fn cmd_surface() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_docks() -> Result<(), String> {
-    let ws = Workspace::open()?;
-    for d in ws.dock_list() {
-        let marker = if d.current { "*" } else { " " };
-        let head = d.head.as_ref().map(short).unwrap_or_else(|| "(empty)".to_string());
-        let vis = match d.visibility {
-            Some((total, restricted, embargoed)) => seal_hint(total, restricted, embargoed),
-            None => String::new(),
-        };
-        println!("{marker} {:<20} {}{}", d.name, head, vis);
-    }
-    Ok(())
-}
-
 fn cmd_gc(args: &[String]) -> Result<(), String> {
     let dry_run = args.iter().any(|a| a == "--dry-run" || a == "-n");
     let mut ws = Workspace::open()?;
@@ -1230,72 +1208,23 @@ const fn subspec(
     FlagSpec { bin: "loot", name, valued, bare }
 }
 
-/// `loot dock`'s subcommand specs (#278): merge / rm / the create form.
-const DOCK_MERGE: FlagSpec = subspec("dock merge", &[], OUT);
-const DOCK_RM: FlagSpec = subspec("dock rm", &[], &[]);
-const DOCK_CREATE: FlagSpec = subspec("dock <name>", &["--at"], &[]);
-#[cfg(test)]
-const DOCK_SUBS: &[&FlagSpec] = &[&DOCK_MERGE, &DOCK_RM, &DOCK_CREATE];
-
-fn cmd_dock(args: &[String]) -> Result<(), String> {
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    // Subcommand forms: `loot dock merge <name>` collapses another dock's tip
-    // into this one locally (CA2); `loot dock rm <name>` removes a dock
-    // (#212). Everything else is create/switch.
-    if positional.first().map(|s| s.as_str()) == Some("merge") {
-        DOCK_MERGE.check_sub(args)?;
-        let name = positional
-            .get(1)
-            .ok_or("usage: loot dock merge <name>")?;
-        return cmd_dock_merge(name, args);
-    }
-    if positional.first().map(|s| s.as_str()) == Some("rm") {
-        DOCK_RM.check_sub(args)?;
-        let name = positional.get(1).ok_or("usage: loot dock rm <name>")?;
-        let mut ws = Workspace::open()?;
-        let parked = ws.remove_dock(name)?;
-        match parked {
-            Some(w) => println!(
-                "removed dock '{name}' — dropped its parked working change {} (unsigned, never travelled); `loot undo` brings both back",
-                short(&w)
-            ),
-            None => println!("removed dock '{name}' — its pointers only; signed history is untouched"),
-        }
-        return Ok(());
-    }
-    DOCK_CREATE.check_sub(args)?;
-    let name = positional
-        .first()
-        .ok_or("usage: loot dock <name> --at <dir>  |  loot dock merge <name>  |  loot dock rm <name>")?;
-    // In-place switching is retired (#3b): a bare `loot dock <name>` now returns
-    // the "use a lane or --at" refusal from `create_dock`; only `--at` proceeds.
-    let at = flag(args, "--at").map(std::path::PathBuf::from);
-    let mut ws = Workspace::open()?;
-    ws.create_dock(name, at.as_deref())?;
-    if let Some(dir) = &at {
-        println!(
-            "created dock '{name}' at {} — a separate working tree over this repo's shared store",
-            dir.display()
-        );
-    }
-    ws.record_op("dock", &format!("dock {name}"), false);
-    Ok(())
-}
-
 /// `loot lane`'s subcommand specs (#278).
 const LANE_NEW: FlagSpec = subspec("lane new", &["--ticket", "--name", "--at"], OUT);
 const LANE_LIST: FlagSpec = subspec("lane list", &[], OUT);
+const LANE_MERGE: FlagSpec = subspec("lane merge", &[], OUT);
 const LANE_NAME: FlagSpec = subspec("lane name", &[], &[]);
 const LANE_RM: FlagSpec = subspec("lane rm", &[], &[]);
 const LANE_GC: FlagSpec = subspec("lane gc", &["--stale-hours"], &[]);
 #[cfg(test)]
-const LANE_SUBS: &[&FlagSpec] = &[&LANE_NEW, &LANE_LIST, &LANE_NAME, &LANE_RM, &LANE_GC];
+const LANE_SUBS: &[&FlagSpec] =
+    &[&LANE_NEW, &LANE_LIST, &LANE_MERGE, &LANE_NAME, &LANE_RM, &LANE_GC];
 
-/// `loot lane <new|list|name|rm|gc>` — the sealed-lane lifecycle (ADR 0034,
-/// #231). A lane is an ephemeral working directory over this repo's shared
+/// `loot lane <new|list|merge|name|rm|gc>` — the sealed-lane lifecycle (ADR
+/// 0034, #231). A lane is an ephemeral working directory over this repo's shared
 /// store, born at the finalized tip; naming it makes it a dock (persisted).
 /// Unnamed lanes are reaped by `lane gc` once their change lands or their
-/// heartbeat goes stale.
+/// heartbeat goes stale; `merge` folds a lane's finalized line into the primary
+/// (#253, the former `loot dock merge`).
 fn cmd_lane(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     // Each arm re-gates against its own spec (#278) before the workspace
@@ -1349,6 +1278,11 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             LANE_LIST.check_sub(args)?;
             cmd_lane_list(args)
         }
+        "merge" => {
+            LANE_MERGE.check_sub(args)?;
+            let key = args.get(1).ok_or("usage: loot lane merge <id-or-name>")?;
+            cmd_lane_merge(key, args)
+        }
         "name" => {
             LANE_NAME.check_sub(args)?;
             let name = args.get(1).ok_or("usage: loot lane name <name>  (inside the lane)")?;
@@ -1400,7 +1334,7 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
         }
         other => Err(format!(
             "unknown lane subcommand '{other}'\n\nusage: loot lane new [--ticket <n>] [--name <n>] \
-             [--at <dir>] | list | name <n> | rm <id-or-name> | gc [--stale-hours <h>]"
+             [--at <dir>] | list | merge <id-or-name> | name <n> | rm <id-or-name> | gc [--stale-hours <h>]"
         )),
     }
 }
@@ -1500,36 +1434,37 @@ fn fmt_age(secs: u64) -> String {
     }
 }
 
-/// `loot dock merge <name> [--porcelain|--json]` — collapse another dock's tip
-/// into this one (CA2). A reconciliation verb, so it emits the shared verdict
-/// rows for the merge outcomes in machine formats (CA3, ADR 0023) — dropping the
-/// typed outcomes at the `println!` boundary was the exact anti-pattern CA3
-/// removed everywhere else (#126).
-fn cmd_dock_merge(name: &str, args: &[String]) -> Result<(), String> {
+/// `loot lane merge <id-or-name> [--porcelain|--json]` — fold a named lane's
+/// finalized line into the primary (CA2; ADR 0034 — a dock is a named lane). A
+/// reconciliation verb, so it emits the shared verdict rows for the merge
+/// outcomes in machine formats (CA3, ADR 0023) — dropping the typed outcomes at
+/// the `println!` boundary was the exact anti-pattern CA3 removed everywhere
+/// else (#126).
+fn cmd_lane_merge(key: &str, args: &[String]) -> Result<(), String> {
     let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
     let current = ws.current_dock().unwrap_or("main").to_string();
-    let (_source, outcomes) = ws.merge_dock(name)?;
+    let (source, outcomes) = ws.merge_lane(key)?;
     if !outcomes.is_empty() {
-        ws.record_op("dock merge", &format!("merge {name} → {current}"), false);
+        ws.record_op("lane merge", &format!("merge {source} → {current}"), false);
     }
 
     match fmt {
         OutFmt::Human => {
             if outcomes.is_empty() {
-                println!("merge '{name}' → '{current}': already up to date");
+                println!("merge lane '{source}' → '{current}': already up to date");
                 return Ok(());
             }
-            println!("merged dock '{name}' into '{current}':");
+            println!("merged lane '{source}' into '{current}':");
             print!("{}", outcome_rows(&outcomes));
             let conflicts = outcomes
                 .values()
                 .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
                 .count();
             if conflicts > 0 {
-                println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances this dock's tip");
+                println!("resolve {conflicts} conflict(s) with `loot resolve <path> <file>` — each advances the primary's tip");
             } else {
-                println!("merge committed as this dock's tip; run `loot log` to see it");
+                println!("merge committed as the primary's tip; run `loot log` to see it");
             }
         }
         // Machine output: the merge verdict rows only, no prose (empty -> no lines).
@@ -2359,11 +2294,11 @@ mod tests {
                 None => continue, // not a verb line (prose that mentions `loot`)
             };
             // #278: a line that documents a subcommand (`loot lane gc …`,
-            // `loot dock <name> …`) must also pass that subcommand's own
+            // `loot lane merge …`) must also pass that subcommand's own
             // gate — the verb's union alone would hide a flag documented on
             // the wrong sibling.
             let subhead = rest.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-            let subspec = LANE_SUBS.iter().chain(DOCK_SUBS).find(|s| s.name == subhead);
+            let subspec = LANE_SUBS.iter().find(|s| s.name == subhead);
             // Usage decorates flags with brackets and alternation:
             // `[--porcelain|--json]`, `[-m <message>]`.
             for token in rest.split(|c: char| c.is_whitespace() || "[]|()".contains(c)) {
@@ -2397,8 +2332,7 @@ mod tests {
         assert_eq!(check("new", &["--ignore-working-copy"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("abandon", &["--head", "a3f9"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("adopt", &["a3f9", "--discard-wip"]), Ok(FlagCheck::Proceed));
-        assert_eq!(check("dock", &["merge", "x", "--json"]), Ok(FlagCheck::Proceed));
-        assert_eq!(check("dock", &["x", "--at", "dir"]), Ok(FlagCheck::Proceed));
+        assert_eq!(check("lane", &["merge", "x", "--json"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("lane", &["new", "--ticket", "67", "--name", "n", "--at", "d", "--json"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("lane", &["gc", "--stale-hours", "12"]), Ok(FlagCheck::Proceed));
         assert_eq!(check("lanes", &["--porcelain"]), Ok(FlagCheck::Proceed));
@@ -2471,12 +2405,10 @@ mod tests {
         let err = cmd_lane(&args(&["rm", "t1", "--porcelain"])).unwrap_err();
         assert!(err.contains("`loot lane rm` takes no flags"), "{err}");
 
-        // The issue's `dock` example: `--at` is the create form's flag.
-        let err = cmd_dock(&args(&["rm", "x", "--at", "y"])).unwrap_err();
-        assert!(err.contains("--at"), "{err}");
-        assert!(err.contains("`loot dock rm` takes no flags"), "{err}");
-        let err = cmd_dock(&args(&["merge", "x", "--at", "y"])).unwrap_err();
-        assert!(err.contains("`loot dock merge` accepts"), "{err}");
+        // `lane merge` takes only the machine-output selectors — an unrelated
+        // sibling flag (`--at`, the create form's) is refused, not ignored.
+        let err = cmd_lane(&args(&["merge", "x", "--at", "y"])).unwrap_err();
+        assert!(err.contains("`loot lane merge` accepts"), "{err}");
     }
 
     /// Each subcommand's own flags still pass its gate — the narrowed specs
@@ -2490,9 +2422,7 @@ mod tests {
         ok(&LANE_NAME, &["name", "n"]);
         ok(&LANE_RM, &["rm", "t1"]);
         ok(&LANE_GC, &["gc", "--stale-hours", "12"]);
-        ok(&DOCK_MERGE, &["merge", "x", "--json"]);
-        ok(&DOCK_RM, &["rm", "x"]);
-        ok(&DOCK_CREATE, &["x", "--at", "dir"]);
+        ok(&LANE_MERGE, &["merge", "x", "--json"]);
     }
 
     /// The two gates must agree on which flags exist under the verb: the
@@ -2511,12 +2441,12 @@ mod tests {
                 subs.iter().flat_map(|s| s.bare).copied().collect(),
             )
         };
-        for (verb, subs) in [("lane", LANE_SUBS), ("dock", DOCK_SUBS)] {
-            let table = &COMMANDS.iter().find(|v| v.spec.name == verb).unwrap().spec;
-            let (valued, bare) = union(subs);
-            assert_eq!(table.valued.iter().copied().collect::<BTreeSet<_>>(), valued, "{verb}");
-            assert_eq!(table.bare.iter().copied().collect::<BTreeSet<_>>(), bare, "{verb}");
-        }
+        // `lane` is the only multi-subcommand verb now that `dock` is retired
+        // (#253); its table entry must stay the union over `lane`'s subspecs.
+        let table = &COMMANDS.iter().find(|v| v.spec.name == "lane").unwrap().spec;
+        let (valued, bare) = union(LANE_SUBS);
+        assert_eq!(table.valued.iter().copied().collect::<BTreeSet<_>>(), valued, "lane");
+        assert_eq!(table.bare.iter().copied().collect::<BTreeSet<_>>(), bare, "lane");
     }
 
     /// Bare `loot lane` defaults to `list` — it must not panic slicing an

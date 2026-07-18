@@ -184,7 +184,6 @@ const TREE_HASH: &str = "tree-hash";
 const NEXT_CHANGE: &str = "next-change";
 const TIP: &str = "tip";
 const DOCK: &str = "dock";
-const DOCKS: &str = "docks";
 const CONFIG: &str = "config";
 const GIT_MIRROR: &str = "git-mirror";
 const OPS: &str = "ops";
@@ -199,7 +198,9 @@ const STORE_LOCK: &str = "store.lock";
 /// The default dock every repo starts on — the primary directory (ADR 0022
 /// physical model). Its process files are the root `.loot/working`/`tree-hash`/
 /// `tip`, so a repo that never touches docks is byte-for-byte unchanged on disk.
-/// Named docks live under `.loot/docks/<name>/`.
+/// Named `.loot/docks/` are retired (#253/ADR 0034): a second position is a
+/// sealed lane whose own `.loot/` carries its process files, so every position
+/// now resolves against the home selector and the primary is the only dock.
 pub const HOME_DOCK: &str = "main";
 const OBJECTS: &str = "objects";
 const ID: &str = "id";
@@ -272,22 +273,23 @@ impl RepoStore {
     pub fn conflicts(&self) -> PathBuf { self.lane.join(CONFLICTS) }
     pub fn attestations(&self) -> PathBuf { self.dot.join(ATTESTATIONS) }
 
-    // --- Workspace-owned process artifacts (per-dock, ADR 0022) ---
+    // --- Workspace-owned process artifacts (lane-owned, ADR 0034) ---
     //
-    // `dock: None` selects the home dock (root files, unchanged on disk); `Some`
-    // selects a named dock under `.loot/docks/<name>/`. The no-arg `config` and
-    // the ambient-dock pointer are repo-wide, not per-dock.
+    // These live at this store instance's *lane root* — `.loot/` on the primary,
+    // the lane's own `.loot/` for a spawned lane. The `dock` selector is always
+    // the home selector now that named `.loot/docks/` are retired (#253); the
+    // parameter survives until the deferred full dissolve (ADR 0034 consequence).
+    // The no-arg `config` and the ambient-dock pointer are repo-wide.
     pub fn config(&self) -> PathBuf { self.dot.join(CONFIG) }
 
-    /// Directory a dock's process files live in: the lane root for home, else
-    /// `<lane root>/docks/<name>/`. Dock state is positional, so it is
-    /// lane-owned (ADR 0034) — on the primary the lane root is `.loot/` itself,
-    /// the unchanged pre-lane shape.
+    /// Directory a position's process files live in: this store instance's lane
+    /// root. Named docks are retired (#253/ADR 0034), so the selector only ever
+    /// picks home — on the primary the lane root is `.loot/` itself, the
+    /// unchanged pre-lane shape; on a spawned lane it is the lane's own `.loot/`.
     fn dock_dir(&self, dock: Option<&str>) -> PathBuf {
-        match dock {
-            None => self.lane.clone(),
-            Some(name) => self.lane.join(DOCKS).join(name),
-        }
+        debug_assert!(dock.is_none(), "named docks are retired (#253); the selector is always home");
+        let _ = dock;
+        self.lane.clone()
     }
 
     pub fn working(&self, dock: Option<&str>) -> PathBuf { self.dock_dir(dock).join(WORKING) }
@@ -299,7 +301,6 @@ impl RepoStore {
     /// Absent (or `home`) means the home dock — so pre-dock repos read as home.
     /// Positional, so lane-owned.
     pub fn dock_pointer(&self) -> PathBuf { self.lane.join(DOCK) }
-    pub fn docks_dir(&self) -> PathBuf { self.lane.join(DOCKS) }
 
     // --- loot-identity-owned artifacts (named here; written there) ---
     pub fn id(&self) -> PathBuf { self.dot.join(ID) }
@@ -448,50 +449,11 @@ impl RepoStore {
         }
     }
 
-    /// Point the workspace at `name`. Writing [`HOME_DOCK`] removes the pointer so
-    /// the repo returns to its pristine, pre-dock on-disk shape.
-    pub fn write_dock(&self, name: &str) -> std::io::Result<()> {
-        if name == HOME_DOCK {
-            let _ = std::fs::remove_file(self.dock_pointer());
-            Ok(())
-        } else {
-            std::fs::write(self.dock_pointer(), name)
-        }
-    }
-
-    /// Create a named dock's directory (idempotent). Home needs none.
-    pub fn ensure_dock_dir(&self, name: &str) -> std::io::Result<()> {
-        std::fs::create_dir_all(self.docks_dir().join(name))
-    }
-
-    /// Remove a named dock's directory and its pointer files (`loot dock rm`,
-    /// #212). Pointer bookkeeping only — graph nodes and objects are never
-    /// touched here, and the op view captures every dock's files, so a restore
-    /// recreates the directory. Home has no directory and is never removable.
-    pub fn remove_dock_dir(&self, name: &str) -> std::io::Result<()> {
-        std::fs::remove_dir_all(self.docks_dir().join(name))
-    }
-
-    /// True if `name` is the home dock or an existing named dock.
-    pub fn dock_exists(&self, name: &str) -> bool {
-        name == HOME_DOCK || self.docks_dir().join(name).is_dir()
-    }
-
-    /// Every dock in the repo: home first, then named docks sorted. Home is
-    /// always present even before `.loot/docks/` exists.
-    pub fn list_docks(&self) -> Vec<String> {
-        let mut named: Vec<String> = std::fs::read_dir(self.docks_dir())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect();
-        named.sort();
-        let mut out = vec![HOME_DOCK.to_string()];
-        out.extend(named);
-        out
-    }
+    // Named-dock directory management (`ensure_dock_dir`/`remove_dock_dir`/
+    // `dock_exists`/`list_docks`) and the ambient-pointer writer (`write_dock`)
+    // are retired with `.loot/docks/` (#253/ADR 0034): the primary is the only
+    // dock and every other position is a sealed lane in the registry. `read_dock`
+    // survives to read a legacy `.loot/dock` pointer (it returns home otherwise).
 
     // --- lineage persistence (ADR 0022 physical model) ---
     //
@@ -706,9 +668,11 @@ impl LaneEntry {
     }
 }
 
-/// Validate a name for a *new* named dock. The charset (ASCII alphanumerics plus
-/// `-`/`_`) is deliberately narrow so a name can never traverse or escape the
-/// `.loot/docks/` directory. Home is reserved — it always exists.
+/// Validate a name for a *new* lane or its promoted dock-name (#253/ADR 0034).
+/// The charset (ASCII alphanumerics plus `-`/`_`) is deliberately narrow so a
+/// name can never traverse or escape a directory when it seeds a lane directory
+/// or a registry entry id. Home (`main`) is reserved — the primary always holds
+/// it.
 pub fn valid_dock_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("dock name cannot be empty".into());
@@ -771,14 +735,13 @@ mod tests {
     }
 
     #[test]
-    fn home_dock_uses_root_files_named_docks_are_nested() {
-        // The compat guarantee: home's process files are the root files, so a
-        // repo that never docks looks exactly as before.
+    fn home_position_uses_root_files() {
+        // The compat guarantee: the primary's process files are the root files,
+        // so a repo that never spawns a lane looks exactly as before. Named
+        // `.loot/docks/` are retired (#253) — the selector is always home.
         let s = RepoStore::new("/tmp/repo/.loot");
         assert!(s.working(None).ends_with(".loot/working"));
         assert!(s.tip(None).ends_with(".loot/tip"));
-        assert!(s.working(Some("feat")).ends_with(".loot/docks/feat/working"));
-        assert!(s.tip(Some("feat")).ends_with(".loot/docks/feat/tip"));
     }
 
     #[test]
@@ -814,33 +777,18 @@ mod tests {
     }
 
     #[test]
-    fn docks_are_isolated_and_listed_home_first() {
-        let dir = std::env::temp_dir().join(format!("loot-store-docks-{}", std::process::id()));
+    fn read_dock_defaults_to_home_without_a_pointer() {
+        // The ambient pointer is retired (#253/ADR 0034): nothing writes
+        // `.loot/dock` anymore, so a repo always reads as the home dock. A legacy
+        // pointer file, if one survives, still reads back for compatibility.
+        let dir = std::env::temp_dir().join(format!("loot-store-dock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let s = RepoStore::new(&dir);
 
-        // Ambient defaults to home with no pointer on disk.
-        assert_eq!(s.read_dock(), HOME_DOCK);
-        assert_eq!(s.list_docks(), vec![HOME_DOCK.to_string()], "home always present");
-
-        // A named dock's tip is independent of home's.
-        s.ensure_dock_dir("feat").unwrap();
-        s.write_tip(None, Some(&Oid([1; 32]))).unwrap();
-        s.write_tip(Some("feat"), Some(&Oid([2; 32]))).unwrap();
-        assert_eq!(s.read_tip(None), Some(Oid([1; 32])));
-        assert_eq!(s.read_tip(Some("feat")), Some(Oid([2; 32])), "per-dock tips don't collide");
-
-        // Ambient pointer round-trips; writing home clears it back to pristine.
-        s.write_dock("feat").unwrap();
-        assert_eq!(s.read_dock(), "feat");
-        assert!(s.dock_pointer().exists());
-        s.write_dock(HOME_DOCK).unwrap();
-        assert_eq!(s.read_dock(), HOME_DOCK);
-        assert!(!s.dock_pointer().exists(), "home removes the pointer (compat shape)");
-
-        assert_eq!(s.list_docks(), vec![HOME_DOCK.to_string(), "feat".to_string()]);
-        assert!(s.dock_exists("feat") && s.dock_exists(HOME_DOCK) && !s.dock_exists("nope"));
+        assert_eq!(s.read_dock(), HOME_DOCK, "no pointer reads as home");
+        std::fs::write(s.dock_pointer(), "legacy").unwrap();
+        assert_eq!(s.read_dock(), "legacy", "a legacy pointer still reads back");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -881,7 +829,6 @@ mod tests {
             s.abandoned(),
             s.conflicts(),
             s.dock_pointer(),
-            s.docks_dir(),
         ] {
             assert!(
                 lane_owned.starts_with("/repo-lanes/l1/.loot"),

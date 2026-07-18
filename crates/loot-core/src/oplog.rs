@@ -60,24 +60,22 @@ pub struct View {
 
 impl View {
     /// Snapshot the current on-disk view from `store`. Reads only pointer/cache
-    /// files (heads, working-change, conflicts, and each dock's working/tip/
+    /// files (heads, working-change, conflicts, and this position's working/tip/
     /// tree-hash/next-change); never the object store or the finalized graph.
+    ///
+    /// Only the ambient (home) position is captured (#253/ADR 0034): named
+    /// `.loot/docks/` are retired, and a lane's undo history is lane-local — the
+    /// op log never references another position's state. The single home entry
+    /// preserves the on-disk `docks` vec format, so older op logs still decode.
     pub fn capture(store: &RepoStore) -> View {
         let read = |p: std::path::PathBuf| std::fs::read(p).ok();
-        let docks = store
-            .list_docks()
-            .into_iter()
-            .map(|name| {
-                let sel = dock_selector(&name);
-                DockView {
-                    working: read(store.working(sel)),
-                    tip: read(store.tip(sel)),
-                    tree_hash: read(store.tree_hash(sel)),
-                    next_change: read(store.next_change(sel)),
-                    name,
-                }
-            })
-            .collect();
+        let docks = vec![DockView {
+            working: read(store.working(None)),
+            tip: read(store.tip(None)),
+            tree_hash: read(store.tree_hash(None)),
+            next_change: read(store.next_change(None)),
+            name: crate::HOME_DOCK.to_string(),
+        }];
         View {
             heads: read(store.heads()),
             working_change: read(store.working_change()),
@@ -99,14 +97,17 @@ impl View {
         put_file(&store.dock_pointer(), self.dock_pointer.as_deref())?;
         put_file(&store.abandoned(), self.abandoned.as_deref())?;
         for d in &self.docks {
-            let sel = dock_selector(&d.name);
-            if sel.is_some() {
-                store.ensure_dock_dir(&d.name)?;
+            // Named `.loot/docks/` are retired (#253/ADR 0034): only the home
+            // position restores. A named entry can only come from an op log
+            // written before the retirement, and its dock directory no longer
+            // exists — skip it rather than resurrect a retired position.
+            if is_legacy_named_dock(&d.name) {
+                continue;
             }
-            put_file(&store.working(sel), d.working.as_deref())?;
-            put_file(&store.tip(sel), d.tip.as_deref())?;
-            put_file(&store.tree_hash(sel), d.tree_hash.as_deref())?;
-            put_file(&store.next_change(sel), d.next_change.as_deref())?;
+            put_file(&store.working(None), d.working.as_deref())?;
+            put_file(&store.tip(None), d.tip.as_deref())?;
+            put_file(&store.tree_hash(None), d.tree_hash.as_deref())?;
+            put_file(&store.next_change(None), d.next_change.as_deref())?;
         }
         Ok(())
     }
@@ -307,10 +308,12 @@ fn op_at(ops: &[Operation], index: u32) -> Option<&Operation> {
     (index >= 1).then(|| ops.get((index - 1) as usize)).flatten()
 }
 
-/// Map a dock name to the [`RepoStore`] selector: the home dock uses the root
-/// files (`None`), a named dock its `.loot/docks/<name>/` subtree.
-fn dock_selector(name: &str) -> Option<&str> {
-    (name != crate::HOME_DOCK).then_some(name)
+/// Whether a captured entry is a legacy named dock — anything but the home
+/// dock. Named docks are retired (#253/ADR 0034), so such an entry can only come
+/// from an op log written before the retirement, and `restore` skips it rather
+/// than routing it to a `.loot/docks/` that no longer exists.
+fn is_legacy_named_dock(name: &str) -> bool {
+    name != crate::HOME_DOCK
 }
 
 /// Write `bytes` to `path`, or remove the file when `None` (best-effort removal),

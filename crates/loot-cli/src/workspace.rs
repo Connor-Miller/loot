@@ -47,17 +47,19 @@ pub struct Workspace {
     root: PathBuf,
     identity: String,
     repo: DagRepo,
-    /// The ambient dock this workspace is on (ADR 0022). `HOME_DOCK` uses the
-    /// root `.loot/` process files, so a repo that never docks is unchanged on
-    /// disk; named docks live under `.loot/docks/<name>/`.
+    /// The dock this workspace is on — always `HOME_DOCK` now that named docks
+    /// are retired (#253/ADR 0034): the primary and every lane use the root
+    /// `.loot/` process files of their own store instance, so a repo that never
+    /// spawns a lane is byte-for-byte unchanged on disk.
     dock: String,
     /// The working change being rewritten in place, if one is in progress.
     /// `None` right after `init` or `apply` (finalized history, no WIP change).
     working: Option<Oid>,
-    /// The finalized change the ambient dock forks from — new snapshots parent on
-    /// it (ADR 0022). `None` on the home dock until a dock is created, which
-    /// selects the pre-dock behavior (fork from all heads) and keeps existing
-    /// repos byte-for-byte unchanged.
+    /// The finalized change this position forks from — new snapshots parent on it
+    /// (ADR 0022). `None` on a fresh primary that never pinned a tip, selecting
+    /// the pre-dock behavior (fork from all heads) and keeping existing repos
+    /// byte-for-byte unchanged; a lane, or a primary `adopt`/`lane merge` seeded,
+    /// tracks it ([`tracks_tip`](Self::tracks_tip)).
     tip: Option<Oid>,
     /// The durable change id `loot new` minted eagerly for the *next* change
     /// (ADR 0029/0030), before any snapshot has recorded it. The fresh working
@@ -89,10 +91,16 @@ impl Workspace {
     /// Load a repo rooted at an explicit directory (used by `clone`).
     pub fn open_at(dir: &Path) -> Result<Self, String> {
         let loot = dir.join(DOT);
-        // A `--at` worktree dock has a `.loot` *pointer file* (not a directory)
-        // naming the shared store and its dock (ADR 0022 physical model).
+        // A `.loot` *pointer file* (not a directory) is a retired `--at` worktree
+        // dock (#253/ADR 0034): named docks are gone, so this only ever appears as
+        // a dangling pointer from before the retirement. Refuse with the remedy.
         if loot.is_file() {
-            return Self::open_worktree(dir, &loot);
+            return Err(format!(
+                "{} is a retired `--at` worktree-dock pointer (named docks are gone, \
+                 ADR 0034/#253). Delete this directory and use `loot lane new` for a \
+                 sealed position over the shared store.",
+                dir.display()
+            ));
         }
         // A spawned lane's `.loot` is a *directory* whose `store` file points at
         // the shared store; every lane-owned file lives here (ADR 0034).
@@ -131,31 +139,6 @@ impl Workspace {
         Self::assemble(shared.to_path_buf(), store, dir.to_path_buf(), dock, Some(lane_id))
     }
 
-    /// Load a worktree dock: its `.loot` pointer file names the shared store (where
-    /// the graph/objects/dock state live) and this dock; files materialize here.
-    fn open_worktree(dir: &Path, pointer: &Path) -> Result<Self, String> {
-        let text = read_to_string(pointer)?;
-        let mut shared: Option<PathBuf> = None;
-        let mut dock: Option<String> = None;
-        for line in text.lines() {
-            if let Some(v) = line.strip_prefix("store =") {
-                shared = Some(PathBuf::from(v.trim()));
-            } else if let Some(v) = line.strip_prefix("dock =") {
-                dock = Some(v.trim().to_string());
-            }
-        }
-        let shared = shared.ok_or("malformed .loot pointer: missing `store`")?;
-        let dock = dock.ok_or("malformed .loot pointer: missing `dock`")?;
-        let store = RepoStore::new(&shared);
-        if !store.identity().exists() {
-            return Err(format!(
-                "worktree at {} points at a missing store {}",
-                dir.display(),
-                shared.display()
-            ));
-        }
-        Self::assemble(shared, store, dir.to_path_buf(), dock, None)
-    }
 
     /// Finish loading once the store, working `root`, and ambient `dock` are
     /// known (shared by the primary, worktree, and lane open paths). `dot` is
@@ -1127,20 +1110,17 @@ impl Workspace {
     }
 
     /// The [`Liveness`] view for the current operation (#216, map #215): the
-    /// graph plus this store's abandoned set and the sibling docks' parked
-    /// working changes — everything the rule behind the `!` marker needs, in
-    /// one place. Build once per operation; queries answer from the cached
-    /// view. Public because it IS the read interface for liveness questions
-    /// (version resolution in the CLI included).
+    /// graph plus this store's abandoned set — everything the rule behind the
+    /// `!` marker needs, in one place. Build once per operation; queries answer
+    /// from the cached view. Public because it IS the read interface for
+    /// liveness questions (version resolution in the CLI included).
+    ///
+    /// No parked working changes feed in anymore (#253/ADR 0034): with named
+    /// docks retired, the only other positions are sealed lanes whose unsigned
+    /// WIP is lane-local and never visible here — there is no cross-position
+    /// parked head for this position to skip.
     pub fn liveness(&self) -> loot_core::Liveness {
-        let parked: Vec<Oid> = self
-            .store
-            .list_docks()
-            .iter()
-            .filter(|name| name.as_str() != self.dock)
-            .filter_map(|name| self.store.read_working(opt(name)))
-            .collect();
-        self.repo.liveness(&self.store.read_abandoned(), &parked)
+        self.repo.liveness(&self.store.read_abandoned(), &[])
     }
 
     /// Resolve a **version-id** hex prefix among this dock's LIVE version
@@ -1840,15 +1820,19 @@ impl Workspace {
         }
 
         // Reopen: the engine mints the superseding sibling working node; the
-        // dock re-anchors on the edited change's parent so re-snapshots keep
+        // position re-anchors on the edited change's parent so re-snapshots keep
         // the sibling parentage (the working change forks from the tip, ADR
         // 0006 — after `edit`, the tip is the parent and the working change is
         // the reopened version). The cleanliness guard proved the disk already
-        // shows the target's tree, so nothing materializes.
+        // shows the target's tree, so nothing materializes. Re-anchoring is
+        // gated on [`tracks_tip`](Self::tracks_tip) so a pristine primary that
+        // never pinned a tip stays byte-for-byte unchanged on disk (the compat
+        // guarantee) — a lane, or a primary that `adopt`/`lane merge` seeded,
+        // re-anchors and so amends as a sibling.
         let reopened = self.repo.reopen_change(&target).map_err(|e| e.to_string())?;
         let parent = self.repo.parents_of(&target).into_iter().next();
         self.working = Some(reopened.clone());
-        if self.docks_active() {
+        if self.tracks_tip() {
             self.tip = parent;
             let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
         }
@@ -1904,10 +1888,12 @@ impl Workspace {
         Ok(ws)
     }
 
-    // --- docks (ADR 0022) ---
+    // --- positions (ADR 0034) ---
 
-    /// The ambient dock name, or `None` on the primary/default dock (which the
-    /// CLI displays as `main`). `Some(name)` for a named or `--at` dock.
+    /// The ambient dock name, or `None` on the primary (which the CLI displays
+    /// as `main`). Named docks are retired (#253/ADR 0034) and in-place
+    /// switching died in layer 1, so a lane opens as the home dock too — this is
+    /// `None` everywhere now, kept as the seam loot-first's land gate reads.
     pub fn current_dock(&self) -> Option<&str> {
         if self.dock == HOME_DOCK {
             None
@@ -1916,29 +1902,25 @@ impl Workspace {
         }
     }
 
-    /// The store selector for the ambient dock: `None` for home (root files),
-    /// `Some(name)` for a named dock under `.loot/docks/`.
+    /// The store selector for this position's process files: always the home
+    /// selector (`None`) now that named `.loot/docks/` are retired (#253/ADR
+    /// 0034). A lane's files resolve against its own `.loot/` — its store
+    /// instance's lane root — under the same home selector.
     fn dock_opt(&self) -> Option<&str> {
         opt(&self.dock)
     }
 
-    /// Whether docks are in play — either we're on a named dock, or named docks
-    /// exist alongside home. Gates whether home persists an explicit tip, so a
-    /// repo that never docks stays pristine on disk.
-    fn docks_active(&self) -> bool {
-        self.dock != HOME_DOCK || self.store.list_docks().len() > 1
-    }
-
     /// Whether this position tracks a pinned tip that every tip-moving verb
-    /// must advance: a named dock, a lane (born with a spawn-seeded tip), or a
-    /// home dock that `adopt`/`dock merge` seeded. Leaving a seeded tip behind
-    /// is the stuck-tip bug class — `anchor()` stays at the seed while `heads`
-    /// moves on, so the next ferry aims git-main backward and the #195/#201
-    /// guards refuse (#229, #234, #265: three verbs hit it independently
-    /// before this predicate was extracted). `tip.is_some()` subsumes the
-    /// other two; they are kept explicit for the reader.
+    /// must advance: a lane (born with a spawn-seeded tip), or a primary that
+    /// `adopt`/`lane merge` seeded. Leaving a seeded tip behind is the stuck-tip
+    /// bug class — `anchor()` stays at the seed while `heads` moves on, so the
+    /// next ferry aims git-main backward and the #195/#201 guards refuse (#229,
+    /// #234, #265: three verbs hit it independently before this predicate was
+    /// extracted). `tip.is_some()` subsumes the lane case; both are kept
+    /// explicit for the reader. (Named docks — the former third arm,
+    /// `docks_active()` — are retired with #253.)
     fn tracks_tip(&self) -> bool {
-        self.docks_active() || self.lane_id.is_some() || self.tip.is_some()
+        self.lane_id.is_some() || self.tip.is_some()
     }
 
     /// The finalized change the ambient dock currently sits on — a new dock forks
@@ -1954,201 +1936,13 @@ impl Workspace {
         }
     }
 
-    /// `loot dock <name>`: switch to an existing dock, or create it (forking from
-    /// the ambient dock's finalized tip) and switch to it. A no-op if already on
-    /// `name`. The outgoing dock is auto-snapshotted first so no uncommitted work
-    /// is lost — every pruned file is recoverable by switching back (ADR 0022).
-    // In-place dock switching is retired from the CLI (ADR 0034, #3b layer 1):
-    // `create_dock` no longer calls this. It survives as test scaffolding that
-    // exercises the dock/merge/converge/parking machinery until #253 moves those
-    // tests onto lanes and drops `.loot/docks/` for good.
-    #[cfg(test)]
-    pub fn dock_goto(&mut self, name: &str) -> Result<DockAction, String> {
-        self.ensure_primary("`loot dock`")?;
-        if name == self.dock {
-            return Ok(DockAction::Already);
-        }
-        let creating = !self.store.dock_exists(name);
-        if creating {
-            valid_dock_name(name)?;
-        }
-
-        // 1. Capture the outgoing dock's working tree, preserving its message.
-        let msg = self.working_message_or_placeholder();
-        self.snapshot(&msg)?;
-        // Drop an empty/tip-duplicate capture, exactly as `finalize_capturing`
-        // does: an idle dock must not park a stray "(working change)" child on
-        // its tip — it pollutes the tip's descendants (blocking `loot edit`'s
-        // childless guard, ADR 0032) and a later merge would carry the
-        // superseded tip's content against an amend.
-        if let Some(id) = self.working.clone() {
-            let anchor = self.anchor();
-            let empty = self.repo.change_tree(&id).is_none_or(|t| t.is_empty());
-            let duplicate = empty
-                || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &id, self.now));
-            if duplicate {
-                self.repo.drop_working(&id);
-                self.working = None;
-                // Persist while this dock is still ambient, so its working
-                // pointer clears and the graph saves without the dropped node.
-                self.persist()?;
-            }
-        }
-        let from = self.working.clone().or_else(|| self.tip.clone());
-
-        // 2. Pin the outgoing home dock's tip before it stops being the lone dock,
-        //    so a later `status` on home never merges the new fork.
-        let anchor = self.anchor();
-        if self.dock == HOME_DOCK && self.tip.is_none() {
-            if let Some(a) = &anchor {
-                let _ = self.store.write_tip(None, Some(a));
-            }
-        }
-
-        // 3. Resolve the incoming dock's target head + working/tip state.
-        let (target, incoming_working, incoming_tip) = if creating {
-            let a = anchor
-                .clone()
-                .ok_or("nothing to fork yet — record a change first (`loot new`)")?;
-            self.store.ensure_dock_dir(name).map_err(|e| e.to_string())?;
-            self.store.write_tip(Some(name), Some(&a)).map_err(|e| e.to_string())?;
-            (a.clone(), None, Some(a))
-        } else {
-            let o = opt(name);
-            let w = self.store.read_working(o);
-            let t = self.store.read_tip(o);
-            let target = w
-                .clone()
-                .or_else(|| t.clone())
-                .ok_or_else(|| format!("dock '{name}' has no content to materialize"))?;
-            (target, w, t)
-        };
-
-        // 4. Switch the ambient pointer, then reconcile the working tree.
-        self.store.write_dock(name).map_err(|e| e.to_string())?;
-        self.repo
-            .materialize(from.as_ref(), &target, &self.identity, self.now)
-            .map_err(|e| e.to_string())?;
-        self.dock = name.to_string();
-        self.working = incoming_working;
-        self.tip = incoming_tip;
-        // The incoming dock re-derives its snapshot hash on the next `status`.
-        self.store.clear_tree_hash(self.dock_opt());
-        self.persist()?;
-        Ok(if creating { DockAction::Created } else { DockAction::Switched })
-    }
-
-    /// `loot dock <name> --at <dir>` — bind a *separate* working directory to this
-    /// repo's shared store via a `.loot` pointer file and materialize the dock's
-    /// tree there, so concurrent agents edit physically separate trees over one
-    /// object store (ADR 0022, a git-worktree analogue).
-    ///
-    /// In-place switching (the old no-`--at` flow that re-materialized the single
-    /// primary tree and parked its WIP) is **retired** (ADR 0034, #3b layer 1): a
-    /// second position is always a separate directory — a `--at` dock, or
-    /// preferably a `loot lane new` lane. The bare form now refuses with that
-    /// guidance. (Dropping `.loot/docks/` entirely in favour of lanes rides #253.)
-    pub fn create_dock(&mut self, name: &str, at: Option<&Path>) -> Result<(), String> {
-        self.ensure_primary("`loot dock`")?;
-        match at {
-            None => Err(
-                "in-place dock switching is retired (ADR 0034): a second position is a \
-                 separate directory. Use `loot lane new` for a sealed lane over this store, \
-                 or `loot dock <name> --at <dir>` to bind a separate worktree."
-                    .into(),
-            ),
-            Some(dir) => self.bind_dock_dir(name, dir),
-        }
-    }
-
-    /// Bind a new named dock to a separate working directory `dir` (a git-worktree
-    /// analogue). The dock's process state lives in the shared store under
-    /// `.loot/docks/<name>/`; `dir` gets a `.loot` *pointer file* naming the shared
-    /// store + dock, and the dock's tree is materialized into it. Does not disturb
-    /// the ambient dock or the primary working tree.
-    fn bind_dock_dir(&mut self, name: &str, dir: &Path) -> Result<(), String> {
-        valid_dock_name(name)?;
-        if self.store.dock_exists(name) {
-            return Err(format!("dock '{name}' already exists — pick a fresh name"));
-        }
-        // The review-ref namespace is shared with lane ids (#281): the ref
-        // suffix is the dock name from the primary but the lane id from a
-        // lane, so a dock named like a live lane would put two writers back
-        // on one `review/<x>`. Lane spawn guards the other direction.
-        self.ensure_lane_name_free(name, None)
-            .map_err(|e| format!("{e} — a dock and a lane share the review-ref namespace (#281)"))?;
-        // Capture the current dock's work so the new dock forks from a real tip.
-        if self.working.is_some() {
-            let msg = self.working_message_or_placeholder();
-            self.snapshot(&msg)?;
-        }
-        let anchor = self
-            .anchor()
-            .ok_or("nothing to fork yet — record a change first (`loot new`)")?;
-        // Pin the primary's tip if it's about to gain a sibling (see dock_goto).
-        if self.dock == HOME_DOCK && self.tip.is_none() {
-            let _ = self.store.write_tip(None, Some(&anchor));
-        }
-        self.store.ensure_dock_dir(name).map_err(|e| e.to_string())?;
-        self.store
-            .write_tip(Some(name), Some(&anchor))
-            .map_err(|e| e.to_string())?;
-        self.persist()?;
-
-        // Write the worktree dir + its `.loot` pointer at the shared store.
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let shared = std::fs::canonicalize(&self.dot)
-            .map_err(|e| format!("resolve store path: {e}"))?;
-        let pointer = format!("store = {}\ndock = {}\n", shared.display(), name);
-        std::fs::write(dir.join(DOT), pointer)
-            .map_err(|e| format!("write {} pointer: {e}", dir.join(DOT).display()))?;
-
-        // Materialize the dock's tree into the new worktree by opening it.
-        Workspace::open_at(dir)?.surface()?;
-        Ok(())
-    }
-
-    /// `loot dock rm <name>`: remove a named dock — pointer bookkeeping, not
-    /// graph surgery (#212, amending ADR 0022). The dock's **parked unsigned
-    /// working change** (if any) is dropped from the live heads — nothing
-    /// signed, nothing travelled, the same rationale as abandoning a docking
-    /// PR — and its node leaves the working-change blob on the next save. The
-    /// dock's pinned **tip is just a pointer**: signed work lives in the
-    /// shared graph regardless of dock pointers (which is why no "only copy
-    /// of signed work" refusal exists — there is no such state), so a
-    /// finalized unmerged head simply stays a live head, still mergeable
-    /// later. `.loot/docks/<name>/` is deleted. One **undoable** operation
-    /// (ADR 0031): the op view captures the heads file, the working-change
-    /// blob, and every dock's pointer files, and restore recreates the
-    /// directory. A worktree bound to the dock via `--at` is not tracked
-    /// here; removing its dock leaves that worktree's `.loot` pointer
-    /// dangling (opening it then errors) — the directory is the caller's to
-    /// delete. Refuses the ambient dock (switch away first) and home.
-    /// Returns the dropped parked working change, if there was one.
-    pub fn remove_dock(&mut self, name: &str) -> Result<Option<Oid>, String> {
-        self.ensure_primary("`loot dock rm`")?;
-        if name == HOME_DOCK {
-            return Err(format!("'{HOME_DOCK}' is the default dock — it always exists"));
-        }
-        if name == self.dock {
-            return Err(format!(
-                "'{name}' is the ambient dock — `loot dock <other>` first, then remove it"
-            ));
-        }
-        if !self.store.dock_exists(name) {
-            return Err(format!("no such dock '{name}' (see `loot docks`)"));
-        }
-        let parked = self.store.read_working(opt(name));
-        if let Some(w) = &parked {
-            self.repo.drop_working(w); // unsigned WIP: drop from live heads
-        }
-        self.store
-            .remove_dock_dir(name)
-            .map_err(|e| format!("remove dock '{name}': {e}"))?;
-        self.persist()?;
-        self.record_op("dock rm", &format!("remove dock {name}"), false);
-        Ok(parked)
-    }
+    // Named docks and in-place switching are fully retired (#253/ADR 0034):
+    // `dock_goto` (in-place switch), `create_dock`/`bind_dock_dir` (the `--at`
+    // worktree dock), and `remove_dock` are gone. A second position is a sealed
+    // lane (`loot lane new`), and a lane's finalized line merges into the primary
+    // via [`Workspace::merge_lane`]. A dangling `--at` `.loot` pointer file from
+    // before the retirement now opens with an error; its directory is the
+    // operator's to delete.
 
     // --- lanes (ADR 0034, #231) ---
     //
@@ -2470,19 +2264,14 @@ impl Workspace {
         Ok(lanes_root.join(candidate))
     }
 
-    /// Whether `key` is claimed in the lane lookup space — as a registry id, a
-    /// promoted name (the two share `lane rm <id-or-name>`'s space), or an
-    /// existing dock's name. The dock check guards the review-ref namespace
-    /// (#281): the ref suffix is the lane id from a lane but the *dock name*
-    /// from the primary, so a lane id equal to a dock name would put two
-    /// writers back on one `review/<x>` — spawn is primary-only, making the
-    /// primary's docks exactly the names its projections can use.
+    /// Whether `key` is claimed in the lane lookup space — as a registry id or a
+    /// promoted name (the two share `lane rm <id-or-name>`'s space). Named docks
+    /// are retired (#253/ADR 0034), so the primary's only review handle is `main`
+    /// — refused for every lane by `valid_dock_name` — and no `.loot/docks/` name
+    /// can collide with a lane id on `review/<x>` anymore (the former #281 arm).
     fn lane_key_taken(&self, entries: &[LaneEntry], key: &str) -> bool {
-        // `main` needs no arm here: every lane handle passes `valid_dock_name`,
-        // which already refuses the default dock's name.
         self.store.lane_entry_exists(key)
             || entries.iter().any(|e| e.name.as_deref() == Some(key))
-            || self.store.dock_exists(key)
     }
 
     /// The handle that becomes the registry id: the explicit (ticket-derived)
@@ -2515,34 +2304,87 @@ impl Workspace {
         }
     }
 
-    /// Merge dock `name`'s finalized tip into the current dock, in process (CA2,
-    /// ADR 0022). Docks share one object store and graph, so this is a local fork
-    /// collapse — no relay, no bundle file. Reuses the ADR 0001 convergence rule
-    /// via [`DagRepo::merge_tips`]; adds none.
+    /// `loot lane merge <id-or-name>`: fold lane `key`'s finalized line into the
+    /// primary, in process (CA2; ADR 0022's convergence, ADR 0034's source
+    /// resolution). A dock is a named lane now (#253), so the merge source is
+    /// resolved from the **lane registry** and the lane's **own tip pointer**
+    /// (`<lane>/.loot/tip`) rather than a `.loot/docks/<name>/` subtree.
     ///
-    /// Only *finalized* (signed) history merges (ADR 0018): the source contributes
-    /// its `tip`, and our own in-progress work is captured and finalized first, so
+    /// Only *finalized* (signed) history merges (ADR 0018): the lane contributes
+    /// its tip, and our own in-progress work is captured and finalized first, so
     /// both parents of the merge change are signed and can travel in a later
-    /// bundle. The merge change is then signed and becomes this dock's tip; its
-    /// tree is materialized. Conflicts flow through the existing
-    /// `conflicts`/`resolve` path — no side is dropped. Returns
-    /// `(source dock, per-path outcomes)`.
-    pub fn merge_dock(&mut self, name: &str) -> Result<(String, BTreeMap<PathBuf, MergeOutcome>), String> {
-        self.ensure_primary("`loot dock merge`")?;
-        if name == self.dock {
-            return Err(format!("'{name}' is the current dock — nothing to merge"));
+    /// bundle. Because a lane's `heads` are lane-owned — its finalized tip is a
+    /// sibling **outside** the primary's lineage-filtered view (ADR 0034 seal) —
+    /// the tip's lineage is first pulled in from the shared graph
+    /// ([`DagRepo::ingest_shared_lineage`], the #265 catch-up primitive) so the
+    /// ancestry/supersession checks in [`fold_line_in`] can see it. The merge
+    /// change is then signed and becomes the primary's tip with the merged tree
+    /// materialized; conflicts flow through the existing `conflicts`/`resolve`
+    /// path — no side dropped. Returns `(source lane id, per-path outcomes)`.
+    ///
+    /// [`fold_line_in`]: Workspace::fold_line_in
+    pub fn merge_lane(&mut self, key: &str) -> Result<(String, BTreeMap<PathBuf, MergeOutcome>), String> {
+        self.ensure_primary("`loot lane merge`")?;
+        // Resolve the source from the registry (by id or promoted name) and read
+        // its finalized tip from the lane's own `.loot/` — the same peek
+        // `loot lanes` does, never opening a workspace there (no heartbeat touch).
+        let entry = self.find_lane(key)?;
+        let lane_dot = entry.path.join(DOT);
+        if !lane_dot.is_dir() {
+            return Err(format!(
+                "lane '{}' has no live directory at {} — reap it (`loot lane rm {}`) \
+                 or re-spawn it",
+                entry.id,
+                entry.path.display(),
+                entry.id
+            ));
         }
-        if !self.store.dock_exists(name) {
-            return Err(format!("no such dock '{name}' (see `loot docks`)"));
-        }
-        // The source dock's finalized tip — only signed history merges.
-        let their = self.store.read_tip(opt(name)).ok_or_else(|| {
-            format!("dock '{name}' has no finalized change to merge — run `loot new` in it first")
+        let lane_store = RepoStore::for_lane(&self.dot, &lane_dot);
+        let their = lane_store.read_tip(None).ok_or_else(|| {
+            format!(
+                "lane '{}' has no finalized change to merge — run `loot new` in it first",
+                entry.id
+            )
         })?;
+        // The lane's finalized tip is a sibling head outside this position's view
+        // (isolation is by view, ADR 0034): pull its lineage in from the shared
+        // graph so `fold_line_in`'s ancestry checks can reason about it. `false`
+        // means the shared graph never recorded it — the lane finalized nothing
+        // that crossed the seal (a spawn-anchor-only lane), so there is nothing
+        // to merge.
+        if !self.repo.ingest_shared_lineage(&self.store, &their).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "lane '{}'s tip {} is not in the shared graph — it has no finalized \
+                 change that crossed the seal to merge",
+                entry.id,
+                short_version(&their)
+            ));
+        }
 
-        let msg = format!("merge dock '{name}' into '{}'", self.dock);
+        let msg = format!("merge lane '{}' into '{}'", entry.id, self.dock);
         let outcomes = self.fold_line_in(&their, &msg)?;
-        Ok((name.to_string(), outcomes))
+        Ok((entry.id, outcomes))
+    }
+
+    /// Test-only: pull a finalized tip's lineage into this position's view as a
+    /// sibling head — the shape a pull/adopt (or a lane's landed line) leaves —
+    /// so converge/resolve tests can build a real two-head fork without the
+    /// retired in-place dock switching (#253/ADR 0034). Returns whether the tip
+    /// is now known.
+    #[cfg(test)]
+    pub fn ingest_sibling(&mut self, tip: &Oid) -> bool {
+        self.repo.ingest_shared_lineage(&self.store, tip).unwrap()
+    }
+
+    /// Test-only: pin this position's tip at its current finalized anchor — the
+    /// state a real `adopt`/`lane merge`/land leaves behind. Named docks are
+    /// retired (#253), so an amend is a *sibling* only when the position
+    /// [`tracks_tip`](Self::tracks_tip); the old ferry amend-projection tests
+    /// got that for free from `docks_active` on a non-home dock.
+    #[cfg(test)]
+    pub fn pin_tip_at_anchor(&mut self) {
+        self.tip = self.anchor();
+        let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
     }
 
     /// Fold a finalized line `their` into this dock's current line, returning the
@@ -2551,8 +2393,9 @@ impl Workspace {
     /// is already ours), a fast-forward (their line superseded ours per ADR 0032,
     /// or our line is strictly behind theirs), or a reconciled signed merge change
     /// (`merge_tips` reuses converge) that becomes our tip with the merged tree
-    /// materialized. Shared by `dock merge` (their = a named dock's tip) and the
-    /// no-arg `loot adopt` catch-up (their = the harbor's landed main head).
+    /// materialized. Shared by `lane merge` (their = a named lane's tip, its
+    /// lineage ingested first by [`merge_lane`](Self::merge_lane)) and the no-arg
+    /// `loot adopt` catch-up (their = the harbor's landed main head).
     fn fold_line_in(
         &mut self,
         their: &Oid,
@@ -2797,7 +2640,7 @@ impl Workspace {
                     if disk_dirty {
                         return Err(REFUSE_UNCAPTURED_TREE.into());
                     }
-                    if self.docks_active() {
+                    if self.tracks_tip() {
                         self.tip = Some(survivor.clone());
                         let _ = self.store.write_tip(self.dock_opt(), self.tip.as_ref());
                     }
@@ -3172,29 +3015,9 @@ impl Workspace {
         Ok(outcomes)
     }
 
-    /// Every dock with its head and visibility summary, for `loot docks`.
-    pub fn dock_list(&self) -> Vec<DockInfo> {
-        self.store
-            .list_docks()
-            .into_iter()
-            .map(|name| {
-                let current = name == self.dock;
-                // For the ambient dock, in-memory state is authoritative and may
-                // be ahead of disk; for others, read the persisted head.
-                let head = if current {
-                    self.working
-                        .clone()
-                        .or_else(|| self.tip.clone())
-                        .or_else(|| self.repo.heads().into_iter().next())
-                } else {
-                    let o = opt(&name);
-                    self.store.read_working(o).or_else(|| self.store.read_tip(o))
-                };
-                let visibility = head.as_ref().map(|h| self.repo.visibility_summary_at(h));
-                DockInfo { name, head, current, visibility }
-            })
-            .collect()
-    }
+    // `dock_list`/`DockInfo` (the `loot docks` listing) are retired with named
+    // docks (#253/ADR 0034): the primary is the only dock, and every other
+    // position is a lane surfaced by `loot lanes` ([`Workspace::lane_statuses`]).
 
     fn persist(&self) -> Result<(), String> {
         // Two-root save (ADR 0034): shared artifacts to the store root, this
@@ -3313,15 +3136,6 @@ fn opt(name: &str) -> Option<&str> {
     } else {
         Some(name)
     }
-}
-
-/// What `dock_goto` did — test-only now that in-place switching is retired (#3b).
-#[cfg(test)]
-#[derive(Debug)]
-pub enum DockAction {
-    Already,
-    Switched,
-    Created,
 }
 
 // --- lane lifecycle plumbing (ADR 0034, #231) ---
@@ -3811,15 +3625,6 @@ fn barrier_message(b: &oplog::BarrierRefusal) -> String {
         "refusing to undo across a barrier (op {}, {}).\n      {remedy}",
         b.index, b.description
     )
-}
-
-/// A dock's summary for `loot docks`: its head change, visibility counts
-/// `(total, restricted, embargoed)`, and whether it's the ambient dock.
-pub struct DockInfo {
-    pub name: String,
-    pub head: Option<Oid>,
-    pub visibility: Option<(usize, usize, usize)>,
-    pub current: bool,
 }
 
 /// The workspace clock (unix seconds). `LOOT_CLOCK` overrides it when set —
@@ -5544,9 +5349,10 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_that_never_docks_writes_no_dock_files() {
-        // The CA1 compatibility guarantee (ADR 0022): docks are opt-in, so a repo
-        // that never runs a dock command is byte-for-byte its pre-dock self.
+    fn a_repo_that_never_spawns_a_lane_writes_no_dock_files() {
+        // The CA1 compatibility guarantee (ADR 0022/0034): the primary is the
+        // only dock and lanes are opt-in, so a repo that never spawns one is
+        // byte-for-byte its pre-dock self — no ambient pointer, no `docks/` dir.
         let (dir, mut ws) = dock_repo("compat");
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
         ws.snapshot("work").unwrap();
@@ -5555,62 +5361,16 @@ mod tests {
 
         let dot = dir.join(".loot");
         assert!(!dot.join("dock").exists(), "no ambient-dock pointer");
-        assert!(!dot.join("docks").exists(), "no docks directory");
-        assert!(!dot.join("tip").exists(), "home persists no explicit tip pre-dock");
+        assert!(!dot.join("docks").exists(), "no docks directory (retired, #253)");
+        assert!(!dot.join("tip").exists(), "the primary persists no explicit tip when idle");
         assert_eq!(ws.current_dock(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn two_docks_hold_independent_tips_and_isolated_trees() {
-        // Acceptance: two docks editing disjoint paths reach independent tips over
-        // one store, and switching re-materializes each dock's own tree.
-        let (dir, mut ws) = dock_repo("iso");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-
-        // Fork a dock and give it a file the home dock never sees.
-        ws.dock_goto("feature").unwrap();
-        assert_eq!(ws.current_dock(), Some("feature"));
-        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
-        let (feat_tip, _) = ws.snapshot("feature work").unwrap();
-
-        // Back on home: feature.txt is pruned from disk, base.txt remains.
-        ws.dock_goto("main").unwrap();
-        assert!(dir.join("base.txt").exists(), "shared base kept");
-        assert!(!dir.join("feature.txt").exists(), "feature-only file pruned on switch home");
-        std::fs::write(dir.join("home.txt"), b"H").unwrap();
-        let (home_tip, _) = ws.snapshot("home work").unwrap();
-
-        assert_ne!(feat_tip, home_tip, "docks advance to independent tips");
-
-        // Switching back restores the feature tree in full — nothing was lost.
-        ws.dock_goto("feature").unwrap();
-        assert!(dir.join("feature.txt").exists(), "feature file restored on switch back");
-        assert!(!dir.join("home.txt").exists(), "home-only file absent on feature");
-
-        // Both docks are listed, home first, with the ambient one marked.
-        let docks = ws.dock_list();
-        assert_eq!(docks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["main", "feature"]);
-        assert!(docks.iter().find(|d| d.name == "feature").unwrap().current);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dock_goto_is_idempotent_and_rejects_bad_names() {
-        let (dir, mut ws) = dock_repo("names");
-        std::fs::write(dir.join("a.txt"), b"x").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-
-        assert!(matches!(ws.dock_goto("main"), Ok(DockAction::Already)), "self-switch is a no-op");
-        assert!(ws.dock_goto("../escape").is_err(), "path traversal rejected");
-        assert!(matches!(ws.dock_goto("feat").unwrap(), DockAction::Created));
-        assert!(matches!(ws.dock_goto("feat"), Ok(DockAction::Already)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // In-place dock switching and named-dock isolation (`two_docks_hold_…`,
+    // `dock_goto_is_idempotent_…`) are retired with `.loot/docks/` (#253/ADR
+    // 0034): a second position is a sealed lane, and lane isolation is proven by
+    // `lane_wip_is_sealed_…` / `lane_spawn_materializes_…` below.
 
     // --- lanes (ADR 0034, #231) ---
 
@@ -5625,6 +5385,34 @@ mod tests {
         ws.snapshot("base").unwrap();
         ws.finalize_working().unwrap();
         (area, dir, ws)
+    }
+
+    /// Spawn a named lane beside the repo (sibling of `dir`), write `files` into
+    /// it, and snapshot + finalize one signed change there. The lane's finalized
+    /// change enters the shared graph/objects (the seal) but stays out of the
+    /// primary's view — the merge source `loot lane merge` resolves and ingests
+    /// (#253). Returns the lane's finalized tip. Callers reopen the primary
+    /// afterward to load the lane's new objects, exactly as the CLI's fresh
+    /// `Workspace::open()` does before a merge.
+    fn lane_with_change(
+        ws: &mut Workspace,
+        area: &Path,
+        name: &str,
+        files: &[(&str, &[u8])],
+        msg: &str,
+    ) -> Oid {
+        let spawned = ws.spawn_lane_as(Some(name), Some(&area.join(name)), None).unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        for (rel, content) in files {
+            let path = spawned.dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+        lw.snapshot(msg).unwrap();
+        lw.finalize_working().unwrap();
+        lw.heads().into_iter().next().expect("the lane finalized a tip")
     }
 
     #[test]
@@ -5679,26 +5467,21 @@ mod tests {
     }
 
     #[test]
-    fn lane_ids_and_dock_names_share_the_review_ref_namespace() {
-        // #281: the review ref suffix is the lane id from a lane but the dock
-        // name from the primary — either name claimed by the other kind would
-        // put two writers back on one `review/<x>`.
-        let (area, _dir, mut ws) = lane_setup("lane-dock-collide");
-        ws.create_dock("t9", Some(&area.join("dock-t9"))).unwrap();
-
-        // A lane handle equal to an existing dock name suffixes past it, and
-        // `main` (the home dock, the primary's usual review handle) is always
-        // taken.
-        let spawned = ws.spawn_lane_as(None, Some(&area.join("lane-a")), Some("t9")).unwrap();
-        assert_eq!(spawned.id, "t9-2", "dock names are taken in the lane id space");
-        // `main` (the primary's usual review handle) never becomes a lane id:
-        // handle validation already refuses the default dock's name.
-        let err = ws.spawn_lane_as(None, Some(&area.join("lane-b")), Some("main")).unwrap_err();
+    fn a_lane_cannot_take_the_primary_handle_or_a_live_lane_id() {
+        // #281/#253: the review-ref suffix is the lane id from a lane and `main`
+        // from the primary. Named docks are retired, so the only reservations
+        // left in the lane id space are `main` (the primary's handle, always
+        // taken) and each live lane's own id.
+        let (area, _dir, mut ws) = lane_setup("lane-namespace");
+        let a = ws.spawn_lane_as(None, Some(&area.join("lane-a")), Some("t9")).unwrap();
+        assert_eq!(a.id, "t9");
+        // A second spawn under the same handle suffixes past the live lane.
+        let b = ws.spawn_lane_as(None, Some(&area.join("lane-b")), Some("t9")).unwrap();
+        assert_eq!(b.id, "t9-2", "a live lane id is taken in the lane id space");
+        // `main` (the primary's review handle) never becomes a lane id: handle
+        // validation already refuses the default dock's name.
+        let err = ws.spawn_lane_as(None, Some(&area.join("lane-c")), Some("main")).unwrap_err();
         assert!(err.contains("default dock"), "{err}");
-
-        // And the reverse: a dock cannot take a live lane's id.
-        let err = ws.create_dock("t9-2", Some(&area.join("dock-t9-2"))).unwrap_err();
-        assert!(err.contains("review-ref namespace"), "{err}");
 
         let _ = std::fs::remove_dir_all(&area);
     }
@@ -5721,10 +5504,7 @@ mod tests {
         for err in [
             lw.spawn_lane(None, None).unwrap_err(),
             lw.gc(true).unwrap_err(),
-            lw.dock_goto("elsewhere").unwrap_err(),
-            lw.create_dock("elsewhere", None).unwrap_err(),
-            lw.remove_dock("elsewhere").unwrap_err(),
-            lw.merge_dock("elsewhere").map(|_| ()).unwrap_err(),
+            lw.merge_lane("elsewhere").map(|_| ()).unwrap_err(),
             lw.remove_lane("l1").map(|_| ()).unwrap_err(),
             lw.lane_gc(0).map(|_| ()).unwrap_err(),
         ] {
@@ -6194,25 +5974,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&area);
     }
 
-    // --- CA2: local dock merge ---
+    // --- CA2: local lane merge (#253/ADR 0034 — a dock is a named lane) ---
 
     #[test]
-    fn dock_merge_does_not_nag_for_a_name_when_there_is_no_real_work_to_sign() {
+    fn lane_merge_does_not_nag_for_a_name_when_there_is_no_real_work_to_sign() {
         // The #275 refusal must fire on *work*, never on a capture that adds
-        // nothing over the tip — otherwise `dock merge` demands a name for
+        // nothing over the tip — otherwise `lane merge` demands a name for
         // content that will never be signed. The sibling sites (`finalize_capturing`,
         // `reconcile_capture`) sit below such a drop; `fold_line_in` now does too.
-        let (dir, mut ws) = dock_repo("merge-no-nag");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
+        let (area, dir, mut ws) = lane_setup("merge-no-nag");
+        lane_with_change(&mut ws, &area, "feature", &[("feature.txt", b"F")], "feature work");
+        // Reopen the primary to load the lane's objects (the CLI's fresh open).
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        ws.dock_goto("feature").unwrap();
-        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
-        ws.snapshot("feature work").unwrap();
-        ws.finalize_working().unwrap();
-
-        ws.dock_goto("main").unwrap();
         // An un-described capture that duplicates the tip: the operator's edit,
         // reverted before merging. Real state, no real work.
         std::fs::write(dir.join("scratch.txt"), b"tmp").unwrap();
@@ -6220,89 +5994,68 @@ mod tests {
         std::fs::remove_file(dir.join("scratch.txt")).unwrap();
 
         let (src, _outcomes) = ws
-            .merge_dock("feature")
+            .merge_lane("feature")
             .expect("nothing to sign, so nothing to name — the merge just runs");
         assert_eq!(src, "feature");
         assert!(
             ws.repo().change_message(&ws.anchor().unwrap()).is_some_and(|m| !is_undescribed(&m)),
             "and no placeholder-named change was signed as a parent",
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
-    fn dock_merge_refuses_to_seal_undescribed_work_as_a_merge_parent() {
-        // The other half: with real un-described work pending, `dock merge` asks
+    fn lane_merge_refuses_to_seal_undescribed_work_as_a_merge_parent() {
+        // The other half: with real un-described work pending, `lane merge` asks
         // for a name rather than signing the placeholder as its parent (#275).
-        let (dir, mut ws) = dock_repo("merge-undescribed");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
+        let (area, dir, mut ws) = lane_setup("merge-undescribed");
+        lane_with_change(&mut ws, &area, "feature", &[("feature.txt", b"F")], "feature work");
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        ws.dock_goto("feature").unwrap();
-        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
-        ws.snapshot("feature work").unwrap();
-        ws.finalize_working().unwrap();
-
-        ws.dock_goto("main").unwrap();
         std::fs::write(dir.join("home.txt"), b"my unnamed work").unwrap();
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
 
-        let err = ws.merge_dock("feature").map(|_| ()).unwrap_err();
+        let err = ws.merge_lane("feature").map(|_| ()).unwrap_err();
         assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
-    fn dock_merge_converges_disjoint_edits() {
-        // Acceptance: two docks editing disjoint paths merge cleanly with no
-        // conflict, and the merged tree carries both lines' files.
-        let (dir, mut ws) = dock_repo("merge-disjoint");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
+    fn lane_merge_converges_disjoint_edits() {
+        // Acceptance: a lane and the primary editing disjoint paths merge cleanly
+        // with no conflict, and the merged tree carries both lines' files.
+        let (area, dir, mut ws) = lane_setup("merge-disjoint");
+        lane_with_change(&mut ws, &area, "feature", &[("feature.txt", b"F")], "feature work");
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        ws.dock_goto("feature").unwrap();
-        std::fs::write(dir.join("feature.txt"), b"F").unwrap();
-        ws.snapshot("feature work").unwrap();
-        ws.finalize_working().unwrap();
-
-        ws.dock_goto("main").unwrap();
         std::fs::write(dir.join("home.txt"), b"H").unwrap();
         ws.snapshot("home work").unwrap();
         ws.finalize_working().unwrap();
 
-        let (src, outcomes) = ws.merge_dock("feature").unwrap();
+        let (src, outcomes) = ws.merge_lane("feature").unwrap();
         assert_eq!(src, "feature");
         assert!(ws.repo().conflicts().is_empty(), "disjoint edits: no conflicts");
         assert_eq!(outcomes[&PathBuf::from("feature.txt")], MergeOutcome::Converged);
-        // Merge materialized both lines onto the home working tree.
+        // Merge materialized both lines onto the primary working tree.
         assert!(dir.join("base.txt").exists());
         assert!(dir.join("home.txt").exists());
         assert!(dir.join("feature.txt").exists(), "feature work present after merge");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
-    fn dock_merge_same_path_conflicts_and_keeps_both_sides() {
+    fn lane_merge_same_path_conflicts_and_keeps_both_sides() {
         // Acceptance: a genuine same-path divergence surfaces as a Conflict via the
         // existing conflicts/resolve flow, with neither side dropped.
-        let (dir, mut ws) = dock_repo("merge-conflict");
-        std::fs::write(dir.join("a.txt"), b"base\n").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
+        let (area, dir, mut ws) = lane_setup("merge-conflict");
+        lane_with_change(&mut ws, &area, "feature", &[("a.txt", b"feature side\n")], "feat");
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        ws.dock_goto("feature").unwrap();
-        std::fs::write(dir.join("a.txt"), b"feature side\n").unwrap();
-        ws.snapshot("feat").unwrap();
-        ws.finalize_working().unwrap();
-
-        ws.dock_goto("main").unwrap();
         std::fs::write(dir.join("a.txt"), b"home side\n").unwrap();
         ws.snapshot("home").unwrap();
         ws.finalize_working().unwrap();
 
-        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        let (_src, outcomes) = ws.merge_lane("feature").unwrap();
         assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
         assert!(
             ws.repo().conflicts().contains_key(&PathBuf::from("a.txt")),
@@ -6311,33 +6064,26 @@ mod tests {
         // Ours is kept on disk; theirs is preserved in the recorded conflict and
         // via the merge change's second parent — no side dropped.
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"home side\n");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
-    fn dock_merge_conflict_resolution_advances_the_dock_tip() {
-        // Regression (CA2 review): after a conflicted dock merge, `resolve` must
-        // build on and advance the dock's tip — not orphan the resolution onto a
-        // stray head — so later work on the dock sees the resolved content.
-        let (dir, mut ws) = dock_repo("merge-resolve");
-        std::fs::write(dir.join("a.txt"), b"base\n").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
+    fn lane_merge_conflict_resolution_advances_the_primary_tip() {
+        // Regression (CA2 review): after a conflicted lane merge, `resolve` must
+        // build on and advance the primary's tip — not orphan the resolution onto
+        // a stray head — so later work sees the resolved content.
+        let (area, dir, mut ws) = lane_setup("merge-resolve");
+        lane_with_change(&mut ws, &area, "feature", &[("a.txt", b"feature side\n")], "feat");
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        ws.dock_goto("feature").unwrap();
-        std::fs::write(dir.join("a.txt"), b"feature side\n").unwrap();
-        ws.snapshot("feat").unwrap();
-        ws.finalize_working().unwrap();
-
-        ws.dock_goto("main").unwrap();
         std::fs::write(dir.join("a.txt"), b"home side\n").unwrap();
         ws.snapshot("home").unwrap();
         ws.finalize_working().unwrap();
 
-        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        let (_src, outcomes) = ws.merge_lane("feature").unwrap();
         assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
 
-        // Resolve — the resolution becomes the dock tip and lands on disk.
+        // Resolve — the resolution becomes the primary tip and lands on disk.
         ws.resolve_conflict(Path::new("a.txt"), b"resolved\n", Visibility::Public).unwrap();
         assert!(ws.repo().conflicts().is_empty(), "conflict cleared");
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"resolved\n", "resolution written to disk");
@@ -6351,10 +6097,10 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.join("a.txt")).unwrap(),
             b"resolved\n",
-            "dock line carries the resolution, not the conflicted merge"
+            "the primary line carries the resolution, not the conflicted merge"
         );
         assert!(dir.join("b.txt").exists(), "new work sits on the resolved tip");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
@@ -6366,21 +6112,23 @@ mod tests {
         // when a harbor bounce left several conflicts). `resolve` touches exactly
         // one path, so it must write exactly that path and leave every other file
         // — unrelated edits and still-unresolved sibling conflicts — untouched.
-        let (dir, mut ws) = dock_repo("resolve-no-clobber");
+        let (area, dir, mut ws) = lane_setup("resolve-no-clobber");
         // Base carries the two files that will conflict plus an unrelated file.
         std::fs::write(dir.join("a.txt"), b"base a\n").unwrap();
         std::fs::write(dir.join("d.txt"), b"base d\n").unwrap();
         std::fs::write(dir.join("c.txt"), b"base c\n").unwrap();
-        ws.snapshot("base").unwrap();
+        ws.snapshot("base2").unwrap();
         ws.finalize_working().unwrap();
 
-        ws.dock_goto("feature").unwrap();
-        std::fs::write(dir.join("a.txt"), b"feature a\n").unwrap();
-        std::fs::write(dir.join("d.txt"), b"feature d\n").unwrap();
-        ws.snapshot("feat").unwrap();
-        ws.finalize_working().unwrap();
+        lane_with_change(
+            &mut ws,
+            &area,
+            "feature",
+            &[("a.txt", b"feature a\n"), ("d.txt", b"feature d\n")],
+            "feat",
+        );
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        ws.dock_goto("main").unwrap();
         std::fs::write(dir.join("a.txt"), b"home a\n").unwrap();
         std::fs::write(dir.join("d.txt"), b"home d\n").unwrap();
         ws.snapshot("home").unwrap();
@@ -6388,7 +6136,7 @@ mod tests {
 
         // Merge produces two conflicts (a.txt and d.txt); the merge leaves ours
         // on disk and c.txt at its base content.
-        let (_src, outcomes) = ws.merge_dock("feature").unwrap();
+        let (_src, outcomes) = ws.merge_lane("feature").unwrap();
         assert!(matches!(outcomes[&PathBuf::from("a.txt")], MergeOutcome::Conflict { .. }));
         assert!(matches!(outcomes[&PathBuf::from("d.txt")], MergeOutcome::Conflict { .. }));
 
@@ -6420,39 +6168,30 @@ mod tests {
         assert!(ws.repo().conflicts().is_empty(), "all conflicts resolved in one pass");
         assert_eq!(std::fs::read(dir.join("d.txt")).unwrap(), b"resolved d\n");
         assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"uncommitted work\n");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
-    fn harbor_is_an_ordinary_dock_that_round_trips() {
-        // Acceptance: `harbor` is a plain dock by convention; merging into it and
-        // re-basing from it round-trips through the same machinery.
-        let (dir, mut ws) = dock_repo("harbor");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
+    fn the_primary_integrates_a_lane_and_re_merging_is_up_to_date() {
+        // The primary IS the harbor now (#253/ADR 0034): a lane's finalized line
+        // folds into it through the shared merge machinery, and folding the same
+        // line again is a clean no-op — the round-trip the old three-dock
+        // `harbor`-by-convention test exercised, over one primary + one lane.
+        let (area, dir, mut ws) = lane_setup("harbor");
+        lane_with_change(&mut ws, &area, "feature", &[("feat.txt", b"F")], "feat");
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        ws.dock_goto("feature").unwrap();
-        std::fs::write(dir.join("feat.txt"), b"F").unwrap();
-        ws.snapshot("feat").unwrap();
-        ws.finalize_working().unwrap();
-
-        // Create harbor from a neutral base (home), then integrate feature into
-        // it — an ordinary dock playing the integrator role by convention.
-        ws.dock_goto("main").unwrap();
-        ws.dock_goto("harbor").unwrap();
-        assert!(!dir.join("feat.txt").exists(), "harbor forks from home, without feature's work");
-        let (_s, o1) = ws.merge_dock("feature").unwrap();
-        assert!(o1.contains_key(&PathBuf::from("feat.txt")));
-        assert!(dir.join("feat.txt").exists(), "harbor integrated feature work");
-
-        // Re-base home from harbor: the work flows back cleanly.
-        ws.dock_goto("main").unwrap();
-        assert!(!dir.join("feat.txt").exists(), "home has not merged yet");
-        ws.merge_dock("harbor").unwrap();
-        assert!(dir.join("feat.txt").exists(), "home re-based from harbor");
+        assert!(!dir.join("feat.txt").exists(), "the primary has not merged yet");
+        ws.merge_lane("feature").unwrap();
+        assert!(dir.join("feat.txt").exists(), "the primary integrated the lane's work");
         assert!(ws.repo().conflicts().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+
+        // Folding the same finalized line again is safe — no conflict, the
+        // integrated work stays on disk (the round-trip stays clean).
+        ws.merge_lane("feature").unwrap();
+        assert!(ws.repo().conflicts().is_empty(), "the re-merge stays clean");
+        assert!(dir.join("feat.txt").exists());
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
@@ -6460,24 +6199,20 @@ mod tests {
         // #128: after a peer's divergent tip is ingested (pull/apply), the graph
         // has two heads and the working tree shows only our side — apply records +
         // classifies but never merges tips. `converge_heads` collapses the fork
-        // into ONE head whose tree carries BOTH sides. Two lines stand in for the
-        // two independently-advanced writers (the exact shape a pull leaves).
-        let (dir, mut ws) = dock_repo("converge-fork");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
+        // into ONE head whose tree carries BOTH sides. The peer's line is built in
+        // a sealed lane and ingested (the exact shape a pull leaves), since
+        // in-place dock switching is retired (#253/ADR 0034).
+        let (area, dir, mut ws) = lane_setup("converge-fork");
 
-        // "Their" line, advanced independently.
-        ws.dock_goto("peer").unwrap();
-        std::fs::write(dir.join("their.txt"), b"T").unwrap();
-        ws.snapshot("theirs").unwrap();
-        ws.finalize_working().unwrap();
+        // "Their" line, advanced independently in a lane, then brought into view.
+        let their = lane_with_change(&mut ws, &area, "peer", &[("their.txt", b"T")], "theirs");
+        let mut ws = Workspace::open_at(&dir).unwrap();
 
-        // "Our" line, back on main — now the graph is forked.
-        ws.dock_goto("main").unwrap();
+        // "Our" line advances on the primary — now the graph is forked.
         std::fs::write(dir.join("ours.txt"), b"O").unwrap();
         ws.snapshot("ours").unwrap();
         ws.finalize_working().unwrap();
+        ws.ingest_sibling(&their);
         assert!(ws.repo().heads().len() >= 2, "precondition: a real two-writer fork");
 
         let ours = ws.anchor();
@@ -6491,7 +6226,7 @@ mod tests {
             outcomes.contains_key(&PathBuf::from("their.txt")),
             "the collapse reports the peer's file as a merge outcome"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     // --- ADR 0032: amend via `loot edit` — supersession ---
@@ -6632,51 +6367,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Shared setup for the collapse tests: main holds `target` (a.txt =
-    /// "target"); an `amender` dock reopens it and finalizes an amended version.
-    /// Returns main's pre-amend tip `x` and the amend `x2`, with `ws` on main.
-    fn amended_on_a_dock(tag: &str) -> (PathBuf, Workspace, Oid, Oid) {
-        let (dir, mut ws, x, cid) = amendable_ws(tag);
-        ws.dock_goto("amender").unwrap();
-        ws.edit(&loot_core::hex::letters(&cid)).unwrap();
-        std::fs::write(dir.join("a.txt"), b"target amended").unwrap();
+    /// Shared setup for the collapse tests: the primary holds `target` (a.txt =
+    /// "target"); an `amender` **lane** reopens it and finalizes an amended
+    /// version x2 (a.txt = "target amended", superseding x). The lane's x2 is
+    /// then ingested into the primary's view as a sibling head — the shape the
+    /// old `amender` dock produced when docks shared one heads file (#253/ADR
+    /// 0034). Returns the primary's pre-amend tip `x` and the amend `x2`, with
+    /// `ws` reopened on the primary (still showing "target").
+    fn amended_in_a_lane(tag: &str) -> (PathBuf, PathBuf, Workspace, Oid, Oid) {
+        let area = std::env::temp_dir().join(format!("loot-amend-lane-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&area);
+        let dir = area.join("repo");
+        let mut ws = authored_ws(&dir);
+        std::fs::write(dir.join("a.txt"), b"base").unwrap();
+        ws.snapshot("base").unwrap();
+        ws.finalize_working().unwrap();
+        std::fs::write(dir.join("a.txt"), b"target").unwrap();
         ws.snapshot("target").unwrap();
         ws.finalize_working().unwrap();
-        let x2 = ws
-            .liveness()
-            .live_of(&cid)
-            .into_iter()
-            .next()
-            .unwrap();
-        ws.dock_goto("main").unwrap();
-        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"target", "main still pre-amend");
-        (dir, ws, x, x2)
+        let x = ws.repo().heads()[0].clone();
+        let cid = ws.repo().change_change_id(&x).unwrap();
+
+        // Amend `target` in a lane (born at the primary's tip = x).
+        let spawned = ws.spawn_lane_as(Some("amender"), Some(&area.join("amender")), None).unwrap();
+        let mut lw = Workspace::open_at(&spawned.dir).unwrap();
+        lw.edit(&loot_core::hex::letters(&cid)).unwrap();
+        std::fs::write(spawned.dir.join("a.txt"), b"target amended").unwrap();
+        lw.snapshot("target").unwrap();
+        lw.finalize_working().unwrap();
+        let x2 = lw.liveness().live_of(&cid).into_iter().next().unwrap();
+
+        // Reopen the primary (still on x) and pull the lane's amend into view as a
+        // sibling head — the two-head precondition the collapse tests need.
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        ws.ingest_sibling(&x2);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"target", "primary still pre-amend");
+        (area, dir, ws, x, x2)
     }
 
     #[test]
-    fn dock_merge_adopts_an_amend_as_a_fast_forward() {
-        // ADR 0032: merging a dock whose line SUPERSEDES our tip must not
+    fn lane_merge_adopts_an_amend_as_a_fast_forward() {
+        // ADR 0032: merging a lane whose line SUPERSEDES our tip must not
         // content-merge the two versions (that would resurrect what the amend
-        // removed) — it adopts the amend.
-        let (dir, mut ws, _x, x2) = amended_on_a_dock("dockff");
+        // removed) — it adopts the amend by fast-forward.
+        let (area, dir, mut ws, _x, x2) = amended_in_a_lane("laneff");
         let nodes_before = ws.repo().log_detailed().len();
-        let (_name, outcomes) = ws.merge_dock("amender").unwrap();
+        let (_name, outcomes) = ws.merge_lane("amender").unwrap();
         assert!(outcomes.is_empty(), "a supersession adopts — no merge outcomes");
         assert_eq!(ws.repo().log_detailed().len(), nodes_before, "no merge node minted");
         assert_eq!(
             std::fs::read(dir.join("a.txt")).unwrap(),
             b"target amended",
-            "main adopted the amend"
+            "the primary adopted the amend"
         );
         assert!(ws.divergent_change_ids().is_empty(), "a solo amend never renders divergence");
-        // And the mirror case: merging main back into the amender is a no-op —
-        // our superseded tip has nothing to offer their line.
-        ws.dock_goto("amender").unwrap();
-        let (_n, back) = ws.merge_dock("main").unwrap();
-        assert!(back.is_empty(), "the superseded direction is a no-op");
+        // Re-merging the now-adopted line is a clean no-op (the up-to-date
+        // direction: our superseded tip has nothing to offer the amend).
+        let (_n, back) = ws.merge_lane("amender").unwrap();
+        assert!(back.is_empty(), "re-merging the adopted amend is a no-op");
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"target amended");
         let _ = x2;
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
@@ -6684,7 +6435,7 @@ mod tests {
         // The peer-side pull path (ADR 0032): a solo amend arrives as a sibling
         // head; converge must DROP the superseded side and adopt the amend —
         // never fold the two into a content merge.
-        let (dir, mut ws, x, x2) = amended_on_a_dock("convdrop");
+        let (area, dir, mut ws, x, x2) = amended_in_a_lane("convdrop");
         let nodes_before = ws.repo().log_detailed().len();
         let outcomes = ws.converge_heads(Some(&x)).unwrap();
         assert!(outcomes.is_empty(), "dropping a superseded head is not a merge");
@@ -6700,7 +6451,7 @@ mod tests {
             "the amend materialized"
         );
         assert!(ws.divergent_change_ids().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     /// A store shaped like a divergent pull (#198/#203): our amend `x2` is the
@@ -7094,18 +6845,13 @@ mod tests {
         // fold a fork refuses when the disk holds uncaptured edits rather than
         // clobbering them — the backstop behind capture-first. The refusal is
         // atomic: no side is merged, both heads survive.
-        let (dir, mut ws) = dock_repo("219choke");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-        ws.dock_goto("peer").unwrap();
-        std::fs::write(dir.join("their.txt"), b"T").unwrap();
-        ws.snapshot("theirs").unwrap();
-        ws.finalize_working().unwrap();
-        ws.dock_goto("main").unwrap();
+        let (area, dir, mut ws) = lane_setup("219choke");
+        let their = lane_with_change(&mut ws, &area, "peer", &[("their.txt", b"T")], "theirs");
+        let mut ws = Workspace::open_at(&dir).unwrap();
         std::fs::write(dir.join("ours.txt"), b"O").unwrap();
         ws.snapshot("ours").unwrap();
         ws.finalize_working().unwrap();
+        ws.ingest_sibling(&their);
         assert!(ws.repo().heads().len() >= 2, "precondition: a real two-writer fork");
 
         // Skip capture-first (a direct converge): scribble an uncaptured edit.
@@ -7120,7 +6866,7 @@ mod tests {
             b"O edited but not captured",
             "the uncaptured edit was not clobbered"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&area);
     }
 
     #[test]
@@ -7175,53 +6921,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn converge_heads_skips_a_sibling_docks_parked_working_change() {
-        // The bd926e81 specimen (#199 finding → #203): a dock switched away
-        // from mid-work leaves its unsigned working change parked as a head in
-        // the shared graph. Converge on another dock must not fold that
-        // in-flight WIP into a content-merge — the parked dock's next snapshot
-        // rewrites it in place.
-        let (dir, mut ws) = dock_repo("convpark");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-
-        ws.dock_goto("side").unwrap();
-        std::fs::write(dir.join("side.txt"), b"parked WIP").unwrap();
-        ws.snapshot("side wip").unwrap(); // in progress, never finalized
-        ws.dock_goto("main").unwrap(); // parks it on the side dock
-        let parked = ws
-            .store()
-            .read_working(Some("side"))
-            .expect("the side dock parked its working change");
-
-        // main advances so a real fork exists beside the parked WIP.
-        std::fs::write(dir.join("ours.txt"), b"O").unwrap();
-        ws.snapshot("ours").unwrap();
-        ws.finalize_working().unwrap();
-
-        let nodes_before = ws.repo().log_detailed().len();
-        let ours = ws.anchor();
-        let outcomes = ws.converge_heads(ours.as_ref()).unwrap();
-        assert!(outcomes.is_empty(), "parked WIP is not a line to converge");
-        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "no merge node minted");
-        assert!(
-            ws.repo().heads().contains(&parked),
-            "the parked working change stays the side dock's live head"
-        );
-        assert!(!dir.join("side.txt").exists(), "the parked WIP never entered main's tree");
-
-        // The live #203 footgun: `pull` used to pass "first head" as the
-        // base, handing converge the parked head as OURS — the dock's own tip
-        // was then merged INTO foreign in-flight WIP. A parked base must never
-        // become the merge side.
-        let outcomes = ws.converge_heads(Some(&parked)).unwrap();
-        assert!(outcomes.is_empty(), "a parked base never becomes the merge side");
-        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "still no merge node");
-        assert!(ws.repo().heads().contains(&parked), "the parked head survives");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // `converge_heads_skips_a_sibling_docks_parked_working_change` is retired
+    // (#253/ADR 0034): a lane's unsigned WIP is sealed lane-local and never
+    // enters another position's view, so there is no cross-position parked head
+    // for converge to skip — `liveness()` now feeds an empty parked set.
 
     #[test]
     fn resolve_live_version_refuses_abandoned_and_superseded_prefixes() {
@@ -7450,119 +7153,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&relay_dir);
     }
 
-    #[test]
-    fn dock_rm_reaps_a_parked_working_head_and_is_undoable() {
-        // #212: the bd926e81 shape — a dock switched away from mid-work parks
-        // its unsigned working change as a live head. `dock rm` drops the
-        // parked head + the dock's pointers (bookkeeping, not graph surgery),
-        // and one undo brings both back.
-        let (dir, mut ws) = dock_repo("dockrm");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-        ws.record_op("new", "finalize base", false); // the undo floor
-
-        ws.dock_goto("stale").unwrap();
-        ws.record_op("dock", "dock stale", false); // as cmd_dock records
-        std::fs::write(dir.join("wip.txt"), b"parked").unwrap();
-        ws.snapshot("stale wip").unwrap();
-        ws.dock_goto("main").unwrap();
-        ws.record_op("dock", "dock main", false);
-        let base = ws.anchor().expect("main sits on the finalized base");
-        let parked = ws.store().read_working(Some("stale")).expect("wip parked");
-        assert!(ws.repo().heads().contains(&parked), "precondition: the parked WIP is a head");
-
-        let dropped = ws.remove_dock("stale").unwrap();
-        assert_eq!(dropped, Some(parked.clone()), "the parked working change is reported");
-        assert!(!ws.repo().heads().contains(&parked), "the parked head is gone");
-        assert_eq!(
-            ws.repo().heads(),
-            vec![base],
-            "the base the WIP forked from is the sole head again"
-        );
-        assert!(!ws.store().dock_exists("stale"), "the dock's directory is gone");
-        assert!(
-            !ws.dock_list().iter().any(|d| d.name == "stale"),
-            "the dock left the listing"
-        );
-
-        // One undo restores the dock, its pointers, and the parked head.
-        ws.undo().unwrap();
-        assert!(ws.store().dock_exists("stale"), "undo recreated the dock");
-        assert_eq!(ws.store().read_working(Some("stale")), Some(parked.clone()));
-        assert!(ws.repo().heads().contains(&parked), "undo restored the parked head");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dock_rm_without_parked_wip_removes_pointers_only() {
-        // The proof-amend-divergence shape: a dock idle on a finalized tip
-        // that is an ancestor of another line. Removal is pure bookkeeping —
-        // heads and graph are untouched.
-        let (dir, mut ws) = dock_repo("dockrm-idle");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-        ws.dock_goto("idle").unwrap();
-        ws.dock_goto("main").unwrap();
-        std::fs::write(dir.join("more.txt"), b"more").unwrap();
-        ws.snapshot("more").unwrap();
-        ws.finalize_working().unwrap();
-        let heads_before = ws.repo().heads();
-        let nodes_before = ws.repo().log_detailed().len();
-
-        let dropped = ws.remove_dock("idle").unwrap();
-        assert_eq!(dropped, None, "nothing was parked, nothing dropped");
-        assert_eq!(ws.repo().heads(), heads_before, "heads untouched");
-        assert_eq!(ws.repo().log_detailed().len(), nodes_before, "graph untouched");
-        assert!(!ws.store().dock_exists("idle"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dock_rm_refuses_home_ambient_and_unknown() {
-        let (dir, mut ws) = dock_repo("dockrm-guard");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-
-        let err = ws.remove_dock("main").unwrap_err();
-        assert!(err.contains("default dock"), "unexpected: {err}");
-
-        ws.dock_goto("here").unwrap();
-        let err = ws.remove_dock("here").unwrap_err();
-        assert!(err.contains("ambient dock"), "unexpected: {err}");
-
-        let err = ws.remove_dock("nope").unwrap_err();
-        assert!(err.contains("no such dock"), "unexpected: {err}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dock_at_binds_a_separate_worktree_over_the_shared_store() {
-        // Physical model (ADR 0022): `--at` creates a separate working directory
-        // with a `.loot` pointer file at the shared store, materialized with the
-        // dock's tree, without disturbing the primary.
-        let (dir, mut ws) = dock_repo("worktree");
-        std::fs::write(dir.join("base.txt"), b"base").unwrap();
-        ws.snapshot("base").unwrap();
-        ws.finalize_working().unwrap();
-
-        let wt = std::env::temp_dir().join(format!("loot-wt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&wt);
-        ws.create_dock("feature", Some(&wt)).unwrap();
-
-        // A worktree has a `.loot` pointer *file* (not a dir) and the dock's tree.
-        assert!(wt.join(".loot").is_file(), "worktree has a .loot pointer file");
-        assert!(wt.join("base.txt").exists(), "dock tree materialized into worktree");
-
-        // Opening the worktree loads the shared store on dock `feature`; the
-        // primary is untouched (still the default `main` dock).
-        let wtws = Workspace::open_at(&wt).unwrap();
-        assert_eq!(wtws.current_dock(), Some("feature"));
-        assert_eq!(ws.current_dock(), None, "primary stays on the default dock");
-
-        let _ = std::fs::remove_dir_all(&wt);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // `dock rm` (`dock_rm_*`) and the `--at` worktree dock (`dock_at_binds_…`)
+    // are retired with `.loot/docks/` (#253/ADR 0034): a second position is a
+    // sealed lane, reaped by `loot lane rm` (`remove_lane`, covered by
+    // `lane_spawn_requires_a_keyed_repo_and_the_primary` and the lane-lifecycle
+    // tests) and spawned by `loot lane new` (`lane_spawn_materializes_…`).
 }

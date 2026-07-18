@@ -229,3 +229,50 @@ a daemon or an on-demand lock is #229's decision.
   will not see lane trees, and deleting a repo can orphan its `<repo>-lanes/`
   sibling. Accepted as the price of keeping foreign trees out of the
   primary's snapshot walks.
+
+## Amendment (#253, 2026-07-17): `.loot/docks/` retired — merge resolves a lane
+
+The "dock becomes the *name* of a lane" decision above landed in two layers.
+Layer 1 (#3b, `9308e40`) retired in-place dock *switching* from the CLI but left
+mergeable positions living as `.loot/docks/<name>/` subtrees, created by `loot
+dock <name> --at <dir>` and read by `loot dock merge`. This layer finishes the
+retirement: **`.loot/docks/` is gone entirely**, and the merge source resolves
+from the **lane registry** (`.loot/lanes/`) plus the lane's **own tip pointer**.
+
+What moved:
+
+- **`loot dock merge <name>` → `loot lane merge <id-or-name>`.** The verb folds a
+  named lane's finalized line into the primary. It resolves the source with
+  `find_lane` (id or promoted name) and reads the tip from `<lane>/.loot/tip`
+  (the same read-only peek `loot lanes` does) instead of `.loot/docks/<name>/tip`.
+- **The seam is real merge-source machinery, not a rename.** A lane's `heads`
+  are lane-owned, so its finalized tip is a *sibling outside the primary's
+  lineage-filtered view* (the seal). `merge_lane` therefore first pulls the
+  tip's lineage in from the shared graph via `ingest_shared_lineage` (the #265
+  catch-up primitive) so the ancestry/supersession checks in `fold_line_in` —
+  shared with the no-arg `loot adopt` — can reason about it. `fold_line_in`
+  itself is unchanged.
+- **`loot dock <name> --at`, `loot dock rm`, and `loot docks` are removed.** A
+  second position is a `loot lane new`; a lane is reaped with `loot lane rm` and
+  the registry is surfaced by `loot lanes`. In-place switching (`dock_goto`) and
+  the `--at` worktree binder (`bind_dock_dir`) are gone; a dangling `--at`
+  `.loot` pointer file now opens with an error naming the remedy.
+- **The store's named-dock API is deleted:** `list_docks`, `ensure_dock_dir`,
+  `remove_dock_dir`, `dock_exists`, `docks_dir`, `write_dock`, and the `DOCKS`
+  layout constant. `dock_dir`'s `Some(name)` arm is gone (the selector is always
+  home); the `dock: Option<&str>` *parameter* survives — its full dissolution
+  (a consequence above) stays deferred, as this ticket is a source-resolution
+  change, not a mechanical migration. The oplog captures only the home position
+  (a lane's undo history is lane-local), keeping its on-disk format.
+- **Follow-on retirements the removal forced:** `liveness()` no longer collects
+  sibling docks' parked WIP (lanes seal their WIP — nothing cross-position is
+  visible), so the `!`-marker view feeds an empty parked set; ferry drops the
+  `refs/loot/docks/<name>` projection (a lane's unlanded tip is never in the
+  mirror) and refuses a non-`main` `--dock` designation (git-main tracks the
+  primary — there is no other position's tip to designate).
+
+Amend-topology note: `loot edit` re-anchors to a *sibling* amend only when the
+position `tracks_tip()` (a lane, or a primary that `adopt`/`lane merge` seeded).
+Pre-#253 the old `--at`/switched dock made `docks_active()` true and gave the
+amend-projection path (ADR 0033) that re-anchor for free; a plain primary that
+never pinned a tip still produces a *child* amend, unchanged from before.

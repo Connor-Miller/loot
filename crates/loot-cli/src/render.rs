@@ -35,18 +35,6 @@ pub fn short(oid: &Oid) -> String {
     oid.0[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Annotate a dock/change with its sealed/embargoed file counts, or "" if all
-/// public — the `docks` summary token. Distinct from [`vis_col`], which is the
-/// compact `log` column over the same counts.
-pub fn seal_hint(total: usize, restricted: usize, embargoed: usize) -> String {
-    match (restricted, embargoed) {
-        (0, 0) => String::new(),
-        (r, 0) => format!("  [{r}/{total} sealed]"),
-        (0, e) => format!("  [{e}/{total} embargoed]"),
-        (r, e) => format!("  [{r} sealed, {e} embargoed / {total}]"),
-    }
-}
-
 /// A change id's short display: the first 4 bytes as reverse-hex **letters**
 /// (ADR 0029), e.g. `qsouzmpr` — the durable-handle twin of [`short`]'s hex
 /// **digits**. The two alphabets disambiguate the ids at a glance.

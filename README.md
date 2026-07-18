@@ -168,8 +168,9 @@ loot status [-m <message>]               snapshot the working tree into the work
 loot describe -m <message>               name the working change
 loot new                                 finalize the working change; start a fresh one
 loot surface                             materialize what the current identity may see
-loot dock <name>                         create a dock (isolated tree + tip), or switch to an existing one
-loot docks                               list docks with their tip and visibility
+loot lane new [--name <n>]               spawn a sealed lane (isolated tree + tip) over the shared store
+loot lanes                               list lanes with their tip, in-flight PR, and status
+loot lane merge <id-or-name>             fold a named lane's finalized line into the primary (CA2)
 loot log                                 show change history with visibility hints
 loot gc [--dry-run]                      prune loose objects no change references
 loot bundle <file>                       write a sync bundle (ciphertext, no keys)

@@ -274,9 +274,9 @@ Until legacy switching is fully retired from the primary, the safe rules are:
 - **Resolve one conflict at a time.** `loot resolve` writes only the resolved path
   now (#233), but treat a dirty tree with respect: capture or finalize before you
   reconcile.
-- If you find a parked working change from an older session, it is that dock's
-  in-flight WIP — `loot dock rm <name>` drops it with its dock (#212). Confirm the
-  dock is stale (its work landed) first.
+- If you find a parked working change from an older session, it is that lane's
+  in-flight WIP — `loot lane rm <id-or-name>` reaps it with its lane (#253; was
+  `loot dock rm`, #212). Confirm the lane is stale (its work landed) first.
 
 ## The drift discipline in one line
 

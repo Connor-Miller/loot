@@ -20,11 +20,11 @@ the working change and `new` finalizes it and starts a fresh one on top. It is
 placeholder an internal carry-along capture stored. Naming stays after-the-fact,
 but **nothing signs an un-described change** (#174/#275, ADR 0030 amendments): a
 signed message is permanent and becomes the subject on git `main`. `new` refuses;
-so do the merges that would seal it as a parent in passing (`dock merge`, the
+so do the merges that would seal it as a parent in passing (`lane merge`, the
 `adopt` catch-up, a `ferry` over a git `main` that moved). Every refusal lands
 *after* the capture — the edits are held, only the signature waits for a name.
 The merge **nodes** themselves are exempt: they are machine-authored and carry an
-honest mechanical subject (`merge dock 'x' into 'main'`). Mechanical content may
+honest mechanical subject (`merge lane 'x' into 'main'`). Mechanical content may
 be named mechanically; authored content may not. Under
 implicit auto-snapshot (ADR 0030, #144) every **mutating** verb (`new`,
 `describe`, `grant`, `maroon`, `migrate`, and — since #219 — `pull`/`apply`)
@@ -55,7 +55,7 @@ injection live here. See ADR 0006.
 
 **Operation log & undo** *(S4, ADR 0031, #146)* — the safety net under implicit
 auto-snapshot. Every **view-changing** command (the mutating verbs above,
-`dock`/`dock merge`, `resolve`, `apply`/`pull`/`ferry`, and the barriers below)
+`lane merge`, `resolve`, `apply`/`pull`/`ferry`, and the barriers below)
 records one **operation** in an append-only, repo-wide, **local-only** log at
 `.loot/ops`. An operation captures the resulting **view** — the change-graph
 heads, each dock's `working`/`tip` pointers, the `conflicts` set, and the
@@ -81,7 +81,7 @@ the same change id (the honest answer to a concurrent amend, not an error). It i
 per-change-id, *not* head-counting — two versions of one change id can sit under
 a single graph head (e.g. as the two parents of a merge) and may even have
 identical trees — so it is detected by scanning every node, never just the heads,
-and it is **not** a tree conflict (`resolve`/`dock merge` are untouched). `log`
+and it is **not** a tree conflict (`resolve`/`lane merge` are untouched). `log`
 and `status` render it with a trailing **`!`** on the change id and list each
 version; a log whose only multi-head reason is one divergent change stays the
 flat listing (routing by *distinct change lines*, not head count, so the "run
@@ -121,8 +121,8 @@ executor of the partition, not an owner of the rule.
 operator switched away: still that dock's working pointer, still a live head in
 the shared graph, resumed in place by the dock's next snapshot. It is in-flight
 WIP, not a line: converge never folds it (#203), projection never ships it
-(unsigned never travels, ADR 0018), and `loot dock rm` drops it with its dock
-(#212). *(ADR 0034 retires the concept once lanes land: WIP stays inside its
+(unsigned never travels, ADR 0018), and `loot lane rm` reaps it with its
+lane (#253; was `loot dock rm`, #212). *(ADR 0034 retires the concept once lanes land: WIP stays inside its
 [[Lane]] and never enters the shared heads, so there is nothing to park.)*
 _Avoid_: stray head, orphan WIP.
 
@@ -221,13 +221,15 @@ becomes a **named [[Lane]]** — since #231 the promotion verb is `loot lane
 name <n>`. The naming call is locked and #234 swept the primary's stale named
 docks (`adr-0033-ferry`, `list`, `loot-first`) into the lane model, leaving only
 `main` — the git-`main`-tracked [[Harbor]] position, a dock in the new sense.
-Legacy in-place *switching* is **retired from the CLI** (#3b layer 1): a bare
-`loot dock <name>` now refuses ("use `loot lane new`, or `--at <dir>` to bind a
-separate worktree") — a second position is always a separate directory, never a
-re-materialization of the primary tree. `dock_goto` survives only as test
-scaffolding. The deeper end-state — dropping `.loot/docks/` entirely so
-`dock merge` resolves a named [[Lane]] from the registry — rides #253.)* _Avoid_:
-worktree, checkout, berth, slip.
+Legacy in-place *switching* is **retired from the CLI** (#3b layer 1): a second
+position is always a separate directory, never a re-materialization of the
+primary tree. **Retirement completed by #253:** `.loot/docks/` is gone
+entirely — `loot dock <name> --at`, `loot dock rm`, and `loot docks` are
+removed, `dock_goto`/`bind_dock_dir` deleted, and the merge verb is now `loot
+lane merge <id-or-name>`, which resolves a named [[Lane]] from the registry and
+reads its own `.loot/tip` (ingesting that sealed line into view before folding).
+The only dock left is `main` — the git-`main`-tracked [[Harbor]] position.)*
+_Avoid_: worktree, checkout, berth, slip.
 
 **Buoy** *(CA4 shipped, 2026-07-09)* — a change that
 carries a navigational-role [[Attestation]] (e.g. `reviewed`, `base`), used as a
@@ -243,9 +245,10 @@ in contrast to the moving [[Dock]]. _Avoid_: tag, bookmark, branch.
 integrator [[Dock]] that agents converge into and re-base from: a dock with a
 well-known name and *no* permissions attached, so it is a coordination
 convention, not a gated branch (branches stay a permanent non-goal). Merging is
-direct and local — `loot dock merge <name>` applies one dock's tip onto
-another's working change in-process, reusing the `apply`/converge path with no
-relay hop, because docks share one object store. The relay remains the path for
+direct and local — `loot lane merge <id-or-name>` (#253; was `loot dock merge`)
+folds a named [[Lane]]'s finalized tip onto the primary's working change
+in-process, reusing the `apply`/converge path with no relay hop, because lanes
+share one object store. The relay remains the path for
 *remote* agents only. *(Promoted by ADR 0034 from convention to **owner**, and
 **shipped** by #229/ADR 0036 as an **on-demand lock** — not a daemon: a land
 takes a brief shared-store lock (`.loot/git-mirror/harbor.lock`) across the

@@ -68,17 +68,22 @@ pub fn run(
         cfg.insert("gitdir".into(), dir.into());
     }
     if let Some(dock) = dock_flag {
-        let prev = cfg.insert("dock".into(), dock.into());
-        if let Some(prev) = prev.filter(|p| p != dock) {
-            report.notes.push(format!("mirror main now tracks dock '{dock}' (was '{prev}')"));
+        // Designating a *non-main* dock for git-main is retired (#253/ADR 0034):
+        // named docks are gone, so git-main tracks the primary. `--dock main` is
+        // the harmless default; anything else can no longer name a live position.
+        if dock != "main" {
+            return Err(format!(
+                "designating dock '{dock}' for git-main is retired (#253/ADR 0034) — \
+                 git-main tracks the primary. Drop `--dock {dock}`."
+            ));
         }
+        cfg.insert("dock".into(), "main".into());
     }
     let git_dir = resolve_gitdir(
         cfg.get("gitdir")
             .ok_or("no mirror bound — run `loot ferry --git-dir <path>` once to bind one")?,
         ws.store().dot(),
     );
-    let main_dock = cfg.get("dock").cloned().unwrap_or_else(|| "main".to_string());
     // The config persists with the spine at the END of the pass, not here: a
     // flag on a run that then fails must not rebind future bare passes (#201
     // — a failed `--dock` probe silently retargeted main at a stale dock tip,
@@ -220,14 +225,11 @@ pub fn run(
         report.projected += 1;
     }
 
-    // --- refs: heads, docks, and the designated-dock main ---
+    // --- refs: heads, and git-main tracking the primary ---
     update_loot_refs(ws, &git, &marks)?;
-    let dock_sel = |name: &str| if name == "main" { None } else { Some(name.to_string()) };
-    let main_target = if ws.dock_name() == main_dock {
-        ws.finalized_anchor()
-    } else {
-        ws.store().read_tip(dock_sel(&main_dock).as_deref())
-    };
+    // git-main tracks the primary's finalized anchor (#253/ADR 0034): named docks
+    // are retired, so there is no other position's tip to designate.
+    let main_target = ws.finalized_anchor();
     if let Some(tip_change) = main_target {
         if let Some(sha) = marks.sha_for(&tip_change) {
             let oid = git2::Oid::from_str(sha).map_err(|e| e.to_string())?;
@@ -247,11 +249,11 @@ pub fn run(
                 // Fast-forward only (#201): the published branch is append-only
                 // to everything downstream (the GitHub push rejects a regression
                 // anyway) — a target that does not descend from the current tip
-                // means the designated dock is stale or freshly rebound, so say
-                // so instead of silently moving main backward.
+                // means the primary was settled backward (e.g. `loot adopt
+                // <older>`), so say so instead of silently moving main backward.
                 report.notes.push(format!(
                     "main NOT moved to {} — it does not descend from the current tip {}; \
-                     is the designated dock ('{main_dock}') stale? see .loot/git-mirror/config",
+                     was the primary settled onto an older change? see .loot/git-mirror/config",
                     &sha[..12.min(sha.len())],
                     &cur.to_string()[..12]
                 ));
@@ -1173,9 +1175,14 @@ fn write_git_tree(
 
 // --- refs ---
 
-/// Point `refs/loot/heads/<id>` at every mirrored head (and prune stale ones),
-/// plus `refs/loot/docks/<name>` at each dock's mirrored tip. Mechanical
-/// reachability handles, not branches (ADR 0022 stands).
+/// Point `refs/loot/heads/<id>` at every mirrored head (and prune stale ones).
+/// Mechanical reachability handles, not branches (ADR 0022 stands).
+///
+/// The per-dock `refs/loot/docks/<name>` projection is retired with named docks
+/// (#253/ADR 0034): the only other positions are sealed lanes, whose
+/// finalized-but-unlanded tips live outside the mirror (a lane exports to the
+/// mirror only when it lands, at which point it is on `main`), so there is
+/// nothing extra to anchor here.
 fn update_loot_refs(ws: &Workspace, git: &git2::Repository, marks: &MarkMap) -> Result<(), String> {
     let mut live: Vec<String> = Vec::new();
     for head in ws.heads() {
@@ -1196,14 +1203,6 @@ fn update_loot_refs(ws: &Workspace, git: &git2::Repository, marks: &MarkMap) -> 
             if let Ok(mut r) = git.find_reference(&name) {
                 let _ = r.delete();
             }
-        }
-    }
-    for info in ws.dock_list() {
-        let Some(head) = info.head else { continue };
-        if let Some(sha) = marks.sha_for(&head) {
-            let name = format!("refs/loot/docks/{}", info.name);
-            let oid = git2::Oid::from_str(sha).map_err(|e| e.to_string())?;
-            git.reference(&name, oid, true, "loot ferry").map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -1581,30 +1580,22 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_designated_dock_cannot_drag_main_backward() {
+    fn designating_a_non_main_dock_for_git_main_is_retired() {
+        // #253/ADR 0034: named docks are gone, so git-main tracks the primary.
+        // `--dock <other>` can no longer name a live position, so ferry refuses
+        // it outright rather than silently retargeting main — the #201 hazard the
+        // old designated-dock FF-guard protected against, now impossible to enter.
         let (mut ws, dir, mirror) = setup("ffguard");
         put_file(&dir, "a.txt", "one\n");
         seal_change(&mut ws, "first");
         ferry(&mut ws, &mirror);
 
-        // Fork a side dock at the current tip, then advance main past it.
-        ws.dock_goto("side").unwrap();
-        ws.dock_goto("main").unwrap();
-        put_file(&dir, "a.txt", "two\n");
-        seal_change(&mut ws, "second");
-        ferry(&mut ws, &mirror);
-        let git = git2::Repository::open(&mirror).unwrap();
-        let tip = main_commit(&git).id();
-
-        // Rebinding main onto the stale fork must not rewind the published
-        // branch (#201) — the pass says so and leaves the ref alone.
-        let report = run(&mut ws, Some(mirror.to_str().unwrap()), Some("side"), false).unwrap();
-        assert_eq!(main_commit(&git).id(), tip, "main did not move backward");
-        assert!(
-            report.notes.iter().any(|n| n.contains("NOT moved")),
-            "the skipped update is loud: {:?}",
-            report.notes
-        );
+        let err = run(&mut ws, Some(mirror.to_str().unwrap()), Some("side"), false)
+            .err()
+            .expect("designating a non-main dock refuses");
+        assert!(err.contains("retired") && err.contains("side"), "{err}");
+        // `--dock main` (the default) is still accepted — a harmless no-op.
+        assert!(run(&mut ws, Some(mirror.to_str().unwrap()), Some("main"), false).is_ok());
     }
 
     #[test]
@@ -1616,10 +1607,11 @@ mod tests {
         let before = read_or_empty(&ws.store().git_config());
 
         // A pass that dies after flag parsing (an existing path that is not a
-        // git repository) must not rebind the designated dock (#201).
+        // git repository) must not rebind the mirror config (#201). The config
+        // persists at the END of a successful pass, never at flag-parse time.
         let bogus = dir.join("not-a-repo");
         std::fs::write(&bogus, "x").unwrap();
-        let err = match run(&mut ws, Some(bogus.to_str().unwrap()), Some("side"), false) {
+        let err = match run(&mut ws, Some(bogus.to_str().unwrap()), None, false) {
             Err(e) => e,
             Ok(_) => panic!("pass against a non-repo path unexpectedly succeeded"),
         };
@@ -2297,12 +2289,6 @@ mod tests {
         assert!(git.find_reference(&lane_ref).is_err());
     }
 
-    /// Ferry designating `dock` as the git-main dock — the binding pass. Using
-    /// a named dock (not the home dock) also activates dock semantics, so
-    /// `loot edit` re-anchors to the sibling parent exactly as in production.
-    fn ferry_on(ws: &mut Workspace, mirror: &Path, dock: &str) -> FerryReport {
-        run(ws, Some(mirror.to_str().unwrap()), Some(dock), false).unwrap()
-    }
 
     /// Reopen the change carrying version `v`, amend `a.txt`, finalize; returns
     /// the superseding version X′.
@@ -2326,9 +2312,12 @@ mod tests {
         // force-push — and the commit records the supersession in a trailer.
         let (mut ws, dir, mirror) = setup("amend-landed");
         put_file(&dir, "a.txt", "base\n");
-        seal_change(&mut ws, "base"); // P, on the home dock
-        ws.dock_goto("work").unwrap(); // work forks from P; activates dock semantics
-        ferry_on(&mut ws, &mirror, "work");
+        seal_change(&mut ws, "base"); // P, on the primary
+        ferry(&mut ws, &mirror);
+        // The primary tracks its tip (the post-land state) so `loot edit`
+        // re-anchors to a *sibling* amend — named docks that gave the old test
+        // this for free are retired (#253/ADR 0034).
+        ws.pin_tip_at_anchor();
         put_file(&dir, "a.txt", "feature\n");
         put_file(&dir, "b.txt", "added\n");
         let x = seal_change(&mut ws, "feature"); // X, child of P
@@ -2381,9 +2370,11 @@ mod tests {
         // P -> X′ and the intermediate X stays reachable on a loot head ref.
         let (mut ws, dir, mirror) = setup("amend-local");
         put_file(&dir, "a.txt", "base\n");
-        seal_change(&mut ws, "base"); // P, on the home dock
-        ws.dock_goto("work").unwrap(); // work forks from P; activates dock semantics
-        ferry_on(&mut ws, &mirror, "work");
+        seal_change(&mut ws, "base"); // P, on the primary
+        ferry(&mut ws, &mirror);
+        // The primary tracks its tip (post-land state) so `loot edit` re-anchors
+        // to a sibling amend — #253 retired the dock that gave this for free.
+        ws.pin_tip_at_anchor();
         let git = git2::Repository::open(&mirror).unwrap();
         let p_sha = main_commit(&git).id(); // main == P
 
@@ -2419,10 +2410,9 @@ mod tests {
         // change-id-wide "a signed version exists" test reaped it every pass.
         let (mut ws, dir, mirror) = setup("reopen-lane");
         put_file(&dir, "a.txt", "base\n");
-        seal_change(&mut ws, "base"); // P, on the home dock
-        ws.dock_goto("work").unwrap(); // work forks from P; activates dock semantics
-        ferry_on(&mut ws, &mirror, "work");
-        let dock = ws.dock_name().to_string();
+        seal_change(&mut ws, "base"); // P, on the primary
+        ferry(&mut ws, &mirror);
+        let dock = ws.dock_name().to_string(); // the primary's handle: "main"
         let git = git2::Repository::open(&mirror).unwrap();
 
         // Open a review lane for a feature, then finalize + land it (lane reaps).
@@ -2454,7 +2444,7 @@ mod tests {
         ws.edit(&loot_core::hex::letters(&cid)).unwrap();
         put_file(&dir, "a.txt", "feature amended\n");
         ws.snapshot("feature").unwrap();
-        assert_eq!(ws.store().read_working(Some(&dock)).map(|w| ws.graph().change_id(&w)), Some(Some(cid)),
+        assert_eq!(ws.store().read_working(None).map(|w| ws.graph().change_id(&w)), Some(Some(cid)),
             "the reopened working change carries X's handle");
         let _ = x;
         let reopened = ferry_wip(&mut ws, &mirror);
