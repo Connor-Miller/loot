@@ -42,15 +42,17 @@ fn main() -> ExitCode {
         };
     }
 
-    let result = match cmd {
+    // Every verb *returns* its output as a boxed [`Emit`] shape rather than
+    // writing stdout itself (1a): the dispatcher renders it once, here, with
+    // the resolved format. `help`/`version` and the per-verb `--help` gate
+    // print their static text directly and return an empty shape (nothing more
+    // to render). `buoy` dispatched above keeps its own ExitCode.
+    let result: Result<Box<dyn Emit>, String> = match cmd {
         "help" | "-h" | "--help" => {
             print_help();
-            Ok(())
+            Ok(Box::new(emit::Message::new(String::new())))
         }
-        "-V" | "--version" => {
-            println!("{}", version_line());
-            Ok(())
-        }
+        "-V" | "--version" => Ok(Box::new(emit::Message::new(format!("{}\n", version_line())))),
         other => match COMMANDS.iter().find(|v| v.spec.name == other) {
             // The flag gate runs *before* the verb (#67): a verb never sees an
             // argument list holding a flag it does not understand, so a typo
@@ -58,7 +60,7 @@ fn main() -> ExitCode {
             Some(v) => match v.spec.check(rest) {
                 Ok(FlagCheck::Help) => {
                     print_help();
-                    Ok(())
+                    Ok(Box::new(emit::Message::new(String::new())))
                 }
                 Ok(FlagCheck::Proceed) => (v.run)(rest),
                 Err(e) => Err(e),
@@ -68,7 +70,10 @@ fn main() -> ExitCode {
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(shape) => {
+            print!("{}", shape.render(out_fmt(rest)));
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("loot: {e}");
             ExitCode::FAILURE
@@ -77,17 +82,20 @@ fn main() -> ExitCode {
 }
 
 /// A dispatchable verb: what it is called, which flags it accepts (#67, gated
-/// by [`FlagSpec::check`] before the verb runs), and how to run it.
+/// by [`FlagSpec::check`] before the verb runs), and how to run it. A verb
+/// yields its output as a boxed [`Emit`] shape (1a) — the dispatcher renders
+/// and prints it — so a verb is callable in-process and its output is a value
+/// a test can assert on without spawning the binary.
 struct Verb {
     spec: FlagSpec,
-    run: fn(&[String]) -> Result<(), String>,
+    run: fn(&[String]) -> Result<Box<dyn Emit>, String>,
 }
 
 const fn verb(
     name: &'static str,
     valued: &'static [&'static str],
     bare: &'static [&'static str],
-    run: fn(&[String]) -> Result<(), String>,
+    run: fn(&[String]) -> Result<Box<dyn Emit>, String>,
 ) -> Verb {
     Verb { spec: FlagSpec { bin: "loot", name, valued, bare }, run }
 }
@@ -387,9 +395,20 @@ fn conflict_verdicts(
         .collect()
 }
 
+/// A verb's return (1a): a boxed [`Emit`] shape the dispatcher renders once
+/// with the resolved format. Aliased because ~57 `cmd_*` signatures carry it.
+type Emitted = Result<Box<dyn Emit>, String>;
+
+/// Wrap prose (or empty) text as an [`emit::Message`] — the return for every
+/// verb with no machine-output contract (the ~49 human-only verbs). The verb
+/// builds its exact former stdout into one string and hands it back.
+fn msg(text: impl Into<String>) -> Emitted {
+    Ok(Box::new(emit::Message::new(text)))
+}
+
 // --- commands ---
 
-fn cmd_init(args: &[String]) -> Result<(), String> {
+fn cmd_init(args: &[String]) -> Emitted {
     let id_name = flag(args, "--identity")
         .map(String::from)
         .or_else(|| GlobalConfig::load().get("identity").map(String::from))
@@ -398,7 +417,7 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
 }
 
 /// Shared init logic: initialize a repo at `dir`, generate keypair, print summary.
-fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
+fn init_repo(dir: &std::path::Path, id_name: &str) -> Emitted {
     let ws = Workspace::init_at(dir, id_name)?;
     let dot = ws.dot().to_path_buf();
     let keypair = identity::generate_and_save(&dot, &format!("{id_name}@loot"))
@@ -413,16 +432,18 @@ fn init_repo(dir: &std::path::Path, id_name: &str) -> Result<(), String> {
     // Genesis operation: the floor of the op log, so `undo` always has an
     // initial view to walk back to and never below (ADR 0031).
     ws.record_op("init", "initialized repo", false);
-    println!("initialized empty loot repo at {}, identity = {id_name}", dir.display());
-    println!("public key: {}", pub_line.trim());
-    println!("tip: share your public key with peers via `loot whoami`");
-    println!("tip: declare per-file privacy in .lootattributes, e.g. `.env restricted={id_name}`");
+    let mut out = String::new();
+    let _ = writeln!(out, "initialized empty loot repo at {}, identity = {id_name}", dir.display());
+    let _ = writeln!(out, "public key: {}", pub_line.trim());
+    let _ = writeln!(out, "tip: share your public key with peers via `loot whoami`");
+    let _ =
+        writeln!(out, "tip: declare per-file privacy in .lootattributes, e.g. `.env restricted={id_name}`");
     // Quickstart (#21): teach the three visibility modes right at init, on
     // stdout so CI logs carry it too. Print-only — pasting it is the user's call.
-    println!("\nquickstart — paste this into a .lootattributes file to control visibility:\n");
-    println!("{}", lootattributes_quickstart());
+    let _ = writeln!(out, "\nquickstart — paste this into a .lootattributes file to control visibility:\n");
+    let _ = writeln!(out, "{}", lootattributes_quickstart());
     let _ = keypair;
-    Ok(())
+    msg(out)
 }
 
 /// The commented `.lootattributes` example `init` prints (#21): one comment per
@@ -439,7 +460,7 @@ fn lootattributes_quickstart() -> &'static str {
 RELEASE.md    embargoed=1800000000"
 }
 
-fn cmd_status(args: &[String]) -> Result<(), String> {
+fn cmd_status(args: &[String]) -> Emitted {
     let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
     // status is READ-ONLY (ADR 0030): it recomputes the pending delta live and
@@ -457,8 +478,12 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         // the edits in one stroke, skipping the review lane (#174). `describe` is
         // the first verb on dirty work; `new` is step 6 (docs/agents/workflow.md).
         let human = "no working change (run `loot describe -m \"<subject>\"` to start one)\n".to_string();
-        print!("{}", emit::Status { change_id: None, version: None, entries: &[], human }.render(fmt));
-        return Ok(());
+        return Ok(Box::new(emit::Status {
+            change_id: None,
+            version: None,
+            entries: Vec::new(),
+            human,
+        }));
     };
 
     // An empty working change (no delta over the tip) has no meaningful version
@@ -493,8 +518,12 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         String::new()
     };
     // status is not a merge: its own working-change shape (ADR 0023/0029).
-    print!("{}", emit::Status { change_id: row.change_id, version, entries, human }.render(fmt));
-    Ok(())
+    Ok(Box::new(emit::Status {
+        change_id: row.change_id,
+        version: version.cloned(),
+        entries: entries.to_vec(),
+        human,
+    }))
 }
 
 /// `loot diff [<from>] [<to>]` (#1): the path-level delta between two changes.
@@ -502,15 +531,14 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
 /// defaults are command-specific — no arg diffs HEAD vs the working change, one
 /// arg diffs that change vs the working change, two diffs the pair. Output is
 /// the #306 shared path-delta line, one row per changed path.
-fn cmd_diff(args: &[String]) -> Result<(), String> {
+fn cmd_diff(args: &[String]) -> Emitted {
     // `--conflict <path>` is a distinct mode (#13): inspect both sides of a
     // recorded conflict rather than diff two changes. It takes no from/to.
     if has_flag(args, "--conflict") {
         let path = flag(args, "--conflict").ok_or("usage: loot diff --conflict <path>")?;
         let ws = Workspace::open()?;
         let view = ws.graph().conflict_at(std::path::Path::new(path))?;
-        print!("{}", render::conflict_sides(&view));
-        return Ok(());
+        return msg(render::conflict_sides(&view));
     }
     let pos = positionals(args);
     let (from, to) = match pos.as_slice() {
@@ -524,16 +552,16 @@ fn cmd_diff(args: &[String]) -> Result<(), String> {
     let to_oid = ws.resolve_selector(to)?;
     let deltas = ws.diff(&from_oid, &to_oid)?;
     if deltas.is_empty() {
-        println!("no changes");
-        return Ok(());
+        return msg("no changes\n");
     }
+    let mut out = String::new();
     for d in &deltas {
-        println!("{}", delta_line(d));
+        let _ = writeln!(out, "{}", delta_line(d));
     }
-    Ok(())
+    msg(out)
 }
 
-fn cmd_describe(args: &[String]) -> Result<(), String> {
+fn cmd_describe(args: &[String]) -> Emitted {
     let message = message_flag(args).ok_or("describe requires -m <message>")?;
     let allow_demote: Vec<std::path::PathBuf> =
         flag_values(args, "--allow-demote").into_iter().map(Into::into).collect();
@@ -547,12 +575,12 @@ fn cmd_describe(args: &[String]) -> Result<(), String> {
     // snapshots-and-names in one step — `--no-snapshot` does not apply. The
     // demotion guard still rides it via `--allow-demote`.
     let (id, _) = ws.snapshot_allowing(message, &allow_demote)?;
-    println!("described working change {} as \"{message}\"", short(&id));
+    let out = format!("described working change {} as \"{message}\"\n", short(&id));
     ws.record_op("describe", &format!("named \"{message}\""), false);
-    Ok(())
+    msg(out)
 }
 
-fn cmd_new(args: &[String]) -> Result<(), String> {
+fn cmd_new(args: &[String]) -> Emitted {
     let opts = parse_snapshot_opts(args);
     let allow_reveal: Vec<std::path::PathBuf> =
         flag_values(args, "--allow-reveal").into_iter().map(Into::into).collect();
@@ -586,22 +614,27 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
         None => "new (nothing to finalize)".to_string(),
     };
     let did_finalize = finalized.is_some();
+    let mut out = String::new();
     match finalized {
-        Some(id) => println!("finalized working change {}; started fresh change {next}", short(&id)),
-        None => println!("nothing to finalize; started fresh change {next}"),
+        Some(id) => {
+            let _ = writeln!(out, "finalized working change {}; started fresh change {next}", short(&id));
+        }
+        None => {
+            let _ = writeln!(out, "nothing to finalize; started fresh change {next}");
+        }
     }
     // First-seal summary (#63, ADR 0038 §1): when this finalize actually sealed
     // a change, list the paths it sealed for the first time and how each
     // resolved — so a surprise (a secret waved through with `--allow-reveal`, or
     // any path outside the name set) is visible at the moment of signing.
     if did_finalize && !first_seals.is_empty() {
-        println!("first-seal summary ({} new path{}):", first_seals.len(), if first_seals.len() == 1 { "" } else { "s" });
+        let _ = writeln!(out, "first-seal summary ({} new path{}):", first_seals.len(), if first_seals.len() == 1 { "" } else { "s" });
         for (path, vis) in &first_seals {
-            println!("  {}  {}", render::visibility_label(vis), path.display());
+            let _ = writeln!(out, "  {}  {}", render::visibility_label(vis), path.display());
         }
     }
     ws.record_op("new", &desc, false);
-    Ok(())
+    msg(out)
 }
 
 /// `loot edit <change-id>` — reopen a finalized change as the working change,
@@ -611,12 +644,11 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
 /// in-progress working change or uncaptured edits (edit *replaces* the working
 /// change — it never implicit-captures), on a divergent handle, and on a change
 /// with descendants. One undoable operation (ADR 0031).
-fn cmd_edit(args: &[String]) -> Result<(), String> {
+fn cmd_edit(args: &[String]) -> Emitted {
     let prefix = first_positional(args).ok_or("usage: loot edit <change-id>")?;
     let mut ws = Workspace::open()?;
     let report = ws.edit(prefix)?;
-    print!("{}", render::edit_done(&report));
-    Ok(())
+    msg(render::edit_done(&report))
 }
 
 /// `loot abandon <selector>` — drop a version from a **divergent** change (S3,
@@ -631,7 +663,7 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
 /// fork tip), the non-divergent counterpart used to walk a drifted dock off a
 /// stale line before a re-ferry (#243). Same undoable machinery; refuses a
 /// non-head and refuses emptying the dock of its last live head.
-fn cmd_abandon(args: &[String]) -> Result<(), String> {
+fn cmd_abandon(args: &[String]) -> Emitted {
     let head_mode = has_flag(args, "--head");
     let selector = first_positional(args).ok_or(if head_mode {
         "usage: loot abandon --head <selector>"
@@ -644,18 +676,20 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
     // match this used to hand-roll — `loot abandon @` and `loot abandon
     // HEAD~2` now resolve the same way `loot diff` already does.
     let version = ws.resolve_selector(selector)?;
+    let mut out = String::new();
     if head_mode {
         ws.abandon_fork(&version)?;
-        println!("abandoned fork head {} — the dock keeps its other live line(s)", short(&version));
+        let _ = writeln!(out, "abandoned fork head {} — the dock keeps its other live line(s)", short(&version));
     } else {
         ws.abandon(&version)?;
-        println!(
+        let _ = writeln!(
+            out,
             "abandoned version {} — its change id keeps the remaining live version(s)",
             short(&version)
         );
     }
-    println!("  nothing was deleted; `loot undo` brings it back (see `loot op log`)");
-    Ok(())
+    let _ = writeln!(out, "  nothing was deleted; `loot undo` brings it back (see `loot op log`)");
+    msg(out)
 }
 
 /// `loot adopt <version-id> [--discard-wip]` — settle this dock **wholesale**
@@ -666,7 +700,7 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
 /// materializes the target's tree. One undoable op — `loot undo` restores the
 /// pre-adopt view. `--discard-wip` drops a dirty working tree (the sanctioned
 /// override of the #219 tree-write chokepoint).
-fn cmd_adopt(args: &[String]) -> Result<(), String> {
+fn cmd_adopt(args: &[String]) -> Emitted {
     let discard_wip = has_flag(args, "--discard-wip");
     let mut ws = Workspace::open()?;
 
@@ -683,57 +717,59 @@ fn cmd_adopt(args: &[String]) -> Result<(), String> {
         }
         let report = ws.adopt_harbor()?;
         if report.already_current {
-            println!("already caught up to landed main ({}) — nothing to merge", short(&report.harbor));
-            return Ok(());
+            return msg(format!("already caught up to landed main ({}) — nothing to merge\n", short(&report.harbor)));
         }
-        println!("caught up to landed main ({}) — folded the local line in", short(&report.harbor));
+        let mut out = String::new();
+        let _ = writeln!(out, "caught up to landed main ({}) — folded the local line in", short(&report.harbor));
         let conflicts = report
             .outcomes
             .values()
             .filter(|o| matches!(o, MergeOutcome::Conflict { .. }))
             .count();
         if conflicts > 0 {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {conflicts} path(s) need resolution — `loot resolve <path> <file>`, then re-land"
             );
         }
-        println!("  `loot undo` steps back before the catch-up (see `loot op log`)");
-        return Ok(());
+        let _ = writeln!(out, "  `loot undo` steps back before the catch-up (see `loot op log`)");
+        return msg(out);
     };
 
     let report = ws.adopt(prefix, discard_wip)?;
     if report.already_there {
-        println!("already on {} — nothing to settle", short(&report.target));
-        return Ok(());
+        return msg(format!("already on {} — nothing to settle\n", short(&report.target)));
     }
-    println!(
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "adopted {} — the dock now sits on it, no merge",
         short(&report.target)
     );
     if !report.abandoned.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "  discarded the divergent line ({} head(s) abandoned)",
             report.abandoned.len()
         );
     }
     if report.discarded_wip {
-        println!("  dropped the dock's working-tree changes (`--discard-wip`)");
+        let _ = writeln!(out, "  dropped the dock's working-tree changes (`--discard-wip`)");
     }
-    println!("  nothing was deleted; `loot undo` brings the line back (see `loot op log`)");
-    Ok(())
+    let _ = writeln!(out, "  nothing was deleted; `loot undo` brings the line back (see `loot op log`)");
+    msg(out)
 }
 
 /// `loot undo` — step the view back one operation (ADR 0031). Refuses across a
 /// one-way barrier (push/grant/maroon/pull-grants) with the remedy to use instead.
-fn cmd_undo() -> Result<(), String> {
+fn cmd_undo() -> Emitted {
     let mut ws = Workspace::open()?;
     let report = ws.undo()?;
-    print_step(&report);
-    Ok(())
+    msg(print_step(&report))
 }
 
 /// `loot op log` | `loot op restore <n>` — inspect and jump the operation log.
-fn cmd_op(args: &[String]) -> Result<(), String> {
+fn cmd_op(args: &[String]) -> Emitted {
     match args.first().map(String::as_str) {
         None | Some("log") => cmd_op_log(),
         Some("restore") => {
@@ -743,8 +779,7 @@ fn cmd_op(args: &[String]) -> Result<(), String> {
                 .map_err(|_| format!("op restore expects an operation number, got '{target}'"))?;
             let mut ws = Workspace::open()?;
             let report = ws.restore_op(n)?;
-            print_step(&report);
-            Ok(())
+            msg(print_step(&report))
         }
         Some(other) => Err(format!(
             "unknown op subcommand '{other}' — use `loot op log` or `loot op restore <n>`"
@@ -754,13 +789,13 @@ fn cmd_op(args: &[String]) -> Result<(), String> {
 
 /// `loot op log` — the append-only operation history, newest first. Barrier ops
 /// (one-way disclosures undo won't cross) are flagged.
-fn cmd_op_log() -> Result<(), String> {
+fn cmd_op_log() -> Emitted {
     let ws = Workspace::open()?;
     let ops = ws.op_log()?;
     if ops.is_empty() {
-        println!("no operations recorded yet");
-        return Ok(());
+        return msg("no operations recorded yet\n");
     }
+    let mut out = String::new();
     for op in ops.iter().rev() {
         let heads = op.heads();
         let head_col = if heads.is_empty() {
@@ -769,38 +804,39 @@ fn cmd_op_log() -> Result<(), String> {
             format!("  heads {{{}}}", heads.iter().map(short).collect::<Vec<_>>().join(", "))
         };
         let barrier = if op.barrier { "  ⚠ barrier" } else { "" };
-        println!(
+        let _ = writeln!(
+            out,
             "op {:<4} {:<11} {}{}{}",
             op.index, op.command, op.description, head_col, barrier
         );
     }
-    Ok(())
+    msg(out)
 }
 
 /// Report what an `undo`/`op restore` did: which op the view now sits on, its
-/// heads, and the working change (if any).
-fn print_step(r: &StepReport) {
+/// heads, and the working change (if any). Returns the rendered text; the verb
+/// returns it as its shape (1a).
+fn print_step(r: &StepReport) -> String {
     let heads = if r.heads.is_empty() {
         "∅".to_string()
     } else {
         r.heads.iter().map(short).collect::<Vec<_>>().join(", ")
     };
-    println!("{} — now at op {}, head {heads}", r.description, r.restored_to);
+    let mut out = format!("{} — now at op {}, head {heads}\n", r.description, r.restored_to);
     if let Some(w) = &r.working {
-        println!("  working change {}", short(w));
+        let _ = writeln!(out, "  working change {}", short(w));
     }
+    out
 }
 
-fn cmd_surface() -> Result<(), String> {
+fn cmd_surface() -> Emitted {
     let mut ws = Workspace::open()?;
     let (head, written, skipped) = ws.surface_with_report()?;
     let burned = ws.burned_paths_at(&head);
     if written.is_empty() && skipped == 0 && burned.is_empty() {
-        println!("nothing to surface (no changes recorded)");
-        return Ok(());
+        return msg("nothing to surface (no changes recorded)\n");
     }
-    print_surface_listing(&head, &written, skipped, &burned, ws.identity());
-    Ok(())
+    msg(print_surface_listing(&head, &written, skipped, &burned, ws.identity()))
 }
 
 /// The `loot surface` listing — written paths with visibility marks, the
@@ -813,43 +849,47 @@ fn print_surface_listing(
     skipped: usize,
     burned: &[(std::path::PathBuf, Oid)],
     identity: &str,
-) {
+) -> String {
+    let mut out = String::new();
     for (path, vis) in written {
-        println!("  {:<32} {}", path.display(), mark(vis));
+        let _ = writeln!(out, "  {:<32} {}", path.display(), mark(vis));
     }
     for (path, _oid) in burned {
-        println!("  {:<32} burned (bytes destroyed — ADR 0038)", path.display());
+        let _ = writeln!(out, "  {:<32} burned (bytes destroyed — ADR 0038)", path.display());
     }
     if skipped > 0 {
-        println!("  ({skipped} sealed path(s) skipped — request a grant to access them)");
+        let _ = writeln!(out, "  ({skipped} sealed path(s) skipped — request a grant to access them)");
     }
-    println!("surfaced {} as {identity}", short(head));
+    let _ = writeln!(out, "surfaced {} as {identity}", short(head));
+    out
 }
 
-fn cmd_gc(args: &[String]) -> Result<(), String> {
+fn cmd_gc(args: &[String]) -> Emitted {
     let dry_run = args.iter().any(|a| a == "--dry-run" || a == "-n");
     let mut ws = Workspace::open()?;
     let report = ws.gc(dry_run)?;
 
     if report.pruned == 0 {
-        println!("nothing to prune — every stored object is referenced by a change");
-        return Ok(());
+        return msg("nothing to prune — every stored object is referenced by a change\n");
     }
 
     let human = human_bytes(report.bytes);
+    let mut out = String::new();
     if dry_run {
-        println!(
+        let _ = writeln!(
+            out,
             "would prune {} object(s), freeing {human} ({} bytes)",
             report.pruned, report.bytes
         );
-        println!("  run `loot gc` (without --dry-run) to delete them");
+        let _ = writeln!(out, "  run `loot gc` (without --dry-run) to delete them");
     } else {
-        println!(
+        let _ = writeln!(
+            out,
             "pruned {} object(s), freed {human} ({} bytes)",
             report.pruned, report.bytes
         );
     }
-    Ok(())
+    msg(out)
 }
 
 /// `loot verify [--accept-loss]` — integrity-check the loose object store
@@ -866,7 +906,7 @@ fn cmd_gc(args: &[String]) -> Result<(), String> {
 /// the address hashes nonce+ciphertext, and the nonce died with the file —
 /// stops failing every future verify, while NEW damage still fails. Primary
 /// only: the ledger is a shared-store file with one writer (ADR 0034).
-fn cmd_verify(args: &[String]) -> Result<(), String> {
+fn cmd_verify(args: &[String]) -> Emitted {
     let accept = args.iter().any(|a| a == "--accept-loss");
     let dot = workspace::resolve_store_dot(std::path::Path::new("."))?;
     if accept && loot_core::RepoStore::read_store_pointer(std::path::Path::new(".loot")).is_some()
@@ -907,7 +947,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     }
     if report.is_clean() {
         println!("all objects OK — {} object(s) verified", report.ok);
-        return Ok(());
+        return msg("");
     }
     for addr in &report.corrupt {
         println!("corrupt: {}", loot_core::hex::encode(&addr.0));
@@ -984,7 +1024,7 @@ fn human_bytes(bytes: u64) -> String {
 /// --path <path>` shows the ancestry of `<selector>` filtered to changes that
 /// also touched `<path>` — applied here as two sequential retains, in either
 /// order, over the same view.
-fn cmd_log(args: &[String]) -> Result<(), String> {
+fn cmd_log(args: &[String]) -> Emitted {
     let mut ws = Workspace::open()?;
     let identity = ws.identity().to_string();
     // The whole read lives behind the Workspace (R1, #177): rows newest-first
@@ -1014,8 +1054,7 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
         ws.filter_history_to_path(&mut view, std::path::Path::new(p));
     }
     if view.is_empty() {
-        println!("no changes yet");
-        return Ok(());
+        return msg("no changes yet\n");
     }
 
     // Resolve author pubkeys to display names (peer registry + self); the
@@ -1027,23 +1066,20 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
         Some(pk) => resolve_pubkey_name(&reg, pk),
         None => String::new(),
     };
-    print!("{}", render_history(&view, &identity, &name_of));
-    Ok(())
+    msg(render_history(&view, &identity, &name_of))
 }
 
-fn cmd_bundle(args: &[String]) -> Result<(), String> {
+fn cmd_bundle(args: &[String]) -> Emitted {
     let out = args.first().ok_or("bundle requires <file>")?;
     let ws = Workspace::open()?;
     // Full bundle (have = []); apply is idempotent. Ships ciphertext + ANYONE-
     // granted keys only — restricted keys never travel (ADR 0003).
     let bundle = ws.bundle_full()?;
     std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
-    println!("wrote {} ({} bytes) — copy it to a peer and `loot apply`", out, bundle.0.len());
-    Ok(())
+    msg(format!("wrote {} ({} bytes) — copy it to a peer and `loot apply`\n", out, bundle.0.len()))
 }
 
-fn cmd_apply(args: &[String]) -> Result<(), String> {
-    let fmt = out_fmt(args);
+fn cmd_apply(args: &[String]) -> Emitted {
     let infile = first_positional(args).ok_or("apply requires <file>")?;
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
     let mut ws = Workspace::open()?;
@@ -1071,20 +1107,19 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
         human.push_str(&outcome_rows(&outcomes));
         let _ = writeln!(human, "run `loot surface` to materialize what you may see");
     }
-    print!("{}", emit::Reconciliation { verdicts: verdicts_of(&outcomes), human }.render(fmt));
+    let shape = emit::Reconciliation { verdicts: verdicts_of(&outcomes), human };
     // Capture-first can create a working change even when the bundle brought
     // nothing new (#219); record the op so that view change is undoable too.
     if !outcomes.is_empty() || newly_captured.is_some() {
         ws.record_op("apply", &format!("apply {infile} ({} path(s))", outcomes.len()), false);
     }
-    Ok(())
+    Ok(Box::new(shape))
 }
 
 /// `loot ferry` — one bidirectional loot ↔ git mirror pass (GB1, ADR 0028).
 /// A reconciliation verb, so it emits the shared verdict rows for the merge
 /// outcomes when the two sides had diverged (CA3, ADR 0023).
-fn cmd_ferry(args: &[String]) -> Result<(), String> {
-    let fmt = out_fmt(args);
+fn cmd_ferry(args: &[String]) -> Emitted {
     let git_dir = flag(args, "--git-dir");
     let dock = flag(args, "--dock");
     let with_wip = args.iter().any(|a| a == "--with-wip");
@@ -1111,7 +1146,7 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
     if let Some(line) = &report.review {
         let _ = writeln!(human, "{line}");
     }
-    print!("{}", emit::Reconciliation { verdicts: verdicts_of(&report.outcomes), human }.render(fmt));
+    let shape = emit::Reconciliation { verdicts: verdicts_of(&report.outcomes), human };
     if report.ingested > 0 || report.projected > 0 || !report.outcomes.is_empty() {
         ws.record_op(
             "ferry",
@@ -1119,10 +1154,10 @@ fn cmd_ferry(args: &[String]) -> Result<(), String> {
             false,
         );
     }
-    Ok(())
+    Ok(Box::new(shape))
 }
 
-fn cmd_grant(args: &[String]) -> Result<(), String> {
+fn cmd_grant(args: &[String]) -> Emitted {
     if args.iter().any(|a| a == "--relay") {
         return cmd_grant_relay(args);
     }
@@ -1162,18 +1197,20 @@ fn cmd_grant(args: &[String]) -> Result<(), String> {
         repo.grant(&oid, grantee, now, None).map_err(|e| e.to_string())
     })?;
     std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
-    println!(
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
         "wrote grant bundle {} ({} bytes) — send it to {grantee}",
         out,
         bundle.0.len()
     );
-    println!("  {path} → {grantee} (recorded in manifest)");
+    let _ = writeln!(text, "  {path} → {grantee} (recorded in manifest)");
     // A grant hands a content key to a peer — one-way (ADR 0031). Barrier.
     snap.record_op("grant", &format!("grant {path} → {grantee}"), true);
-    Ok(())
+    msg(text)
 }
 
-fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
+fn cmd_grant_relay(args: &[String]) -> Emitted {
     // Usage: grant --relay <remote-name-or-url> <path> <identity> [--expires <ts>]
     let relay_target = flag(args, "--relay")
         .ok_or("grant --relay requires a relay name or URL after --relay")?;
@@ -1241,25 +1278,26 @@ fn cmd_grant_relay(args: &[String]) -> Result<(), String> {
 
     // Address the mailbox by grantee pubkey (loot-net hexes it; relay learns no names, ADR 0015).
     loot_net::deliver_grant(&url, &grantee_ed_pubkey, &envelope).map_err(|e| e.to_string())?;
-    println!("delivered sealed grant for '{grantee}' via relay {url}");
-    println!("  {path} → {grantee} (sealed, signed, recorded in manifest)");
+    let mut text = String::new();
+    let _ = writeln!(text, "delivered sealed grant for '{grantee}' via relay {url}");
+    let _ = writeln!(text, "  {path} → {grantee} (sealed, signed, recorded in manifest)");
     if reveal_at > 0 {
-        println!("  timed: the relay withholds the key until {reveal_at} (hard embargo, ADR 0027)");
+        let _ = writeln!(text, "  timed: the relay withholds the key until {reveal_at} (hard embargo, ADR 0027)");
     }
     if let Some(t) = expires_at {
-        println!("  expires at {t} — `apply_sealed_grant` rejects it for the recipient after that (#20)");
+        let _ = writeln!(text, "  expires at {t} — `apply_sealed_grant` rejects it for the recipient after that (#20)");
     }
-    println!("  recipient runs `loot pull-grants` to receive it");
+    let _ = writeln!(text, "  recipient runs `loot pull-grants` to receive it");
     // Sealed grant delivered to the relay — a one-way disclosure (ADR 0031).
     snap.record_op("grant", &format!("grant {path} → {grantee} (sealed)"), true);
-    Ok(())
+    msg(text)
 }
 
 /// `loot grant-status <path>` (#5): who currently holds a grant for `path`,
 /// read straight from the Manifest — a sanity check before `loot maroon`.
 /// Read-only (no snapshot, ADR 0030 — this inspects existing history, it
 /// doesn't record any).
-fn cmd_grant_status(args: &[String]) -> Result<(), String> {
+fn cmd_grant_status(args: &[String]) -> Emitted {
     let path = args.first().ok_or("grant-status requires <path>")?;
     let ws = Workspace::open()?;
     let reg = identity::PeerRegistry::load(ws.dot());
@@ -1270,8 +1308,7 @@ fn cmd_grant_status(args: &[String]) -> Result<(), String> {
 
     let entries = ws.manifest().grants_for(&oid);
     let name_of = |pk: &[u8; 32]| resolve_pubkey_name(&reg, pk);
-    print!("{}", render_grant_status(std::path::Path::new(path), &entries, &name_of));
-    Ok(())
+    msg(render_grant_status(std::path::Path::new(path), &entries, &name_of))
 }
 
 /// `loot embargo-status <path>` (#15): embargoed / revealed / not embargoed,
@@ -1281,17 +1318,16 @@ fn cmd_grant_status(args: &[String]) -> Result<(), String> {
 /// oid — searches all of history so a path that's been deleted, or one this
 /// dock's heads haven't picked up yet, is still explainable (the
 /// troubleshooting case #15 names: "why isn't a file visible after a pull").
-fn cmd_embargo_status(args: &[String]) -> Result<(), String> {
+fn cmd_embargo_status(args: &[String]) -> Emitted {
     let path = args.first().ok_or("embargo-status requires <path>")?;
     let ws = Workspace::open()?;
     let (_, vis) = ws
         .path_history_entry(std::path::Path::new(path))
         .ok_or_else(|| format!("path '{path}' not found in any recorded change"))?;
-    print!("{}", render_embargo_status(std::path::Path::new(path), &vis, ws.now()));
-    Ok(())
+    msg(render_embargo_status(std::path::Path::new(path), &vis, ws.now()))
 }
 
-fn cmd_clone(args: &[String]) -> Result<(), String> {
+fn cmd_clone(args: &[String]) -> Emitted {
     if args.len() < 2 {
         return Err("clone requires <url> <dir>".into());
     }
@@ -1303,8 +1339,10 @@ fn cmd_clone(args: &[String]) -> Result<(), String> {
         .or_else(|| GlobalConfig::load().get("identity").map(String::from))
         .ok_or("clone requires --identity <name> (or set `identity` in `loot config`)")?;
 
-    // Init repo at the target directory.
-    init_repo(dir, &id_name)?;
+    // Init repo at the target directory. `init_repo` now returns its summary as
+    // a shape rather than printing it (1a); clone still shows those lines, so
+    // fold its rendered text into clone's own output.
+    let mut text = init_repo(dir, &id_name)?.render(OutFmt::Human);
 
     // Register origin so subsequent push/pull work out-of-the-box.
     let mut ws = Workspace::open_at(dir)?;
@@ -1316,16 +1354,16 @@ fn cmd_clone(args: &[String]) -> Result<(), String> {
     if !bytes.is_empty() {
         let outcomes = ws.apply_bundle(bytes)?;
         if !outcomes.is_empty() {
-            println!("pulled {} change(s) from {url}", outcomes.len());
+            let _ = writeln!(text, "pulled {} change(s) from {url}", outcomes.len());
         }
     }
     ws.surface().map_err(|e| e.to_string())?;
-    println!("cloned {url} → {}", dir.display());
-    println!("run `loot status` to see the working tree");
-    Ok(())
+    let _ = writeln!(text, "cloned {url} → {}", dir.display());
+    let _ = writeln!(text, "run `loot status` to see the working tree");
+    msg(text)
 }
 
-fn cmd_config(args: &[String]) -> Result<(), String> {
+fn cmd_config(args: &[String]) -> Emitted {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
         "set" => {
@@ -1335,32 +1373,31 @@ fn cmd_config(args: &[String]) -> Result<(), String> {
             let key = &args[1];
             let val = &args[2];
             GlobalConfig::load().set(key, val)?;
-            println!("set {key} = {val}");
-            Ok(())
+            msg(format!("set {key} = {val}\n"))
         }
         "unset" => {
             let key = args.get(1).ok_or("config unset requires <key>")?;
             GlobalConfig::load().unset(key)?;
-            println!("unset {key}");
-            Ok(())
+            msg(format!("unset {key}\n"))
         }
         "list" | "ls" => {
             let cfg = GlobalConfig::load();
             let pairs = cfg.list();
             if pairs.is_empty() {
-                println!("global config is empty  (~/.config/loot/config)");
+                msg("global config is empty  (~/.config/loot/config)\n")
             } else {
+                let mut text = String::new();
                 for (k, v) in pairs {
-                    println!("{k} = {v}");
+                    let _ = writeln!(text, "{k} = {v}");
                 }
+                msg(text)
             }
-            Ok(())
         }
         other => Err(format!("unknown config subcommand '{other}': use set | unset | list")),
     }
 }
 
-fn cmd_maroon(args: &[String]) -> Result<(), String> {
+fn cmd_maroon(args: &[String]) -> Emitted {
     let hard = args.iter().any(|a| a == "--hard");
     let positional = positionals(args);
     if positional.len() < 2 {
@@ -1394,7 +1431,9 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
     snap.sign_change(&result.change_id)?;
 
     let level = if hard { "hard-marooned" } else { "marooned" };
-    println!(
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
         "{} {} from {} (new oid: {})",
         level,
         marooned,
@@ -1402,12 +1441,12 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
         short(&result.new_oid)
     );
     if hard {
-        println!("  purge event recorded — cooperating peers will remove {marooned}'s old key on next bundle apply");
+        let _ = writeln!(text, "  purge event recorded — cooperating peers will remove {marooned}'s old key on next bundle apply");
     }
-    println!("  {} no longer has future access", marooned);
+    let _ = writeln!(text, "  {} no longer has future access", marooned);
 
     if result.grants.is_empty() {
-        println!("  (no remaining grantees — content is now accessible only to you)");
+        let _ = writeln!(text, "  (no remaining grantees — content is now accessible only to you)");
     } else {
         std::fs::create_dir_all(out_dir)
             .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
@@ -1416,17 +1455,18 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
             let dest = out_dir.join(&filename);
             std::fs::write(&dest, &bundle.0)
                 .map_err(|e| format!("write {}: {e}", dest.display()))?;
-            println!(
+            let _ = writeln!(
+                text,
                 "  grant bundle for {grantee}: {} ({} bytes) — send to {grantee} then `loot apply`",
                 dest.display(),
                 bundle.0.len()
             );
         }
-        println!("  also run `loot bundle` to ship the re-sealed object to all peers");
+        let _ = writeln!(text, "  also run `loot bundle` to ship the re-sealed object to all peers");
     }
     // A maroon is an audited, one-way revocation of a restricted key (ADR 0031).
     snap.record_op("maroon", &format!("maroon {} ⁄ {marooned}", path.display()), true);
-    Ok(())
+    msg(text)
 }
 
 /// `loot burn <path> [--oid <hex>]` — the cure for a secret sealed public (ADR
@@ -1435,7 +1475,7 @@ fn cmd_maroon(args: &[String]) -> Result<(), String> {
 /// which honesty tier applied and the forward-fix + rotate-the-secret guidance,
 /// plus the git-mirror remedy when (and only when) a referencing change was
 /// projected. A non-undoable barrier (ADR 0031).
-fn cmd_burn(args: &[String]) -> Result<(), String> {
+fn cmd_burn(args: &[String]) -> Emitted {
     let oid_val = flag(args, "--oid");
     // `positionals` skips only the bare `--oid` flag, not its value, so drop the
     // hex value explicitly — then `burn --oid <hex> <path>` and `burn <path>
@@ -1455,44 +1495,50 @@ fn cmd_burn(args: &[String]) -> Result<(), String> {
     let mut ws = Workspace::open()?;
     let report = ws.burn_path(path, only_oid)?;
 
-    println!(
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
         "burned {} object(s) at {} — tier: {}",
         report.burned.len(),
         path.display(),
         report.tier.label()
     );
     for (oid, _p) in &report.burned {
-        println!("  destroyed {}", short(oid));
+        let _ = writeln!(text, "  destroyed {}", short(oid));
     }
     match report.tier {
         loot_core::BurnTier::NeverPushed => {
-            println!("  never pushed — destruction is complete on this machine.");
+            let _ = writeln!(text, "  never pushed — destruction is complete on this machine.");
         }
         loot_core::BurnTier::Pushed => {
-            println!(
+            let _ = writeln!(
+                text,
                 "  already pushed — a purge event was deposited; cooperating relays/peers \
                  will destroy their copy on next sync (best-effort, like hard maroon)."
             );
         }
     }
     // Forward fix + rotate-the-secret guidance (ADR 0038 §2).
-    println!(
+    let _ = writeln!(
+        text,
         "  forward fix: re-seal the path restricted (`loot migrate {} restricted=<you>`) \
          or delete it at tip, then finalize.",
         path.display()
     );
-    println!("  ROTATE THE LEAKED SECRET — burning bytes cannot recall what was already read.");
+    let _ = writeln!(text, "  ROTATE THE LEAKED SECRET — burning bytes cannot recall what was already read.");
 
     // Git-mirror guidance, only when a referencing change was projected (§4).
     if !report.projected.is_empty() {
-        println!(
+        let _ = writeln!(
+            text,
             "  ⚠ this content was projected into the git mirror ({} commit(s)):",
             report.projected.len()
         );
         for (_version, sha) in &report.projected {
-            println!("      git {}", &sha[..sha.len().min(12)]);
+            let _ = writeln!(text, "      git {}", &sha[..sha.len().min(12)]);
         }
-        println!(
+        let _ = writeln!(
+            text,
             "    loot never rewrites git history. FIX THE GIT TIP FIRST (remove/re-seal the \
              path at HEAD, then ferry) — otherwise ferry re-ingests the tip's bytes under a \
              fresh oid the burn log cannot match. Then rewrite the mirror + any git remote \
@@ -1502,7 +1548,7 @@ fn cmd_burn(args: &[String]) -> Result<(), String> {
 
     // A burn is a one-way destruction — a non-undoable barrier (ADR 0031).
     ws.record_op("burn", &format!("burn {}", path.display()), true);
-    Ok(())
+    msg(text)
 }
 
 
@@ -1524,7 +1570,7 @@ fn parse_vis_spec(spec: &str) -> Result<Visibility, String> {
     }
 }
 
-fn cmd_migrate(args: &[String]) -> Result<(), String> {
+fn cmd_migrate(args: &[String]) -> Emitted {
     let positional = positionals(args);
     if positional.len() < 2 {
         return Err("migrate requires <path> <vis-spec> [dir]".into());
@@ -1547,7 +1593,9 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
     })?;
 
     let vis_label = verdict::visibility_token(&new_vis);
-    println!(
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
         "migrated {} -> {} (new oid: {})",
         path.display(),
         vis_label,
@@ -1555,7 +1603,7 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
     );
 
     if result.grants.is_empty() {
-        println!("  run `loot bundle` to ship the re-sealed object to all peers");
+        let _ = writeln!(text, "  run `loot bundle` to ship the re-sealed object to all peers");
     } else {
         std::fs::create_dir_all(out_dir)
             .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
@@ -1564,16 +1612,17 @@ fn cmd_migrate(args: &[String]) -> Result<(), String> {
             let dest = out_dir.join(&filename);
             std::fs::write(&dest, &bundle.0)
                 .map_err(|e| format!("write {}: {e}", dest.display()))?;
-            println!(
+            let _ = writeln!(
+                text,
                 "  grant bundle for {grantee}: {} ({} bytes) — send to {grantee} then `loot apply`",
                 dest.display(),
                 bundle.0.len()
             );
         }
-        println!("  run `loot bundle` to ship the re-sealed object to all peers");
+        let _ = writeln!(text, "  run `loot bundle` to ship the re-sealed object to all peers");
     }
     snap.record_op("migrate", &format!("migrate {} → {vis_label}", path.display()), false);
-    Ok(())
+    msg(text)
 }
 
 /// A subcommand's own flag spec (#278): `name` is the resolved form the
@@ -1633,10 +1682,9 @@ fn lane_gate(args: &[String]) -> Result<&'static str, String> {
     Ok(sub)
 }
 
-fn cmd_lane(args: &[String]) -> Result<(), String> {
+fn cmd_lane(args: &[String]) -> Emitted {
     match lane_gate(args)? {
         "new" => {
-            let fmt = out_fmt(args);
             let name = flag(args, "--name");
             let at = flag(args, "--at").map(std::path::PathBuf::from);
             // The ticket-derived handle (#232): `--ticket 232` spawns lane
@@ -1672,8 +1720,7 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
                     );
                 }
             }
-            print!("{}", emit::Lanes { rows, human }.render(fmt));
-            Ok(())
+            Ok(Box::new(emit::Lanes { rows, human }))
         }
         // Full `args` (not `args[1..]`): `out_fmt` only reads flags, and bare
         // `loot lane` used to panic slicing an empty argv here.
@@ -1686,23 +1733,21 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             let name = args.get(1).ok_or("usage: loot lane name <name>  (inside the lane)")?;
             let ws = Workspace::open()?;
             ws.name_lane(name)?;
-            println!(
-                "lane '{}' named '{name}' — now a dock; persists until `loot lane rm {name}`",
+            msg(format!(
+                "lane '{}' named '{name}' — now a dock; persists until `loot lane rm {name}`\n",
                 ws.lane_id().unwrap_or("?")
-            );
-            Ok(())
+            ))
         }
         "rm" => {
             let key = args.get(1).ok_or("usage: loot lane rm <id-or-name>")?;
             let mut ws = Workspace::open()?;
             let e = ws.remove_lane(key)?;
-            println!(
+            msg(format!(
                 "reaped lane '{}' ({}) — unsigned WIP died with the directory; \
-                 signed changes stay in the store",
+                 signed changes stay in the store\n",
                 e.id,
                 e.path.display()
-            );
-            Ok(())
+            ))
         }
         "gc" => {
             let stale_secs: u64 = match flag(args, "--stale-hours") {
@@ -1716,17 +1761,17 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
             let mut ws = Workspace::open()?;
             let outcomes = ws.lane_gc(stale_secs)?;
             if outcomes.is_empty() {
-                println!("no lanes to sweep");
-                return Ok(());
+                return msg("no lanes to sweep\n");
             }
+            let mut text = String::new();
             for (e, o) in outcomes {
                 match o {
-                    SweepOutcome::Reaped(why) => println!("reaped {:<16} ({why})", e.id),
-                    SweepOutcome::Kept(why) => println!("kept   {:<16} ({why})", e.id),
-                    SweepOutcome::Failed(why) => println!("FAILED {:<16} — {why}", e.id),
+                    SweepOutcome::Reaped(why) => { let _ = writeln!(text, "reaped {:<16} ({why})", e.id); }
+                    SweepOutcome::Kept(why) => { let _ = writeln!(text, "kept   {:<16} ({why})", e.id); }
+                    SweepOutcome::Failed(why) => { let _ = writeln!(text, "FAILED {:<16} — {why}", e.id); }
                 }
             }
-            Ok(())
+            msg(text)
         }
         // `lane_gate` refuses anything it doesn't resolve to one of the above.
         _ => unreachable!("lane_gate returns only resolved subcommands"),
@@ -1738,8 +1783,7 @@ fn cmd_lane(args: &[String]) -> Result<(), String> {
 /// in-flight PR, dirty/clean, heartbeat age, and landed/stale markers. The
 /// check an agent (or the human) runs before acting on shared state — and it
 /// is read-only: no heartbeat refreshes, no capture, no op recorded.
-fn cmd_lane_list(args: &[String]) -> Result<(), String> {
-    let fmt = out_fmt(args);
+fn cmd_lane_list(_args: &[String]) -> Emitted {
     let ws = Workspace::open()?;
     let rows = lane_rows(&ws, |_| true);
     let mut human = String::new();
@@ -1781,8 +1825,7 @@ fn cmd_lane_list(args: &[String]) -> Result<(), String> {
             );
         }
     }
-    print!("{}", emit::Lanes { rows, human }.render(fmt));
-    Ok(())
+    Ok(Box::new(emit::Lanes { rows, human }))
 }
 
 /// [`LaneStatus`] → the encoder rows, deriving the presentation-side facts
@@ -1825,8 +1868,7 @@ fn fmt_age(secs: u64) -> String {
 /// outcomes in machine formats (CA3, ADR 0023) — dropping the typed outcomes at
 /// the `println!` boundary was the exact anti-pattern CA3 removed everywhere
 /// else (#126).
-fn cmd_lane_merge(key: &str, args: &[String]) -> Result<(), String> {
-    let fmt = out_fmt(args);
+fn cmd_lane_merge(key: &str, _args: &[String]) -> Emitted {
     let mut ws = Workspace::open()?;
     let current = ws.current_dock().unwrap_or("main").to_string();
     let (source, outcomes) = ws.merge_lane(key)?;
@@ -1851,21 +1893,20 @@ fn cmd_lane_merge(key: &str, args: &[String]) -> Result<(), String> {
         }
         out
     };
-    print!("{}", emit::Reconciliation { verdicts: verdicts_of(&outcomes), human }.render(fmt));
-    Ok(())
+    Ok(Box::new(emit::Reconciliation { verdicts: verdicts_of(&outcomes), human }))
 }
 
-fn cmd_manifest() -> Result<(), String> {
+fn cmd_manifest() -> Emitted {
     let ws = Workspace::open()?;
     let dot = ws.dot().to_owned();
     let reg = identity::PeerRegistry::load(&dot);
     let entries: Vec<_> = ws.manifest().iter().collect();
     if entries.is_empty() {
-        println!("no grants recorded");
-        return Ok(());
+        return msg("no grants recorded\n");
     }
-    println!("{:<12} {:<16} {:<16} oid", "granted_at", "grantee", "grantor");
-    println!("{}", "-".repeat(72));
+    let mut text = String::new();
+    let _ = writeln!(text, "{:<12} {:<16} {:<16} oid", "granted_at", "grantee", "grantor");
+    let _ = writeln!(text, "{}", "-".repeat(72));
     let mut sorted = entries;
     sorted.sort_by_key(|e| e.granted_at);
     for e in sorted {
@@ -1874,16 +1915,17 @@ fn cmd_manifest() -> Result<(), String> {
         } else {
             "(file)".to_string()
         };
-        println!("{:<12} {:<16} {:<16} {}", e.granted_at, e.grantee, grantor, short(&e.oid));
+        let _ = writeln!(text, "{:<12} {:<16} {:<16} {}", e.granted_at, e.grantee, grantor, short(&e.oid));
     }
 
     // Attestations (S4, ADR 0018): advisory sign-offs over changes, by pubkey.
     let attestations = ws.all_attestations();
     if !attestations.is_empty() {
-        println!();
-        println!("attestations:");
+        let _ = writeln!(text);
+        let _ = writeln!(text, "attestations:");
         for a in attestations {
-            println!(
+            let _ = writeln!(
+                text,
                 "  {}  {} ({})",
                 short(&a.change_id),
                 resolve_pubkey_name(&reg, &a.attester),
@@ -1891,10 +1933,10 @@ fn cmd_manifest() -> Result<(), String> {
             );
         }
     }
-    Ok(())
+    msg(text)
 }
 
-fn cmd_attest(args: &[String]) -> Result<(), String> {
+fn cmd_attest(args: &[String]) -> Emitted {
     // `args[0]` is always the selector and `args[1]` (if present) the role —
     // both read by fixed position, not `first_positional`'s flag-skipping
     // scan, so a selector like `HEAD~1` in `args[0]` is never mistaken for a
@@ -1925,8 +1967,7 @@ fn cmd_attest(args: &[String]) -> Result<(), String> {
         );
     }
     ws.attest(&version, role)?;
-    println!("attested {} as \"{}\"", short(&version), role);
-    Ok(())
+    msg(format!("attested {} as \"{}\"\n", short(&version), role))
 }
 
 /// `loot buoy [role] [--verbose] [--porcelain|--json]`
@@ -1993,8 +2034,7 @@ fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> Strin
     hex_short(pubkey)
 }
 
-fn cmd_conflicts(args: &[String]) -> Result<(), String> {
-    let fmt = out_fmt(args);
+fn cmd_conflicts(_args: &[String]) -> Emitted {
     let ws = Workspace::open()?;
     let conflicts = ws.conflicts();
     let mut human = String::new();
@@ -2008,11 +2048,10 @@ fn cmd_conflicts(args: &[String]) -> Result<(), String> {
         }
     }
     // Every recorded conflict is a `C` row (ADR 0023); empty -> no lines.
-    print!("{}", emit::Reconciliation { verdicts: conflict_verdicts(conflicts), human }.render(fmt));
-    Ok(())
+    Ok(Box::new(emit::Reconciliation { verdicts: conflict_verdicts(conflicts), human }))
 }
 
-fn cmd_resolve(args: &[String]) -> Result<(), String> {
+fn cmd_resolve(args: &[String]) -> Emitted {
     if args.len() < 2 {
         return Err("resolve requires <path> <file>".into());
     }
@@ -2029,26 +2068,27 @@ fn cmd_resolve(args: &[String]) -> Result<(), String> {
 
     let (new_oid, message) = ws.resolve_conflict(path, &bytes, vis)?;
 
-    println!("resolved {} (new oid: {})", path.display(), short(&new_oid));
+    let mut text = String::new();
+    let _ = writeln!(text, "resolved {} (new oid: {})", path.display(), short(&new_oid));
     // The minted subject (#337): the ours-line subject suffixed with
     // "(conflict resolution: <path>)", or the bare placeholder when none was
     // derivable — showing it here is what tells the operator whether a
     // `loot describe` rescue is still needed before landing (#316).
-    println!("recorded as \"{message}\"");
+    let _ = writeln!(text, "recorded as \"{message}\"");
     ws.record_op("resolve", &format!("resolve {}", path.display()), false);
 
     // The resolution is signed on the spot; on a dock it also advanced the tip.
     if ws.conflicts().is_empty() {
         if ws.current_dock().is_none() {
-            println!("all conflicts resolved");
+            let _ = writeln!(text, "all conflicts resolved");
         } else {
-            println!("all conflicts resolved — dock tip advanced");
+            let _ = writeln!(text, "all conflicts resolved — dock tip advanced");
         }
     }
-    Ok(())
+    msg(text)
 }
 
-fn cmd_grants(args: &[String]) -> Result<(), String> {
+fn cmd_grants(args: &[String]) -> Emitted {
     // `--quarantined`/`--trust` are local-only review of what `pull-grants`
     // already fetched (#12) — neither touches the network, unlike the default
     // mailbox-peek below, so they're dispatched before any remote resolves.
@@ -2065,20 +2105,18 @@ fn cmd_grants(args: &[String]) -> Result<(), String> {
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
     let count = loot_net::peek_grants(&url, &id.public_key_bytes()).map_err(|e| e.to_string())?;
     if count == 0 {
-        println!("no pending grants at {url}");
+        msg(format!("no pending grants at {url}\n"))
     } else {
-        println!("{count} grant(s) pending at {url} — run `loot pull-grants` to receive");
+        msg(format!("{count} grant(s) pending at {url} — run `loot pull-grants` to receive\n"))
     }
-    Ok(())
 }
 
 /// `loot grants --quarantined` (#12): list every grant `pull-grants` held back
 /// from an unregistered sender, purely local (no network, no mutation).
-fn cmd_grants_quarantined() -> Result<(), String> {
+fn cmd_grants_quarantined() -> Emitted {
     let ws = Workspace::open()?;
     let entries = ws.store().read_quarantine();
-    print!("{}", render::render_quarantined(&entries));
-    Ok(())
+    msg(render::render_quarantined(&entries))
 }
 
 /// `loot grants --trust <pubkey-hex>` (#12): register the sender as a peer,
@@ -2087,7 +2125,7 @@ fn cmd_grants_quarantined() -> Result<(), String> {
 /// longer be unsealed, or has since expired — #20's `apply_sealed_grant` rejects
 /// an expired sealed grant the same way whether it arrived fresh or waited in
 /// quarantine) stays quarantined rather than being silently dropped.
-fn cmd_grants_trust(pubkey_hex: &str) -> Result<(), String> {
+fn cmd_grants_trust(pubkey_hex: &str) -> Emitted {
     let pubkey = loot_core::hex::decode_array::<32>(pubkey_hex)
         .ok_or_else(|| format!("--trust requires a 64-character hex pubkey, got '{pubkey_hex}'"))?;
     // Canonical (lowercase) form — the quarantine directory's real key, so a
@@ -2110,7 +2148,7 @@ fn cmd_grants_trust(pubkey_hex: &str) -> Result<(), String> {
     let mut reg = identity::PeerRegistry::load(&dot);
     reg.add(&sender_hex, &openssh_line);
     reg.save().map_err(|e| e.to_string())?;
-    println!("registered peer '{sender_hex}'");
+    let mut text = format!("registered peer '{sender_hex}'\n");
 
     let mut applied = 0usize;
     let mut failed = 0usize;
@@ -2127,17 +2165,17 @@ fn cmd_grants_trust(pubkey_hex: &str) -> Result<(), String> {
         }
     }
 
-    println!("re-applied {applied}/{} quarantined grant(s) from {sender_hex}", entries.len());
+    let _ = writeln!(text, "re-applied {applied}/{} quarantined grant(s) from {sender_hex}", entries.len());
     if failed > 0 {
-        println!("  {failed} still quarantined (re-apply failed) — see the error(s) above");
+        let _ = writeln!(text, "  {failed} still quarantined (re-apply failed) — see the error(s) above");
     }
     if applied > 0 {
-        println!("run `loot surface` to materialize newly-accessible content");
+        let _ = writeln!(text, "run `loot surface` to materialize newly-accessible content");
         // Same barrier reasoning as `pull-grants`: this files keys into the
         // keyring, which `undo` never touches (ADR 0031).
         ws.record_op("grants", &format!("grants --trust {sender_hex} ({applied} applied)"), true);
     }
-    Ok(())
+    msg(text)
 }
 
 /// Decode a sealed-grant bundle's target oid without unsealing anything — the
@@ -2151,7 +2189,7 @@ fn sealed_grant_oid(bundle_bytes: &[u8]) -> Result<Oid, String> {
     }
 }
 
-fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
+fn cmd_pull_grants(args: &[String]) -> Emitted {
     let mut ws = Workspace::open()?;
     let dot = ws.dot().to_owned();
     let url = resolve_remote(args, &ws)?;
@@ -2162,8 +2200,7 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
     // Fetch by pubkey — loot-net hexes it; relay addresses mailbox by pubkey, not name (ADR 0015).
     let envelopes = loot_net::fetch_grants(&url, &my_pubkey).map_err(|e| e.to_string())?;
     if envelopes.is_empty() {
-        println!("no pending grants at {url}");
-        return Ok(());
+        return msg(format!("no pending grants at {url}\n"));
     }
 
     let reg = identity::PeerRegistry::load(&dot);
@@ -2221,24 +2258,25 @@ fn cmd_pull_grants(args: &[String]) -> Result<(), String> {
         }
     }
 
-    println!("applied {applied}/{n} grant(s) from {url}", n = envelopes.len());
+    let mut text = String::new();
+    let _ = writeln!(text, "applied {applied}/{n} grant(s) from {url}", n = envelopes.len());
     if quarantined > 0 {
-        println!("  {quarantined} quarantined (unknown grantor) — register the sender as a peer to trust them");
+        let _ = writeln!(text, "  {quarantined} quarantined (unknown grantor) — register the sender as a peer to trust them");
     }
     if applied > 0 {
-        println!("run `loot surface` to materialize newly-accessible content");
+        let _ = writeln!(text, "run `loot surface` to materialize newly-accessible content");
     }
     if applied > 0 {
         // pull-grants files keys into the keyring — key state undo never touches
         // (ADR 0031). Record as a barrier so `undo` refuses to sit "before" it.
         ws.record_op("pull-grants", &format!("pull-grants ({applied} applied)"), true);
     }
-    Ok(())
+    msg(text)
 }
 
 // --- identity keypairs (ADR 0014, 0016) ---
 
-fn cmd_id(args: &[String]) -> Result<(), String> {
+fn cmd_id(args: &[String]) -> Emitted {
     let sub = args.first().map(String::as_str).unwrap_or("help");
     match sub {
         "export" => {
@@ -2252,9 +2290,9 @@ fn cmd_id(args: &[String]) -> Result<(), String> {
             let passphrase = identity::prompt_new_passphrase().map_err(|e| e.to_string())?;
             id.export_encrypted(std::path::Path::new(file.as_str()), &passphrase, &format!("{}@loot", ws.identity()))
                 .map_err(|e| e.to_string())?;
-            println!("exported identity to {file} (passphrase-encrypted)");
-            println!("  move this file to your other machine and run `loot id import {file}`");
-            Ok(())
+            msg(format!(
+                "exported identity to {file} (passphrase-encrypted)\n  move this file to your other machine and run `loot id import {file}`\n"
+            ))
         }
         "import" => {
             let file = args.get(1).ok_or("id import requires <file>")?;
@@ -2272,9 +2310,7 @@ fn cmd_id(args: &[String]) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             let pub_line = std::fs::read_to_string(dot.join("id.pub"))
                 .map_err(|e| format!("read id.pub: {e}"))?;
-            println!("imported identity keypair");
-            println!("public key: {}", pub_line.trim());
-            Ok(())
+            msg(format!("imported identity keypair\npublic key: {}\n", pub_line.trim()))
         }
         "rotate" => cmd_id_rotate(args),
         _ => Err("id subcommands: export <file> | import <file> | rotate [dir]".into()),
@@ -2298,7 +2334,7 @@ fn cmd_id(args: &[String]) -> Result<(), String> {
 ///    where the bundles go, and what the archived key still opens.
 ///
 /// The wave runs first so any failure aborts before the keypair is touched.
-fn cmd_id_rotate(args: &[String]) -> Result<(), String> {
+fn cmd_id_rotate(args: &[String]) -> Emitted {
     let out_dir = args
         .get(1)
         .map(|s| std::path::Path::new(s.as_str()))
@@ -2337,21 +2373,18 @@ fn cmd_id_rotate(args: &[String]) -> Result<(), String> {
         .to_string();
 
     // 4) The operator ritual.
-    print!(
-        "{}",
-        render_rotate_instructions(
-            &name,
-            &new_pub_line,
-            &bundle_files,
-            report.skipped_expired.len(),
-            report.skipped_unheld.len(),
-            &priv_arch,
-        )
+    let text = render_rotate_instructions(
+        &name,
+        &new_pub_line,
+        &bundle_files,
+        report.skipped_expired.len(),
+        report.skipped_unheld.len(),
+        &priv_arch,
     );
     // Rotation swaps the signing key and mints grant bundles — key state undo
     // never touches (ADR 0031). Barrier.
     ws.record_op("id", "id rotate (new keypair + re-grant wave)", true);
-    Ok(())
+    msg(text)
 }
 
 /// The `loot id rotate` report + operator instructions (#16): everything the
@@ -2463,7 +2496,7 @@ fn render_rotate_instructions(
     s
 }
 
-fn cmd_keygen() -> Result<(), String> {
+fn cmd_keygen() -> Emitted {
     let ws = Workspace::open()?;
     let dot = ws.dot();
     if identity::keypair_exists(dot) {
@@ -2473,13 +2506,14 @@ fn cmd_keygen() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let pub_line = std::fs::read_to_string(dot.join("id.pub"))
         .map_err(|e| format!("read id.pub: {e}"))?;
-    println!("generated keypair at .loot/id (private) and .loot/id.pub (public)");
-    println!("public key: {}", pub_line.trim());
     let _ = keypair;
-    Ok(())
+    msg(format!(
+        "generated keypair at .loot/id (private) and .loot/id.pub (public)\npublic key: {}\n",
+        pub_line.trim()
+    ))
 }
 
-fn cmd_whoami(args: &[String]) -> Result<(), String> {
+fn cmd_whoami(args: &[String]) -> Emitted {
     let ws = Workspace::open()?;
     let dot = ws.dot();
     if !identity::keypair_exists(dot) {
@@ -2491,8 +2525,7 @@ fn cmd_whoami(args: &[String]) -> Result<(), String> {
     // `--pubkey`: emit only the bare OpenSSH line so it pipes cleanly into
     // `loot peer add <name> -` on another box (#4). No labels, no trailer.
     let pubkey_only = args.iter().any(|a| a == "--pubkey");
-    print!("{}", render_whoami(&ws.identity(), pub_line, pubkey_only));
-    Ok(())
+    msg(render_whoami(&ws.identity(), pub_line, pubkey_only))
 }
 
 /// The `loot whoami` output. `--pubkey` (`pubkey_only`) yields the bare
@@ -2533,7 +2566,7 @@ fn read_stdin_key() -> Result<String, String> {
     Ok(key)
 }
 
-fn cmd_peer(args: &[String]) -> Result<(), String> {
+fn cmd_peer(args: &[String]) -> Emitted {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
         "add" => {
@@ -2548,8 +2581,7 @@ fn cmd_peer(args: &[String]) -> Result<(), String> {
             let mut reg = identity::PeerRegistry::load(ws.dot());
             reg.add(name, &pubkey);
             reg.save().map_err(|e| e.to_string())?;
-            println!("registered peer '{name}'");
-            Ok(())
+            msg(format!("registered peer '{name}'\n"))
         }
         "remove" | "rm" => {
             let name = args.get(1).ok_or("peer remove requires <name>")?;
@@ -2557,21 +2589,21 @@ fn cmd_peer(args: &[String]) -> Result<(), String> {
             let mut reg = identity::PeerRegistry::load(ws.dot());
             reg.remove(name);
             reg.save().map_err(|e| e.to_string())?;
-            println!("removed peer '{name}'");
-            Ok(())
+            msg(format!("removed peer '{name}'\n"))
         }
         "list" | "ls" => {
             let ws = Workspace::open()?;
             let reg = identity::PeerRegistry::load(ws.dot());
             let peers = reg.list();
             if peers.is_empty() {
-                println!("no peers registered  (use `loot peer add <name> <pubkey>`)");
+                msg("no peers registered  (use `loot peer add <name> <pubkey>`)\n")
             } else {
+                let mut text = String::new();
                 for (name, pubkey) in peers {
-                    println!("{:<16} {pubkey}", name);
+                    let _ = writeln!(text, "{:<16} {pubkey}", name);
                 }
+                msg(text)
             }
-            Ok(())
         }
         other => Err(format!("unknown peer subcommand '{other}': use add | remove | list")),
     }
@@ -2579,7 +2611,7 @@ fn cmd_peer(args: &[String]) -> Result<(), String> {
 
 // --- named remotes (ADR 0013) ---
 
-fn cmd_remote(args: &[String]) -> Result<(), String> {
+fn cmd_remote(args: &[String]) -> Emitted {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
         "add" => {
@@ -2590,27 +2622,26 @@ fn cmd_remote(args: &[String]) -> Result<(), String> {
             let url = &args[2];
             let ws = Workspace::open()?;
             ws.remotes().add(name, url)?;
-            println!("remote '{name}' → {url}");
-            Ok(())
+            msg(format!("remote '{name}' → {url}\n"))
         }
         "remove" | "rm" => {
             let name = args.get(1).ok_or("remote remove requires <name>")?;
             let ws = Workspace::open()?;
             ws.remotes().remove(name)?;
-            println!("removed remote '{name}'");
-            Ok(())
+            msg(format!("removed remote '{name}'\n"))
         }
         "list" | "ls" => {
             let ws = Workspace::open()?;
             let remotes = ws.remotes().list();
             if remotes.is_empty() {
-                println!("no remotes configured  (use `loot remote add origin <url>`)");
+                msg("no remotes configured  (use `loot remote add origin <url>`)\n")
             } else {
+                let mut text = String::new();
                 for (name, url) in remotes {
-                    println!("{:<16} {url}", name);
+                    let _ = writeln!(text, "{:<16} {url}", name);
                 }
+                msg(text)
             }
-            Ok(())
         }
         other => Err(format!("unknown remote subcommand '{other}': use add | remove | list")),
     }
@@ -2753,7 +2784,7 @@ fn fish_completions() -> String {
 /// to stdout for the caller to pipe into their shell config. No repo needed
 /// (like `--help`/`--version`); an unknown or missing shell name is a clear
 /// usage error rather than a silent no-op.
-fn cmd_completions(args: &[String]) -> Result<(), String> {
+fn cmd_completions(args: &[String]) -> Emitted {
     let script = match args.first().map(String::as_str) {
         Some("bash") => bash_completions(),
         Some("zsh") => zsh_completions(),
@@ -2763,13 +2794,12 @@ fn cmd_completions(args: &[String]) -> Result<(), String> {
         }
         None => return Err("usage: loot completions <bash|zsh|fish>".into()),
     };
-    print!("{script}");
-    Ok(())
+    msg(script)
 }
 
 // --- network sync (ADR 0011) ---
 
-fn cmd_serve(args: &[String]) -> Result<(), String> {
+fn cmd_serve(args: &[String]) -> Emitted {
     let dir = flag(args, "--dir").unwrap_or(".loot-relay");
     let addr = flag(args, "--addr").unwrap_or("127.0.0.1:4000");
 
@@ -2797,7 +2827,11 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         println!("starting loot relay (dir = {dir}, addr = {addr}) — {n} key(s) allowed", n = allowed_keys.len());
     }
     println!("  a relay holds ciphertext and forwards it — it holds no keys and reads nothing");
-    loot_net::serve(std::path::PathBuf::from(dir), addr, allowed_keys).map_err(|e| e.to_string())
+    // `serve` blocks until the relay is killed; it only returns on a bind/serve
+    // error. The startup lines above print directly (before the block); on the
+    // unreachable clean return there is nothing more to render.
+    loot_net::serve(std::path::PathBuf::from(dir), addr, allowed_keys).map_err(|e| e.to_string())?;
+    msg("")
 }
 
 fn parse_pubkey_hex(hex: &str) -> Result<[u8; 32], String> {
@@ -2832,7 +2866,7 @@ const OBJECTS_PER_BATCH: usize = 32;
 // ships alone (only the relay's hard limit can refuse it).
 const BYTES_PER_BATCH: usize = loot_net::MAX_BODY_BYTES / 8;
 
-fn cmd_push(args: &[String]) -> Result<(), String> {
+fn cmd_push(args: &[String]) -> Emitted {
     let mut ws = Workspace::open()?;
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
@@ -2880,7 +2914,9 @@ fn cmd_push(args: &[String]) -> Result<(), String> {
     // A push discloses to a relay — a one-way act undo cannot retract (ADR 0031).
     // Record it as a barrier so `undo` refuses to step across it.
     ws.record_op("push", &format!("push → {url}"), true);
-    Ok(())
+    // push streams its progress directly (network I/O, incl. the deposit
+    // helper's per-grant lines); nothing left to render.
+    msg("")
 }
 
 /// One planned hard-embargo deposit: a timed grant for `oid` to `peer`.
@@ -3006,7 +3042,7 @@ impl workspace::SyncTransport for HttpTransport {
     }
 }
 
-fn cmd_pull(args: &[String]) -> Result<(), String> {
+fn cmd_pull(args: &[String]) -> Emitted {
     let fmt = out_fmt(args);
     let no_surface = has_flag(args, "--no-surface");
     let mut ws = Workspace::open()?;
@@ -3029,7 +3065,7 @@ fn run_pull(
     url: &str,
     fmt: OutFmt,
     no_surface: bool,
-) -> Result<(), String> {
+) -> Emitted {
     let identity = ws.identity().to_string();
     let report = ws.pull_via(transport)?;
     let outcomes = &report.outcomes;
@@ -3062,22 +3098,24 @@ fn run_pull(
         }
         out
     };
-    // Machine output: the merge verdict rows only, no prose (empty -> no lines).
-    print!("{}", emit::Reconciliation { verdicts: verdicts_of(outcomes), human }.render(fmt));
+    let mut human = human;
     if !outcomes.is_empty() || report.deferred.is_some() {
         ws.record_op("pull", &format!("pull from {url} ({} path(s))", outcomes.len()), false);
     }
     // Auto-surface (#3): a non-empty converged apply materializes the tree.
     // Machine output still materializes — the working tree is behavior, not
-    // rendering — but stays verdict-rows-only; a no-op pull stays quiet.
+    // rendering — but stays verdict-rows-only (the surface listing joins the
+    // Human `human` field, which porcelain/json render ignores); a no-op pull
+    // stays quiet.
     if !no_surface && !outcomes.is_empty() && report.deferred.is_none() {
         let (head, written, skipped) = ws.surface_with_report()?;
         if matches!(fmt, OutFmt::Human) {
             let burned = ws.burned_paths_at(&head);
-            print_surface_listing(&head, &written, skipped, &burned, ws.identity());
+            human.push_str(&print_surface_listing(&head, &written, skipped, &burned, ws.identity()));
         }
     }
-    Ok(())
+    // Machine output: the merge verdict rows only, no prose (empty -> no lines).
+    Ok(Box::new(emit::Reconciliation { verdicts: verdicts_of(outcomes), human }))
 }
 
 // --- formatting (the log/outcome family lives in render.rs, R5 #181) ---
@@ -4134,10 +4172,10 @@ mod tests {
     /// error, never a silent no-op or a panic.
     #[test]
     fn cmd_completions_rejects_missing_or_unknown_shell() {
-        let err = cmd_completions(&args(&[])).unwrap_err();
+        let err = cmd_completions(&args(&[])).err().unwrap();
         assert!(err.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
 
-        let err = cmd_completions(&args(&["powershell"])).unwrap_err();
+        let err = cmd_completions(&args(&["powershell"])).err().unwrap();
         assert!(err.contains("unknown shell 'powershell'"), "{err}");
         assert!(err.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
     }
@@ -4150,6 +4188,21 @@ mod tests {
         for shell in ["bash", "zsh", "fish"] {
             assert!(cmd_completions(&args(&[shell])).is_ok(), "loot completions {shell}");
         }
+    }
+
+    /// The 1a seam: a verb *returns* its output as an [`Emit`] shape a test
+    /// renders in-process — no spawning `CARGO_BIN_EXE_loot`, the friction
+    /// `tests/emit_snapshot.rs` documents ("there is no in-process seam to
+    /// call"). `completions` needs no repo, so it exercises the seam without a
+    /// tempdir. A `Message` (every prose verb's shape) renders identically
+    /// across formats — it has only one rendering.
+    #[test]
+    fn cmd_verb_returns_a_renderable_shape_in_process() {
+        let shape = cmd_completions(&args(&["bash"])).expect("bash completions");
+        let human = shape.render(OutFmt::Human);
+        assert!(human.contains("loot"), "rendered completion script should mention the binary");
+        assert_eq!(human, shape.render(OutFmt::Porcelain), "a prose verb has one rendering");
+        assert_eq!(human, shape.render(OutFmt::Json));
     }
 
     /// The flag gate still applies: `completions` takes no flags, so a stray

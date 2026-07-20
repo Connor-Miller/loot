@@ -55,10 +55,33 @@ pub enum OutFmt {
 
 /// One verb output shape, rendering all three [`OutFmt`] variants from
 /// already-computed data. `render` is pure formatting/format selection —
-/// never I/O, never fallible — so every `cmd_*` handler calls it exactly
-/// once and prints the result with a single `print!`.
+/// never I/O, never fallible. Every `cmd_*` handler *returns* one of these
+/// (boxed) instead of writing to stdout; `main.rs`'s dispatcher renders it
+/// once with the resolved [`OutFmt`] and prints it. That single return is the
+/// in-process test seam: a verb's output is a value a test can assert on
+/// without spawning the binary.
 pub trait Emit {
     fn render(&self, fmt: OutFmt) -> String;
+}
+
+/// A plain-text verb output: prose (or nothing) identical across every
+/// [`OutFmt`]. Verbs with no machine-output contract — the ~49 that only ever
+/// printed human text and never accepted `--porcelain`/`--json` — build their
+/// exact output into one of these and return it, so the dispatcher renders
+/// every verb through the same [`Emit`] seam and no `cmd_*` writes stdout
+/// itself. `render` ignores the format because these verbs have only one.
+pub struct Message(pub String);
+
+impl Message {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+}
+
+impl Emit for Message {
+    fn render(&self, _fmt: OutFmt) -> String {
+        self.0.clone()
+    }
 }
 
 /// The `status` shape (ADR 0023/0029/0030): the working-change header plus
@@ -67,26 +90,26 @@ pub trait Emit {
 /// arguments instead of a `Vec<PathVerdict>`. Used only by `cmd_status`
 /// (main.rs), which has two call sites (no working change / a working
 /// change present) that each build one `Status` and render it once.
-pub struct Status<'a> {
+pub struct Status {
     pub change_id: Option<[u8; 16]>,
-    pub version: Option<&'a Oid>,
-    pub entries: &'a [(PathBuf, Visibility)],
+    pub version: Option<Oid>,
+    pub entries: Vec<(PathBuf, Visibility)>,
     /// Pre-rendered human text — built only when `fmt == Human` will actually
     /// print it (see the module doc's note on `status`'s disk read).
     pub human: String,
 }
 
-impl Emit for Status<'_> {
+impl Emit for Status {
     fn render(&self, fmt: OutFmt) -> String {
         match fmt {
             OutFmt::Human => self.human.clone(),
             OutFmt::Porcelain => {
-                verdict::status_porcelain(self.change_id, self.version, self.entries)
+                verdict::status_porcelain(self.change_id, self.version.as_ref(), &self.entries)
             }
             OutFmt::Json => {
                 format!(
                     "{}\n",
-                    verdict::status_json(self.change_id, self.version, self.entries)
+                    verdict::status_json(self.change_id, self.version.as_ref(), &self.entries)
                 )
             }
         }
