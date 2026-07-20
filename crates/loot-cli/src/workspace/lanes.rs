@@ -354,3 +354,70 @@ impl Workspace {
         }
     }
 }
+
+// --- lane report DTOs + registry-side free helpers (candidate 5: DTOs out of
+// workspace.rs). Re-exported from `workspace` so `workspace::LaneStatus` etc.
+// stay stable for main.rs. ---
+
+/// A freshly spawned lane, for CLI reporting.
+#[derive(Debug)]
+pub struct SpawnedLane {
+    /// The registry id (the auto-handle, or suffixed until free).
+    pub id: String,
+    /// The lane's working directory, canonicalized.
+    pub dir: PathBuf,
+}
+
+/// One lane's observable status (`loot lanes`, #232): the registry entry plus
+/// a read-only peek at the lane's position. `change` is the review-lane key
+/// ([`crate::ledger::PrMap`]'s `change` column), which is what matched `pr`.
+/// `dirty` means uncaptured edits beyond the lane's captured state; `None`
+/// peek fields mean the lane's directory or store state was unreadable.
+#[derive(Debug)]
+pub struct LaneStatus {
+    pub entry: LaneEntry,
+    pub tip: Option<Oid>,
+    pub change: Option<String>,
+    pub pr: Option<u64>,
+    pub dirty: Option<bool>,
+}
+
+/// One lane's fate in a `loot lane gc` sweep.
+pub enum SweepOutcome {
+    Reaped(&'static str),
+    Kept(&'static str),
+    Failed(String),
+}
+
+/// Delete a lane's working directory, guarded: only a directory whose
+/// `.loot/lane-id` matches the registry entry is deleted, so a corrupted or
+/// hand-edited `path` file can never point the reaper at an innocent tree. A
+/// path that is already gone reaps as a no-op.
+fn reap_lane_dir(entry: &loot_core::LaneEntry) -> Result<(), String> {
+    if !entry.path.exists() {
+        return Ok(());
+    }
+    match RepoStore::read_lane_id(&entry.path.join(DOT)) {
+        Some(id) if id == entry.id => std::fs::remove_dir_all(&entry.path)
+            .map_err(|e| format!("remove {}: {e} (is it in use?)", entry.path.display())),
+        _ => Err(format!(
+            "{} does not look like lane '{}' (no matching lane-id) — refusing to delete it",
+            entry.path.display(),
+            entry.id
+        )),
+    }
+}
+
+/// A generated lane handle for spawns without a usable directory name —
+/// short, unique enough for one registry (collisions are suffixed anyway).
+fn gen_lane_handle() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    format!("lane-{:06x}", h.finish() & 0xff_ffff)
+}
