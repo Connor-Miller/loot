@@ -186,13 +186,27 @@ bounces (nothing minted, nothing pushed); `loot resolve <path> <file>` then
 re-run `land`, and the resolution folds into the carried commit rather than
 trailing it.
 
-One seal path remains, and it is deliberate: a **plain `loot ferry`** (or
-no-arg `loot adopt`) over described WIP still finalizes it — after which the
-WIP projection reports "nothing to review" and the signed line is PR-less.
-Don't run bare sync verbs in a lane with live WIP; if it happens, the
-follow-up-round recovery (a working change in the same lane opens a round
-whose branch carries the sealed work) still applies — making the tool own
-that round is #356.
+One seal path remained — a **plain `loot ferry`** (not `--with-wip`) or
+**no-arg `loot adopt`** over live *described* WIP would finalize it into a
+PR-less signed line — and #418 now **guards it at the source**. Either bare
+verb refuses with a typed error (`RepoError::SealWip`) rather than seal:
+
+```
+refusing to finalize your described working change "…": a bare `loot ferry`
+would fold it onto `main` with no review … or re-run with `--seal-wip` to seal
+it here deliberately
+```
+
+The guard fires *only* when the ambient position holds a **described** working
+change the sync would actually fold — an un-described one is still the #275
+refusal, and a break-glass ferry or no-op sync (no live described WIP) is never
+tripped. Pass **`--seal-wip`** to seal on purpose; on override the verb prints
+the **follow-up-round recovery recipe** (make a working change in the same
+lane, `loot-first review` — its branch carries the sealed work — then
+`loot-first land`), and the review "nothing to review" and land "not in the
+pr-map" paths print the same recipe when they meet a sealed-but-unlanded line.
+The tool owns that round now; it is no longer folklore (#356's "Prevent +
+hint" resolution).
 
 ### A break-glass git commit landed on `main` → `loot ferry`
 

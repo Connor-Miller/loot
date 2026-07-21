@@ -120,7 +120,7 @@ const COMMANDS: &[Verb] = &[
     verb("new", &["-m", "--message", "--allow-demote", "--allow-reveal"], SKIP, cmd_new),
     verb("edit", &[], &[], cmd_edit),
     verb("abandon", &[], &["--head"], cmd_abandon),
-    verb("adopt", &[], &["--discard-wip"], cmd_adopt),
+    verb("adopt", &[], &["--discard-wip", "--seal-wip"], cmd_adopt),
     verb("undo", &[], &[], |_| cmd_undo()),
     verb("op", &[], &[], cmd_op),
     verb("surface", &[], &[], |_| cmd_surface()),
@@ -153,7 +153,7 @@ const COMMANDS: &[Verb] = &[
     verb("clone", &["--identity"], &[], cmd_clone),
     verb("config", &[], &[], cmd_config),
     verb("id", &[], &[], cmd_id),
-    verb("ferry", &["--git-dir", "--dock"], &["--with-wip", "--porcelain", "--json"], cmd_ferry),
+    verb("ferry", &["--git-dir", "--dock"], &["--with-wip", "--porcelain", "--json", "--seal-wip"], cmd_ferry),
     verb("completions", &[], &[], cmd_completions),
 ];
 
@@ -702,6 +702,7 @@ fn cmd_abandon(args: &[String]) -> Emitted {
 /// override of the #219 tree-write chokepoint).
 fn cmd_adopt(args: &[String]) -> Emitted {
     let discard_wip = has_flag(args, "--discard-wip");
+    let seal_wip = has_flag(args, "--seal-wip");
     let mut ws = Workspace::open()?;
 
     // No target → the harbor catch-up **merge** arm (ADR 0034): fold the landed
@@ -715,12 +716,21 @@ fn cmd_adopt(args: &[String]) -> Emitted {
                     .into(),
             );
         }
-        let report = ws.adopt_harbor()?;
+        let report = ws.adopt_harbor(seal_wip)?;
         if report.already_current {
             return msg(format!("already caught up to landed main ({}) — nothing to merge\n", short(&report.harbor)));
         }
         let mut out = String::new();
         let _ = writeln!(out, "caught up to landed main ({}) — folded the local line in", short(&report.harbor));
+        // #418: the override sealed described WIP into a PR-less merge parent —
+        // point at the follow-up round so the tool owns it, not folklore.
+        if let Some(subject) = &report.sealed_wip {
+            let _ = writeln!(
+                out,
+                "  sealed \"{subject}\" (--seal-wip) — {}",
+                workspace::SEAL_WIP_RECOVERY
+            );
+        }
         let conflicts = report
             .outcomes
             .values()
@@ -1122,13 +1132,23 @@ fn cmd_apply(args: &[String]) -> Emitted {
 fn cmd_ferry(args: &[String]) -> Emitted {
     let git_dir = flag(args, "--git-dir");
     let dock = flag(args, "--dock");
-    let with_wip = args.iter().any(|a| a == "--with-wip");
+    let with_wip = has_flag(args, "--with-wip");
+    let seal_wip = has_flag(args, "--seal-wip");
     let mut ws = Workspace::open()?;
-    let report = ferry::run(&mut ws, git_dir, dock, with_wip)?;
+    let report = ferry::run(&mut ws, git_dir, dock, with_wip, seal_wip)?;
 
     let mut human = String::new();
     for note in &report.notes {
         let _ = writeln!(human, "note: {note}");
+    }
+    // #418: the override sealed described WIP into a PR-less line — the tool
+    // owns the follow-up round rather than leaving it to memory/folklore.
+    if let Some(subject) = &report.sealed_wip {
+        let _ = writeln!(
+            human,
+            "sealed \"{subject}\" (--seal-wip) — {}",
+            workspace::SEAL_WIP_RECOVERY
+        );
     }
     if with_wip {
         // A review pass is a pure projection (ADR 0039): no ingest, no

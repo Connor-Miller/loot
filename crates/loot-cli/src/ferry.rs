@@ -41,6 +41,11 @@ pub struct FerryReport {
     /// The WIP review projection this pass made (map #148), preformatted as a
     /// stable machine-parsable line for the orchestrator.
     pub review: Option<String>,
+    /// The subject of a described working change this pass sealed into a
+    /// PR-less signed line under the `--seal-wip` override (#418) — `Some`
+    /// only when the seal actually landed, so the CLI prints the recovery
+    /// recipe exactly once and only when it applies.
+    pub sealed_wip: Option<String>,
 }
 
 /// Run one ferry pass. `git_dir_flag`/`dock_flag` override the mirror config
@@ -65,11 +70,19 @@ pub struct FerryReport {
 ///
 /// Provisional lifecycle reaping runs on every pass regardless of the flag —
 /// it touches only `review/*` refs and the local wip ledger, never the spine.
+///
+/// `seal_wip` is the #418 override for the full pass: a bare ferry that would
+/// fold the ambient position's live **described** working change into a
+/// PR-less signed line refuses (`RepoError::SealWip`) unless this is `true`.
+/// It is meaningless in review mode (a review projection never seals) and for
+/// the authorized finalizers (`loot-first land` pre-finalizes before its
+/// ferry pass, so no wip is captured here).
 pub fn run(
     ws: &mut Workspace,
     git_dir_flag: Option<&str>,
     dock_flag: Option<&str>,
     with_wip: bool,
+    seal_wip: bool,
 ) -> Result<FerryReport, String> {
     let mut report = FerryReport::default();
     let mirror_dir = ws.store().git_mirror_dir();
@@ -225,14 +238,21 @@ pub fn run(
         // ADR 0039. The label survives solely as the merge subject of the
         // foreign-work fallback; a self-authored diverged line carries, so
         // nothing on landed history wears it.)
-        report.outcomes = match ws.reconcile_onto(
+        match ws.reconcile_onto(
             target.as_ref(),
             ours.as_ref(),
             "ferry: reconcile git main",
+            seal_wip,
         ) {
-            Ok(outcomes) => outcomes,
-            // A reconcile refusal (#275) aborts the pass — roll the
-            // freshly ingested changes back with it (#307, above).
+            // `sealed` is `Some(subject)` only when this pass actually sealed a
+            // described working change under `--seal-wip` (#418) — reported by
+            // the reconcile seam that decided it, not re-derived here.
+            Ok((outcomes, sealed)) => {
+                report.outcomes = outcomes;
+                report.sealed_wip = sealed;
+            }
+            // A reconcile refusal (#275 un-described, #418 seal-WIP) aborts the
+            // pass — roll the freshly ingested changes back with it (#307).
             Err(e) => return Err(rollback_note(ws.rollback_ingested(&minted), e)),
         };
         // Past the reconcile the ingested changes are folded into the dock's
@@ -506,6 +526,20 @@ pub fn run(
                         ));
                     }
                 }
+            }
+        }
+        // #418 belt-and-suspenders: a review that found nothing to project while
+        // the ambient anchor sits ahead of `main` with no PR is the
+        // sealed-but-unlanded state (a `--seal-wip` override, or any bare-verb
+        // seal). Point at the recovery round rather than leaving the operator
+        // staring at "nothing to review".
+        if report.review.as_deref().is_some_and(|r| r.contains("op=none")) {
+            if let Some(anchor) = ws.sealed_unlanded_anchor() {
+                report.notes.push(format!(
+                    "sealed line {} is ahead of main with no PR — {}",
+                    hex::short(&anchor.0, 8),
+                    crate::workspace::SEAL_WIP_RECOVERY
+                ));
             }
         }
     }
@@ -1532,11 +1566,11 @@ mod tests {
     }
 
     fn ferry(ws: &mut Workspace, mirror: &Path) -> FerryReport {
-        run(ws, Some(mirror.to_str().unwrap()), None, false).unwrap()
+        run(ws, Some(mirror.to_str().unwrap()), None, false, true).unwrap()
     }
 
     fn ferry_wip(ws: &mut Workspace, mirror: &Path) -> FerryReport {
-        run(ws, Some(mirror.to_str().unwrap()), None, true).unwrap()
+        run(ws, Some(mirror.to_str().unwrap()), None, true, false).unwrap()
     }
 
     /// All blob paths in a commit's tree, recursively (unix-style).
@@ -1690,12 +1724,12 @@ mod tests {
         seal_change(&mut ws, "first");
         ferry(&mut ws, &mirror);
 
-        let err = run(&mut ws, Some(mirror.to_str().unwrap()), Some("side"), false)
+        let err = run(&mut ws, Some(mirror.to_str().unwrap()), Some("side"), false, true)
             .err()
             .expect("designating a non-main dock refuses");
         assert!(err.contains("retired") && err.contains("side"), "{err}");
         // `--dock main` (the default) is still accepted — a harmless no-op.
-        assert!(run(&mut ws, Some(mirror.to_str().unwrap()), Some("main"), false).is_ok());
+        assert!(run(&mut ws, Some(mirror.to_str().unwrap()), Some("main"), false, true).is_ok());
     }
 
     #[test]
@@ -1711,7 +1745,7 @@ mod tests {
         // persists at the END of a successful pass, never at flag-parse time.
         let bogus = dir.join("not-a-repo");
         std::fs::write(&bogus, "x").unwrap();
-        let err = match run(&mut ws, Some(bogus.to_str().unwrap()), None, false) {
+        let err = match run(&mut ws, Some(bogus.to_str().unwrap()), None, false, true) {
             Err(e) => e,
             Ok(_) => panic!("pass against a non-repo path unexpectedly succeeded"),
         };
@@ -1782,6 +1816,36 @@ mod tests {
         // Round-trip: the ingested change is marked, never re-emitted.
         let after = ferry(&mut ws, &mirror);
         assert_eq!((after.ingested, after.projected), (0, 0));
+    }
+
+    #[test]
+    fn break_glass_ferry_and_no_op_are_not_tripped_by_the_seal_guard() {
+        // #418 criterion 3, end-to-end over a real mirror: a *bare* ferry with
+        // the override OFF (`seal_wip=false`) that ingests a break-glass git
+        // commit — the primary's "git commit → loot ferry" flow — never
+        // refuses, because there is no live described WIP to seal; and a
+        // follow-up no-op pass is equally quiet.
+        let (mut ws, dir, mirror) = setup("418-breakglass");
+        put_file(&dir, "a.txt", "base\n");
+        seal_change(&mut ws, "base");
+        run(&mut ws, Some(mirror.to_str().unwrap()), None, false, false).unwrap();
+
+        let git = git2::Repository::open(&mirror).unwrap();
+        git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
+
+        // Bare ferry, override OFF: the break-glass commit ingests with no
+        // whisper of the seal-WIP guard, and nothing is reported sealed.
+        let report = run(&mut ws, Some(mirror.to_str().unwrap()), None, false, false)
+            .expect("break-glass ingest never trips the seal-WIP guard");
+        assert_eq!(report.ingested, 1);
+        assert!(report.sealed_wip.is_none(), "no described WIP existed — nothing sealed");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "from git\n");
+
+        // No-op mirror sync, override OFF: nothing to ingest or project, no refusal.
+        let after = run(&mut ws, Some(mirror.to_str().unwrap()), None, false, false)
+            .expect("a no-op sync never trips the guard");
+        assert_eq!((after.ingested, after.projected), (0, 0));
+        assert!(after.sealed_wip.is_none());
     }
 
     #[test]
@@ -1897,7 +1961,7 @@ mod tests {
         .unwrap();
         git_native_commit(&git, &[("b.txt", "from git\n")], ("Bob", "bob@example.com"), "add b");
 
-        let err = match run(&mut ws, Some(mirror.to_str().unwrap()), None, false) {
+        let err = match run(&mut ws, Some(mirror.to_str().unwrap()), None, false, true) {
             Err(e) => e,
             Ok(_) => panic!("a parent with no loadable tree must refuse the pass"),
         };
@@ -2020,7 +2084,7 @@ mod tests {
         // first (#275). The refusal is the subject of the #275 tests; here it is
         // the setup for the real assertion — that the capture is what saves the
         // edits, and refusing costs only the signature.
-        let refused = match run(&mut ws, Some(mirror.to_str().unwrap()), None, false) {
+        let refused = match run(&mut ws, Some(mirror.to_str().unwrap()), None, false, true) {
             Err(e) => e,
             Ok(_) => panic!("un-described WIP must hold the merge (#275)"),
         };
@@ -2413,7 +2477,7 @@ mod tests {
         let mut w1 = Workspace::open_at(&l1.dir).unwrap();
         put_file(&l1.dir, "b.txt", "sibling\n");
         seal_change(&mut w1, "landed: sibling change");
-        run(&mut w1, None, None, false).unwrap();
+        run(&mut w1, None, None, false, true).unwrap();
         let git = git2::Repository::open(&mirror).unwrap();
         let sibling_sha = main_commit(&git).id();
 
@@ -2423,7 +2487,7 @@ mod tests {
         put_file(&l2.dir, "c.txt", "mine\n");
         seal_change(&mut w2, "landed: stale-lane change");
         let stale = w2.finalized_anchor().unwrap();
-        let r = run(&mut w2, None, None, false).unwrap();
+        let r = run(&mut w2, None, None, false, true).unwrap();
         assert!(w2.conflicts().is_empty(), "disjoint paths: no bounce");
         assert!(r.projected >= 1, "the carried change projected");
 
@@ -2464,7 +2528,7 @@ mod tests {
         let mut w1 = Workspace::open_at(&l1.dir).unwrap();
         put_file(&l1.dir, "base.txt", "theirs\n");
         seal_change(&mut w1, "landed: sibling edit");
-        run(&mut w1, None, None, false).unwrap();
+        run(&mut w1, None, None, false, true).unwrap();
         let git = git2::Repository::open(&mirror).unwrap();
         let sibling_sha = main_commit(&git).id();
 
@@ -2474,7 +2538,7 @@ mod tests {
         put_file(&l2.dir, "base.txt", "ours\n");
         seal_change(&mut w2, "fix: base edit");
         let stale = w2.finalized_anchor().unwrap();
-        let r = run(&mut w2, None, None, false).unwrap();
+        let r = run(&mut w2, None, None, false, true).unwrap();
         assert!(
             matches!(r.outcomes[&PathBuf::from("base.txt")], MergeOutcome::Conflict { .. }),
             "the same-path divergence bounced"
@@ -2491,7 +2555,7 @@ mod tests {
         // change instead of trailing it as its own commit.
         w2.resolve_conflict(Path::new("base.txt"), b"resolved\n", loot_core::Visibility::Public)
             .unwrap();
-        let r2 = run(&mut w2, None, None, false).unwrap();
+        let r2 = run(&mut w2, None, None, false, true).unwrap();
         assert!(w2.conflicts().is_empty(), "nothing left to resolve");
         assert!(r2.projected >= 1);
 
@@ -2964,7 +3028,7 @@ mod tests {
         put_file(&spawned.dir, "b.txt", "landed");
         seal_change(&mut lw, "landed c2");
         let c2 = lw.heads()[0].clone();
-        let r2 = run(&mut lw, None, None, false).unwrap();
+        let r2 = run(&mut lw, None, None, false, true).unwrap();
         assert_eq!(r2.projected, 1, "the lane's land projected c2");
         let landed_sha = git2::Repository::open(&mirror)
             .unwrap()
@@ -2975,7 +3039,7 @@ mod tests {
 
         // The primary reopens fresh: strictly behind, c2 out of its lineage.
         let mut ws = Workspace::open_at(&repo_dir).unwrap();
-        let r3 = run(&mut ws, None, None, false).unwrap();
+        let r3 = run(&mut ws, None, None, false, true).unwrap();
         assert_eq!(r3.ingested, 0, "the landed commit is already marked — nothing to ingest");
         assert_eq!(r3.projected, 0, "a catch-up projects nothing");
         assert!(r3.notes.is_empty(), "no refusals — the catch-up is clean: {:?}", r3.notes);

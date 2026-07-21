@@ -98,6 +98,18 @@ pub enum RepoError {
     /// resolution provenance.
     #[error("refusing to seal {} publicly: it matches a built-in secret-shaped name and resolves Public only by fallthrough (no .lootattributes rule names it). Name it in .lootattributes — `<path> restricted=<id>` to seal it, or `<path> public` to consent — or re-run with `--allow-reveal <path>` to seal it public deliberately", .paths.join(", "))]
     MisSeal { paths: Vec<String> },
+    /// The seal-WIP guard (#418, map #354; ADR 0039). A **bare sync verb** —
+    /// plain `loot ferry` (not `--with-wip`, which is a pure review projection)
+    /// or no-arg `loot adopt` (the catch-up merge arm) — is about to fold the
+    /// ambient position's live **described** working change into signed
+    /// history, stranding it as a PR-less line no review ever saw. The sibling
+    /// of `MisSeal`/`Demotion`: a typed, matchable refusal mirroring the ADR
+    /// 0030/0038 guard+override pattern, overridable with `--seal-wip`. Unlike
+    /// the mis-seal gate this is not per-path — the whole described line is
+    /// what would become PR-less — so it carries the change's subject, not a
+    /// path list. `verb` names the bare sync verb that tripped it.
+    #[error("refusing to finalize your described working change \"{subject}\": a bare `{verb}` would fold it onto `main` with no review — no PR would ever carry it, and it lands PR-less. Land it through review instead (`loot-first review` then `loot-first land`), or re-run with `--seal-wip` to seal it here deliberately", subject = .subject, verb = .verb)]
+    SealWip { subject: String, verb: String },
     #[error("backend error: {0}")]
     Backend(String),
 }

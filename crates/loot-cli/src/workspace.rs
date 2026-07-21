@@ -692,6 +692,27 @@ impl Workspace {
         self.working_message().is_none_or(|m| is_undescribed(&m))
     }
 
+    /// Does the ambient position hold a **described** (named, unsigned) working
+    /// change? The #418 seal-WIP trip condition: exactly the state a bare sync
+    /// verb would fold into a PR-less signed line (`working_is_undescribed` is
+    /// the #275 refusal's job, not this guard's).
+    pub fn has_described_working_change(&self) -> bool {
+        self.working.is_some() && !self.working_is_undescribed()
+    }
+
+    /// The working change's subject (its message's first line) — what the #418
+    /// [`RepoError::SealWip`](loot_core::RepoError::SealWip) names so the
+    /// operator recognizes the line a bare sync verb was about to seal, and
+    /// what ferry echoes into the override's recovery-recipe print.
+    pub fn working_subject(&self) -> String {
+        self.working_message_or_placeholder()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    }
+
     /// Nothing signs an un-described change (#174, extended to the merges by
     /// #275) — one rule, two refusals, because the two callers must explain
     /// themselves very differently. [`REFUSE_UNDESCRIBED`] answers a deliberate
@@ -1882,7 +1903,7 @@ impl Workspace {
     /// A live working change is captured and finalized into the merge, not
     /// discarded — so there is no `--discard-wip`. Allowed from a lane (its whole
     /// point is catching a lane up), so it does not `ensure_primary`.
-    pub fn adopt_harbor(&mut self) -> Result<AdoptCatchupReport, String> {
+    pub fn adopt_harbor(&mut self, seal_wip: bool) -> Result<AdoptCatchupReport, String> {
         let their = self.mirror_main_change().ok_or(
             "no mirror main to catch up to — bind and `loot ferry` a mirror first, \
              or name a landed change: `loot adopt <version-id>`",
@@ -1918,6 +1939,7 @@ impl Workspace {
                     already_current: true,
                     merged: false,
                     outcomes: BTreeMap::new(),
+                    sealed_wip: None,
                 });
             }
         }
@@ -1972,10 +1994,31 @@ impl Workspace {
                         already_current: false,
                         merged: true,
                         outcomes: BTreeMap::new(),
+                        // A clean fast-forward has no captured wip to seal.
+                        sealed_wip: None,
                     });
                 }
             }
         }
+        // #418 seal-WIP guard: the no-arg catch-up is a bare sync verb, and
+        // `fold_line_in` below finalizes the captured working change as our
+        // signed merge parent — a PR-less line no review saw. Reaching here
+        // means a real captured line diverged (the clean fast-forward already
+        // returned); if it is *described* (an un-described one is `fold_line_in`'s
+        // own #275 refusal), refuse to seal it unless the operator asked with
+        // `--seal-wip`. The capture is already safe on disk.
+        let sealing_subject = if self.has_described_working_change() {
+            if !seal_wip {
+                return Err(RepoError::SealWip {
+                    subject: self.working_subject(),
+                    verb: "loot adopt".into(),
+                }
+                .to_string());
+            }
+            Some(self.working_subject())
+        } else {
+            None
+        };
         // Otherwise fold the local line into a merge (`fold_line_in` finalizes the
         // captured WIP as our signed merge parent).
         let before = self.anchor();
@@ -1984,7 +2027,14 @@ impl Workspace {
         if merged {
             self.record_op("adopt", &msg, false);
         }
-        Ok(AdoptCatchupReport { harbor: their, already_current: !merged, merged, outcomes })
+        Ok(AdoptCatchupReport {
+            harbor: their,
+            already_current: !merged,
+            merged,
+            outcomes,
+            // The override sealed only if the fold actually advanced the tip.
+            sealed_wip: sealing_subject.filter(|_| merged),
+        })
     }
 
     /// The harbor/main lineage fence for [`adopt`](Self::adopt) (§4): `target`
@@ -2838,6 +2888,20 @@ impl Workspace {
         self.anchor()
     }
 
+    /// The #418 belt-and-suspenders signal: the ambient position's finalized
+    /// anchor when it is a signed line strictly *ahead* of the mirror's `main`
+    /// — sealed but never landed through a PR, the state a `--seal-wip`
+    /// override (or any bare-verb seal) leaves behind. `None` when the anchor
+    /// is on or behind `main` (nothing stranded) or no mirror `main` is bound.
+    /// Read by the review "nothing to review" path and land's no-pr-map refusal
+    /// so both point at [`SEAL_WIP_RECOVERY`] instead of leaving the operator
+    /// to fold folklore.
+    pub fn sealed_unlanded_anchor(&self) -> Option<Oid> {
+        let main = self.mirror_main_change()?;
+        let anchor = self.finalized_anchor()?;
+        (anchor != main && self.graph().is_ancestor(&main, &anchor)).then_some(anchor)
+    }
+
     /// SSHSIG-sign `msg` under `namespace` with this repo's keypair (mirrored
     /// commits sign under `"git"`). Errors on a keyless repo.
     pub fn ssh_sign(&self, namespace: &str, msg: &[u8]) -> Result<String, String> {
@@ -2914,13 +2978,23 @@ impl Workspace {
     /// `preserve_wip` refusal (#292, `REFUSE_REVIEW_STALE_ANCHOR`) is gone
     /// with the fold it guarded against.
     ///
-    /// Returns the per-path outcomes (empty on adopt/no-op).
+    /// Returns the per-path outcomes (empty on adopt/no-op) and, when this pass
+    /// **sealed a described working change** under the override, that change's
+    /// subject — so the caller reports the seal from the seam that *decided* it
+    /// rather than re-deriving it from post-state (#418).
+    /// `seal_wip` is the #418 override: a bare `loot ferry` is the only
+    /// production caller that reaches the wip-fold arm below (land pre-finalizes
+    /// before its ferry pass; no-arg adopt folds through `fold_line_in`), so
+    /// when a real described working change was captured this pass, sealing it
+    /// into a PR-less signed line is refused unless the operator passed
+    /// `--seal-wip`. Pass `true` from the authorized finalizers.
     pub fn reconcile_onto(
         &mut self,
         target: Option<&Oid>,
         pinned: Option<&Oid>,
         label: &str,
-    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+        seal_wip: bool,
+    ) -> Result<(BTreeMap<PathBuf, MergeOutcome>, Option<String>), String> {
         // The incoming change may have landed from a lane this dock never
         // adopted — outside the lineage-filtered load (#265). Pull its line in
         // from the shared graph first, so the arms below see the truth: the
@@ -2931,7 +3005,7 @@ impl Workspace {
         // pre-guard) keeps the pre-#265 arms — ferry's baseline adoption
         // (#263) recovers its content.
         let Some(target) = target else {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), None));
         };
         self.repo.ingest_shared_lineage(&self.store, target).map_err(|e| e.to_string())?;
 
@@ -2956,7 +3030,7 @@ impl Workspace {
             o == target || self.graph().is_ancestor(target, o) || self.repo.supersedes(o, target)
         }) || self.working.as_ref().is_some_and(|w| self.repo.supersedes(w, target));
         if covered {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), None));
         }
 
         // Past the no-ops, every arm below materializes `target`'s tree over the
@@ -2989,17 +3063,37 @@ impl Workspace {
             described,
         };
         match reconcile::decide(&view) {
-            reconcile::Plan::NoOp => Ok(BTreeMap::new()),
+            reconcile::Plan::NoOp => Ok((BTreeMap::new(), None)),
             reconcile::Plan::Refuse(refusal) => Err(refusal.message().to_string()),
             reconcile::Plan::Adopt => {
                 self.reconcile_adopt(target)?;
-                Ok(BTreeMap::new())
+                Ok((BTreeMap::new(), None))
             }
             reconcile::Plan::Merge { ours } => {
                 // Carrying the just-captured wip signs it first (#275's "this
                 // seals your local work into signed history") — a pinned tip
                 // carried instead is already finalized, nothing left to sign.
+                let mut sealed_wip = None;
                 if wip.is_some() {
+                    // The #418 seal-WIP guard: this arm is the *only* place a
+                    // bare `loot ferry` seals a described working change (the
+                    // planner already refused an un-described one, #275). The
+                    // sync would fold it onto `main` PR-less, so refuse unless
+                    // the operator asked for it — `--seal-wip`. The capture is
+                    // already safe on disk (reconcile_capture persisted it) and
+                    // ferry rolls its ingest back on this Err (#307), so the
+                    // re-run with the override redoes the ingest and seals.
+                    if !seal_wip {
+                        return Err(RepoError::SealWip {
+                            subject: self.working_subject(),
+                            verb: "loot ferry".into(),
+                        }
+                        .to_string());
+                    }
+                    // Read the subject before `finalize_working` clears the
+                    // working change — this seam decided to seal, so it reports
+                    // it (the caller no longer re-derives from post-state, #418).
+                    sealed_wip = Some(self.working_subject());
                     // Mis-seal gate (#353, ADR 0038 §1): the wip about to be
                     // signed was captured from the disk this pass — same seam
                     // as `fold_line_in`'s capture-and-sign, same gate. The
@@ -3009,7 +3103,8 @@ impl Workspace {
                     self.seal_gate(&[])?;
                     self.finalize_working()?;
                 }
-                self.reconcile_carry(&ours, target, label)
+                let outcomes = self.reconcile_carry(&ours, target, label)?;
+                Ok((outcomes, sealed_wip))
             }
         }
     }
@@ -3238,6 +3333,19 @@ const REFUSE_UNDESCRIBED: &str = "refusing to sign an un-described working chang
      becomes the permanent subject on git `main`\n  name it:        loot describe -m \"<subject>\"\n  \
      or in one step: loot new -m \"<subject>\"\n  (your edits are captured and safe — only the \
      signature was withheld)";
+
+/// The follow-up-round recovery recipe (#418, map #354): what to do once a
+/// described working change has been sealed into a signed line no PR carried —
+/// whether reached deliberately by `--seal-wip` or stumbled into. A working
+/// change in the same lane opens a review round whose branch carries the sealed
+/// work, landed through one PR. Shared verbatim by the `--seal-wip` override
+/// print, the review "nothing to review" hint, and land's no-pr-map refusal, so
+/// the guidance is one seam and never drifts (the #174 discipline). The tool
+/// owning this round is #356's "Prevent + hint" resolution.
+pub const SEAL_WIP_RECOVERY: &str = "the sealed work is now a signed line ahead of `main` with no PR.\n  \
+     to land it through review: make a follow-up working change in this lane\n  \
+     (any edit, then `loot describe -m \"<subject>\"`), run `loot-first review`\n  \
+     — its branch carries the sealed work — then `loot-first land --pr <n>`.";
 
 /// Resolve visibility for `path` under an explicit `.lootattributes` text.
 /// The bridge classifies ingested files under the *ingested commit's own*
@@ -4520,7 +4628,7 @@ mod tests {
         ws.snapshot("c1").unwrap();
         ws.finalize_working().unwrap();
         let c1 = ws.repo().heads()[0].clone();
-        let r1 = crate::ferry::run(&mut ws, Some(mirror.to_str().unwrap()), None, false).unwrap();
+        let r1 = crate::ferry::run(&mut ws, Some(mirror.to_str().unwrap()), None, false, true).unwrap();
         assert_eq!(r1.projected, 1, "c1 projects to git-main");
 
         // Drift the dock ahead of main with a divergent c2.
@@ -4537,7 +4645,7 @@ mod tests {
 
         // The re-ferry is a no-op on the git side: nothing to ingest, and c1 is
         // already main, so nothing projects backward.
-        let r2 = crate::ferry::run(&mut ws, None, None, false).unwrap();
+        let r2 = crate::ferry::run(&mut ws, None, None, false, true).unwrap();
         assert_eq!(r2.ingested, 0, "no git-native commits to ingest");
         assert_eq!(r2.projected, 0, "the dock is on main — nothing projects (§6.5)");
         let _ = std::fs::remove_dir_all(&base);
@@ -4550,7 +4658,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("loot-250-nomirror-{}", std::process::id()));
         let mut ws = authored_ws(&dir);
         seed_fork(&mut ws);
-        let err = ws.adopt_harbor().unwrap_err();
+        let err = ws.adopt_harbor(true).unwrap_err();
         assert!(err.contains("no mirror main"), "names the missing mirror: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4563,7 +4671,7 @@ mod tests {
         seed_mirror_main(&ws, &"1".repeat(40), &c1);
         ws.adopt(&loot_core::hex::encode(&c1.0), false).unwrap(); // settle tip on c1
 
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.already_current && !report.merged, "harbor is our tip — a no-op");
         assert_eq!(ws.anchor(), Some(c1), "the tip did not move");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4594,7 +4702,7 @@ mod tests {
         ws.record_op("seed", "harbor advanced to c2", false);
         seed_mirror_main(&ws, &"2".repeat(40), &c2);
 
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged && !report.already_current, "caught up");
         assert!(report.outcomes.is_empty(), "a fast-forward has no merge outcomes");
         assert_eq!(ws.repo().heads(), vec![c2.clone()], "tip fast-forwarded to c2, no merge head");
@@ -4632,7 +4740,7 @@ mod tests {
         ws.record_op("seed", "harbor advanced to f", false);
         seed_mirror_main(&ws, &"6".repeat(40), &f);
 
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged && !report.already_current, "folded the local line in");
         let tip = ws.anchor().unwrap();
         let parents = ws.graph().parents(&tip);
@@ -4676,7 +4784,7 @@ mod tests {
         // since #275 this case always takes two passes. Pass 1 captures the edit
         // (the #250 guarantee this test exists for) and refuses to sign it
         // nameless; the materialize never runs, so nothing is clobbered.
-        let err = ws.adopt_harbor().unwrap_err();
+        let err = ws.adopt_harbor(true).unwrap_err();
         assert!(err.contains("describe"), "nameless dirt holds the merge: {err}");
         assert!(ws.working_id().is_some(), "pass 1 captured the edit — #250's whole point");
         assert_eq!(
@@ -4687,7 +4795,7 @@ mod tests {
 
         // Pass 2, once named: the fold happens exactly as it always did.
         ws.snapshot("feat: my local line").unwrap();
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged, "the dirty local line was folded in");
         assert_eq!(
             std::fs::read(dir.join("local.txt")).unwrap(),
@@ -4729,7 +4837,7 @@ mod tests {
             ws.repo().change_message(&c2).is_none(),
             "precondition: the landed change is outside the loaded lineage"
         );
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged && !report.already_current, "caught up");
         assert!(report.outcomes.is_empty(), "a fast-forward has no merge outcomes");
         assert_eq!(ws.repo().heads(), vec![c2.clone()], "clean FF — no merge node minted");
@@ -4762,7 +4870,7 @@ mod tests {
 
         let mut ws = Workspace::open_at(&dir).unwrap();
         let before = ws.finalized_anchor();
-        let err = ws.adopt_harbor().unwrap_err();
+        let err = ws.adopt_harbor(true).unwrap_err();
         assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
 
         // Safe, not lossy: the capture happened, only the signature was withheld.
@@ -4773,7 +4881,7 @@ mod tests {
 
         // And naming it clears the refusal — the catch-up then folds it in.
         ws.snapshot("feat: my local line").unwrap();
-        assert!(ws.adopt_harbor().unwrap().merged, "named work folds in");
+        assert!(ws.adopt_harbor(true).unwrap().merged, "named work folds in");
         let _ = std::fs::remove_dir_all(&area);
     }
 
@@ -4785,7 +4893,7 @@ mod tests {
 
         let mut ws = Workspace::open_at(&dir).unwrap();
         ws.snapshot("feat: my local line").unwrap();
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
 
         assert!(report.merged, "described local work still folds in");
         let tip = ws.anchor().expect("a merge tip");
@@ -4810,7 +4918,7 @@ mod tests {
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
 
         let err = ws
-            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", true)
             .unwrap_err();
         assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
         assert!(ws.working_id().is_some(), "the local work is captured, not dropped");
@@ -4826,7 +4934,7 @@ mod tests {
         std::fs::write(dir.join("local.txt"), b"my work").unwrap();
         ws.snapshot("feat: my local line").unwrap();
 
-        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", true)
             .expect("described work reconciles");
         let tip = ws.anchor().expect("the dock advanced");
         assert!(ws.graph().is_ancestor(&c2, &tip), "the landed side is under the carried tip");
@@ -4843,6 +4951,131 @@ mod tests {
             vec![c2.clone()],
             "the carried tip sits directly on landed main — linear, no merge node"
         );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    // -----------------------------------------------------------------------
+    // #418 — the seal-WIP guard: a *bare* sync verb (plain `loot ferry` /
+    // no-arg `loot adopt`) must not fold a *described* working change into a
+    // PR-less signed line without the operator's `--seal-wip` override. The
+    // #275 tests above cover the un-described refusal that still fires first;
+    // these cover the described line the bare verb would otherwise seal
+    // silently, and the sealed-but-unlanded signal the recovery hints read.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ferry_refuses_to_seal_described_wip_without_the_override() {
+        let (area, dir, c2) = landed_from_lane("418-ferry-refuse");
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let ours = ws.finalized_anchor();
+        std::fs::write(dir.join("local.txt"), b"my work").unwrap();
+        ws.snapshot("feat: my described line").unwrap();
+
+        // seal_wip = false: a bare ferry refuses rather than strand the line.
+        let before = ws.finalized_anchor();
+        let err = ws
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", false)
+            .unwrap_err();
+        assert!(err.contains("--seal-wip"), "the refusal names the override: {err}");
+        assert!(
+            err.contains("feat: my described line"),
+            "and the described line it protects: {err}"
+        );
+        // Safe, not lossy: the capture is on disk, only the signature withheld.
+        assert!(ws.working_id().is_some(), "the described work is captured, not sealed");
+        assert_eq!(ws.finalized_anchor(), before, "nothing was signed onto the line");
+
+        // The override seals it exactly as before the guard existed.
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", true)
+            .expect("--seal-wip proceeds");
+        assert_eq!(
+            ws.repo().change_message(&ws.anchor().unwrap()).as_deref(),
+            Some("feat: my described line"),
+            "the carried tip keeps the work's own subject",
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn catch_up_refuses_to_seal_described_wip_without_the_override() {
+        let (area, dir, _c2) = landed_from_lane("418-adopt-refuse");
+        std::fs::write(dir.join("local.txt"), b"my work").unwrap();
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        ws.snapshot("feat: my described line").unwrap();
+
+        let before = ws.finalized_anchor();
+        let err = ws.adopt_harbor(false).unwrap_err();
+        assert!(err.contains("--seal-wip"), "the refusal names the override: {err}");
+        assert!(ws.working_id().is_some(), "the described work is captured, not sealed");
+        assert_eq!(ws.finalized_anchor(), before, "nothing was signed");
+
+        // The override folds it in and reports the sealed subject for the recipe.
+        let report = ws.adopt_harbor(true).unwrap();
+        assert!(report.merged, "described work folds in under --seal-wip");
+        assert_eq!(
+            report.sealed_wip.as_deref(),
+            Some("feat: my described line"),
+            "the report carries the sealed subject so the CLI prints the recovery recipe",
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn undescribed_wip_is_the_275_refusal_even_without_the_override() {
+        // The #418 guard protects a *named* line; an un-described one is still
+        // the #275 refusal (the planner refuses it before the seal-WIP arm),
+        // so a raw disk edit with no name never trips the new guard.
+        let (area, dir, c2) = landed_from_lane("418-undescribed");
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let ours = ws.finalized_anchor();
+        std::fs::write(dir.join("local.txt"), b"my unnamed work").unwrap();
+        ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
+
+        let err = ws
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", false)
+            .unwrap_err();
+        assert!(err.contains("describe"), "un-described stays the #275 refusal: {err}");
+        assert!(!err.contains("--seal-wip"), "not the seal-WIP guard: {err}");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn break_glass_catch_up_with_no_described_wip_is_not_tripped() {
+        // A bare `loot ferry`/`loot adopt` with no live described work — the
+        // primary's break-glass ingest, or a routine catch-up — folds without
+        // a whisper of the guard.
+        let (area, dir, c2) = landed_from_lane("418-breakglass");
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        let ours = ws.finalized_anchor();
+        // No working change on disk: a pure catch-up onto landed main.
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", false)
+            .expect("a no-wip catch-up is never the seal-WIP refusal");
+        assert_eq!(ws.anchor(), Some(c2), "the dock caught up to landed main");
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    #[test]
+    fn sealed_unlanded_anchor_flags_a_line_sealed_ahead_of_main() {
+        let (area, dir, c2) = landed_from_lane("418-sealed-unlanded");
+        let mut ws = Workspace::open_at(&dir).unwrap();
+        // Before any seal the dock is behind landed main — nothing stranded.
+        assert!(
+            ws.sealed_unlanded_anchor().is_none(),
+            "behind main: no sealed-unlanded line"
+        );
+
+        let ours = ws.finalized_anchor();
+        std::fs::write(dir.join("local.txt"), b"my work").unwrap();
+        ws.snapshot("feat: sealed by mistake").unwrap();
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", true)
+            .expect("--seal-wip seals");
+        let tip = ws.anchor().unwrap();
+        assert_eq!(
+            ws.sealed_unlanded_anchor(),
+            Some(tip.clone()),
+            "the freshly sealed tip is ahead of mirror main with no PR",
+        );
+        assert!(ws.graph().is_ancestor(&c2, &tip), "and it descends from landed main");
         let _ = std::fs::remove_dir_all(&area);
     }
 
@@ -4863,8 +5096,8 @@ mod tests {
         let stale = ws.finalized_anchor().expect("the lane's finalized change");
         let stale_cid = ws.repo().change_change_id(&stale);
 
-        let outcomes = ws
-            .reconcile_onto(Some(&c2), Some(&stale), "ferry: reconcile git main")
+        let (outcomes, _sealed) = ws
+            .reconcile_onto(Some(&c2), Some(&stale), "ferry: reconcile git main", true)
             .expect("a clean stale land carries");
         assert!(
             !outcomes
@@ -4934,7 +5167,7 @@ mod tests {
         // The reconcile a `had_new == false` ferry makes: main is the marked
         // lane-landed c2, and our line is its ancestor. Pre-#280 this hit the
         // `(None, Some(o)) if is_ancestor(o, target)` adopt arm and clobbered.
-        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+        ws.reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", true)
             .expect("the working change reconciles — it is not clobbered");
 
         assert_eq!(
@@ -4961,7 +5194,7 @@ mod tests {
         std::fs::write(dir.join("landed.txt"), b"landed").unwrap();
 
         let mut ws = Workspace::open_at(&dir).unwrap();
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged && report.outcomes.is_empty(), "clean FF");
         assert_eq!(ws.repo().heads(), vec![c2], "no duplicate line, no merge node");
         assert!(ws.working_id().is_none(), "no stray working change survives the catch-up");
@@ -4979,7 +5212,7 @@ mod tests {
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
         assert!(ws.working_id().is_some(), "precondition: the stale capture exists");
 
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged && report.outcomes.is_empty(), "clean FF");
         assert_eq!(ws.repo().heads(), vec![c2], "the duplicate capture did not become a merge");
         assert!(ws.working_id().is_none(), "the redundant capture was dropped");
@@ -5002,7 +5235,7 @@ mod tests {
         // The reset: the disk now holds exactly the landed content.
         std::fs::write(dir.join("landed.txt"), b"landed").unwrap();
 
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged && report.outcomes.is_empty(), "clean FF");
         assert_eq!(ws.repo().heads(), vec![c2], "the stale capture did not become a merge");
         assert!(ws.working_id().is_none(), "the refreshed-then-redundant capture was dropped");
@@ -5044,7 +5277,7 @@ mod tests {
         // not what this test is about — that the work is folded in rather than
         // clobbered is; the refusal has its own tests.
         ws.snapshot("feat: my local line").unwrap();
-        let report = ws.adopt_harbor().unwrap();
+        let report = ws.adopt_harbor(true).unwrap();
         assert!(report.merged, "the local line was folded in");
         let tip = ws.anchor().unwrap();
         assert!(ws.graph().is_ancestor(&c2, &tip), "landed main is an ancestor — caught up");
@@ -6541,8 +6774,8 @@ mod tests {
         let ours = ws.finalized_anchor();
 
         // The ferry reconcile the land runs — same-path divergence bounces.
-        let outcomes = ws
-            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main")
+        let (outcomes, _sealed) = ws
+            .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", true)
             .unwrap();
         assert!(
             matches!(outcomes[&PathBuf::from("base.txt")], MergeOutcome::Conflict { .. }),

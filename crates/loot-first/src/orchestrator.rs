@@ -167,7 +167,7 @@ pub fn review(
     // revert of landed work (#243). Local read only — review stays cheap.
     warn_if_drifted(ws, OriginRef::Tracking);
 
-    let report = ferry::run(ws, None, None, /* with_wip */ true)?;
+    let report = ferry::run(ws, None, None, /* with_wip */ true, /* seal_wip */ false)?;
     for note in &report.notes {
         println!("  {note}");
     }
@@ -488,7 +488,16 @@ pub fn land(
     let lane = read_pr_map(&p.pr_map)
         .lane_for_pr(pr)
         .cloned()
-        .ok_or_else(|| format!("PR #{pr} is not in the pr-map ledger (was it opened by 'review'?)"))?;
+        .ok_or_else(|| {
+            let mut m = format!("PR #{pr} is not in the pr-map ledger (was it opened by 'review'?)");
+            // #418 belt-and-suspenders: if the ambient anchor is a sealed line
+            // ahead of main with no PR (a `--seal-wip` override, or any bare-verb
+            // seal), the missing PR is the *symptom* — point at the recovery round.
+            if ws.sealed_unlanded_anchor().is_some() {
+                m.push_str(&format!("\n  {}", loot_cli::workspace::SEAL_WIP_RECOVERY));
+            }
+            m
+        })?;
 
     let ambient = ws.current_dock().unwrap_or("main").to_string();
     let tracked = tracked_dock(&ws.store().git_config());
@@ -563,7 +572,10 @@ pub fn land(
     let main_before = mirror_main_sha(&p.mirror).ok();
 
     println!(">>> loot ferry  (project signed change → main, reap the lane)");
-    let fr = ferry::run(ws, None, None, /* with_wip */ false)?;
+    // The finalize above already sealed and signed the reviewed change, so this
+    // ferry pass captures no wip — but pass the override anyway: `land` is the
+    // authorized finalizer, and the #418 guard is only for the bare verbs.
+    let fr = ferry::run(ws, None, None, /* with_wip */ false, /* seal_wip */ true)?;
     for note in &fr.notes {
         println!("  {note}");
     }
@@ -685,7 +697,10 @@ pub fn tag(ws: &mut Workspace, forge: &dyn Forge, name: &str, message: &str) -> 
     // tag lands on the current projection rather than a stale one. Idempotent
     // when main is already current — this cuts a tag, it lands no new change.
     println!(">>> loot ferry  (project → main)");
-    let fr = ferry::run(ws, None, None, /* with_wip */ false)?;
+    // Cutting a release tag is not a finalizer: it projects landed main, never
+    // reviews a change. If the operator has live described WIP, this bare ferry
+    // must refuse rather than silently seal it (#418) — pass the guard through.
+    let fr = ferry::run(ws, None, None, /* with_wip */ false, /* seal_wip */ false)?;
     for note in &fr.notes {
         println!("  {note}");
     }

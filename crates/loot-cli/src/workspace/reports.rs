@@ -126,6 +126,11 @@ pub struct AdoptCatchupReport {
     pub merged: bool,
     /// Per-path merge outcomes when a reconcile ran (empty on a fast-forward).
     pub outcomes: BTreeMap<PathBuf, MergeOutcome>,
+    /// The subject of a described working change this catch-up sealed into a
+    /// PR-less signed merge parent under the `--seal-wip` override (#418) —
+    /// `Some` only when the seal actually landed, so the CLI prints the
+    /// recovery recipe exactly once and only when it applies.
+    pub sealed_wip: Option<String>,
 }
 
 /// The outcome of a pull (#219). Carries the folded per-path merge outcomes,

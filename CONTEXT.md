@@ -198,6 +198,23 @@ work would forge provenance.
 _Avoid_: rebase (git's word for a history *rewrite* — the carry deletes
 nothing), reconcile-merge (the shape it replaces).
 
+**Seal-WIP guard** *(#418, map #354; `RepoError::SealWip`)* — the refusal a
+**bare sync verb** (plain `loot ferry`, not `--with-wip`; or no-arg `loot
+adopt`) hits when it would fold the ambient position's live **described**
+working change into signed history — stranding it as a **PR-less line** no
+review ever saw. The sibling of the [[mis-seal gate]]/`Demotion`: a typed,
+matchable refusal on the ADR 0030/0038 guard+override pattern, overridable
+with `--seal-wip`. It trips *only* on a described line the sync would actually
+fold — an un-described one is the #275 refusal, and a break-glass ferry or
+no-op sync is untouched. On override the verb prints the **follow-up-round
+recovery** (a working change in the same lane opens a review round whose
+branch carries the sealed work, landed through one PR); the "nothing to
+review" and "not in the pr-map" paths print it too when a sealed-but-unlanded
+line is present. Resolves #356's "Prevent + hint": the tool owns that round,
+not folklore.
+_Avoid_: "seal guard" alone (ambiguous with the mis-seal gate), calling
+`--seal-wip` a break-glass (it is a first-class, guided override).
+
 **Position** *(#324, shipped this wave)* — ADR 0034's "position is place, not
 state" lifted into its own module (`crates/loot-cli/src/position.rs`): the
 three fields that name where a [[Workspace]] sits — the dock, the
