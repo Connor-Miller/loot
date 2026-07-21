@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::kv;
 use crate::policy::{is_secret_name, Attributes, Ignore, ATTRS, IGNORE};
 
 /// Lane-registry lifecycle (spawn/name/list/observe/reap) — `impl Workspace`
@@ -3744,20 +3745,6 @@ fn walk(dir: &Path, ignore: &Ignore) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn parse_config_text(text: &str) -> BTreeMap<String, String> {
-    let mut entries = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            entries.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    entries
-}
-
 /// Named remotes from `.loot/config`. Format: one `name = url` pair per line;
 /// blank lines and `#` comments are ignored.
 struct Config {
@@ -3767,7 +3754,7 @@ struct Config {
 impl Config {
     fn load(path: &Path) -> Self {
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        Config { entries: parse_config_text(&text) }
+        Config { entries: kv::parse(&text) }
     }
 
     fn get(&self, name: &str) -> Option<String> {
@@ -3787,11 +3774,8 @@ impl Config {
     }
 
     fn save(&self, path: &Path) -> Result<(), String> {
-        let mut out = String::new();
-        for (k, v) in &self.entries {
-            out.push_str(&format!("{k} = {v}\n"));
-        }
-        std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
+        std::fs::write(path, kv::encode(&self.entries))
+            .map_err(|e| format!("write {}: {e}", path.display()))
     }
 }
 
@@ -3809,7 +3793,7 @@ impl GlobalConfig {
     pub fn load() -> Self {
         let path = global_config_path();
         let text = std::fs::read_to_string(&path).unwrap_or_default();
-        GlobalConfig { entries: parse_config_text(&text), path }
+        GlobalConfig { entries: kv::parse(&text), path }
     }
 
     /// Read a key. Returns `None` if not set.
@@ -3839,11 +3823,7 @@ impl GlobalConfig {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create config dir: {e}"))?;
         }
-        let mut out = String::new();
-        for (k, v) in &self.entries {
-            out.push_str(&format!("{k} = {v}\n"));
-        }
-        std::fs::write(&self.path, out)
+        std::fs::write(&self.path, kv::encode(&self.entries))
             .map_err(|e| format!("write {}: {e}", self.path.display()))
     }
 }

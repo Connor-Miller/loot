@@ -77,7 +77,7 @@ pub fn run(
 
     // --- config: where the mirror lives, which dock main tracks ---
     let cfg_path = ws.store().git_config();
-    let mut cfg = parse_kv(&read_or_empty(&cfg_path));
+    let mut cfg = crate::kv::parse(&read_or_empty(&cfg_path));
     if let Some(dir) = git_dir_flag {
         cfg.insert("gitdir".into(), dir.into());
     }
@@ -114,13 +114,13 @@ pub fn run(
     };
 
     // --- identity map + allowed-signers (seeded once, kept local) ---
-    let mut id_map = parse_kv(&read_or_empty(&ws.store().git_identity_map()));
+    let mut id_map = crate::kv::parse(&read_or_empty(&ws.store().git_identity_map()));
     if let Some(pk) = ws.author_pubkey() {
         let pk_hex = hex::encode(&pk);
         if !id_map.contains_key(&pk_hex) {
             let (name, email) = self_name_email(ws, &git);
             id_map.insert(pk_hex, format!("{name} <{email}>"));
-            write_kv(&ws.store().git_identity_map(), &id_map)?;
+            write_spine(&ws.store().git_identity_map(), &crate::kv::encode(&id_map))?;
         }
         if let Some(pub_line) = ws.public_key_openssh() {
             let (_, email) = self_name_email(ws, &git);
@@ -525,7 +525,7 @@ pub fn run(
         state.loot_heads = ws.heads();
         write_spine(&marks_path, &marks.encode())?;
         write_spine(&state_path, &state.encode())?;
-        write_kv(&cfg_path, &cfg)?;
+        write_spine(&cfg_path, &crate::kv::encode(&cfg))?;
     }
     Ok(report)
 }
@@ -546,7 +546,7 @@ pub fn run(
 /// (nothing has been projected yet), or when a tag of this name already exists
 /// (a release tag is never clobbered). Returns the tagged commit sha.
 pub fn tag_projected_main(ws: &Workspace, name: &str, message: &str) -> Result<String, String> {
-    let cfg = parse_kv(&read_or_empty(&ws.store().git_config()));
+    let cfg = crate::kv::parse(&read_or_empty(&ws.store().git_config()));
     let git_dir = resolve_gitdir(
         cfg.get("gitdir")
             .ok_or("no mirror bound — run `loot ferry` to project main before tagging")?,
@@ -1500,27 +1500,6 @@ mod resolve_gitdir_tests {
 }
 
 /// `key = value` files under `.loot/git-mirror/` (config, identity map).
-fn parse_kv(text: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    out
-}
-
-fn write_kv(path: &Path, entries: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut out = String::new();
-    for (k, v) in entries {
-        out.push_str(&format!("{k} = {v}\n"));
-    }
-    write_spine(path, &out)
-}
 
 #[cfg(test)]
 mod tests {
@@ -2262,7 +2241,7 @@ mod tests {
 
         // Commit as exactly the name/email the bridge seeded for self in the
         // identity map (it prefers git config, so read it back from disk).
-        let id_map = parse_kv(&read_or_empty(&ws.store().git_identity_map()));
+        let id_map = crate::kv::parse(&read_or_empty(&ws.store().git_identity_map()));
         let self_entry = id_map[&hex::encode(&ws.author_pubkey().unwrap())].clone();
         let (name, email) = split_name_email(&self_entry).unwrap();
         let git = git2::Repository::open(&mirror).unwrap();
