@@ -167,3 +167,29 @@ pub struct BurnReport {
     /// `(version-id, git-sha)` — non-empty means the git-side guidance applies.
     pub projected: Vec<(Oid, String)>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_class_gutter_is_the_frozen_306_mapping() {
+        assert_eq!(DeltaClass::Added.gutter(), '+');
+        assert_eq!(DeltaClass::Modified.gutter(), 'M');
+        assert_eq!(DeltaClass::Deleted.gutter(), '-');
+    }
+
+    #[test]
+    fn working_row_version_hex_is_full_hex_of_the_version() {
+        let row = WorkingRow {
+            change_id: None,
+            version: Oid([0xab; 32]),
+            message: String::new(),
+            entries: Vec::new(),
+            empty: true,
+        };
+        let hex = row.version_hex();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c == 'a' || c == 'b'));
+    }
+}

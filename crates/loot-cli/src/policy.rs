@@ -253,3 +253,101 @@ pub(crate) fn glob_match(pat: &str, text: &str) -> bool {
     }
     go(&p, &t)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- glob dialect (`*` stops at `/`, `**` crosses it) ---
+
+    #[test]
+    fn glob_star_stops_at_slash_double_star_crosses() {
+        assert!(glob_match(".env", ".env"));
+        assert!(!glob_match(".env", ".envx"));
+        assert!(glob_match("*.md", "README.md"));
+        assert!(!glob_match("*.md", "docs/x.md")); // single star does not cross /
+        assert!(glob_match("**/*.md", "docs/x.md"));
+        assert!(glob_match("secrets/**", "secrets/a/b.txt"));
+        assert!(glob_match("*", "anything"));
+        assert!(!glob_match("*", "a/b")); // one segment only
+    }
+
+    #[test]
+    fn glob_normalizes_backslashes_both_ways() {
+        assert!(Glob::new("docs/private/*").matches(r"docs\private\secrets.md"));
+        assert!(Glob::new(r"docs\private\*").matches("docs/private/secrets.md"));
+        assert!(!Glob::new("*.md").matches(r"docs\x.md"));
+    }
+
+    // --- Attributes: first-match-wins visibility + fallthrough consent ---
+
+    #[test]
+    fn attributes_first_matching_rule_wins() {
+        let a = Attributes::parse(".env restricted=alice\n*.md public\n");
+        assert!(matches!(a.visibility_for(".env"), Visibility::Restricted(_)));
+        assert!(matches!(a.visibility_for("README.md"), Visibility::Public));
+        assert!(matches!(a.visibility_for("unmatched.txt"), Visibility::Public)); // default
+    }
+
+    #[test]
+    fn public_by_fallthrough_is_the_mis_seal_consent_test() {
+        // No rule → default Public → fallthrough.
+        assert!(Attributes::parse("").public_by_fallthrough("secret.env"));
+        // A catch-all `* public` also waves it through → fallthrough.
+        assert!(Attributes::parse("* public\n").public_by_fallthrough("secret.env"));
+        // An explicit rule naming the path public is consent, NOT fallthrough.
+        assert!(!Attributes::parse("secret.env public\n").public_by_fallthrough("secret.env"));
+        // A non-Public resolution is never a fallthrough-public.
+        assert!(!Attributes::parse("secret.env restricted=me\n").public_by_fallthrough("secret.env"));
+    }
+
+    // --- catch-all classification + secret-shaped names (ADR 0038 §1) ---
+
+    #[test]
+    fn is_catchall_distinguishes_wildcards_from_named_rules() {
+        assert!(is_catchall("*"));
+        assert!(is_catchall("**"));
+        assert!(is_catchall("**/*"));
+        assert!(is_catchall("*/**"));
+        assert!(!is_catchall(""));
+        assert!(!is_catchall("*.pem")); // a literal segment names it
+        assert!(!is_catchall(".env*"));
+        assert!(!is_catchall("docs/private/*"));
+    }
+
+    #[test]
+    fn is_secret_name_matches_basenames_anywhere_case_insensitively() {
+        for p in [".env", "config/.env", "id_rsa", "server.pem", "AWS_credentials.txt", "keys/.env.LOCAL"] {
+            assert!(is_secret_name(std::path::Path::new(p)), "should be secret-shaped: {p}");
+        }
+        for p in ["main.rs", "id_map.rs", "README.md", "environment.txt"] {
+            assert!(!is_secret_name(std::path::Path::new(p)), "should NOT be secret-shaped: {p}");
+        }
+        // NB the `.env*` pattern is anchored at the basename start, so the
+        // suffix style `prod.env` is NOT caught (only `.env`, `.env.local`, …).
+        assert!(!is_secret_name(std::path::Path::new("deploy/prod.env")));
+    }
+
+    // --- Ignore: file exclusion, subtree pruning, policy-file protection ---
+
+    #[test]
+    fn ignore_excludes_files_prunes_subtrees_and_never_ignores_policy() {
+        let ig = Ignore::parse("target/\n*.tmp\n");
+        assert!(ig.ignores_file("target/debug/x.o"));
+        assert!(ig.ignores_dir("target")); // trailing-slash subtree prunes the dir
+        assert!(ig.ignores_file("scratch.tmp"));
+        assert!(!ig.ignores_dir("src")); // a file glob never prunes a dir
+        // The policy files themselves are never ignorable (#62).
+        assert!(!Ignore::parse("**\n").ignores_file(ATTRS));
+        assert!(!Ignore::parse("**\n").ignores_file(IGNORE));
+    }
+
+    #[test]
+    fn parse_visibility_reads_the_three_specs() {
+        assert!(matches!(parse_visibility("public"), Some(Visibility::Public)));
+        assert!(matches!(parse_visibility("restricted=a,b"), Some(Visibility::Restricted(ids)) if ids.len() == 2));
+        assert!(matches!(parse_visibility("embargoed=1800000000"), Some(Visibility::Embargoed { reveal_at: 1800000000 })));
+        assert!(parse_visibility("restricted=").is_none()); // empty id set
+        assert!(parse_visibility("bogus").is_none());
+    }
+}
