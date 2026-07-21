@@ -1,0 +1,22 @@
+{
+  "name": "@millerbyte/loot-sdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "In-memory loot for JS/TS agents. Slice 1 (#423): relay-backed, diskless public read over the WASM crypto/codec core.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build:wasm": "wasm-pack build ../crates/loot-wasm --target nodejs --out-dir ../../sdk/wasm --out-name loot_wasm",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "fzstd": "^0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

@@ -47,6 +47,24 @@ pub mod core {
         obj.address().0
     }
 
+    /// Encode a relay `/fetch` request body: the `[major][minor]` format marker,
+    /// then the caller's `have` change-ids and `wants` object addresses, each a
+    /// length-prefixed list — byte-identical to `loot-net`'s `encode_have_wants`.
+    /// `have`/`wants` are flat concatenations of 32-byte ids. Kept in the wasm
+    /// core so the version marker can never drift from the binary's.
+    pub fn encode_fetch_request(have: &[u8], wants: &[u8]) -> Result<Vec<u8>, String> {
+        if have.len() % 32 != 0 || wants.len() % 32 != 0 {
+            return Err("have/wants must each be a multiple of 32 bytes".into());
+        }
+        let mut out = Vec::new();
+        loot_codec::format::put_version(&mut out);
+        out.extend_from_slice(&((have.len() / 32) as u32).to_le_bytes());
+        out.extend_from_slice(have);
+        out.extend_from_slice(&((wants.len() / 32) as u32).to_le_bytes());
+        out.extend_from_slice(wants);
+        Ok(out)
+    }
+
     /// AES-256-GCM decrypt under `key` — the raw open primitive (no gates, no
     /// decompression). For compressed public content the plaintext is still
     /// zstd-deflated; the host inflates it.
@@ -185,6 +203,13 @@ fn nonce12(nonce: &[u8]) -> Result<[u8; 12], JsError> {
 #[wasm_bindgen]
 pub fn blake3_address(nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, JsError> {
     Ok(core::address(&nonce12(nonce)?, ciphertext).to_vec())
+}
+
+/// Encode a relay `/fetch` request body (format marker + `have` + `wants`).
+/// `have`/`wants` are flat concatenations of 32-byte ids.
+#[wasm_bindgen(js_name = encodeFetchRequest)]
+pub fn encode_fetch_request(have: &[u8], wants: &[u8]) -> Result<Vec<u8>, JsError> {
+    core::encode_fetch_request(have, wants).map_err(js)
 }
 
 /// AES-256-GCM decrypt of a sealed object's ciphertext under `key`.

@@ -27,6 +27,10 @@ const DEC_PLAINTEXT: &[u8] = b"loot slice 1 tracer bullet";
 const OBJ_BYTE: u8 = 0x42;
 const CONTENT_KEY: [u8; 32] = [5u8; 32];
 
+// /fetch request framing: one `have` id (0x11) + one `wants` id (0x22).
+const REQ_HAVE: [u8; 32] = [0x11; 32];
+const REQ_WANTS: [u8; 32] = [0x22; 32];
+
 // --- frozen native vectors (regenerated + re-asserted by the native run) ---
 /// blake3(ADDR_NONCE ‖ ADDR_CIPHERTEXT).
 const FROZEN_ADDRESS: &str = "270fc28469c89467298dc6454975985ba36dd2231ce075eba2f585d33d9793e7";
@@ -35,6 +39,8 @@ const FROZEN_OBJ_ADDR: &str = "62db251da2e062dcf972f9009539614e88b47fcbbc745aede
 /// AES-256-GCM(DEC_KEY, DEC_NONCE) of DEC_PLAINTEXT.
 const FROZEN_CIPHERTEXT: &str =
     "4beaebe09e83ad08c307eb09c69ed1beb7d511d3569b9bac0ada8ac5a72b120867419fca27c37c9b3c20";
+/// The `/fetch` request framing for REQ_HAVE + REQ_WANTS (marker + counts + ids).
+const FROZEN_FETCH_REQ: &str = "0800010000001111111111111111111111111111111111111111111111111111111111111111010000002222222222222222222222222222222222222222222222222222222222222222";
 /// A one-change, one-object Sync frame, encoded by native `loot-codec`.
 const FROZEN_BUNDLE: &str = "080000000000000100000062db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea4242424242424242424242420010000000424242424242424242424242424242420001000000010000002a0100000062db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea0505050505050505050505050505050505050505050505050505050505050505010000000101010101010101010101010101010101010101010101010101010101010101000000000c0000006669727374206368616e67650100000009000000726561646d652e6d6462db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea000000000000000000000000";
 
@@ -86,6 +92,10 @@ fn check_bundle(
     assert_eq!(missing_object, None, "an unknown address resolves to None, not an error");
 }
 
+fn check_fetch_request(got: Vec<u8>) {
+    assert_eq!(hex(&got), FROZEN_FETCH_REQ, "/fetch request framing != frozen native vector");
+}
+
 fn frozen_obj_addr_bytes() -> Vec<u8> {
     unhex(FROZEN_OBJ_ADDR)
 }
@@ -101,7 +111,7 @@ fn parity_native() {
     use loot_codec::bundle_codec::{BundleBody, Frame};
     use loot_codec::sealed::SealedObject;
     use loot_codec::ChangeNode;
-    use loot_wasm::core::{address, decrypt, DecodedBundle};
+    use loot_wasm::core::{address, decrypt, encode_fetch_request, DecodedBundle};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -139,20 +149,24 @@ fn parity_native() {
 
     // Print-on-mismatch so regenerating the vectors is a copy-paste (see the
     // PLACEHOLDER seeds); then hard-assert the frozen constants.
+    let fetch_req = encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap();
     if hex(&addr.0) != FROZEN_OBJ_ADDR
         || hex(&ciphertext) != FROZEN_CIPHERTEXT
         || hex(&bundle_bytes) != FROZEN_BUNDLE
+        || hex(&fetch_req) != FROZEN_FETCH_REQ
     {
         panic!(
-            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_BUNDLE = {:?}",
+            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_FETCH_REQ = {:?}\nFROZEN_BUNDLE = {:?}",
             hex(&addr.0),
             hex(&ciphertext),
+            hex(&fetch_req),
             hex(&bundle_bytes)
         );
     }
 
     // Now the actual parity checks, all against the FROZEN bytes.
     check_address(address(&ADDR_NONCE, &ADDR_CIPHERTEXT).to_vec());
+    check_fetch_request(encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap());
 
     let frozen_ct = unhex(FROZEN_CIPHERTEXT);
     let got = decrypt(&DEC_NONCE, &frozen_ct, &DEC_KEY).unwrap();
@@ -177,9 +191,10 @@ fn parity_native() {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen_test::wasm_bindgen_test]
 fn parity_wasm() {
-    use loot_wasm::{blake3_address, decrypt, WasmBundle};
+    use loot_wasm::{blake3_address, decrypt, encode_fetch_request, WasmBundle};
 
     check_address(blake3_address(&ADDR_NONCE, &ADDR_CIPHERTEXT).unwrap());
+    check_fetch_request(encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap());
 
     let frozen_ct = unhex(FROZEN_CIPHERTEXT);
     let got = decrypt(&DEC_NONCE, &frozen_ct, &DEC_KEY).unwrap();
