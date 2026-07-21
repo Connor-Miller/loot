@@ -162,6 +162,45 @@ content, not re-captured as local work. And `loot gc` roots every change in the
 shared graph file plus every live lane's WIP, so a landed-but-unadopted change
 can never be pruned (#263's root cause, prevented).
 
+## Running a wave
+
+A **wave** is the ordinary case at scale: several lanes in flight at once, each
+opening a review and landing on its own schedule, interleaved with each other
+and with the occasional out-of-wave land. There is **no wave verb, no
+orchestrator, and nothing to configure** — the machinery already described *is*
+the wave protocol (#358, "Nothing new"). Two invariants carry the whole thing:
+
+1. **A review is a pure projection, so it never goes stale.** Every lane opens
+   its PR with `loot-first review` and refreshes it whenever it likes, in any
+   order relative to anyone's land. `main` moving under a lane — a sibling
+   landing, an out-of-wave land — changes nothing about that lane's review: it
+   re-mints from the lane's own anchor and re-pushes its own `review/<lane>`
+   ref (ADR 0039). No lane ever has to stop and re-anchor to keep its PR alive.
+2. **Land queues on the harbor and carries onto the moved tip.** N lanes fire
+   `loot-first land` freely. Each takes the shared-store harbor lock
+   (`harbor.lock`, ADR 0036) across the git-`main`-critical section, so they
+   pass through one at a time; a waiter blocks up to `HARBOR_WAIT` (120s) and
+   then proceeds. Whoever lands second is now *behind* the tip the first one
+   moved — and the land **carries** its signed change onto that tip as a
+   superseding version (one commit per change, no merge noise). A genuine
+   same-path collision **bounces** instead (nothing minted, nothing pushed);
+   `loot resolve <path> <file>` then re-run `land`, and the resolution folds
+   into the carried commit. `main` stays linear no matter the landing order.
+
+So the operator's job in a wave is: **spawn a lane per ticket, and let each land
+fire when its PR is approved.** You do not sequence the lands, name a queue, wait
+for a re-anchor, or hand-merge anything. The queue position is a readout nobody
+has to act on; the lock is the discipline. That is the whole of it — the pain the
+#339 wave hit (respawn-and-copy to recover a stalled review, hand-merges to land
+behind a moved tip) is now absorbed by these two invariants, with **zero
+orchestrator surgery**.
+
+Proven live, not asserted: a three-lane wave — overlapping files, an interleaved
+out-of-wave land, a stale-anchor review refresh, an in-lane bounce-and-resolve,
+and the #418 seal-WIP guard — runs green in
+[`docs/evidence/wave-proof-lanes.md`](../evidence/wave-proof-lanes.md) (map
+[#354](https://github.com/Connor-Miller/loot/issues/354)'s destination).
+
 ## Recovery playbook
 
 ### Reviews never go stale — land from wherever you are (ADR 0039)

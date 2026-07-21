@@ -1,0 +1,258 @@
+=== loot wave-proof lanes demo (wayfinder map #354) ===
+run started (utc): 2026-07-21 05:48:16Z
+work dir:          C:\Users\conno\AppData\Local\Temp\loot-wave-1784612896
+lanes dir:         C:\Users\conno\AppData\Local\Temp\loot-wave-1784612896-lanes
+
+>>> building loot (release) -- carries the #418 seal-WIP guard
+
+>>> init the repo (identity dev) + lay down a base change on the shared file
+    initialized empty loot repo at ., identity = dev
+    public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHmd9/MSt5T9RKgTBg9xSj6+IlYgqpnyztN1P6h5yw9g dev@loot
+    tip: share your public key with peers via `loot whoami`
+    tip: declare per-file privacy in .lootattributes, e.g. `.env restricted=dev`
+    quickstart — paste this into a .lootattributes file to control visibility:
+    # .lootattributes — control per-path visibility
+    # public      — everyone can read
+    # restricted  — only named identities
+    # embargoed   — sealed until unix timestamp
+    *.md          public
+    .env          restricted=alice
+    RELEASE.md    embargoed=1800000000
+
+>>> finalize the base (every lane forks from here)
+    finalized working change 38995e4a; started fresh change lyqnplxl
+    first-seal summary (1 new path):
+      public  shared.txt
+
+>>> bind a bare git mirror + project the base to main (git is a projection of loot)
+    note: initialized bare mirror at .\.loot/git-mirror/mirror.git
+    ferry: ingested 0 git commit(s), projected 1 loot change(s)
+PASS: the base is projected to mirror main
+
+>>> spawn lane t1 (sealed over the shared store, born at the base)
+    lane 't1' at \\?\C:\Users\conno\AppData\Local\Temp\loot-wave-1784612896-lanes\t1 — sealed over this repo's store, born at the finalized tip
+      ephemeral — `loot lane gc` reaps it once it lands or goes stale; `loot lane name <n>` (inside it) keeps it
+
+>>> spawn lane t2 (sealed over the shared store, born at the base)
+    lane 't2' at \\?\C:\Users\conno\AppData\Local\Temp\loot-wave-1784612896-lanes\t2 — sealed over this repo's store, born at the finalized tip
+      ephemeral — `loot lane gc` reaps it once it lands or goes stale; `loot lane name <n>` (inside it) keeps it
+
+>>> spawn lane t3 (sealed over the shared store, born at the base)
+    lane 't3' at \\?\C:\Users\conno\AppData\Local\Temp\loot-wave-1784612896-lanes\t3 — sealed over this repo's store, born at the finalized tip
+      ephemeral — `loot lane gc` reaps it once it lands or goes stale; `loot lane name <n>` (inside it) keeps it
+PASS: three lanes exist over one store
+
+>>> t1: edit shared.txt + add featureA, describe
+    described working change 192527b0 as "t1: edit shared.txt + add featureA"
+
+>>> t2: add featureB, describe
+    described working change 607386e5 as "t2: add featureB"
+
+>>> t3: add featureC (disjoint), describe
+    described working change 5e357dd1 as "t3: add featureC (disjoint)"
+
+############################################################
+# ACT 1 -- pure-projection reviews: 3 lanes, 3 review refs (ADR 0039)
+############################################################
+
+>>> t1: loot ferry --with-wip (open review/t1)
+    review: dock=main owner=t1 branch=review/t1 sha=e66ae6316fadea522f2be945c9e129fb5a5a2d13 change=5d816b9a7da76bda31fe0d39c1e78fde version=192527b0 round=1 op=opened
+PASS: t1's review projects to review/t1 (op=opened)
+
+>>> t2: loot ferry --with-wip (open review/t2)
+    review: dock=main owner=t2 branch=review/t2 sha=fb531070dc66f7ce4d402d416545664a0b5c2d25 change=63fa60000d941b3e1dc6773c02e28e55 version=607386e5 round=1 op=opened
+PASS: t2's review projects to review/t2 (op=opened)
+
+>>> t3: loot ferry --with-wip (open review/t3)
+    review: dock=main owner=t3 branch=review/t3 sha=4bac8665aab7e501c1dee34bfebb7da620153b1d change=f3dc6bf51207589311c56c4a64d7512b version=5e357dd1 round=1 op=opened
+PASS: t3's review projects to review/t3 (op=opened)
+PASS: opening three reviews did NOT advance main (a review is not a land)
+
+############################################################
+# ACT 2 -- an out-of-wave land moves main mid-wave
+############################################################
+
+>>> primary: finalize + ferry an edit to shared.txt (a land from outside the 3 lanes)
+    finalized working change a1f18ad0; started fresh change yxzyvkwu
+    ferry: ingested 0 git commit(s), projected 1 loot change(s)
+PASS: the out-of-wave land advanced main off the base -- every open review's anchor is now stale
+
+############################################################
+# ACT 3 -- a stale-anchor review refreshes clean (no respawn, no seal)
+############################################################
+
+>>> t1: loot ferry --with-wip again -- its anchor went stale under the out-of-wave land
+    review: dock=main owner=t1 branch=review/t1 sha=e66ae6316fadea522f2be945c9e129fb5a5a2d13 change=5d816b9a7da76bda31fe0d39c1e78fde version=192527b0 round=1 op=up-to-date
+PASS: t1's refreshed review is a pure projection from its own anchor (op=up-to-date)
+PASS: the review sha is byte-identical before and after main moved -- the projection did not go stale
+
+>>> t1: loot status -- the described working change is untouched (not sealed by the refresh)
+    working change pxslqvtu  192527b0  "t1: edit shared.txt + add featureA"
+      +  featureA.txt           public
+      M  shared.txt             public
+PASS: t1's described WIP survived the refresh intact -- no REFUSE_REVIEW_STALE_ANCHOR, no respawn
+
+############################################################
+# ACT 4 -- the seal-WIP guard (#418): bare sync verbs refuse to seal
+############################################################
+
+>>> t2: bare loot ferry over live described WIP (expect a typed refusal)
+    loot: refusing to finalize your described working change "t2: add featureB": a bare `loot ferry` would fold it onto `main` with no review — no PR would ever carry it, and it lands PR-less. Land it through review instead (`loot-first review` then `loot-first land`), or re-run with `--seal-wip` to seal it here deliberately
+PASS: a bare 'loot ferry' refuses to seal t2's described WIP (RepoError::SealWip)
+
+>>> t2: bare no-arg loot adopt over live described WIP (expect a typed refusal)
+    loot: refusing to finalize your described working change "t2: add featureB": a bare `loot adopt` would fold it onto `main` with no review — no PR would ever carry it, and it lands PR-less. Land it through review instead (`loot-first review` then `loot-first land`), or re-run with `--seal-wip` to seal it here deliberately
+PASS: a bare no-arg 'loot adopt' refuses to seal t2's described WIP too
+
+>>> t2: loot ferry --seal-wip -- seal on purpose, print the recovery round
+    note: reaped review/t2 (change 63fa6000 landed)
+    sealed "t2: add featureB" (--seal-wip) — the sealed work is now a signed line ahead of `main` with no PR.
+      to land it through review: make a follow-up working change in this lane
+      (any edit, then `loot describe -m "<subject>"`), run `loot-first review`
+      — its branch carries the sealed work — then `loot-first land --pr <n>`.
+    ferry: ingested 0 git commit(s), projected 2 loot change(s)
+      shared.txt               merged
+PASS: --seal-wip seals the described change deliberately
+PASS: the override prints the follow-up-round recovery recipe -- the tool owns the round, not folklore
+
+############################################################
+# ACT 5 -- catch up over the moved tip: a same-path bounce, resolved in-lane
+############################################################
+
+>>> t1: loot adopt --seal-wip -- fold onto the moved main (t1 collides on shared.txt)
+    caught up to landed main (1fa6aff8) — folded the local line in
+      sealed "t1: edit shared.txt + add featureA" (--seal-wip) — the sealed work is now a signed line ahead of `main` with no PR.
+      to land it through review: make a follow-up working change in this lane
+      (any edit, then `loot describe -m "<subject>"`), run `loot-first review`
+      — its branch carries the sealed work — then `loot-first land --pr <n>`.
+      1 path(s) need resolution — `loot resolve <path> <file>`, then re-land
+      `loot undo` steps back before the catch-up (see `loot op log`)
+PASS: t1 folds its line onto the moved main
+PASS: the same-path collision surfaces as a conflict -- a bounce, nothing dropped
+
+>>> t1: loot resolve shared.txt <reconciled> -- reconcile the bounce in the lane
+    resolved shared.txt (new oid: a5d398a2)
+    recorded as "t1: edit shared.txt + add featureA (conflict resolution: shared.txt)"
+    all conflicts resolved
+PASS: the resolution inherits t1's subject as '<subject> (conflict resolution: shared.txt)' (#337) -- it folds in
+PASS: after resolve, the lane is clean -- reconciled in-lane, no orchestrator surgery
+
+############################################################
+# ACT 6 -- a disjoint lane catches up clean (overlap is the only cost)
+############################################################
+
+>>> t3: loot adopt --seal-wip -- catch up over the same moved main (disjoint file)
+    caught up to landed main (1fa6aff8) — folded the local line in
+      sealed "t3: add featureC (disjoint)" (--seal-wip) — the sealed work is now a signed line ahead of `main` with no PR.
+      to land it through review: make a follow-up working change in this lane
+      (any edit, then `loot describe -m "<subject>"`), run `loot-first review`
+      — its branch carries the sealed work — then `loot-first land --pr <n>`.
+      `loot undo` steps back before the catch-up (see `loot op log`)
+PASS: t3 folds onto the moved main
+PASS: t3 catches up with NO conflict -- a disjoint lane pays no merge cost
+
+>>> t3: loot conflicts (expect none)
+    no conflicts
+PASS: t3 has no conflicts to resolve
+PASS: t3's own work is still present after the catch-up
+
+############################################################
+# ACT 7 -- the loot-first land layer (harbor bounce, #349) via its tests
+############################################################
+
+    The harbor land-bounce refusal and the #349 'already-projected -> proceed'
+    path live inside 'loot-first land', which shells to 'gh' -- they cannot run
+    in a hermetic script. loot-first drives its land policy end-to-end through
+    the FakeForge seam (no network); these are those tests. Key names:
+      gate_proceeds_on_approved / gate_refuses_* (the approval + dock gate)
+      already_projected_line_ahead_of_origin_reads_as_landable (#349)
+      a_land_finishing_after_sibling_reviews_keeps_their_rows (#336 pr-map)
+
+>>> cargo test -p loot-first --lib
+        Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+         Running unittests src\lib.rs (target\debug\deps\loot_first-2b5c72f9a4ad6259.exe)
+    running 69 tests
+    test forge::tests::parses_pr_states ... ok
+    test forge::tests::parses_pr_number_from_url ... ok
+    test forge::tests::parses_review_decisions ... ok
+    test orchestrator::tests::an_overlong_subject_is_cut_to_githubs_cap_on_a_char_boundary ... ok
+    test orchestrator::tests::a_one_line_message_is_its_own_subject ... ok
+    test orchestrator::tests::a_pr_title_is_the_messages_first_line_not_its_body ... ok
+    test orchestrator::tests::gate_allows_the_owning_lane_to_land ... ok
+    test orchestrator::tests::gate_proceeds_on_approved ... ok
+    test orchestrator::tests::gate_proceeds_on_a_real_described_subject ... ok
+    test orchestrator::tests::gate_refuses_a_land_from_another_position ... ok
+    test orchestrator::tests::gate_refuses_dock_mismatch ... ok
+    test orchestrator::tests::gate_refuses_non_open_pr ... ok
+    test orchestrator::tests::gate_refuses_side_lane_not_on_tracked_dock ... ok
+    test orchestrator::tests::gate_refuses_unapproved_from_other_author ... ok
+    test orchestrator::tests::gate_refuses_stale_review ... ok
+    test orchestrator::tests::gate_refuses_resolve_placeholder_subject ... ok
+    test orchestrator::tests::gate_self_authored_fast_path ... ok
+    test orchestrator::tests::harbor_guard_passes_when_main_advances ... ok
+    test orchestrator::tests::harbor_guard_refuses_a_no_op_land ... ok
+    test orchestrator::tests::landing_auto_close_is_the_signal ... ok
+    test orchestrator::tests::landing_diverged_main_closes_with_pointer ... ok
+    test orchestrator::tests::landing_collapses_the_lane_named_branch ... ok
+    test orchestrator::tests::landing_merged_by_reachability ... ok
+    test orchestrator::tests::landing_open_after_poll_closes_with_pointer ... ok
+    test harbor::tests::acquires_creates_the_file ... ok
+    test harbor::tests::a_contended_acquire_reports_the_callers_message ... ok
+    test orchestrator::tests::tag_push_publishes_main_then_the_tag_ref ... ok
+    test orchestrator::tests::tag_push_refuses_on_diverged_main_without_pushing_the_tag ... ok
+    test harbor::tests::release_frees_the_lock_for_the_next_land ... ok
+    test harbor::tests::a_freed_lock_lets_a_polling_waiter_in ... ok
+    test policy::tests::approval_refuses_changes_requested_even_self ... ok
+    test policy::tests::approval_refuses_unapproved_from_other_author ... ok
+    test policy::tests::approval_self_authored_fast_path ... ok
+    test harbor::tests::drop_releases_the_lock ... ok
+    test policy::tests::approval_takes_explicit_approved ... ok
+    test policy::tests::dock_targeting_matches_exactly ... ok
+    test policy::tests::drift_ahead_is_quiet ... ok
+    test harbor::tests::contention_with_a_live_lock_times_out ... ok
+    test policy::tests::drift_behind_warns_reconcile ... ok
+    test policy::tests::drift_diverged_warns_do_not_land ... ok
+    test policy::tests::landing_signal_interpretation ... ok
+    test policy::tests::drift_same_is_quiet ... ok
+    test harbor::tests::stale_lock_is_broken ... ok
+    test policy::tests::parse_review_line_carries_the_owning_lane ... ok
+    test policy::tests::parse_review_line_op_none ... ok
+    test policy::tests::parse_review_line_projected ... ok
+    test policy::tests::parse_review_line_rejects_missing_field ... ok
+    test policy::tests::pre_land_gate_honours_break_glass ... ok
+    test policy::tests::review_currency_stale_only_when_both_present_and_differ ... ok
+    test orchestrator::tests::the_ledger_lock_is_held_only_across_the_write ... ok
+    test orchestrator::tests::a_land_finishing_after_sibling_reviews_keeps_their_rows ... ok
+    test orchestrator::tests::the_pre_land_gate_runs_in_the_landing_positions_tree_not_the_shared_stores ... ok
+    test orchestrator::tests::on_the_primary_the_position_and_the_checkout_are_the_same_directory ... ok
+    test orchestrator::tests::remote_refresh_falls_back_to_the_tracking_ref_when_origin_is_unreachable ... ok
+    test orchestrator::tests::ancestry_same_when_shas_match ... ok
+    test orchestrator::tests::ancestry_diverged_when_no_repo_holds_the_mirror_commit ... ok
+    test orchestrator::tests::a_mirror_matching_origin_is_genuinely_nothing_to_land ... ok
+    test orchestrator::tests::no_origin_ref_keeps_the_conservative_refusal ... ok
+    test orchestrator::tests::a_land_with_no_finalized_tip_keeps_the_conservative_refusal ... ok
+    test orchestrator::tests::remote_refresh_reads_mains_tip_and_brings_its_objects ... ok
+    test orchestrator::tests::an_ahead_line_that_is_not_this_lands_does_not_unlock_the_land ... ok
+    test orchestrator::tests::an_already_pushed_tip_behind_a_siblings_projection_does_not_unlock_the_land ... ok
+    test orchestrator::tests::already_projected_line_ahead_of_origin_reads_as_landable ... ok
+    test orchestrator::tests::a_diverged_mirror_keeps_the_conservative_refusal ... ok
+    test orchestrator::tests::ancestry_ahead_when_the_mirror_leads_a_stale_tracking_ref ... ok
+    test orchestrator::tests::ancestry_behind_when_origin_advanced_past_the_mirror ... ok
+    test orchestrator::tests::ancestry_ahead_even_when_the_checkout_lacks_the_mirror_commit ... ok
+    test orchestrator::tests::remote_refresh_sees_a_break_glass_push_the_tracking_ref_still_hides ... ok
+    test orchestrator::tests::ancestry_diverged_when_neither_reaches_the_other ... ok
+    test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+PASS: the loot-first land layer is green (harbor bounce + #349 + gate proven)
+
+================  RESULT  ================
+A three-lane wave over one shared store: three reviews open as pure
+projections; an out-of-wave land moves main under all of them; one review
+refreshes byte-identically (never stale); the seal-WIP guard refuses to
+seal a described change and hands over the recovery round; the colliding
+lane bounces and reconciles IN-LANE with the resolution folded into its
+subject; the disjoint lane catches up with no cost. No respawn, no
+hand-merge, no folklore -- the mechanism absorbed every collision. The
+GitHub-facing land layer is proven by loot-first's own end-to-end tests.
+
+ALL CHECKS PASSED -- the wave lands with zero orchestrator surgery.
+run finished (utc): 2026-07-21 05:48:20Z
