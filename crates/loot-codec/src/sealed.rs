@@ -28,7 +28,48 @@ pub type ContentKey = [u8; 32];
 pub const ANYONE: &str = "*";
 
 /// Zstd compression level for public content (matches lore's choice).
+#[cfg(feature = "zstd")]
 const ZSTD_LEVEL: i32 = 6;
+
+/// Compress public content before sealing (S2, ADR 0020). Behind the `zstd`
+/// feature: the native host has it; a wasm build without it never seals public
+/// content (authoring is host/subprocess-side), so the missing path is an error,
+/// not a silent uncompressed write that would break address parity.
+#[cfg(feature = "zstd")]
+fn compress(bytes: &[u8]) -> Result<Vec<u8>, RepoError> {
+    zstd::encode_all(bytes, ZSTD_LEVEL).map_err(|e| RepoError::Backend(format!("zstd compress: {e}")))
+}
+#[cfg(not(feature = "zstd"))]
+fn compress(_bytes: &[u8]) -> Result<Vec<u8>, RepoError> {
+    Err(RepoError::Backend("zstd compression unavailable in this build".into()))
+}
+
+/// Undo [`compress`]. Behind the `zstd` feature; a wasm build decompresses
+/// public content host-side (with a JS zstd library) instead.
+#[cfg(feature = "zstd")]
+fn decompress(plain: &[u8]) -> Result<Vec<u8>, RepoError> {
+    // 64 MiB cap: generous for typical content, prevents adversarial zip-bomb.
+    zstd::bulk::decompress(plain, 64 * 1024 * 1024)
+        .map_err(|e| RepoError::Backend(format!("zstd decompress: {e}")))
+}
+#[cfg(not(feature = "zstd"))]
+fn decompress(_plain: &[u8]) -> Result<Vec<u8>, RepoError> {
+    Err(RepoError::Backend(
+        "zstd decompression unavailable in this build (public content must be decompressed host-side)".into(),
+    ))
+}
+
+/// AES-256-GCM decryption of a sealed object's ciphertext under `key` — the raw
+/// primitive with no embargo/visibility gate and no decompression. [`open`]
+/// layers the authorization gates and (host-only) zstd decompression on top; the
+/// wasm core calls this directly and decompresses public content host-side, so
+/// the decrypt path is single-sourced and cannot drift from the binary.
+pub fn decrypt(sealed: &SealedObject, key: &ContentKey) -> Result<Vec<u8>, RepoError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(&sealed.nonce), sealed.ciphertext.as_ref())
+        .map_err(|e| RepoError::Backend(format!("decrypt: {e}")))
+}
 
 /// Encrypted content with its access policy — but no key.
 ///
@@ -141,12 +182,7 @@ pub fn seal(bytes: &[u8], vis: &Visibility) -> Result<(Oid, SealedObject, Conten
     // this off visibility (already in the clear on the object) reveals nothing
     // new (S2, ADR 0020).
     let compressed = matches!(vis, Visibility::Public);
-    let payload = if compressed {
-        zstd::encode_all(bytes, ZSTD_LEVEL)
-            .map_err(|e| RepoError::Backend(format!("zstd compress: {e}")))?
-    } else {
-        bytes.to_vec()
-    };
+    let payload = if compressed { compress(bytes)? } else { bytes.to_vec() };
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let ciphertext = cipher
@@ -198,18 +234,9 @@ pub fn open(
     //    seek the key"; reaching here without a key while on the list means the
     //    key simply hasn't arrived yet.
     if let Some(key) = keyring.get(oid) {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-        let plain = cipher
-            .decrypt(Nonce::from_slice(&sealed.nonce), sealed.ciphertext.as_ref())
-            .map_err(|e| RepoError::Backend(format!("decrypt: {e}")))?;
+        let plain = decrypt(sealed, key)?;
         // Transparent decompression: undo the compress-then-encrypt from `seal`.
-        return if sealed.compressed {
-            // 64 MiB cap: generous for typical content, prevents adversarial zip-bomb.
-            zstd::bulk::decompress(&plain, 64 * 1024 * 1024)
-                .map_err(|e| RepoError::Backend(format!("zstd decompress: {e}")))
-        } else {
-            Ok(plain)
-        };
+        return if sealed.compressed { decompress(&plain) } else { Ok(plain) };
     }
 
     // 3. Visibility gate — no key held; check if reader is authorized to

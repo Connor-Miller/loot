@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/loot-codec",
+    "crates/loot-wasm",
     "crates/loot-core",
     "crates/loot-net",
     "crates/loot-identity",
@@ -18,6 +20,7 @@ authors = ["Connor Miller"]
 repository = "https://github.com/Connor-Miller/loot"
 
 [workspace.dependencies]
+loot-codec = { path = "crates/loot-codec" }
 loot-core = { path = "crates/loot-core" }
 loot-net = { path = "crates/loot-net" }
 loot-identity = { path = "crates/loot-identity" }

@@ -1,0 +1,28 @@
+[package]
+name = "loot-codec"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# The no-fs, wasm-buildable core: byte format, sync-bundle codec, sealed content
+# (AES-GCM), blake3 addressing, and the leaf value types they share. Extracted
+# from loot-core (ADR: TS SDK bridging) so the crypto/codec can compile to
+# wasm32; zstd (C, won't build for wasm) is an optional feature the host enables.
+[features]
+default = ["zstd"]
+zstd = ["dep:zstd"]
+
+[dependencies]
+thiserror.workspace = true
+blake3.workspace = true
+aes-gcm = "0.10"
+ed25519-dalek.workspace = true
+getrandom = "0.2"
+zstd = { version = "0.13", optional = true }
+
+# For wasm32 the OS RNG is unavailable; getrandom must go through the JS crypto
+# shim (the `js` feature). Native builds keep the plain OS backend.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

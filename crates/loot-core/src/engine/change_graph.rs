@@ -7,44 +7,16 @@
 
 use crate::converge::Tree;
 use crate::{Change, Oid, Visibility};
+// Re-exported (not a private `use`) so `engine::ChangeNode` and other in-crate
+// paths that referenced `change_graph::ChangeNode` keep resolving.
+pub use crate::ChangeNode;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// A node in the change DAG.
-#[derive(Clone)]
-pub struct ChangeNode {
-    /// The **version id** (ADR 0029/0032): `compute_change_id(author ‖ message
-    /// ‖ parents ‖ tree ‖ predecessors)`. Content-and-author-derived, so it
-    /// rewrites on every snapshot; carries dedup, DAG parent edges, and sync
-    /// addressing.
-    pub id: Oid,
-    pub parents: Vec<Oid>,
-    pub message: String,
-    pub tree: BTreeMap<PathBuf, (Oid, Visibility)>,
-    /// The author's ed25519 public key (S3, ADR 0018). `Some` for authored
-    /// changes — the pubkey is folded into `id`, so authorship is intrinsic.
-    /// `None` for legacy/unauthored changes read under an older format version.
-    pub author: Option<[u8; 32]>,
-    /// The author's signature over the finalize message (`version_id ‖
-    /// change_id`, ADR 0029; just `version_id` for a legacy change whose
-    /// `change_id` is `None`), attached at finalization (`loot new`). `None` for
-    /// an in-progress working change, or a legacy/unauthored change.
-    pub signature: Option<[u8; 64]>,
-    /// The **change id** (v6, ADR 0029): a random 16-byte durable handle minted
-    /// when the change begins and carried unchanged across every re-snapshot, so
-    /// a working change has a stable name *while you edit it*. Never folded into
-    /// `id` — it is a label, not a graph edge. `None` for a legacy (pre-v6) or
-    /// unauthored change.
-    pub change_id: Option<[u8; 16]>,
-    /// The version ids this version **supersedes** (v7, ADR 0032): `loot edit`
-    /// reopens a finalized change as a sibling and names the reopened version
-    /// here, so "X′ replaces X" travels as signed data instead of a local-only
-    /// abandon. Unlike `change_id`, predecessors are authored content — they are
-    /// folded into `id` (like `parents`) and covered by the finalize signature.
-    /// Empty for an ordinary change and for legacy/unauthored/bridge nodes.
-    /// Canonically sorted (see [`canonical_predecessors`]).
-    pub predecessors: Vec<Oid>,
-}
+// `ChangeNode` (the pure DAG-node shape the wire codec reads/writes) now lives
+// in `loot-codec` so it can build to wasm; the graph algorithms below operate
+// on it unchanged. `canonical_predecessors` (referenced from its doc) is defined
+// in this module.
 
 /// Canonicalize a predecessors list for hashing/signing (ADR 0032): sorted,
 /// deduplicated. Both the id computation and the signing message consume the
@@ -387,6 +359,7 @@ fn visit<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn node(id: u8, parents: &[u8], path: &str, addr: u8) -> ChangeNode {
         let mut tree = BTreeMap::new();

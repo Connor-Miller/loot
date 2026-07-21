@@ -3,8 +3,8 @@
 //! consumed by `engine::DagRepo::bundle` and `engine::DagRepo::apply`.
 
 use crate::attestation::Attestation;
-use crate::engine::ChangeNode;
 use crate::format;
+use crate::ChangeNode;
 pub use crate::format::Cursor;
 use crate::sealed::{ContentKey, SealedObject};
 use crate::{Oid, RepoError, Visibility};

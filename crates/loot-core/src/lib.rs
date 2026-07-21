@@ -6,24 +6,27 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub mod attestation;    // detachable advisory signatures over changes (S4, ADR 0018)
 pub mod bridge;         // git interop bridge formats: trailers, marks, dates (GB1, ADR 0028)
 pub mod burn;           // burn log: signed tombstones for destroyed objects (ADR 0038, #344)
 pub mod buoy;           // navigational-role resolver over the attestation lane (CA4, ADR 0025)
-pub mod bundle_codec;   // sync bundle wire format (ADR 0003, 0004, 0007)
 pub mod converge;
 pub mod engine;
 pub mod escrow;
-pub mod format;         // format version markers + compatibility gate (S1, ADR 0019)
 pub mod hex;            // shared byte<->hex conversion (one home for all crates)
 pub mod liveness;       // one home for live/superseded/divergent/parked + the head partition (map #215)
 pub mod manifest;
 pub mod oplog;          // operation log + undo (S4, ADR 0031)
-pub mod sealed;
 pub mod store;          // the .loot/ on-disk layout (single source of truth)
 pub mod verdict;        // machine-facing reconciliation output (CA3, ADR 0023)
 
-pub use attestation::{Attestation, AttestationLog};
+// The no-fs codec/crypto core now lives in `loot-codec` (extracted so it can
+// build to wasm). Re-exported here at their original paths, so `loot_core::Oid`,
+// `loot_core::bundle_codec::…`, `loot_core::sealed::…`, etc. are unchanged for
+// every downstream crate.
+pub use loot_codec::{
+    attestation, bundle_codec, format, sealed, Attestation, AttestationLog, ChangeNode, Oid,
+    RepoError, Visibility,
+};
 pub use burn::{BurnLog, BurnTier, Tombstone};
 pub use liveness::{HeadPartition, Liveness};
 pub use engine::{
@@ -34,24 +37,6 @@ pub use oplog::{BarrierRefusal, Operation, StepError, Stepped, View};
 pub use store::{valid_dock_name, LaneEntry, QuarantinedGrant, RepoStore, HOME_DOCK};
 pub use verdict::{PathVerdict, VERDICT_CONTRACT};
 
-/// Content identity. A stable handle to a unit of content, independent of
-/// where (or whether) it is currently materialized on disk.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Oid(pub [u8; 32]);
-
-/// Who may read a unit of content. The whole product thesis lives here:
-/// visibility is a property of the *content*, not the repo.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Visibility {
-    /// Readable by anyone who can read the repo.
-    Public,
-    /// Readable only by the listed identities (by key id).
-    Restricted(Vec<String>),
-    /// Encrypted to all, but the decryption key is withheld until `reveal_at`
-    /// (unix seconds). Models embargoed security fixes / delayed-reveal merges.
-    Embargoed { reveal_at: u64 },
-}
-
 /// A change: the reviewable, permission-bearing unit (loot's answer to a commit).
 #[derive(Clone, Debug)]
 pub struct Change {
@@ -61,57 +46,6 @@ pub struct Change {
     /// Path -> content, with per-path visibility. This is where `.env`
     /// becomes committable: it lives in the change as `Restricted`/`Embargoed`.
     pub tree: BTreeMap<PathBuf, (Oid, Visibility)>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RepoError {
-    #[error("object not found: {0:?}")]
-    NotFound(Oid),
-    #[error("not authorized to read {0:?}")]
-    Unauthorized(Oid),
-    #[error("content still embargoed until {0}")]
-    Embargoed(u64),
-    /// A grant whose `expires_at` has already passed as of the applying
-    /// clock (#20). Parallel to `Embargoed`, but the other direction in time
-    /// and a harder stop: an embargoed key merely isn't visible *yet* (it
-    /// still stages), whereas an expired grant is rejected outright —
-    /// `apply_sealed_grant` installs nothing for it.
-    #[error("grant expired at {0}")]
-    Expired(u64),
-    #[error("unsupported format version v{found} — upgrade loot (this build reads up to v{supported})")]
-    UnsupportedFormat { found: u8, supported: u8 },
-    #[error("change {0:?} has a missing or invalid author signature")]
-    BadChangeSignature(Oid),
-    /// A snapshot would re-seal one or more paths *more readably* than the tree
-    /// already records (#62, ADR 0030). A typed, matchable outcome carrying the
-    /// offending paths so a driver can classify the abort (rather than scrape a
-    /// prose string) and re-run with `--allow-demote` for the ones it intends.
-    #[error("refusing to demote visibility of {}: an attributes change would re-seal private content more readably; restore the .lootattributes rule, or re-run with `--allow-demote <path>` to demote deliberately", .paths.join(", "))]
-    Demotion { paths: Vec<String> },
-    /// The mis-seal gate (#63, ADR 0038 §1): a secret-shaped path is being
-    /// sealed public for the first time, but resolves Public only by
-    /// *fallthrough* — no `.lootattributes` rule names it, so the default (or a
-    /// catch-all glob) is what makes it readable. The sibling of `Demotion`: a
-    /// typed, matchable refusal carrying the offending paths so a driver can
-    /// classify the abort rather than scrape prose, overridable per-path with
-    /// `--allow-reveal`. Content is never inspected — only the name and the
-    /// resolution provenance.
-    #[error("refusing to seal {} publicly: it matches a built-in secret-shaped name and resolves Public only by fallthrough (no .lootattributes rule names it). Name it in .lootattributes — `<path> restricted=<id>` to seal it, or `<path> public` to consent — or re-run with `--allow-reveal <path>` to seal it public deliberately", .paths.join(", "))]
-    MisSeal { paths: Vec<String> },
-    /// The seal-WIP guard (#418, map #354; ADR 0039). A **bare sync verb** —
-    /// plain `loot ferry` (not `--with-wip`, which is a pure review projection)
-    /// or no-arg `loot adopt` (the catch-up merge arm) — is about to fold the
-    /// ambient position's live **described** working change into signed
-    /// history, stranding it as a PR-less line no review ever saw. The sibling
-    /// of `MisSeal`/`Demotion`: a typed, matchable refusal mirroring the ADR
-    /// 0030/0038 guard+override pattern, overridable with `--seal-wip`. Unlike
-    /// the mis-seal gate this is not per-path — the whole described line is
-    /// what would become PR-less — so it carries the change's subject, not a
-    /// path list. `verb` names the bare sync verb that tripped it.
-    #[error("refusing to finalize your described working change \"{subject}\": a bare `{verb}` would fold it onto `main` with no review — no PR would ever carry it, and it lands PR-less. Land it through review instead (`loot-first review` then `loot-first land`), or re-run with `--seal-wip` to seal it here deliberately", subject = .subject, verb = .verb)]
-    SealWip { subject: String, verb: String },
-    #[error("backend error: {0}")]
-    Backend(String),
 }
 
 /// An opaque, transport-ready bundle of changes produced by one repo and

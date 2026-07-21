@@ -7,15 +7,13 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The no-fs codec/crypto core (byte format, sync-bundle codec, sealed content,
+# leaf value types). Extracted so it can compile to wasm; loot-core re-exports
+# every item at its original path. Default features include zstd (native host).
+loot-codec.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
-# Vetted AEAD for the Sealed content module (no novel crypto). AES-256-GCM via
-# RustCrypto.
-aes-gcm = "0.10"
 getrandom = "0.2"
-# Zstd compression for public content (S2, ADR 0020). Compress-then-encrypt;
-# each object is its own context.
-zstd = "0.13"
 # Verify-only: authored-change signature checking on apply/stow (S3, ADR 0018).
 # loot-core VERIFIES (read-side DAG integrity); signing + key custody stay in
 # loot-identity. Same version as the rest of the workspace.
