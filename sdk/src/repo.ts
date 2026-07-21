@@ -10,7 +10,13 @@ export interface PathEntry {
   visibility: Visibility;
 }
 
-/** The result of `read`: a byte stream, with a `.bytes()` collector for the small-object case. */
+/**
+ * The result of `read`: an `AsyncIterable<Uint8Array>` with a `.bytes()`
+ * collector. A sealed object is one AES-GCM unit — it can't be authenticated
+ * until fully in hand — so slice 1 yields it as a **single chunk** rather than
+ * true chunked streaming; the iterable shape is the interface later slices grow
+ * into (e.g. `pull` over many changes).
+ */
 export interface ReadStream extends AsyncIterable<Uint8Array> {
   bytes(): Promise<Uint8Array>;
 }
