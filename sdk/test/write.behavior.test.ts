@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connectRelay, Identity, type LootRepo } from "../src/index.js";
+import { WasmBundle, encodeFetchRequest } from "../wasm/loot_wasm.js";
 
 const REPO_ROOT = join(process.cwd(), "..");
 const LOOT = join(REPO_ROOT, "target", "release", process.platform === "win32" ? "loot.exe" : "loot");
@@ -101,6 +102,19 @@ describe("in-memory write against a real relay (allow-listed key)", () => {
     expect(await reader.list()).toContainEqual({ path: README, visibility: "public" });
     const back = await reader.read(README).bytes();
     expect(back).toEqual(CONTENT);
+  });
+
+  it("the landed change carries its describe message on the wire (AC#5)", async () => {
+    // The message travels with the change metadata (there is no `log` verb in
+    // the v1 surface yet), so assert it at the wire level.
+    const resp = await fetch(`${URL}/fetch`, {
+      method: "POST",
+      body: encodeFetchRequest(new Uint8Array(0), new Uint8Array(0)),
+    });
+    const meta = WasmBundle.fromBytes(new Uint8Array(await resp.arrayBuffer()));
+    const changes = JSON.parse(meta.changesJson()) as { message: string; tree: { path: string }[] }[];
+    const authored = changes.find((c) => c.tree.some((e) => e.path === README));
+    expect(authored?.message).toBe("first authored change");
   });
 
   it("refuses to push without a describe, and with nothing pending", async () => {

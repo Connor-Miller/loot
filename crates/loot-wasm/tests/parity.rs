@@ -190,7 +190,7 @@ fn parity_native() {
     let signature = id.sign(SIGN_MSG);
     let envelope = id.wrap_envelope(ENV_BUNDLE);
     let mut builder = ChangeBuilder::new(&id, CHANGE_MESSAGE.to_string());
-    builder.set_parent(&PARENT_ID).unwrap();
+    builder.add_parent(&PARENT_ID).unwrap();
     builder.carry("readme.md", &CARRY_OID, "public").unwrap();
     let version_id = builder.finish().version_id.0.to_vec();
 
@@ -251,7 +251,7 @@ fn parity_wasm() {
 
     let id = Identity::from_seed(&SEED).unwrap();
     let mut builder = ChangeBuilder::new(&id, CHANGE_MESSAGE.to_string());
-    builder.set_parent(&PARENT_ID).unwrap();
+    builder.add_parent(&PARENT_ID).unwrap();
     builder.carry("readme.md", &CARRY_OID, "public").unwrap();
     check_write(
         id.public_key(),

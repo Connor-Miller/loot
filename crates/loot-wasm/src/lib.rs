@@ -38,11 +38,24 @@ pub mod core {
     fn visibility_from(tag: &str) -> Result<Visibility, String> {
         match tag {
             "public" => Ok(Visibility::Public),
-            // A carried path may be private; slice 2 authors public content only,
-            // so `put` rejects non-public, but `carry` must preserve the tag.
+            // Slice 2 authors public content only. A carried non-public path is
+            // collapsed to Restricted with no grants — enough to round-trip a
+            // public-only tree; preserving real grant ids on carry is slice 4.
             "private" => Ok(Visibility::Restricted(Vec::new())),
             other => Err(format!("unknown visibility {other:?}")),
         }
+    }
+
+    /// The `/stow` envelope framing (`[0x01][pubkey 32][sig 64][bundle]`) — the
+    /// one place the wire shape is written, shared by [`Identity::wrap_envelope`]
+    /// and [`ChangeBuilder::finish`].
+    fn envelope_bytes(author: &[u8; 32], signature: &[u8], bundle: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(97 + bundle.len());
+        out.push(ENVELOPE_VERSION);
+        out.extend_from_slice(author);
+        out.extend_from_slice(signature);
+        out.extend_from_slice(bundle);
+        out
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -215,12 +228,7 @@ pub mod core {
         /// [bundle]`, the signature over `bundle` — byte-identical to
         /// loot-identity's `wrap_envelope`.
         pub fn wrap_envelope(&self, bundle: &[u8]) -> Vec<u8> {
-            let mut out = Vec::with_capacity(97 + bundle.len());
-            out.push(ENVELOPE_VERSION);
-            out.extend_from_slice(&self.author());
-            out.extend_from_slice(&self.sign(bundle));
-            out.extend_from_slice(bundle);
-            out
+            envelope_bytes(&self.author(), &self.sign(bundle), bundle)
         }
     }
 
@@ -260,7 +268,7 @@ pub mod core {
             }
         }
 
-        pub fn set_parent(&mut self, parent: &[u8]) -> Result<(), String> {
+        pub fn add_parent(&mut self, parent: &[u8]) -> Result<(), String> {
             let p: [u8; 32] = parent.try_into().map_err(|_| "parent id must be 32 bytes".to_string())?;
             self.parents.push(Oid(p));
             Ok(())
@@ -310,11 +318,8 @@ pub mod core {
                 BundleBody { changes: vec![node], objs: self.objs, keys: self.keys, attestations: Vec::new() };
             let bundle = Frame::Sync { purges: Vec::new(), body }.encode();
 
-            let mut envelope = Vec::with_capacity(97 + bundle.len());
-            envelope.push(ENVELOPE_VERSION);
-            envelope.extend_from_slice(&self.author);
-            envelope.extend_from_slice(&self.signing_key.sign(&bundle).to_bytes());
-            envelope.extend_from_slice(&bundle);
+            let esig = self.signing_key.sign(&bundle).to_bytes();
+            let envelope = envelope_bytes(&self.author, &esig, &bundle);
 
             AuthoredChange { envelope, change_id, version_id }
         }
@@ -448,9 +453,9 @@ impl ChangeBuilder {
     pub fn new(identity: &Identity, message: String) -> ChangeBuilder {
         ChangeBuilder(core::ChangeBuilder::new(&identity.0, message))
     }
-    #[wasm_bindgen(js_name = setParent)]
-    pub fn set_parent(&mut self, parent: &[u8]) -> Result<(), JsError> {
-        self.0.set_parent(parent).map_err(js)
+    #[wasm_bindgen(js_name = addParent)]
+    pub fn add_parent(&mut self, parent: &[u8]) -> Result<(), JsError> {
+        self.0.add_parent(parent).map_err(js)
     }
     pub fn carry(&mut self, path: &str, oid: &[u8], visibility: &str) -> Result<(), JsError> {
         self.0.carry(path, oid, visibility).map_err(js)

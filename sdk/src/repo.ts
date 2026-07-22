@@ -1,7 +1,7 @@
 import { WasmBundle, ChangeBuilder, decrypt, encodeFetchRequest } from "../wasm/loot_wasm.js";
 import type { Identity } from "../wasm/loot_wasm.js";
 import { decompress as zstdInflate } from "fzstd";
-import { AuthError, LootError, NotFoundError, TransportError } from "./errors.js";
+import { AuthError, NotFoundError, TransportError } from "./errors.js";
 
 export type Visibility = "public" | "private";
 
@@ -197,11 +197,13 @@ class RelayRepo implements LootRepo {
   }
 
   async push(): Promise<string> {
+    // Caller preconditions (usage bugs), not loot-domain errors — a plain Error,
+    // not a typed LootError, since "conflict" means a real same-path bounce.
     if (this.message === null) {
-      throw new LootError("conflict", "describe the change before pushing (no message set)");
+      throw new Error("describe the change before pushing (no message set)");
     }
     if (this.overlay.size === 0) {
-      throw new LootError("conflict", "nothing to push (no pending edits)");
+      throw new Error("nothing to push (no pending edits)");
     }
     const { parents, tree } = await this.snapshot();
 
@@ -209,7 +211,7 @@ class RelayRepo implements LootRepo {
     // seal + put edited ones, skip removed. Composition (id fold, signing,
     // bundle encode, envelope) never leaves Rust.
     const builder = new ChangeBuilder(this.identity, this.message);
-    for (const id of parents) builder.setParent(hexToBytes(id));
+    for (const id of parents) builder.addParent(hexToBytes(id));
     for (const entry of tree) {
       const pending = this.overlay.get(entry.path);
       if (pending) continue; // removed (skip) or replaced (put below)
