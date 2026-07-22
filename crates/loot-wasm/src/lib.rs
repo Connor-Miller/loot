@@ -93,6 +93,18 @@ pub mod core {
         Ok(out)
     }
 
+    /// Encode a relay `/negotiate` request body: a flat run of the caller's
+    /// `have` change-ids (each 32 bytes), byte-identical to `loot-net`'s
+    /// `encode_have`. Unlike `/fetch`, the negotiate body carries no version
+    /// marker — it is a bare id run the relay decodes as `body.len() / 32` ids.
+    /// Kept in the wasm core so the framing can never drift from the binary's.
+    pub fn encode_negotiate_request(have: &[u8]) -> Result<Vec<u8>, String> {
+        if have.len() % 32 != 0 {
+            return Err("have must be a multiple of 32 bytes".into());
+        }
+        Ok(have.to_vec())
+    }
+
     /// AES-256-GCM decrypt under `key` — the raw open primitive (no gates, no
     /// decompression). For compressed public content the plaintext is still
     /// zstd-deflated; the host inflates it.
@@ -349,6 +361,13 @@ pub fn blake3_address(nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, JsErro
 #[wasm_bindgen(js_name = encodeFetchRequest)]
 pub fn encode_fetch_request(have: &[u8], wants: &[u8]) -> Result<Vec<u8>, JsError> {
     core::encode_fetch_request(have, wants).map_err(js)
+}
+
+/// Encode a relay `/negotiate` request body (a flat run of 32-byte `have`
+/// change-ids, no version marker).
+#[wasm_bindgen(js_name = encodeNegotiateRequest)]
+pub fn encode_negotiate_request(have: &[u8]) -> Result<Vec<u8>, JsError> {
+    core::encode_negotiate_request(have).map_err(js)
 }
 
 /// AES-256-GCM decrypt of a sealed object's ciphertext under `key`.

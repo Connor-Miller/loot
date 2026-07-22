@@ -1,4 +1,10 @@
-import { WasmBundle, ChangeBuilder, decrypt, encodeFetchRequest } from "../wasm/loot_wasm.js";
+import {
+  WasmBundle,
+  ChangeBuilder,
+  decrypt,
+  encodeFetchRequest,
+  encodeNegotiateRequest,
+} from "../wasm/loot_wasm.js";
 import type { Identity } from "../wasm/loot_wasm.js";
 import { decompress as zstdInflate } from "fzstd";
 import { AuthError, NotFoundError, TransportError } from "./errors.js";
@@ -47,6 +53,12 @@ export interface LootRepo {
   diff(): Promise<ChangeSummary[]>;
   /** Sign + stow the pending change; returns its durable change-id (hex). */
   push(): Promise<string>;
+  /**
+   * Stream changes authored elsewhere, advancing the session's view so later
+   * `read`/`list` reflect them. Yields one chunk per new change; a pull with
+   * nothing new completes cleanly (no chunks, no error).
+   */
+  pull(): AsyncIterable<Uint8Array>;
 }
 
 interface TreeEntry {
@@ -81,6 +93,14 @@ function toVisibility(raw: string): Visibility {
 class RelayRepo implements LootRepo {
   private readonly overlay = new Map<string, Pending>();
   private message: string | null = null;
+  /**
+   * Change-ids (hex, the 32-byte change-graph node id) this session already
+   * holds. `pull` sends this as its `/negotiate` `have` so the relay ships only
+   * newer changes, and folds each returned id back in so a repeat pull with
+   * nothing new returns empty. `push` records its own change so the session
+   * never re-pulls what it just authored.
+   */
+  private readonly have = new Set<string>();
 
   constructor(
     private readonly url: string,
@@ -223,6 +243,9 @@ class RelayRepo implements LootRepo {
     const authored = builder.finish();
 
     await this.stow(authored.envelope);
+    // Record the authored change (by its graph node id, the `/negotiate` unit)
+    // so a later `pull` does not stream our own change back as "new".
+    this.have.add(bytesToHex(authored.versionId));
     this.overlay.clear();
     this.message = null;
     return bytesToHex(authored.changeId);
@@ -258,6 +281,54 @@ class RelayRepo implements LootRepo {
       );
     }
     throw new TransportError(`relay /stow returned ${resp.status} ${resp.statusText}`);
+  }
+
+  // --- streaming pull (#427) -----------------------------------------------
+
+  /**
+   * Bring down changes authored elsewhere. Sends the session's `have`
+   * change-ids to the relay's `/negotiate`, which returns a bundle of every
+   * change not in that set, then yields each one the session did not already
+   * hold — folding its id into `have` as it goes, so a later pull fetches only
+   * what is newer still and a pull with nothing new completes with no chunks.
+   *
+   * Streaming is per-change: a sync bundle is one codec unit (it decodes whole,
+   * like a sealed object in `read`), but the v1 commitment is that `pull`
+   * surfaces changes one at a time rather than as a buffered batch — the caller
+   * observes each as `have` advances, and stopping early stops the work.
+   *
+   * The session's read view is live (each `read`/`list` re-resolves the head
+   * from the relay), so those already reflect a pulled change; `pull`'s durable
+   * effect is advancing `have`. Each yielded chunk is the new change's metadata
+   * as UTF-8 JSON (`{ id, message, parents, tree }`).
+   */
+  async *pull(): AsyncGenerator<Uint8Array> {
+    const known = [...this.have];
+    const haveBytes = new Uint8Array(known.length * 32);
+    known.forEach((id, i) => haveBytes.set(hexToBytes(id), i * 32));
+
+    let resp: Response;
+    try {
+      resp = await fetch(`${this.url}/negotiate`, {
+        method: "POST",
+        body: encodeNegotiateRequest(haveBytes),
+        headers: { "content-type": "application/octet-stream" },
+      });
+    } catch (e) {
+      throw new TransportError(`relay unreachable at ${this.url}: ${String(e)}`);
+    }
+    if (!resp.ok) {
+      throw new TransportError(`relay /negotiate returned ${resp.status} ${resp.statusText}`);
+    }
+
+    const bundle = WasmBundle.fromBytes(new Uint8Array(await resp.arrayBuffer()));
+    const changes: ChangeView[] = JSON.parse(bundle.changesJson());
+    const encoder = new TextEncoder();
+    for (const change of changes) {
+      if (this.have.has(change.id)) continue; // already held — not new
+      this.have.add(change.id);
+      yield encoder.encode(JSON.stringify(change));
+    }
   }
 }
 

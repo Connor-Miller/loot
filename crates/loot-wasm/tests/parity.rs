@@ -50,6 +50,9 @@ const FROZEN_CIPHERTEXT: &str =
     "4beaebe09e83ad08c307eb09c69ed1beb7d511d3569b9bac0ada8ac5a72b120867419fca27c37c9b3c20";
 /// The `/fetch` request framing for REQ_HAVE + REQ_WANTS (marker + counts + ids).
 const FROZEN_FETCH_REQ: &str = "0800010000001111111111111111111111111111111111111111111111111111111111111111010000002222222222222222222222222222222222222222222222222222222222222222";
+/// The `/negotiate` request framing for `have = [REQ_HAVE, REQ_WANTS]` — a bare
+/// run of the two 32-byte ids, no version marker.
+const FROZEN_NEGOTIATE_REQ: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222";
 /// ed25519 public key for SEED.
 const FROZEN_PUBKEY: &str = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
 /// ed25519 signature (SEED) over SIGN_MSG — deterministic.
@@ -114,6 +117,15 @@ fn check_fetch_request(got: Vec<u8>) {
     assert_eq!(hex(&got), FROZEN_FETCH_REQ, "/fetch request framing != frozen native vector");
 }
 
+fn check_negotiate_request(got: Vec<u8>) {
+    assert_eq!(hex(&got), FROZEN_NEGOTIATE_REQ, "/negotiate request framing != frozen native vector");
+}
+
+/// The `have` id run fed to the `/negotiate` framing (REQ_HAVE ‖ REQ_WANTS).
+fn negotiate_have() -> Vec<u8> {
+    [REQ_HAVE, REQ_WANTS].concat()
+}
+
 /// The deterministic write primitives: pubkey, signature, `/stow` envelope, and
 /// the change-id fold — each frozen from the native build.
 fn check_write(pubkey: Vec<u8>, signature: Vec<u8>, envelope: Vec<u8>, version_id: Vec<u8>) {
@@ -143,7 +155,8 @@ fn parity_native() {
     use loot_codec::sealed::SealedObject;
     use loot_codec::ChangeNode;
     use loot_wasm::core::{
-        address, decrypt, encode_fetch_request, ChangeBuilder, DecodedBundle, Identity,
+        address, decrypt, encode_fetch_request, encode_negotiate_request, ChangeBuilder,
+        DecodedBundle, Identity,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -183,6 +196,7 @@ fn parity_native() {
     // Print-on-mismatch so regenerating the vectors is a copy-paste (see the
     // PLACEHOLDER seeds); then hard-assert the frozen constants.
     let fetch_req = encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap();
+    let negotiate_req = encode_negotiate_request(&negotiate_have()).unwrap();
 
     // Write primitives (deterministic).
     let id = Identity::from_seed(&SEED).unwrap();
@@ -198,16 +212,18 @@ fn parity_native() {
         || hex(&ciphertext) != FROZEN_CIPHERTEXT
         || hex(&bundle_bytes) != FROZEN_BUNDLE
         || hex(&fetch_req) != FROZEN_FETCH_REQ
+        || hex(&negotiate_req) != FROZEN_NEGOTIATE_REQ
         || hex(&pubkey) != FROZEN_PUBKEY
         || hex(&signature) != FROZEN_SIGN
         || hex(&envelope) != FROZEN_ENVELOPE
         || hex(&version_id) != FROZEN_VERSION_ID
     {
         panic!(
-            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_FETCH_REQ = {:?}\nFROZEN_PUBKEY = {:?}\nFROZEN_SIGN = {:?}\nFROZEN_ENVELOPE = {:?}\nFROZEN_VERSION_ID = {:?}\nFROZEN_BUNDLE = {:?}",
+            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_FETCH_REQ = {:?}\nFROZEN_NEGOTIATE_REQ = {:?}\nFROZEN_PUBKEY = {:?}\nFROZEN_SIGN = {:?}\nFROZEN_ENVELOPE = {:?}\nFROZEN_VERSION_ID = {:?}\nFROZEN_BUNDLE = {:?}",
             hex(&addr.0),
             hex(&ciphertext),
             hex(&fetch_req),
+            hex(&negotiate_req),
             hex(&pubkey),
             hex(&signature),
             hex(&envelope),
@@ -219,6 +235,7 @@ fn parity_native() {
     // Now the actual parity checks, all against the FROZEN bytes.
     check_address(address(&ADDR_NONCE, &ADDR_CIPHERTEXT).to_vec());
     check_fetch_request(encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap());
+    check_negotiate_request(encode_negotiate_request(&negotiate_have()).unwrap());
     check_write(pubkey, signature, envelope, version_id);
 
     let frozen_ct = unhex(FROZEN_CIPHERTEXT);
@@ -244,10 +261,14 @@ fn parity_native() {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen_test::wasm_bindgen_test]
 fn parity_wasm() {
-    use loot_wasm::{blake3_address, decrypt, encode_fetch_request, ChangeBuilder, Identity, WasmBundle};
+    use loot_wasm::{
+        blake3_address, decrypt, encode_fetch_request, encode_negotiate_request, ChangeBuilder,
+        Identity, WasmBundle,
+    };
 
     check_address(blake3_address(&ADDR_NONCE, &ADDR_CIPHERTEXT).unwrap());
     check_fetch_request(encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap());
+    check_negotiate_request(encode_negotiate_request(&negotiate_have()).unwrap());
 
     let id = Identity::from_seed(&SEED).unwrap();
     let mut builder = ChangeBuilder::new(&id, CHANGE_MESSAGE.to_string());
