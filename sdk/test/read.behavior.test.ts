@@ -14,25 +14,18 @@ import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll } from "vitest";
 import { connectRelay, Identity } from "../src/index.js";
-import { WasmBundle, encodeFetchRequest } from "../wasm/loot_wasm.js";
 import { OTHER, OTHER_TEXT, README, README_TEXT, runReadContract } from "./read-contract.js";
 
 const REPO_ROOT = join(process.cwd(), "..");
 const LOOT = join(REPO_ROOT, "target", "release", process.platform === "win32" ? "loot.exe" : "loot");
 const PORT = 47800 + Math.floor(Math.random() * 800);
 const URL = `http://127.0.0.1:${PORT}`;
-const EMPTY = new Uint8Array(0);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function loot(cwd: string, args: string[]): string {
   return execFileSync(LOOT, args, { cwd, encoding: "utf8" });
-}
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return out;
 }
 
 let relay: ChildProcess;
@@ -91,30 +84,9 @@ afterAll(() => {
   }
 });
 
+// The read round-trip smoke: the shared backend-agnostic contract against a real
+// relay. Client-side path-scoping + decode/decrypt branches moved to fast unit
+// tests over a fake transport + golden bundles — see relay.unit.test.ts (#432).
 runReadContract("in-memory (connectRelay) against a real relay", () =>
   connectRelay(URL, Identity.generate()),
 );
-
-describe("client-side path-scoping (#380)", () => {
-  async function fetchBundle(have: Uint8Array, wants: Uint8Array): Promise<WasmBundle> {
-    const resp = await fetch(`${URL}/fetch`, { method: "POST", body: encodeFetchRequest(have, wants) });
-    return WasmBundle.fromBytes(new Uint8Array(await resp.arrayBuffer()));
-  }
-
-  it("a scoped fetch returns only the requested object's bytes, not the sibling's", async () => {
-    // Metadata fetch (no object bytes) resolves both paths to their addresses.
-    const meta = await fetchBundle(EMPTY, EMPTY);
-    const tree = (JSON.parse(meta.changesJson()) as { tree: { path: string; oid: string }[] }[]).flatMap(
-      (c) => c.tree,
-    );
-    const readmeOid = hexToBytes(tree.find((e) => e.path === README)!.oid);
-    const otherOid = hexToBytes(tree.find((e) => e.path === OTHER)!.oid);
-
-    // Scope the fetch to readme only: its bytes travel, the sibling's do not.
-    const scoped = await fetchBundle(EMPTY, readmeOid);
-    expect(scoped.object(readmeOid)).toBeInstanceOf(Uint8Array);
-    expect(scoped.object(otherOid)).toBeUndefined();
-    // Structure (the sibling's address) is still visible — loot scopes content, not names.
-    expect(tree.some((e) => e.path === OTHER)).toBe(true);
-  });
-});

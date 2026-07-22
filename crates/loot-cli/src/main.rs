@@ -116,6 +116,13 @@ const DEMOTE: &[&str] = &["--allow-demote"];
 const SKIP: &[&str] = &["--no-snapshot", "--ignore-working-copy"];
 /// The machine-output selectors (CA3, ADR 0023).
 const OUT: &[&str] = &["--porcelain", "--json"];
+/// `new`'s bare flags: the capture skips plus `--json` only. A subprocess
+/// consumer (the physical SDK adapter) requests `--json` to read a coded
+/// `{"error":{"code"}}` on a finalize failure (#434) instead of scraping prose;
+/// success output is a plain message either way. `--porcelain` is deliberately
+/// NOT granted — no consumer needs it, and a per-verb machine shape is frozen
+/// forever once shipped (CONTEXT.md, Verdict).
+const NEW_BARE: &[&str] = &["--no-snapshot", "--ignore-working-copy", "--json"];
 
 /// Every dispatchable verb in one table the dispatcher and the usage test
 /// share, so a verb cannot silently vanish from the CLI while its usage line
@@ -126,8 +133,8 @@ const COMMANDS: &[Verb] = &[
     verb("init", &["--identity"], &[], cmd_init),
     verb("status", &[], OUT, cmd_status),
     verb("diff", &["--conflict"], &[], cmd_diff),
-    verb("describe", &["-m", "--message", "--allow-demote", "--allow-reveal"], &[], cmd_describe),
-    verb("new", &["-m", "--message", "--allow-demote", "--allow-reveal"], SKIP, cmd_new),
+    verb("describe", &["-m", "--message", "--allow-demote", "--allow-reveal"], &["--json"], cmd_describe),
+    verb("new", &["-m", "--message", "--allow-demote", "--allow-reveal"], NEW_BARE, cmd_new),
     verb("edit", &[], &[], cmd_edit),
     verb("abandon", &[], &["--head"], cmd_abandon),
     verb("adopt", &[], &["--discard-wip", "--seal-wip"], cmd_adopt),

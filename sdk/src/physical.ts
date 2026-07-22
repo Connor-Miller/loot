@@ -1,9 +1,8 @@
-import { execFile, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { promisify } from "node:util";
-import { ConflictError, LootError, NotFoundError, SetupError } from "./errors.js";
+import { GuardError, LootError, NotFoundError, SetupError } from "./errors.js";
+import { type LootRunner, SubprocessRunner } from "./loot-runner.js";
 import type {
   ChangeSummary,
   EditOptions,
@@ -16,11 +15,81 @@ import type {
 } from "./repo.js";
 import { WorkingOverlay } from "./working-overlay.js";
 
-const execFileAsync = promisify(execFile);
+/**
+ * Map the binary's machine error channel (`{"contract":N,"error":{"code","message"}}`
+ * on stderr under `--json`, #430) down to the SDK's collapsed `LootErrorCode`
+ * taxonomy — in ONE place, driven by the stable `code` slug, not stderr prose
+ * (#434). The binary serves every consumer with its own richer taxonomy; the SDK
+ * maps it down here.
+ *
+ * Not mapped: the *conflict family* (a moved parent / non-fast-forward). loot's
+ * engine has no such error — `/stow` accumulates concurrent forks and convergence
+ * is a pull-time job, so no `RepoError` variant (and thus no coded slug) exists
+ * to map (see `ConflictError` in errors.ts, deferred). It falls to the generic
+ * `LootError` until a slug lands, rather than being reverse-engineered from prose.
+ */
+function classifyCodedFailure(verb: string | undefined, stderr: string): LootError {
+  const parsed = parseCodedError(stderr);
+  const message = parsed?.message ?? stderr.trim();
+  const context = `loot ${verb ?? "command"} failed: ${message}`;
+  switch (parsed?.code) {
+    // A visibility/seal guard the binary refused (public→private demotion, a
+    // mis-seal of a secret-shaped path, a sealed-WIP guard).
+    case "demotion":
+    case "mis_seal":
+    case "seal_wip":
+      return new GuardError(context);
+    // An environment problem: the binary can't read this repo's format, it isn't
+    // a loot checkout, or it's too old to know a flag the SDK sent.
+    case "unsupported_format":
+    case "no_repo":
+    case "unknown_flag":
+      return new SetupError(`incompatible or missing loot checkout: ${message}`);
+    case "not_found":
+      return new NotFoundError(context);
+    // Everything else the binary can emit (backend, bad_signature, embargoed,
+    // expired, the generic `error`) — and any code the SDK doesn't branch on, or
+    // stderr that wasn't coded JSON at all — is a generic loot failure.
+    default:
+      return new LootError("unsupported", context);
+  }
+}
 
-/** Options for {@link openRepo}. `loot` overrides the binary (default: `loot` on PATH). */
+/** The `ENOENT`-spawn-failure error, shared by the buffered (`run`) and
+ * streaming (`pull`) paths: a missing/non-executable binary is a setup problem. */
+function missingBinaryError(loot: string): SetupError {
+  return new SetupError(`loot binary not found: ${loot} — install loot or pass { loot } to openRepo`);
+}
+
+/** Parse the binary's coded failure object off stderr. Returns `undefined` when
+ * stderr isn't the `{"error":{"code","message"}}` shape (e.g. a pre-#430 binary
+ * emitting prose), so the caller falls back to a generic error. */
+function parseCodedError(stderr: string): { code: string; message: string } | undefined {
+  const trimmed = stderr.trim();
+  if (!trimmed) return undefined;
+  // The coded object is a single line; if other output precedes it, the last
+  // non-empty line is the failure `fail()` printed.
+  const line = trimmed.slice(trimmed.lastIndexOf("\n") + 1).trim();
+  for (const candidate of line === trimmed ? [trimmed] : [line, trimmed]) {
+    try {
+      const obj = JSON.parse(candidate) as { error?: { code?: unknown; message?: unknown } };
+      const code = obj.error?.code;
+      if (typeof code === "string") {
+        return { code, message: typeof obj.error?.message === "string" ? obj.error.message : candidate };
+      }
+    } catch {
+      /* not coded JSON — try the next candidate, else fall through */
+    }
+  }
+  return undefined;
+}
+
+/** Options for {@link openRepo}. `loot` overrides the binary (default: `loot` on
+ * PATH); `runner` injects the subprocess seam (default: a {@link SubprocessRunner}
+ * over `loot`), so tests drive the physical branches without the real binary. */
 export interface OpenRepoOptions {
   loot?: string;
+  runner?: LootRunner;
 }
 
 interface SurfaceEntry {
@@ -64,6 +133,7 @@ class PhysicalRepo implements LootRepo {
   constructor(
     private readonly path: string,
     private readonly loot: string,
+    private readonly runner: LootRunner,
   ) {}
 
   /** Fail fast on a missing binary / non-repo, and snapshot the committed tree. */
@@ -72,42 +142,28 @@ class PhysicalRepo implements LootRepo {
   }
 
   /**
-   * Run a `loot` verb in the repo and return its (buffered) stdout. Maps
-   * subprocess failure to typed errors. loot has no machine error codes, so the
-   * taxonomy mapping reads stderr prose — the pragmatic reality of wrapping a
-   * CLI; only the load-bearing cases (setup, conflict) are matched, everything
-   * else is a generic `LootError`.
+   * Run a `loot` verb in the repo and return its (buffered) stdout, mapping a
+   * subprocess failure to a typed error. `--json` is appended so a failure emits
+   * the binary's coded error object on stderr (#430/#434); the runner never
+   * throws on a non-zero exit — it hands back `{ code, stderr }` — so a failure
+   * is classified here from that `code`. A genuine spawn failure (`ENOENT`) is
+   * the one throw, and it is a setup problem.
    */
   private async run(args: string[]): Promise<string> {
+    let result;
     try {
-      const { stdout } = await execFileAsync(this.loot, args, { cwd: this.path, maxBuffer: 64 << 20 });
-      return stdout;
+      result = await this.runner.run([...args, "--json"]);
     } catch (e) {
-      const err = e as { code?: string; stderr?: string; message?: string };
       // A missing / non-executable binary is a setup problem — its own code.
-      if (err.code === "ENOENT") {
-        throw new SetupError(
-          `loot binary not found: ${this.loot} — install loot or pass { loot } to openRepo`,
-        );
-      }
-      const detail = (err.stderr ?? err.message ?? "").trim();
-      // An old binary lacking a verb/flag (e.g. `surface --json`) or reading an
-      // older format is a setup problem, not a repo error.
-      if (/unknown (flag|command)|reads up to v|unsupported format/i.test(detail)) {
-        throw new SetupError(`incompatible loot binary: ${detail}`);
-      }
-      if (/no \.loot|not a loot repo/i.test(detail)) {
-        throw new SetupError(`not a loot checkout at ${this.path}: ${detail}`);
-      }
-      if (/moved|non-fast-forward|diverged|reconcile/i.test(detail)) {
-        throw new ConflictError(`loot ${args[0]} failed: ${detail}`);
-      }
-      throw new LootError("unsupported", `loot ${args[0]} failed: ${detail}`);
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") throw missingBinaryError(this.loot);
+      throw e;
     }
+    if (result.code === 0) return result.stdout;
+    throw classifyCodedFailure(args[0], result.stderr);
   }
 
   async list(): Promise<PathEntry[]> {
-    const out = await this.run(["surface", "--json"]);
+    const out = await this.run(["surface"]);
     const { tree } = JSON.parse(out) as { tree: SurfaceEntry[] };
     return tree.map((e) => ({ path: e.path, visibility: toVisibility(e.visibility) }));
   }
@@ -187,7 +243,7 @@ class PhysicalRepo implements LootRepo {
     // signs). A configured remote is pushed to separately by the operator.
     await this.run(["new", "-m", this.working.message!, ...this.guardArgs(effective)]);
     // The durable change id is the `change` field of the machine status.
-    const { change } = JSON.parse(await this.run(["status", "--json"])) as { change: string | null };
+    const { change } = JSON.parse(await this.run(["status"])) as { change: string | null };
     this.working.clear();
     // The just-finalized change is the new baseline for the next edit cycle.
     this.baseline = new Set((await this.list()).map((e) => e.path));
@@ -196,22 +252,21 @@ class PhysicalRepo implements LootRepo {
 
   async *pull(): AsyncGenerator<Uint8Array> {
     // Sync from the checkout's configured remote, STREAMING the child's stdout
-    // (the reconciliation report) as it arrives rather than buffering it.
-    const child = spawn(this.loot, ["pull", "--porcelain"], { cwd: this.path });
-    const stderr: Buffer[] = [];
-    child.stderr?.on("data", (c: Buffer) => stderr.push(c));
-    const done = new Promise<number>((resolve, reject) => {
-      child.on("error", (e: NodeJS.ErrnoException) =>
-        reject(e.code === "ENOENT" ? new SetupError(`loot binary not found: ${this.loot}`) : e),
-      );
-      child.on("close", (code) => resolve(code ?? 0));
-    });
-    if (child.stdout) {
-      for await (const chunk of child.stdout) yield new Uint8Array(chunk as Buffer);
-    }
-    const code = await done;
-    if (code !== 0) {
-      throw new LootError("unsupported", `loot pull failed: ${Buffer.concat(stderr).toString("utf8").trim()}`);
+    // (the reconciliation report) as it arrives rather than buffering it, then
+    // classifying on the exit code once it closes.
+    // `--json` so a pull failure emits the coded error object on stderr; its
+    // stdout (the reconciliation report) is streamed opaquely to the caller.
+    const { stdout, result } = this.runner.spawn(["pull", "--json"]);
+    // Observe `result` defensively so a spawn failure surfaced through the
+    // stdout stream can't leave its rejection unhandled.
+    result.catch(() => {});
+    try {
+      for await (const chunk of stdout) yield chunk;
+      const outcome = await result;
+      if (outcome.code !== 0) throw classifyCodedFailure("pull", outcome.stderr);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") throw missingBinaryError(this.loot);
+      throw e;
     }
   }
 }
@@ -223,7 +278,9 @@ class PhysicalRepo implements LootRepo {
  * is what the binary signs with.
  */
 export async function openRepo(path: string, opts?: OpenRepoOptions): Promise<LootRepo> {
-  const repo = new PhysicalRepo(path, opts?.loot ?? "loot");
+  const loot = opts?.loot ?? "loot";
+  const runner = opts?.runner ?? new SubprocessRunner(loot, path);
+  const repo = new PhysicalRepo(path, loot, runner);
   await repo.init(); // fail fast on a missing binary / non-repo; snapshot the baseline
   return repo;
 }

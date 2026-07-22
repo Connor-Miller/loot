@@ -7,8 +7,13 @@
  * slices.
  */
 export { connectRelay } from "./repo.js";
+export type { ConnectRelayOptions } from "./repo.js";
+export { HttpRelayTransport } from "./relay-transport.js";
+export type { RelayTransport, RelayResponse } from "./relay-transport.js";
 export { openRepo } from "./physical.js";
 export type { OpenRepoOptions } from "./physical.js";
+export { SubprocessRunner } from "./loot-runner.js";
+export type { LootRunner, RunResult, StreamHandle } from "./loot-runner.js";
 export type {
   LootRepo,
   PathEntry,

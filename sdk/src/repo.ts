@@ -8,7 +8,8 @@ import {
 import type { Identity } from "../wasm/loot_wasm.js";
 import { decompress as zstdInflate } from "fzstd";
 import { AuthError, GuardError, NotFoundError, TransportError } from "./errors.js";
-import { WorkingOverlay } from "./working-overlay.js";
+import { HttpRelayTransport, type RelayResponse, type RelayTransport } from "./relay-transport.js";
+import { type OverlayEntry, WorkingOverlay } from "./working-overlay.js";
 
 export type Visibility = "public" | "private";
 
@@ -109,6 +110,68 @@ function toVisibility(raw: string): Visibility {
   return raw === "public" ? "public" : "private";
 }
 
+/** A 2xx relay response. */
+function isOk(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
+/**
+ * Assert a `/stow` response is an acceptance, else throw — the relay's write-path
+ * verdict, kept adapter-side so it is unit-testable against a fake transport
+ * (#432). A 2xx is a clean stow. A 401 is the allow-list rejecting this signing
+ * key: the SDK always signs in the WASM core, so it means the key is not enrolled
+ * — throw an `AuthError` carrying the offending pubkey so an operator knows which
+ * to enroll (#383: attempt & report, no pre-check / auto-enroll / downgrade).
+ * Anything else is transport.
+ */
+function assertStowAccepted(resp: RelayResponse, identity: Identity, url: string): void {
+  if (isOk(resp.status)) return;
+  if (resp.status === 401) {
+    const pubkey = bytesToHex(identity.publicKey());
+    const detail = new TextDecoder().decode(resp.body).trim();
+    throw new AuthError(
+      `relay rejected push: signing key ${pubkey} is not on the allow-list` + (detail ? ` (${detail})` : ""),
+      pubkey,
+    );
+  }
+  throw new TransportError(`relay ${url}/stow returned ${resp.status}`);
+}
+
+/**
+ * Resolve each edited path's target visibility and enforce the guard model —
+ * BEFORE composing, so a refused change stows nothing. Pure and relay-specific
+ * (physical delegates visibility to the binary): a new path picks its visibility
+ * freely; changing an *established* path's visibility needs the matching guard
+ * (`allowDemote` names public→private; `allowReveal` permits private→public).
+ * Extracted from `push` so it is unit-testable with hand-built trees (#432).
+ */
+function resolvePushVisibilities<P>(
+  overlay: Map<string, OverlayEntry<P>>,
+  existing: Map<string, Visibility>,
+  guard: VisibilityGuard,
+): Map<string, Visibility> {
+  const resolved = new Map<string, Visibility>();
+  for (const [path, pending] of overlay) {
+    if (pending.kind !== "put") continue;
+    const prior = existing.get(path);
+    const target: Visibility = pending.visibility ?? prior ?? "public";
+    if (prior !== undefined && target !== prior) {
+      if (prior === "public" && !(guard.allowDemote ?? []).includes(path)) {
+        throw new GuardError(
+          `refusing to make ${path} private without allowDemote (public→private is a demotion)`,
+        );
+      }
+      if (prior === "private" && !guard.allowReveal) {
+        throw new GuardError(
+          `refusing to make ${path} public without allowReveal (private→public reveals sealed content)`,
+        );
+      }
+    }
+    resolved.set(path, target);
+  }
+  return resolved;
+}
+
 class RelayRepo implements LootRepo {
   /** Capture-first pending change (#429). Relay's payload is the `Uint8Array`
    * bytes to seal; the overlay owns the message + guard union + status kinds. */
@@ -130,25 +193,26 @@ class RelayRepo implements LootRepo {
   constructor(
     private readonly url: string,
     private readonly identity: Identity,
+    private readonly transport: RelayTransport,
   ) {}
 
-  private async fetchBundle(have: Uint8Array, wants: Uint8Array): Promise<WasmBundle> {
-    const body = encodeFetchRequest(have, wants);
-    let resp: Response;
+  /** POST through the transport, mapping a connection failure to `TransportError`.
+   * Response *classification* stays with each caller (fetch/stow/negotiate map
+   * status differently), so this only owns the unreachable-relay case. */
+  private async post(endpoint: string, body: Uint8Array): Promise<RelayResponse> {
     try {
-      resp = await fetch(`${this.url}/fetch`, {
-        method: "POST",
-        body,
-        headers: { "content-type": "application/octet-stream" },
-      });
+      return await this.transport.post(endpoint, body);
     } catch (e) {
       throw new TransportError(`relay unreachable at ${this.url}: ${String(e)}`);
     }
-    if (!resp.ok) {
-      throw new TransportError(`relay /fetch returned ${resp.status} ${resp.statusText}`);
+  }
+
+  private async fetchBundle(have: Uint8Array, wants: Uint8Array): Promise<WasmBundle> {
+    const resp = await this.post("/fetch", encodeFetchRequest(have, wants));
+    if (!isOk(resp.status)) {
+      throw new TransportError(`relay ${this.url}/fetch returned ${resp.status}`);
     }
-    const bytes = new Uint8Array(await resp.arrayBuffer());
-    return WasmBundle.fromBytes(bytes);
+    return WasmBundle.fromBytes(resp.body);
   }
 
   /**
@@ -270,29 +334,9 @@ class RelayRepo implements LootRepo {
     // Resolve each edited path's visibility (inherit / new-path default) and
     // enforce the guard model BEFORE composing — a refused change stows nothing.
     // This client-side visibility resolution + GuardError enforcement is
-    // genuinely relay behaviour, so it stays here (physical delegates to the
-    // binary), not in the backend-agnostic overlay.
-    const resolved = new Map<string, Visibility>();
-    for (const [path, pending] of overlay) {
-      if (pending.kind !== "put") continue;
-      const prior = existing.get(path);
-      const target: Visibility = pending.visibility ?? prior ?? "public";
-      // A guard is required only to CHANGE an established path's visibility; a
-      // brand-new path (no prior) picks its initial visibility freely.
-      if (prior !== undefined && target !== prior) {
-        if (prior === "public" && !(effectiveGuard.allowDemote ?? []).includes(path)) {
-          throw new GuardError(
-            `refusing to make ${path} private without allowDemote (public→private is a demotion)`,
-          );
-        }
-        if (prior === "private" && !effectiveGuard.allowReveal) {
-          throw new GuardError(
-            `refusing to make ${path} public without allowReveal (private→public reveals sealed content)`,
-          );
-        }
-      }
-      resolved.set(path, target);
-    }
+    // genuinely relay behaviour (physical delegates to the binary), so it lives
+    // in this file — extracted to a pure helper so it is unit-testable (#432).
+    const resolved = resolvePushVisibilities(overlay, existing, effectiveGuard);
 
     // Compose the full-tree change in the WASM core: carry unchanged paths,
     // seal + put edited ones, skip removed. Composition (id fold, signing,
@@ -322,35 +366,11 @@ class RelayRepo implements LootRepo {
   }
 
   private async stow(envelope: Uint8Array): Promise<void> {
-    let resp: Response;
-    try {
-      resp = await fetch(`${this.url}/stow`, {
-        method: "POST",
-        body: envelope,
-        headers: { "content-type": "application/octet-stream" },
-      });
-    } catch (e) {
-      throw new TransportError(`relay unreachable at ${this.url}: ${String(e)}`);
-    }
-    if (resp.ok) return;
-    // The relay rejects an unverifiable push with 401 (loot-net `handle_stow` →
-    // `identity::unwrap_envelope`, which maps both a bad signature and a
-    // non-allow-listed key to `BadSignature`/UNAUTHORIZED). The SDK always signs
-    // its envelope in the WASM core, so a 401 here means this key is not on the
-    // relay's allow-list — surface it as `unauthorized`, carrying the offending
-    // pubkey so an operator knows which key to enroll (#383: attempt & report,
-    // no pre-check / auto-enroll / downgrade). Any other non-2xx is a genuine
-    // transport/relay failure.
-    if (resp.status === 401) {
-      const pubkey = bytesToHex(this.identity.publicKey());
-      const detail = (await resp.text().catch(() => "")).trim();
-      throw new AuthError(
-        `relay rejected push: signing key ${pubkey} is not on the allow-list` +
-          (detail ? ` (${detail})` : ""),
-        pubkey,
-      );
-    }
-    throw new TransportError(`relay /stow returned ${resp.status} ${resp.statusText}`);
+    const resp = await this.post("/stow", envelope);
+    // 2xx → clean; 401 → this signing key is not allow-listed (AuthError + the
+    // offending pubkey); anything else → transport. Kept in a pure helper so the
+    // write-path verdict is unit-testable against a fake transport (#432).
+    assertStowAccepted(resp, this.identity, this.url);
   }
 
   // --- streaming pull (#427) -----------------------------------------------
@@ -377,21 +397,12 @@ class RelayRepo implements LootRepo {
     const haveBytes = new Uint8Array(known.length * 32);
     known.forEach((id, i) => haveBytes.set(hexToBytes(id), i * 32));
 
-    let resp: Response;
-    try {
-      resp = await fetch(`${this.url}/negotiate`, {
-        method: "POST",
-        body: encodeNegotiateRequest(haveBytes),
-        headers: { "content-type": "application/octet-stream" },
-      });
-    } catch (e) {
-      throw new TransportError(`relay unreachable at ${this.url}: ${String(e)}`);
-    }
-    if (!resp.ok) {
-      throw new TransportError(`relay /negotiate returned ${resp.status} ${resp.statusText}`);
+    const resp = await this.post("/negotiate", encodeNegotiateRequest(haveBytes));
+    if (!isOk(resp.status)) {
+      throw new TransportError(`relay ${this.url}/negotiate returned ${resp.status}`);
     }
 
-    const bundle = WasmBundle.fromBytes(new Uint8Array(await resp.arrayBuffer()));
+    const bundle = WasmBundle.fromBytes(resp.body);
     const changes: ChangeView[] = JSON.parse(bundle.changesJson());
     const encoder = new TextEncoder();
     for (const change of changes) {
@@ -402,11 +413,24 @@ class RelayRepo implements LootRepo {
   }
 }
 
+/** Options for {@link connectRelay}. `transport` injects the network seam
+ * (default: an {@link HttpRelayTransport} over `url`), so tests drive the relay
+ * branches without a live `loot serve`. */
+export interface ConnectRelayOptions {
+  transport?: RelayTransport;
+}
+
 /**
  * Connect to a relay and drive a loot repo entirely in memory — no `.loot/` on
  * disk (#382/#383). `identity` is a WASM `Identity` (generate / fromSeed); a
  * pre-registered key (`fromSeed`) is what the relay allow-list gates `push` on.
  */
-export function connectRelay(url: string, identity: Identity): Promise<LootRepo> {
-  return Promise.resolve(new RelayRepo(url.replace(/\/+$/, ""), identity));
+export function connectRelay(
+  url: string,
+  identity: Identity,
+  opts?: ConnectRelayOptions,
+): Promise<LootRepo> {
+  const base = url.replace(/\/+$/, "");
+  const transport = opts?.transport ?? new HttpRelayTransport(base);
+  return Promise.resolve(new RelayRepo(base, identity, transport));
 }

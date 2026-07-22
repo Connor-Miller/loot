@@ -78,13 +78,5 @@ describe("physical authoring round-trip", () => {
   });
 });
 
-describe("physical error surface", () => {
-  it("openRepo on a non-repo path throws a typed error", async () => {
-    const empty = mkdtempSync(join(tmpdir(), "loot-phys-none-"));
-    try {
-      await expect(openRepo(empty, { loot: LOOT })).rejects.toMatchObject({ code: expect.any(String) });
-    } finally {
-      rmSync(empty, { recursive: true, force: true });
-    }
-  });
-});
+// The error surface (missing binary, non-repo, guard/conflict mapping) moved to
+// fast unit tests against a fake runner — see physical.unit.test.ts (#433/#434).
