@@ -12,3 +12,8 @@ site/dist/
 site/.vercel/
 site/*.tsbuildinfo
 .vercel/
+# TS SDK (#423): npm deps + the wasm-pack-generated core (rebuilt from
+# crates/loot-wasm), neither of which belongs in loot history.
+sdk/node_modules/
+sdk/wasm/
+sdk/*.tsbuildinfo
