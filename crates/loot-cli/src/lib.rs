@@ -16,6 +16,7 @@
 //! `View -> Plan` table the executor in `workspace.rs` matches on.
 
 pub mod emit;
+pub mod error;
 pub mod ferry;
 pub mod flags;
 mod kv;

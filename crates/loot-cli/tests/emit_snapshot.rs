@@ -590,3 +590,73 @@ fn pull_reports_a_converged_change_in_every_format() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// --- machine error channel (#430) -------------------------------------------
+
+/// Run the binary and return `(stderr, exit_code)`. The error channel writes to
+/// stderr, so these tests read it directly rather than stdout.
+fn run_stderr_with_code(dir: &Path, args: &[&str]) -> (String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_loot"))
+        .args(args)
+        .env("LOOT_CLOCK", FIXED_CLOCK)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    (String::from_utf8(out.stderr).unwrap(), out.status.code().unwrap_or(-1))
+}
+
+/// The whole contract, both directions: a `Workspace::open` failure in a
+/// non-repo directory carries the CLI-level `no_repo` slug. Under `--json` the
+/// taxonomy travels as a `{"contract":N,"error":{"code","message"}}` object on
+/// stderr with a non-zero exit; **without** `--json` the output is byte-for-byte
+/// the pre-#430 `loot: <message>` line (no human/script breakage).
+#[test]
+fn json_failure_emits_coded_error_object_non_json_is_unchanged() {
+    let dir = area("err-no-repo");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The message is `Workspace::open`'s own prose, with `.` as the display path
+    // (`open` discovers from the current directory).
+    let message = "not a loot repo at . (no .loot/). Run `loot init` first.";
+
+    // Non-`--json`: byte-for-byte the old `loot: <message>` line, exit non-zero.
+    let (stderr, code) = run_stderr_with_code(&dir, &["status"]);
+    assert_eq!(stderr, format!("loot: {message}\n"));
+    assert_ne!(code, 0, "a failure exits non-zero");
+
+    // `--json`: the coded object, contract-versioned, exit non-zero.
+    let (stderr, code) = run_stderr_with_code(&dir, &["status", "--json"]);
+    assert_eq!(
+        stderr,
+        format!(
+            "{{\"contract\":{FORMAT_MAJOR},\"error\":{{\"code\":\"no_repo\",\"message\":\"{message}\"}}}}\n"
+        )
+    );
+    assert_ne!(code, 0, "a failure exits non-zero");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The flag gate carries its own CLI-level slug (`unknown_flag`), and the
+/// `--json` selector is honored even when the failing flag list *contains* the
+/// bad flag: the coded object still reaches stderr.
+#[test]
+fn unknown_flag_carries_its_slug_under_json() {
+    let dir = area("err-unknown-flag");
+    keyed_repo(&dir, "connor");
+
+    let (stderr, code) = run_stderr_with_code(&dir, &["status", "--json", "--bogus"]);
+    assert!(
+        stderr.starts_with(&format!("{{\"contract\":{FORMAT_MAJOR},\"error\":{{\"code\":\"unknown_flag\",")),
+        "coded unknown_flag object on stderr: {stderr}"
+    );
+    assert!(stderr.contains("--bogus"), "the message still names the offending flag: {stderr}");
+    assert_ne!(code, 0);
+
+    // Without `--json`, the same failure prints the unchanged `loot: <prose>`.
+    let (stderr, _) = run_stderr_with_code(&dir, &["status", "--bogus"]);
+    assert!(stderr.starts_with("loot: unknown flag '--bogus'"), "unchanged prose: {stderr}");
+    assert!(!stderr.contains("\"code\""), "no JSON leaks into the human path: {stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

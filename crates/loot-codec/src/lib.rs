@@ -129,3 +129,56 @@ pub enum RepoError {
     #[error("backend error: {0}")]
     Backend(String),
 }
+
+impl RepoError {
+    /// A stable, machine-readable slug per variant — the source of truth for the
+    /// CLI's `--json` error channel (#430). The binary emits this as
+    /// `{"error":{"code":…}}` on stderr so a subprocess consumer (the physical
+    /// SDK adapter) reads the taxonomy as **data** instead of regex-matching the
+    /// prose. Versioned with `FORMAT_MAJOR` like the other ADR-0023 machine
+    /// contracts: these slugs are part of the wire and must not drift silently.
+    /// Each arm is spelled out (no `_` catch-all) so a new variant fails to
+    /// compile until it is given a slug.
+    pub fn code(&self) -> &'static str {
+        match self {
+            RepoError::NotFound(_) => "not_found",
+            RepoError::Unauthorized(_) => "unauthorized",
+            RepoError::Embargoed(_) => "embargoed",
+            RepoError::Expired(_) => "expired",
+            RepoError::UnsupportedFormat { .. } => "unsupported_format",
+            RepoError::BadChangeSignature(_) => "bad_signature",
+            RepoError::Demotion { .. } => "demotion",
+            RepoError::MisSeal { .. } => "mis_seal",
+            RepoError::SealWip { .. } => "seal_wip",
+            RepoError::Backend(_) => "backend",
+        }
+    }
+}
+
+#[cfg(test)]
+mod repo_error_code_tests {
+    use super::*;
+
+    /// Every variant maps to its stable slug (#430). This is the source of truth
+    /// for the CLI's machine error channel; a slug change here is a wire change.
+    #[test]
+    fn code_is_a_stable_slug_per_variant() {
+        let oid = Oid([0u8; 32]);
+        assert_eq!(RepoError::NotFound(oid.clone()).code(), "not_found");
+        assert_eq!(RepoError::Unauthorized(oid.clone()).code(), "unauthorized");
+        assert_eq!(RepoError::Embargoed(42).code(), "embargoed");
+        assert_eq!(RepoError::Expired(42).code(), "expired");
+        assert_eq!(
+            RepoError::UnsupportedFormat { found: 9, supported: 8 }.code(),
+            "unsupported_format"
+        );
+        assert_eq!(RepoError::BadChangeSignature(oid).code(), "bad_signature");
+        assert_eq!(RepoError::Demotion { paths: vec![".env".into()] }.code(), "demotion");
+        assert_eq!(RepoError::MisSeal { paths: vec![".env".into()] }.code(), "mis_seal");
+        assert_eq!(
+            RepoError::SealWip { subject: "x".into(), verb: "ferry".into() }.code(),
+            "seal_wip"
+        );
+        assert_eq!(RepoError::Backend("io".into()).code(), "backend");
+    }
+}

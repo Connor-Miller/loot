@@ -6,6 +6,7 @@
 //! id) is owned by the [`Workspace`]; commands are thin verbs over it.
 
 use loot_cli::emit::{self, Emit, OutFmt};
+use loot_cli::error::CliError;
 use loot_cli::flags::{FlagCheck, FlagSpec};
 use loot_cli::{ferry, render, workspace};
 use loot_core::{
@@ -35,10 +36,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(FlagCheck::Proceed) => cmd_buoy(rest),
-            Err(e) => {
-                eprintln!("loot: {e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => fail(CliError::unknown_flag(e), rest),
         };
     }
 
@@ -47,7 +45,7 @@ fn main() -> ExitCode {
     // the resolved format. `help`/`version` and the per-verb `--help` gate
     // print their static text directly and return an empty shape (nothing more
     // to render). `buoy` dispatched above keeps its own ExitCode.
-    let result: Result<Box<dyn Emit>, String> = match cmd {
+    let result: Result<Box<dyn Emit>, CliError> = match cmd {
         "help" | "-h" | "--help" => {
             print_help();
             Ok(Box::new(emit::Message::new(String::new())))
@@ -63,9 +61,10 @@ fn main() -> ExitCode {
                     Ok(Box::new(emit::Message::new(String::new())))
                 }
                 Ok(FlagCheck::Proceed) => (v.run)(rest),
-                Err(e) => Err(e),
+                // A refused flag is a CLI-level failure with its own code (#430).
+                Err(e) => Err(CliError::unknown_flag(e)),
             },
-            None => Err(format!("unknown command '{other}'\n\n{USAGE}")),
+            None => Err(format!("unknown command '{other}'\n\n{USAGE}").into()),
         },
     };
 
@@ -74,11 +73,22 @@ fn main() -> ExitCode {
             print!("{}", shape.render(out_fmt(rest)));
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("loot: {e}");
-            ExitCode::FAILURE
-        }
+        Err(e) => fail(e, rest),
     }
+}
+
+/// Emit a verb failure and return the failing [`ExitCode`] (#430). Under
+/// `--json` the error travels as data — `{"contract":N,"error":{"code","message"}}`
+/// on stderr — so a subprocess consumer reads the taxonomy instead of scraping
+/// prose. Without `--json` the output is byte-for-byte the pre-#430
+/// `loot: <message>` line, so no human or script breaks.
+fn fail(e: CliError, args: &[String]) -> ExitCode {
+    if out_fmt(args) == OutFmt::Json {
+        eprintln!("{}", e.to_json());
+    } else {
+        eprintln!("loot: {}", e.message);
+    }
+    ExitCode::FAILURE
 }
 
 /// A dispatchable verb: what it is called, which flags it accepts (#67, gated
@@ -88,14 +98,14 @@ fn main() -> ExitCode {
 /// a test can assert on without spawning the binary.
 struct Verb {
     spec: FlagSpec,
-    run: fn(&[String]) -> Result<Box<dyn Emit>, String>,
+    run: fn(&[String]) -> Result<Box<dyn Emit>, CliError>,
 }
 
 const fn verb(
     name: &'static str,
     valued: &'static [&'static str],
     bare: &'static [&'static str],
-    run: fn(&[String]) -> Result<Box<dyn Emit>, String>,
+    run: fn(&[String]) -> Result<Box<dyn Emit>, CliError>,
 ) -> Verb {
     Verb { spec: FlagSpec { bin: "loot", name, valued, bare }, run }
 }
@@ -397,13 +407,21 @@ fn conflict_verdicts(
 
 /// A verb's return (1a): a boxed [`Emit`] shape the dispatcher renders once
 /// with the resolved format. Aliased because ~57 `cmd_*` signatures carry it.
-type Emitted = Result<Box<dyn Emit>, String>;
+type Emitted = Result<Box<dyn Emit>, CliError>;
 
 /// Wrap prose (or empty) text as an [`emit::Message`] — the return for every
 /// verb with no machine-output contract (the ~49 human-only verbs). The verb
 /// builds its exact former stdout into one string and hands it back.
 fn msg(text: impl Into<String>) -> Emitted {
     Ok(Box::new(emit::Message::new(text)))
+}
+
+/// Open the ambient repo, tagging a failure with the CLI-level `no_repo` code
+/// (#430). `Workspace::open` returns a bare `String` (its message is unchanged);
+/// this is the one place the CLI stamps the "there is no loot repo here" slug so
+/// the `?` sites downstream stay a plain `open_repo()?`.
+fn open_repo() -> Result<Workspace, CliError> {
+    Workspace::open().map_err(CliError::no_repo)
 }
 
 // --- commands ---
@@ -462,7 +480,7 @@ RELEASE.md    embargoed=1800000000"
 
 fn cmd_status(args: &[String]) -> Emitted {
     let fmt = out_fmt(args);
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // status is READ-ONLY (ADR 0030): it recomputes the pending delta live and
     // never persists a snapshot, so scripts and parallel agents can call it
     // freely. The version id it shows is live-computed and non-durable — the
@@ -536,7 +554,7 @@ fn cmd_diff(args: &[String]) -> Emitted {
     // recorded conflict rather than diff two changes. It takes no from/to.
     if has_flag(args, "--conflict") {
         let path = flag(args, "--conflict").ok_or("usage: loot diff --conflict <path>")?;
-        let ws = Workspace::open()?;
+        let ws = open_repo()?;
         let view = ws.graph().conflict_at(std::path::Path::new(path))?;
         return msg(render::conflict_sides(&view));
     }
@@ -547,7 +565,7 @@ fn cmd_diff(args: &[String]) -> Emitted {
         [a, b] => (*a, *b),
         _ => return Err("usage: loot diff [<from>] [<to>]".into()),
     };
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let from_oid = ws.resolve_selector(from)?;
     let to_oid = ws.resolve_selector(to)?;
     let deltas = ws.diff(&from_oid, &to_oid)?;
@@ -567,7 +585,7 @@ fn cmd_describe(args: &[String]) -> Emitted {
         flag_values(args, "--allow-demote").into_iter().map(Into::into).collect();
     let allow_reveal: Vec<std::path::PathBuf> =
         flag_values(args, "--allow-reveal").into_iter().map(Into::into).collect();
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // The mis-seal gate (#63, ADR 0038 §1): refuse a first-time public-by-
     // fallthrough seal of a secret-shaped path before the capture names it.
     ws.seal_gate(&allow_reveal)?;
@@ -584,7 +602,7 @@ fn cmd_new(args: &[String]) -> Emitted {
     let opts = parse_snapshot_opts(args);
     let allow_reveal: Vec<std::path::PathBuf> =
         flag_values(args, "--allow-reveal").into_iter().map(Into::into).collect();
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // The mis-seal gate (#63, ADR 0038 §1): vet the tree before anything is
     // captured — an early refusal keeps the `-m` snapshot below from naming a
     // tree the finalize would refuse anyway. The gate runs again inside the
@@ -646,7 +664,7 @@ fn cmd_new(args: &[String]) -> Emitted {
 /// with descendants. One undoable operation (ADR 0031).
 fn cmd_edit(args: &[String]) -> Emitted {
     let prefix = first_positional(args).ok_or("usage: loot edit <change-id>")?;
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let report = ws.edit(prefix)?;
     msg(render::edit_done(&report))
 }
@@ -670,7 +688,7 @@ fn cmd_abandon(args: &[String]) -> Emitted {
     } else {
         "usage: loot abandon <selector>"
     })?;
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // Route through the one #305 selector grammar (@ / HEAD / HEAD~n /
     // hex-or-change prefix, #315) rather than the bare live-version-prefix
     // match this used to hand-roll — `loot abandon @` and `loot abandon
@@ -703,7 +721,7 @@ fn cmd_abandon(args: &[String]) -> Emitted {
 fn cmd_adopt(args: &[String]) -> Emitted {
     let discard_wip = has_flag(args, "--discard-wip");
     let seal_wip = has_flag(args, "--seal-wip");
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
 
     // No target → the harbor catch-up **merge** arm (ADR 0034): fold the landed
     // main line into this dock/lane, keeping the local line. `<version>` below is
@@ -773,7 +791,7 @@ fn cmd_adopt(args: &[String]) -> Emitted {
 /// `loot undo` — step the view back one operation (ADR 0031). Refuses across a
 /// one-way barrier (push/grant/maroon/pull-grants) with the remedy to use instead.
 fn cmd_undo() -> Emitted {
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let report = ws.undo()?;
     msg(print_step(&report))
 }
@@ -787,20 +805,21 @@ fn cmd_op(args: &[String]) -> Emitted {
             let n: u32 = target
                 .parse()
                 .map_err(|_| format!("op restore expects an operation number, got '{target}'"))?;
-            let mut ws = Workspace::open()?;
+            let mut ws = open_repo()?;
             let report = ws.restore_op(n)?;
             msg(print_step(&report))
         }
         Some(other) => Err(format!(
             "unknown op subcommand '{other}' — use `loot op log` or `loot op restore <n>`"
-        )),
+        )
+        .into()),
     }
 }
 
 /// `loot op log` — the append-only operation history, newest first. Barrier ops
 /// (one-way disclosures undo won't cross) are flagged.
 fn cmd_op_log() -> Emitted {
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let ops = ws.op_log()?;
     if ops.is_empty() {
         return msg("no operations recorded yet\n");
@@ -841,7 +860,7 @@ fn print_step(r: &StepReport) -> String {
 
 fn cmd_surface(args: &[String]) -> Emitted {
     let fmt = out_fmt(args);
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // Machine output (#428): the full readable tree as path+visibility, so the
     // physical SDK backend can enumerate `list()` without human-text scraping.
     // Sealed-skipped/burned paths are a human concern, omitted from the tree; an
@@ -889,7 +908,7 @@ fn print_surface_listing(
 
 fn cmd_gc(args: &[String]) -> Emitted {
     let dry_run = args.iter().any(|a| a == "--dry-run" || a == "-n");
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let report = ws.gc(dry_run)?;
 
     if report.pruned == 0 {
@@ -983,7 +1002,8 @@ fn cmd_verify(args: &[String]) -> Emitted {
         report.corrupt.len(),
         report.missing.len(),
         report.ok
-    ))
+    )
+    .into())
 }
 
 /// One missing address with its referencing sites (#335); a long-lived path
@@ -1048,7 +1068,7 @@ fn human_bytes(bytes: u64) -> String {
 /// also touched `<path>` — applied here as two sequential retains, in either
 /// order, over the same view.
 fn cmd_log(args: &[String]) -> Emitted {
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let identity = ws.identity().to_string();
     // The whole read lives behind the Workspace (R1, #177): rows newest-first
     // with abandoned versions dropped and the working node excluded (rendered
@@ -1094,7 +1114,7 @@ fn cmd_log(args: &[String]) -> Emitted {
 
 fn cmd_bundle(args: &[String]) -> Emitted {
     let out = args.first().ok_or("bundle requires <file>")?;
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     // Full bundle (have = []); apply is idempotent. Ships ciphertext + ANYONE-
     // granted keys only — restricted keys never travel (ADR 0003).
     let bundle = ws.bundle_full()?;
@@ -1105,7 +1125,7 @@ fn cmd_bundle(args: &[String]) -> Emitted {
 fn cmd_apply(args: &[String]) -> Emitted {
     let infile = first_positional(args).ok_or("apply requires <file>")?;
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let identity = ws.identity().to_string();
     // Capture-first (#219, ADR 0030 amendment): fold uncaptured disk edits into
     // the working change before ingest, like every other mutating verb — so a
@@ -1147,7 +1167,7 @@ fn cmd_ferry(args: &[String]) -> Emitted {
     let dock = flag(args, "--dock");
     let with_wip = has_flag(args, "--with-wip");
     let seal_wip = has_flag(args, "--seal-wip");
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let report = ferry::run(&mut ws, git_dir, dock, with_wip, seal_wip)?;
 
     let mut human = String::new();
@@ -1212,7 +1232,7 @@ fn cmd_grant(args: &[String]) -> Emitted {
     let out = pos[2];
 
     let opts = parse_snapshot_opts(args);
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // Capture the working tree first (ADR 0030) so the grant seals what is on
     // disk now, not a stale last-`status` snapshot — the handle is the proof.
     let mut snap = ws.snapshotted(&opts)?;
@@ -1262,7 +1282,7 @@ fn cmd_grant_relay(args: &[String]) -> Emitted {
     let grantee = positional[1];
 
     let opts = parse_snapshot_opts(args);
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // Capture the working tree first (ADR 0030) so the sealed grant covers the
     // path's current on-disk content — the handle is the proof.
     let mut snap = ws.snapshotted(&opts)?;
@@ -1332,7 +1352,7 @@ fn cmd_grant_relay(args: &[String]) -> Emitted {
 /// doesn't record any).
 fn cmd_grant_status(args: &[String]) -> Emitted {
     let path = args.first().ok_or("grant-status requires <path>")?;
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let reg = identity::PeerRegistry::load(ws.dot());
 
     let oid = ws
@@ -1353,7 +1373,7 @@ fn cmd_grant_status(args: &[String]) -> Emitted {
 /// troubleshooting case #15 names: "why isn't a file visible after a pull").
 fn cmd_embargo_status(args: &[String]) -> Emitted {
     let path = args.first().ok_or("embargo-status requires <path>")?;
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let (_, vis) = ws
         .path_history_entry(std::path::Path::new(path))
         .ok_or_else(|| format!("path '{path}' not found in any recorded change"))?;
@@ -1426,7 +1446,7 @@ fn cmd_config(args: &[String]) -> Emitted {
                 msg(text)
             }
         }
-        other => Err(format!("unknown config subcommand '{other}': use set | unset | list")),
+        other => Err(format!("unknown config subcommand '{other}': use set | unset | list").into()),
     }
 }
 
@@ -1444,7 +1464,7 @@ fn cmd_maroon(args: &[String]) -> Emitted {
         .unwrap_or(std::path::Path::new("."));
 
     let opts = parse_snapshot_opts(args);
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // Re-seal against the working tree as it is now (ADR 0030) — the handle is
     // the proof of capture.
     let mut snap = ws.snapshotted(&opts)?;
@@ -1525,7 +1545,7 @@ fn cmd_burn(args: &[String]) -> Emitted {
         None => None,
     };
 
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let report = ws.burn_path(path, only_oid)?;
 
     let mut text = String::new();
@@ -1616,7 +1636,7 @@ fn cmd_migrate(args: &[String]) -> Emitted {
         .unwrap_or(std::path::Path::new("."));
 
     let opts = parse_snapshot_opts(args);
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // Re-classify against the current on-disk tree (ADR 0030) — the handle is
     // the proof of capture.
     let mut snap = ws.snapshotted(&opts)?;
@@ -1727,7 +1747,7 @@ fn cmd_lane(args: &[String]) -> Emitted {
                 let t = t.trim_start_matches('#');
                 if t.chars().all(|c| c.is_ascii_digit()) { format!("t{t}") } else { t.to_string() }
             });
-            let mut ws = Workspace::open()?;
+            let mut ws = open_repo()?;
             let spawned = ws.spawn_lane_as(name, at.as_deref(), handle.as_deref())?;
             ws.record_op("lane new", &format!("spawn lane {}", spawned.id), false);
             // One row, the `loot lanes` shape — an agent wrapper parses the same
@@ -1764,7 +1784,7 @@ fn cmd_lane(args: &[String]) -> Emitted {
         }
         "name" => {
             let name = args.get(1).ok_or("usage: loot lane name <name>  (inside the lane)")?;
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             ws.name_lane(name)?;
             msg(format!(
                 "lane '{}' named '{name}' — now a dock; persists until `loot lane rm {name}`\n",
@@ -1773,7 +1793,7 @@ fn cmd_lane(args: &[String]) -> Emitted {
         }
         "rm" => {
             let key = args.get(1).ok_or("usage: loot lane rm <id-or-name>")?;
-            let mut ws = Workspace::open()?;
+            let mut ws = open_repo()?;
             let e = ws.remove_lane(key)?;
             msg(format!(
                 "reaped lane '{}' ({}) — unsigned WIP died with the directory; \
@@ -1791,7 +1811,7 @@ fn cmd_lane(args: &[String]) -> Emitted {
                 }
                 None => LANE_STALE_SECS,
             };
-            let mut ws = Workspace::open()?;
+            let mut ws = open_repo()?;
             let outcomes = ws.lane_gc(stale_secs)?;
             if outcomes.is_empty() {
                 return msg("no lanes to sweep\n");
@@ -1817,7 +1837,7 @@ fn cmd_lane(args: &[String]) -> Emitted {
 /// check an agent (or the human) runs before acting on shared state — and it
 /// is read-only: no heartbeat refreshes, no capture, no op recorded.
 fn cmd_lane_list(_args: &[String]) -> Emitted {
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let rows = lane_rows(&ws, |_| true);
     let mut human = String::new();
     if rows.is_empty() {
@@ -1902,7 +1922,7 @@ fn fmt_age(secs: u64) -> String {
 /// the `println!` boundary was the exact anti-pattern CA3 removed everywhere
 /// else (#126).
 fn cmd_lane_merge(key: &str, _args: &[String]) -> Emitted {
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let current = ws.current_dock().unwrap_or("main").to_string();
     let (source, outcomes) = ws.merge_lane(key)?;
     if !outcomes.is_empty() {
@@ -1930,7 +1950,7 @@ fn cmd_lane_merge(key: &str, _args: &[String]) -> Emitted {
 }
 
 fn cmd_manifest() -> Emitted {
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let dot = ws.dot().to_owned();
     let reg = identity::PeerRegistry::load(&dot);
     let entries: Vec<_> = ws.manifest().iter().collect();
@@ -1978,7 +1998,7 @@ fn cmd_attest(args: &[String]) -> Emitted {
         .first()
         .ok_or("usage: loot attest <change-id> [role]")?;
     let role = args.get(1).map(String::as_str).unwrap_or("reviewed");
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     // Route through the one #305 selector grammar (@ / HEAD / HEAD~n / prefix,
     // #315) rather than the verb's own hand-rolled version-prefix match. The
     // id `resolve_selector` returns is a version's `Oid` — exactly what
@@ -2010,20 +2030,17 @@ fn cmd_attest(args: &[String]) -> Emitted {
 fn cmd_buoy(args: &[String]) -> ExitCode {
     match cmd_buoy_inner(args) {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("loot: {e}");
-            ExitCode::FAILURE
-        }
+        Err(e) => fail(e, args),
     }
 }
 
-fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, String> {
+fn cmd_buoy_inner(args: &[String]) -> Result<ExitCode, CliError> {
     // `--verbose`, `--porcelain`, `--json` are flags; the first non-flag arg is the role.
     let verbose = has_flag(args, "--verbose");
     let fmt = out_fmt(args);
     let role = first_positional(args).unwrap_or("reviewed");
 
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let reg = identity::PeerRegistry::load(ws.dot());
 
     // The whole read — present set, parent lookup, attestation stream, trust
@@ -2068,7 +2085,7 @@ fn resolve_pubkey_name(reg: &identity::PeerRegistry, pubkey: &[u8; 32]) -> Strin
 }
 
 fn cmd_conflicts(_args: &[String]) -> Emitted {
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let conflicts = ws.conflicts();
     let mut human = String::new();
     if conflicts.is_empty() {
@@ -2093,7 +2110,7 @@ fn cmd_resolve(args: &[String]) -> Emitted {
 
     let bytes = std::fs::read(infile).map_err(|e| format!("read {infile}: {e}"))?;
 
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
 
     // Determine the visibility for this path from .lootattributes (same logic
     // snapshot uses). Unrecognized paths default to Public.
@@ -2132,7 +2149,7 @@ fn cmd_grants(args: &[String]) -> Emitted {
         return cmd_grants_trust(pubkey_hex);
     }
 
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let dot = ws.dot().to_owned();
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(&dot).map_err(|e| e.to_string())?;
@@ -2147,7 +2164,7 @@ fn cmd_grants(args: &[String]) -> Emitted {
 /// `loot grants --quarantined` (#12): list every grant `pull-grants` held back
 /// from an unregistered sender, purely local (no network, no mutation).
 fn cmd_grants_quarantined() -> Emitted {
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let entries = ws.store().read_quarantine();
     msg(render::render_quarantined(&entries))
 }
@@ -2165,12 +2182,12 @@ fn cmd_grants_trust(pubkey_hex: &str) -> Emitted {
     // mixed-case argument still finds entries `pull-grants` wrote in lowercase.
     let sender_hex = loot_core::hex::encode(&pubkey);
 
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let dot = ws.dot().to_owned();
 
     let entries = ws.store().read_quarantine_for_sender(&sender_hex);
     if entries.is_empty() {
-        return Err(format!("no quarantined grants from {sender_hex}"));
+        return Err(format!("no quarantined grants from {sender_hex}").into());
     }
 
     // Register the sender as a peer — the name it gets is its own pubkey hex,
@@ -2223,7 +2240,7 @@ fn sealed_grant_oid(bundle_bytes: &[u8]) -> Result<Oid, String> {
 }
 
 fn cmd_pull_grants(args: &[String]) -> Emitted {
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let dot = ws.dot().to_owned();
     let url = resolve_remote(args, &ws)?;
 
@@ -2314,7 +2331,7 @@ fn cmd_id(args: &[String]) -> Emitted {
     match sub {
         "export" => {
             let file = args.get(1).ok_or("id export requires <file>")?;
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             let dot = ws.dot();
             if !identity::keypair_exists(dot) {
                 return Err("no identity keypair — run `loot keygen` to generate one".into());
@@ -2329,7 +2346,7 @@ fn cmd_id(args: &[String]) -> Emitted {
         }
         "import" => {
             let file = args.get(1).ok_or("id import requires <file>")?;
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             let dot = ws.dot();
             if identity::keypair_exists(dot) {
                 return Err(
@@ -2372,7 +2389,7 @@ fn cmd_id_rotate(args: &[String]) -> Emitted {
         .get(1)
         .map(|s| std::path::Path::new(s.as_str()))
         .unwrap_or(std::path::Path::new("."));
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let dot = ws.dot().to_owned();
     let name = ws.identity().to_string();
     if !identity::keypair_exists(&dot) {
@@ -2530,7 +2547,7 @@ fn render_rotate_instructions(
 }
 
 fn cmd_keygen() -> Emitted {
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let dot = ws.dot();
     if identity::keypair_exists(dot) {
         return Err("keypair already exists at .loot/id — remove it first if you want to regenerate".into());
@@ -2547,7 +2564,7 @@ fn cmd_keygen() -> Emitted {
 }
 
 fn cmd_whoami(args: &[String]) -> Emitted {
-    let ws = Workspace::open()?;
+    let ws = open_repo()?;
     let dot = ws.dot();
     if !identity::keypair_exists(dot) {
         return Err("no identity keypair — run `loot keygen` to generate one".into());
@@ -2610,7 +2627,7 @@ fn cmd_peer(args: &[String]) -> Emitted {
             // `<pubkey>` of `-` reads the key from stdin, so a piped
             // `loot whoami --pubkey | loot peer add alice -` works (#4).
             let pubkey = resolve_pubkey_arg(&args[2], read_stdin_key)?;
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             let mut reg = identity::PeerRegistry::load(ws.dot());
             reg.add(name, &pubkey);
             reg.save().map_err(|e| e.to_string())?;
@@ -2618,14 +2635,14 @@ fn cmd_peer(args: &[String]) -> Emitted {
         }
         "remove" | "rm" => {
             let name = args.get(1).ok_or("peer remove requires <name>")?;
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             let mut reg = identity::PeerRegistry::load(ws.dot());
             reg.remove(name);
             reg.save().map_err(|e| e.to_string())?;
             msg(format!("removed peer '{name}'\n"))
         }
         "list" | "ls" => {
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             let reg = identity::PeerRegistry::load(ws.dot());
             let peers = reg.list();
             if peers.is_empty() {
@@ -2638,7 +2655,7 @@ fn cmd_peer(args: &[String]) -> Emitted {
                 msg(text)
             }
         }
-        other => Err(format!("unknown peer subcommand '{other}': use add | remove | list")),
+        other => Err(format!("unknown peer subcommand '{other}': use add | remove | list").into()),
     }
 }
 
@@ -2653,18 +2670,18 @@ fn cmd_remote(args: &[String]) -> Emitted {
             }
             let name = &args[1];
             let url = &args[2];
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             ws.remotes().add(name, url)?;
             msg(format!("remote '{name}' → {url}\n"))
         }
         "remove" | "rm" => {
             let name = args.get(1).ok_or("remote remove requires <name>")?;
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             ws.remotes().remove(name)?;
             msg(format!("removed remote '{name}'\n"))
         }
         "list" | "ls" => {
-            let ws = Workspace::open()?;
+            let ws = open_repo()?;
             let remotes = ws.remotes().list();
             if remotes.is_empty() {
                 msg("no remotes configured  (use `loot remote add origin <url>`)\n")
@@ -2676,7 +2693,7 @@ fn cmd_remote(args: &[String]) -> Emitted {
                 msg(text)
             }
         }
-        other => Err(format!("unknown remote subcommand '{other}': use add | remove | list")),
+        other => Err(format!("unknown remote subcommand '{other}': use add | remove | list").into()),
     }
 }
 
@@ -2823,7 +2840,7 @@ fn cmd_completions(args: &[String]) -> Emitted {
         Some("zsh") => zsh_completions(),
         Some("fish") => fish_completions(),
         Some(other) => {
-            return Err(format!("unknown shell '{other}' — usage: loot completions <bash|zsh|fish>"))
+            return Err(format!("unknown shell '{other}' — usage: loot completions <bash|zsh|fish>").into())
         }
         None => return Err("usage: loot completions <bash|zsh|fish>".into()),
     };
@@ -2900,7 +2917,7 @@ const OBJECTS_PER_BATCH: usize = 32;
 const BYTES_PER_BATCH: usize = loot_net::MAX_BODY_BYTES / 8;
 
 fn cmd_push(args: &[String]) -> Emitted {
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let url = resolve_remote(args, &ws)?;
     let id = identity::load_or_missing(ws.dot()).map_err(|e| e.to_string())?;
     // S5: offer our object addresses; the relay replies with the subset it is
@@ -3078,7 +3095,7 @@ impl workspace::SyncTransport for HttpTransport {
 fn cmd_pull(args: &[String]) -> Emitted {
     let fmt = out_fmt(args);
     let no_surface = has_flag(args, "--no-surface");
-    let mut ws = Workspace::open()?;
+    let mut ws = open_repo()?;
     let url = resolve_remote(args, &ws)?;
     run_pull(&mut ws, &HttpTransport { url: url.clone() }, &url, fmt, no_surface)
 }
@@ -4206,11 +4223,11 @@ mod tests {
     #[test]
     fn cmd_completions_rejects_missing_or_unknown_shell() {
         let err = cmd_completions(&args(&[])).err().unwrap();
-        assert!(err.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
+        assert!(err.message.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
 
         let err = cmd_completions(&args(&["powershell"])).err().unwrap();
-        assert!(err.contains("unknown shell 'powershell'"), "{err}");
-        assert!(err.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
+        assert!(err.message.contains("unknown shell 'powershell'"), "{err}");
+        assert!(err.message.contains("usage: loot completions <bash|zsh|fish>"), "{err}");
     }
 
     /// Each supported shell name is accepted and dispatch never opens a
