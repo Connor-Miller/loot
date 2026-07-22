@@ -16,7 +16,7 @@ export type {
   ChangeSummary,
   ChangeKind,
 } from "./repo.js";
-export { LootError, TransportError, NotFoundError, AuthError } from "./errors.js";
+export { LootError, TransportError, NotFoundError, AuthError, ConflictError } from "./errors.js";
 export type { LootErrorCode } from "./errors.js";
 
 // The diskless identity (generate / fromSeed / publicKey), straight from the

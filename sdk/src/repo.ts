@@ -239,11 +239,25 @@ class RelayRepo implements LootRepo {
     } catch (e) {
       throw new TransportError(`relay unreachable at ${this.url}: ${String(e)}`);
     }
-    // A non-2xx here is a rejected push; slice 3 maps the allow-list rejection
-    // to a typed `unauthorized` error. For now surface it as a transport error.
-    if (!resp.ok) {
-      throw new TransportError(`relay /stow returned ${resp.status} ${resp.statusText}`);
+    if (resp.ok) return;
+    // The relay rejects an unverifiable push with 401 (loot-net `handle_stow` →
+    // `identity::unwrap_envelope`, which maps both a bad signature and a
+    // non-allow-listed key to `BadSignature`/UNAUTHORIZED). The SDK always signs
+    // its envelope in the WASM core, so a 401 here means this key is not on the
+    // relay's allow-list — surface it as `unauthorized`, carrying the offending
+    // pubkey so an operator knows which key to enroll (#383: attempt & report,
+    // no pre-check / auto-enroll / downgrade). Any other non-2xx is a genuine
+    // transport/relay failure.
+    if (resp.status === 401) {
+      const pubkey = bytesToHex(this.identity.publicKey());
+      const detail = (await resp.text().catch(() => "")).trim();
+      throw new AuthError(
+        `relay rejected push: signing key ${pubkey} is not on the allow-list` +
+          (detail ? ` (${detail})` : ""),
+        pubkey,
+      );
     }
+    throw new TransportError(`relay /stow returned ${resp.status} ${resp.statusText}`);
   }
 }
 
