@@ -31,6 +31,15 @@ const CONTENT_KEY: [u8; 32] = [5u8; 32];
 const REQ_HAVE: [u8; 32] = [0x11; 32];
 const REQ_WANTS: [u8; 32] = [0x22; 32];
 
+// Write path (deterministic — ed25519 signing is deterministic, and a carry-only
+// change has no random sealing). A fixed seed → fixed key.
+const SEED: [u8; 32] = [0x11; 32];
+const SIGN_MSG: &[u8] = b"loot slice 2 - sign parity";
+const ENV_BUNDLE: &[u8] = b"a fixed pseudo-bundle to wrap in an envelope";
+const CHANGE_MESSAGE: &str = "author a change";
+const PARENT_ID: [u8; 32] = [0x22; 32];
+const CARRY_OID: [u8; 32] = [0x33; 32];
+
 // --- frozen native vectors (regenerated + re-asserted by the native run) ---
 /// blake3(ADDR_NONCE ‖ ADDR_CIPHERTEXT).
 const FROZEN_ADDRESS: &str = "270fc28469c89467298dc6454975985ba36dd2231ce075eba2f585d33d9793e7";
@@ -41,6 +50,15 @@ const FROZEN_CIPHERTEXT: &str =
     "4beaebe09e83ad08c307eb09c69ed1beb7d511d3569b9bac0ada8ac5a72b120867419fca27c37c9b3c20";
 /// The `/fetch` request framing for REQ_HAVE + REQ_WANTS (marker + counts + ids).
 const FROZEN_FETCH_REQ: &str = "0800010000001111111111111111111111111111111111111111111111111111111111111111010000002222222222222222222222222222222222222222222222222222222222222222";
+/// ed25519 public key for SEED.
+const FROZEN_PUBKEY: &str = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+/// ed25519 signature (SEED) over SIGN_MSG — deterministic.
+const FROZEN_SIGN: &str = "3e24a437ca1588852df812241cd006575463d964165a75ed30ada58cd4afd73e4c511bb87e4b00cd04c31ea63c07238f838b684a64a5daf0f4a99554d401140c";
+/// `/stow` envelope wrapping ENV_BUNDLE under SEED — deterministic.
+const FROZEN_ENVELOPE: &str = "01d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737fd03d7663a87c2445364bc2986e554c8ac7e2c54308854e5823380dcc1c4459fe3d3cd52b0e40bc47f53e322eee10139448725af4b6d421422f96652892a3206612066697865642070736575646f2d62756e646c6520746f207772617020696e20616e20656e76656c6f7065";
+/// version-id (change-id fold) of a carry-only change: SEED author, CHANGE_MESSAGE,
+/// parent PARENT_ID, tree {"readme.md" -> (CARRY_OID, public)}.
+const FROZEN_VERSION_ID: &str = "6d80c53008f7f9efd6559eb5f995d354ceca6e771fb64194a437220b12a9d6de";
 /// A one-change, one-object Sync frame, encoded by native `loot-codec`.
 const FROZEN_BUNDLE: &str = "080000000000000100000062db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea4242424242424242424242420010000000424242424242424242424242424242420001000000010000002a0100000062db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea0505050505050505050505050505050505050505050505050505050505050505010000000101010101010101010101010101010101010101010101010101010101010101000000000c0000006669727374206368616e67650100000009000000726561646d652e6d6462db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea000000000000000000000000";
 
@@ -96,6 +114,19 @@ fn check_fetch_request(got: Vec<u8>) {
     assert_eq!(hex(&got), FROZEN_FETCH_REQ, "/fetch request framing != frozen native vector");
 }
 
+/// The deterministic write primitives: pubkey, signature, `/stow` envelope, and
+/// the change-id fold — each frozen from the native build.
+fn check_write(pubkey: Vec<u8>, signature: Vec<u8>, envelope: Vec<u8>, version_id: Vec<u8>) {
+    assert_eq!(hex(&pubkey), FROZEN_PUBKEY, "pubkey != frozen");
+    assert_eq!(hex(&signature), FROZEN_SIGN, "sign != frozen");
+    assert_eq!(hex(&envelope), FROZEN_ENVELOPE, "envelope != frozen");
+    assert_eq!(hex(&version_id), FROZEN_VERSION_ID, "change-id fold != frozen");
+    // Envelope shape: [0x01][pubkey 32][sig 64][bundle verbatim].
+    assert_eq!(envelope[0], 0x01, "envelope version byte");
+    assert_eq!(&envelope[1..33], &pubkey[..], "envelope carries the pubkey");
+    assert_eq!(&envelope[97..], ENV_BUNDLE, "envelope tail is the bundle verbatim");
+}
+
 fn frozen_obj_addr_bytes() -> Vec<u8> {
     unhex(FROZEN_OBJ_ADDR)
 }
@@ -111,7 +142,9 @@ fn parity_native() {
     use loot_codec::bundle_codec::{BundleBody, Frame};
     use loot_codec::sealed::SealedObject;
     use loot_codec::ChangeNode;
-    use loot_wasm::core::{address, decrypt, encode_fetch_request, DecodedBundle};
+    use loot_wasm::core::{
+        address, decrypt, encode_fetch_request, ChangeBuilder, DecodedBundle, Identity,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -150,16 +183,35 @@ fn parity_native() {
     // Print-on-mismatch so regenerating the vectors is a copy-paste (see the
     // PLACEHOLDER seeds); then hard-assert the frozen constants.
     let fetch_req = encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap();
+
+    // Write primitives (deterministic).
+    let id = Identity::from_seed(&SEED).unwrap();
+    let pubkey = id.public_key();
+    let signature = id.sign(SIGN_MSG);
+    let envelope = id.wrap_envelope(ENV_BUNDLE);
+    let mut builder = ChangeBuilder::new(&id, CHANGE_MESSAGE.to_string());
+    builder.set_parent(&PARENT_ID).unwrap();
+    builder.carry("readme.md", &CARRY_OID, "public").unwrap();
+    let version_id = builder.finish().version_id.0.to_vec();
+
     if hex(&addr.0) != FROZEN_OBJ_ADDR
         || hex(&ciphertext) != FROZEN_CIPHERTEXT
         || hex(&bundle_bytes) != FROZEN_BUNDLE
         || hex(&fetch_req) != FROZEN_FETCH_REQ
+        || hex(&pubkey) != FROZEN_PUBKEY
+        || hex(&signature) != FROZEN_SIGN
+        || hex(&envelope) != FROZEN_ENVELOPE
+        || hex(&version_id) != FROZEN_VERSION_ID
     {
         panic!(
-            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_FETCH_REQ = {:?}\nFROZEN_BUNDLE = {:?}",
+            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_FETCH_REQ = {:?}\nFROZEN_PUBKEY = {:?}\nFROZEN_SIGN = {:?}\nFROZEN_ENVELOPE = {:?}\nFROZEN_VERSION_ID = {:?}\nFROZEN_BUNDLE = {:?}",
             hex(&addr.0),
             hex(&ciphertext),
             hex(&fetch_req),
+            hex(&pubkey),
+            hex(&signature),
+            hex(&envelope),
+            hex(&version_id),
             hex(&bundle_bytes)
         );
     }
@@ -167,6 +219,7 @@ fn parity_native() {
     // Now the actual parity checks, all against the FROZEN bytes.
     check_address(address(&ADDR_NONCE, &ADDR_CIPHERTEXT).to_vec());
     check_fetch_request(encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap());
+    check_write(pubkey, signature, envelope, version_id);
 
     let frozen_ct = unhex(FROZEN_CIPHERTEXT);
     let got = decrypt(&DEC_NONCE, &frozen_ct, &DEC_KEY).unwrap();
@@ -191,10 +244,21 @@ fn parity_native() {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen_test::wasm_bindgen_test]
 fn parity_wasm() {
-    use loot_wasm::{blake3_address, decrypt, encode_fetch_request, WasmBundle};
+    use loot_wasm::{blake3_address, decrypt, encode_fetch_request, ChangeBuilder, Identity, WasmBundle};
 
     check_address(blake3_address(&ADDR_NONCE, &ADDR_CIPHERTEXT).unwrap());
     check_fetch_request(encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap());
+
+    let id = Identity::from_seed(&SEED).unwrap();
+    let mut builder = ChangeBuilder::new(&id, CHANGE_MESSAGE.to_string());
+    builder.set_parent(&PARENT_ID).unwrap();
+    builder.carry("readme.md", &CARRY_OID, "public").unwrap();
+    check_write(
+        id.public_key(),
+        id.sign(SIGN_MSG),
+        id.wrap_envelope(ENV_BUNDLE),
+        builder.finish().version_id(),
+    );
 
     let frozen_ct = unhex(FROZEN_CIPHERTEXT);
     let got = decrypt(&DEC_NONCE, &frozen_ct, &DEC_KEY).unwrap();

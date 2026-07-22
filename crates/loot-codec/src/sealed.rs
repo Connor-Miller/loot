@@ -199,6 +199,32 @@ pub fn seal(bytes: &[u8], vis: &Visibility) -> Result<(Oid, SealedObject, Conten
     Ok((sealed.address(), sealed, key))
 }
 
+/// Seal `bytes` **without** compression (`compressed = false`) — for callers
+/// that cannot run zstd, namely the WASM author path (zstd's C won't build for
+/// wasm, ADR 0040). Otherwise identical to [`seal`]: fresh key + nonce,
+/// AES-256-GCM, address over the ciphertext. Public content authored this way is
+/// larger on the wire than the binary's compressed form but is equally valid and
+/// readable (`open`/`decrypt` honor the flag).
+pub fn seal_uncompressed(
+    bytes: &[u8],
+    vis: &Visibility,
+) -> Result<(Oid, SealedObject, ContentKey), RepoError> {
+    let key: ContentKey = random_bytes()?;
+    let nonce: [u8; 12] = random_bytes()?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), bytes)
+        .map_err(|e| RepoError::Backend(format!("encrypt: {e}")))?;
+    let sealed = SealedObject {
+        nonce,
+        ciphertext,
+        vis: vis.clone(),
+        grant_ids: grant_ids(vis),
+        compressed: false,
+    };
+    Ok((sealed.address(), sealed, key))
+}
+
 /// The single authorization chokepoint. Returns the plaintext only if `reader`
 /// is allowed to see it *now*.
 ///

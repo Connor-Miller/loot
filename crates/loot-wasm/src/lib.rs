@@ -23,12 +23,27 @@ use wasm_bindgen::prelude::*;
 pub mod core {
     //! Pure logic, no `wasm-bindgen` — callable natively and from the shell.
 
-    use ed25519_dalek::SigningKey;
-    use loot_codec::bundle_codec::Frame;
-    use loot_codec::sealed::{self, SealedObject};
-    use loot_codec::Visibility;
+    use ed25519_dalek::{Signer, SigningKey};
+    use loot_codec::bundle_codec::{BundleBody, Frame};
+    use loot_codec::change_id;
+    use loot_codec::sealed::{self, ContentKey, SealedObject};
+    use loot_codec::{ChangeNode, Oid, Visibility};
     use serde::Serialize;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    /// ENVELOPE_VERSION (loot-identity): the leading byte of a `/stow` envelope.
+    const ENVELOPE_VERSION: u8 = 0x01;
+
+    fn visibility_from(tag: &str) -> Result<Visibility, String> {
+        match tag {
+            "public" => Ok(Visibility::Public),
+            // A carried path may be private; slice 2 authors public content only,
+            // so `put` rejects non-public, but `carry` must preserve the tag.
+            "private" => Ok(Visibility::Restricted(Vec::new())),
+            other => Err(format!("unknown visibility {other:?}")),
+        }
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -182,7 +197,126 @@ pub mod core {
             Ok(Identity { signing_key: SigningKey::from_bytes(&seed) })
         }
         pub fn public_key(&self) -> Vec<u8> {
-            self.signing_key.verifying_key().to_bytes().to_vec()
+            self.author().to_vec()
+        }
+
+        fn author(&self) -> [u8; 32] {
+            self.signing_key.verifying_key().to_bytes()
+        }
+
+        /// Sign `message` with this identity's ed25519 key (64-byte signature) —
+        /// the primitive both the change finalize-signature and the `/stow`
+        /// envelope are built from.
+        pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+            self.signing_key.sign(message).to_bytes().to_vec()
+        }
+
+        /// Wrap `bundle` in a signed `/stow` envelope: `[0x01][pubkey 32][sig 64]
+        /// [bundle]`, the signature over `bundle` — byte-identical to
+        /// loot-identity's `wrap_envelope`.
+        pub fn wrap_envelope(&self, bundle: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(97 + bundle.len());
+            out.push(ENVELOPE_VERSION);
+            out.extend_from_slice(&self.author());
+            out.extend_from_slice(&self.sign(bundle));
+            out.extend_from_slice(bundle);
+            out
+        }
+    }
+
+    /// The outcome of [`ChangeBuilder::finish`]: the `/stow` envelope to POST,
+    /// plus the durable `change_id` and the content-derived `version_id`.
+    pub struct AuthoredChange {
+        pub envelope: Vec<u8>,
+        pub change_id: [u8; 16],
+        pub version_id: Oid,
+    }
+
+    /// Composes a signed, full-tree change entirely in Rust (#381): the caller
+    /// `carry`s each unchanged path (its existing address) and `put`s each edited
+    /// path (sealed here), then `finish` folds the change-id, signs the finalize
+    /// message, encodes the `Sync` bundle, and wraps the envelope. The TS side
+    /// owns only the overlay bookkeeping — never the composition.
+    pub struct ChangeBuilder {
+        signing_key: SigningKey,
+        author: [u8; 32],
+        message: String,
+        parents: Vec<Oid>,
+        tree: BTreeMap<PathBuf, (Oid, Visibility)>,
+        objs: BTreeMap<Oid, SealedObject>,
+        keys: BTreeMap<Oid, ContentKey>,
+    }
+
+    impl ChangeBuilder {
+        pub fn new(identity: &Identity, message: String) -> Self {
+            ChangeBuilder {
+                signing_key: identity.signing_key.clone(),
+                author: identity.author(),
+                message,
+                parents: Vec::new(),
+                tree: BTreeMap::new(),
+                objs: BTreeMap::new(),
+                keys: BTreeMap::new(),
+            }
+        }
+
+        pub fn set_parent(&mut self, parent: &[u8]) -> Result<(), String> {
+            let p: [u8; 32] = parent.try_into().map_err(|_| "parent id must be 32 bytes".to_string())?;
+            self.parents.push(Oid(p));
+            Ok(())
+        }
+
+        /// An unchanged path keeps its existing content address (the relay
+        /// already holds the object) — carried into the full-tree manifest.
+        pub fn carry(&mut self, path: &str, oid: &[u8], visibility: &str) -> Result<(), String> {
+            let o: [u8; 32] = oid.try_into().map_err(|_| "oid must be 32 bytes".to_string())?;
+            self.tree.insert(PathBuf::from(path), (Oid(o), visibility_from(visibility)?));
+            Ok(())
+        }
+
+        /// An edited/new path: seal the plaintext (uncompressed public content,
+        /// ADR 0040), record its object + public key, and place it in the tree.
+        pub fn put(&mut self, path: &str, plaintext: &[u8], visibility: &str) -> Result<(), String> {
+            let vis = visibility_from(visibility)?;
+            if !matches!(vis, Visibility::Public) {
+                return Err("slice 2 authors public content only (private needs a grant, slice 4)".into());
+            }
+            let (oid, sealed, key) = sealed::seal_uncompressed(plaintext, &vis).map_err(|e| e.to_string())?;
+            self.keys.insert(oid.clone(), key);
+            self.objs.insert(oid.clone(), sealed);
+            self.tree.insert(PathBuf::from(path), (oid, vis));
+            Ok(())
+        }
+
+        pub fn finish(self) -> AuthoredChange {
+            let author = Some(&self.author);
+            let version_id =
+                change_id::compute_change_id_raw(author, &self.message, &self.parents, &self.tree, &[]);
+            let change_id = change_id::mint_change_id();
+            let sign_msg = change_id::change_signing_message(&version_id, &Some(change_id), &[]);
+            let signature: [u8; 64] = self.signing_key.sign(&sign_msg).to_bytes();
+
+            let node = ChangeNode {
+                id: version_id.clone(),
+                parents: self.parents,
+                message: self.message,
+                tree: self.tree,
+                author: Some(self.author),
+                signature: Some(signature),
+                change_id: Some(change_id),
+                predecessors: Vec::new(),
+            };
+            let body =
+                BundleBody { changes: vec![node], objs: self.objs, keys: self.keys, attestations: Vec::new() };
+            let bundle = Frame::Sync { purges: Vec::new(), body }.encode();
+
+            let mut envelope = Vec::with_capacity(97 + bundle.len());
+            envelope.push(ENVELOPE_VERSION);
+            envelope.extend_from_slice(&self.author);
+            envelope.extend_from_slice(&self.signing_key.sign(&bundle).to_bytes());
+            envelope.extend_from_slice(&bundle);
+
+            AuthoredChange { envelope, change_id, version_id }
         }
     }
 }
@@ -252,8 +386,7 @@ impl WasmBundle {
 }
 
 /// A loot authorship identity held entirely in memory: an ed25519 keypair with
-/// no `.loot/` on disk. Signing/envelope construction arrive with the write
-/// path (slice 2).
+/// no `.loot/` on disk. Generate / from-seed / sign / envelope (#383/#424).
 #[wasm_bindgen]
 pub struct Identity(core::Identity);
 
@@ -270,5 +403,62 @@ impl Identity {
     #[wasm_bindgen(js_name = publicKey)]
     pub fn public_key(&self) -> Vec<u8> {
         self.0.public_key()
+    }
+    /// Sign `message` (64-byte ed25519 signature).
+    #[wasm_bindgen]
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.0.sign(message)
+    }
+    /// Wrap `bundle` in a signed `/stow` envelope (`[0x01][pubkey][sig][bundle]`).
+    #[wasm_bindgen(js_name = wrapEnvelope)]
+    pub fn wrap_envelope(&self, bundle: &[u8]) -> Vec<u8> {
+        self.0.wrap_envelope(bundle)
+    }
+}
+
+/// The outcome of [`ChangeBuilder::finish`] — the envelope to POST to `/stow`
+/// plus the change's ids.
+#[wasm_bindgen]
+pub struct AuthoredChange(core::AuthoredChange);
+
+#[wasm_bindgen]
+impl AuthoredChange {
+    #[wasm_bindgen(getter)]
+    pub fn envelope(&self) -> Vec<u8> {
+        self.0.envelope.clone()
+    }
+    #[wasm_bindgen(getter, js_name = changeId)]
+    pub fn change_id(&self) -> Vec<u8> {
+        self.0.change_id.to_vec()
+    }
+    #[wasm_bindgen(getter, js_name = versionId)]
+    pub fn version_id(&self) -> Vec<u8> {
+        self.0.version_id.0.to_vec()
+    }
+}
+
+/// Composes a signed, full-tree change in Rust (#381). `carry` each unchanged
+/// path, `put` each edited path, then `finish` to get the `/stow` envelope.
+#[wasm_bindgen]
+pub struct ChangeBuilder(core::ChangeBuilder);
+
+#[wasm_bindgen]
+impl ChangeBuilder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(identity: &Identity, message: String) -> ChangeBuilder {
+        ChangeBuilder(core::ChangeBuilder::new(&identity.0, message))
+    }
+    #[wasm_bindgen(js_name = setParent)]
+    pub fn set_parent(&mut self, parent: &[u8]) -> Result<(), JsError> {
+        self.0.set_parent(parent).map_err(js)
+    }
+    pub fn carry(&mut self, path: &str, oid: &[u8], visibility: &str) -> Result<(), JsError> {
+        self.0.carry(path, oid, visibility).map_err(js)
+    }
+    pub fn put(&mut self, path: &str, plaintext: &[u8], visibility: &str) -> Result<(), JsError> {
+        self.0.put(path, plaintext, visibility).map_err(js)
+    }
+    pub fn finish(self) -> AuthoredChange {
+        AuthoredChange(self.0.finish())
     }
 }

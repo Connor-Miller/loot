@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 pub mod attestation;
 pub mod bundle_codec;
+pub mod change_id;
 pub mod format;
 pub mod sealed;
 

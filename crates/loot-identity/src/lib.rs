@@ -89,6 +89,14 @@ impl Identity {
         Identity { signing_key: SigningKey::generate(&mut OsRng) }
     }
 
+    /// Build an identity from a raw 32-byte ed25519 seed — the diskless
+    /// injection path (#383/#424): a key held outside any file (secret store,
+    /// env, the in-memory SDK). The same byte-from-seed ctor `load` and
+    /// `import_encrypted` already use internally, now public.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        Identity { signing_key: SigningKey::from_bytes(seed) }
+    }
+
     /// Load from OpenSSH private key file at `path`.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
         let pem = std::fs::read_to_string(path)

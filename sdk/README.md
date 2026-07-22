@@ -3,9 +3,9 @@
 In-memory loot for JS/TS agents. Drive a loot repo entirely in RAM — no `.loot/`
 on disk — over a WASM crypto/codec core.
 
-> **Slice 1 (#423):** connect to a relay and **read public content**. The write
-> path, private/grant reads, and the physical (subprocess) backend arrive in
-> later slices.
+> **Slices 1–2 (#423, #424):** connect to a relay, **read** public content, and
+> **author + push** a signed public change with a pre-registered key. Private /
+> grant reads and the physical (subprocess) backend arrive in later slices.
 
 ## What loot hides — and what it does not
 
@@ -34,6 +34,28 @@ for await (const chunk of repo.read("readme.md")) { /* … */ }
 
 Reads are ungated, so any identity (a fresh `Identity.generate()`) can read public
 content; a pre-registered key (`Identity.fromSeed`) matters for the write path.
+
+### Authoring (capture-first)
+
+```ts
+// A pre-registered key: its public key must be in the relay's allow-list.
+const repo = await connectRelay(url, Identity.fromSeed(seed));
+
+await repo.edit("readme.md", new TextEncoder().encode("# hello\n"));
+await repo.remove("stale.md");
+await repo.describe("update the readme");
+await repo.status(); // { message, changes: [{ path, kind: "added"|"modified"|"removed" }] }
+
+const changeId = await repo.push(); // signs the full-tree change, stows it, returns the id
+```
+
+`edit`/`remove` mutate an in-RAM overlay that **is** the pending change (no
+separate stage step). `push` folds the overlay into a signed full-tree change in
+the WASM core — the change-id fold, both signatures, the bundle encode, and the
+`/stow` envelope never leave Rust — and posts it to the relay. Slice 2 authors
+**public** content, stored **uncompressed** (valid and readable; matching the
+binary's zstd compression is a later efficiency follow-up, since zstd's C won't
+build for wasm).
 
 ## How it works (in-memory mode)
 

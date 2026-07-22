@@ -13,94 +13,26 @@ pub use crate::ChangeNode;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-// `ChangeNode` (the pure DAG-node shape the wire codec reads/writes) now lives
-// in `loot-codec` so it can build to wasm; the graph algorithms below operate
-// on it unchanged. `canonical_predecessors` (referenced from its doc) is defined
-// in this module.
+// `ChangeNode` (the pure DAG-node shape the wire codec reads/writes) and the
+// change-id fold now live in `loot-codec` so they can build to wasm; the graph
+// algorithms below operate on them unchanged. Re-exported here at their original
+// paths so in-crate callers (and `pub use engine::change_signing_message`) are
+// unaffected.
+pub use loot_codec::change_id::{canonical_predecessors, change_signing_message, mint_change_id};
 
-/// Canonicalize a predecessors list for hashing/signing (ADR 0032): sorted,
-/// deduplicated. Both the id computation and the signing message consume the
-/// canonical form, so two writers naming the same set agree byte-for-byte.
-pub fn canonical_predecessors(predecessors: &[Oid]) -> Vec<Oid> {
-    let mut p = predecessors.to_vec();
-    p.sort();
-    p.dedup();
-    p
-}
-
-/// Content-and-author-derived change id: hash of the author pubkey (when
-/// present), message, parents, the path/address tree, and — when non-empty —
-/// the `predecessors` it supersedes (v7, ADR 0032). Pure; identical changes get
-/// identical ids (idempotent commit/apply).
-///
-/// Folding the author in first makes authorship intrinsic (ADR 0018): the same
-/// edit by two identities yields distinct ids. `author = None` reproduces the
-/// pre-authorship id exactly, so legacy/unauthored changes are unchanged and
-/// "newer reads older" holds. Predecessors likewise hash only when present —
-/// behind a domain tag so they can never collide with tree bytes — so every
-/// pre-v7 id (and every ordinary v7 id) is byte-identical to before. Folding
-/// them in is load-bearing: a no-op amend (same author/message/parents/tree)
-/// must still mint a *distinct* version, or "X′ supersedes X" would collapse
-/// into X superseding itself.
+/// Content-and-author-derived change id over a [`Change`] — a thin wrapper that
+/// delegates to [`loot_codec::change_id::compute_change_id_raw`], so the engine
+/// and the WASM author path fold byte-identically. See that function for the
+/// full rationale (authorship intrinsic, predecessors domain-tagged, legacy ids
+/// unchanged).
 pub fn compute_change_id(author: Option<&[u8; 32]>, change: &Change, predecessors: &[Oid]) -> Oid {
-    let mut h = blake3::Hasher::new();
-    if let Some(a) = author {
-        h.update(a);
-    }
-    h.update(change.message.as_bytes());
-    for p in &change.parents {
-        h.update(&p.0);
-    }
-    for (path, (oid, _vis)) in &change.tree {
-        h.update(path.to_string_lossy().as_bytes());
-        h.update(&[0]);
-        h.update(&oid.0);
-    }
-    if !predecessors.is_empty() {
-        h.update(b"\0predecessors\0");
-        for p in canonical_predecessors(predecessors) {
-            h.update(&p.0);
-        }
-    }
-    Oid(*h.finalize().as_bytes())
-}
-
-/// Mint a fresh random 16-byte durable change id (v6, ADR 0029), called when a
-/// change begins. Random — not derived from content — so it survives the
-/// rewrite churn that content-addressed ids cannot, and two peers creating "the
-/// same" change get distinct handles unless one travels to the other.
-pub fn mint_change_id() -> [u8; 16] {
-    let mut id = [0u8; 16];
-    // Same OS CSPRNG the sealed module draws nonces/keys from; a mint failure is
-    // an environment fault, so surface it loudly rather than degrade to a weak id.
-    getrandom::getrandom(&mut id).expect("OS RNG unavailable while minting a change id");
-    id
-}
-
-/// The message the finalize signature covers (ADR 0029/0032): the **version
-/// id**, the **change id** when one is present, then the **predecessors** when
-/// any (v7). A legacy change (`change_id = None`) signs over the 32-byte
-/// version id alone, so its pre-v6 signature still verifies unchanged; a v6
-/// change binds "(this change id → this exact version, by this author)" by
-/// widening the signed message 16 bytes; a superseding change (ADR 0032)
-/// widens it again with each 32-byte predecessor. Predecessors are *also*
-/// folded into the version-id hash, but ingest trusts the id it received —
-/// covering them in the signed message directly is what makes stripping a
-/// supersession claim on the wire detectable without recomputing ids.
-pub fn change_signing_message(
-    version_id: &Oid,
-    change_id: &Option<[u8; 16]>,
-    predecessors: &[Oid],
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(48 + 32 * predecessors.len());
-    msg.extend_from_slice(&version_id.0);
-    if let Some(cid) = change_id {
-        msg.extend_from_slice(cid);
-    }
-    for p in canonical_predecessors(predecessors) {
-        msg.extend_from_slice(&p.0);
-    }
-    msg
+    loot_codec::change_id::compute_change_id_raw(
+        author,
+        &change.message,
+        &change.parents,
+        &change.tree,
+        predecessors,
+    )
 }
 
 #[derive(Default)]

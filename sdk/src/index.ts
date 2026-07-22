@@ -7,7 +7,15 @@
  * slices.
  */
 export { connectRelay } from "./repo.js";
-export type { LootRepo, PathEntry, Visibility, ReadStream } from "./repo.js";
+export type {
+  LootRepo,
+  PathEntry,
+  Visibility,
+  ReadStream,
+  Status,
+  ChangeSummary,
+  ChangeKind,
+} from "./repo.js";
 export { LootError, TransportError, NotFoundError, AuthError } from "./errors.js";
 export type { LootErrorCode } from "./errors.js";
 
