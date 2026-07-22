@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::kv;
 use crate::policy::{is_secret_name, Attributes, Ignore, ATTRS, IGNORE};
+use crate::error::CliError;
 
 /// Lane-registry lifecycle (spawn/name/list/observe/reap) — `impl Workspace`
 /// methods in a child module so they reach the private position/store/root via
@@ -208,7 +209,7 @@ impl Workspace {
     /// after `init` generates the keypair, so the very first change has a name
     /// from birth just as `new` gives every later one. No-op once a change or a
     /// pending handle exists, and on a keyless repo (mints `None`).
-    pub fn start_fresh_change(&mut self) -> Result<(), String> {
+    pub fn start_fresh_change(&mut self) -> Result<(), CliError> {
         if self.working.is_none() && self.next_change_id.is_none() {
             self.next_change_id = self.repo.mint_next_change_id();
             self.persist()?;
@@ -238,9 +239,9 @@ impl Workspace {
     /// without deleting. Refuses from a lane (ADR 0034): a lane's view is a
     /// subgraph, so a lane-side reachability walk could prune objects another
     /// lane still references — the shared object store has one pruner.
-    pub fn gc(&mut self, dry_run: bool) -> Result<loot_core::GcReport, String> {
+    pub fn gc(&mut self, dry_run: bool) -> Result<loot_core::GcReport, CliError> {
         self.ensure_primary("`loot gc`")?;
-        self.repo.gc(&self.dot, dry_run).map_err(|e| e.to_string())
+        self.repo.gc(&self.dot, dry_run).map_err(CliError::from)
     }
 
     /// Resolve the visibility for `path` according to `.lootattributes` — the
@@ -280,7 +281,7 @@ impl Workspace {
     /// once, as the live row), authors as pubkeys (name resolution is display),
     /// divergence marks, and — when heads sit on ≥2 *distinct change lines*
     /// (ADR 0029) — the per-head fork view instead of the flat list.
-    pub fn history(&mut self) -> Result<HistoryView, String> {
+    pub fn history(&mut self) -> Result<HistoryView, CliError> {
         let working = self.live_working_row()?;
         let working_node = self.working.clone();
         // One Liveness view (#216): superseded versions (ADR 0032) leave the
@@ -495,15 +496,15 @@ impl Workspace {
         wants: &[Oid],
         per_batch: usize,
         batch_bytes: usize,
-    ) -> Result<Vec<loot_core::SyncBundle>, String> {
+    ) -> Result<Vec<loot_core::SyncBundle>, CliError> {
         self.repo
             .bundle_wanted_batched(have, wants, per_batch, batch_bytes)
-            .map_err(|e| e.to_string())
+            .map_err(CliError::from)
     }
 
     /// The full sneakernet bundle (`loot bundle`): have = [], apply idempotent.
-    pub fn bundle_full(&self) -> Result<loot_core::SyncBundle, String> {
-        self.repo.bundle(&[]).map_err(|e| e.to_string())
+    pub fn bundle_full(&self) -> Result<loot_core::SyncBundle, CliError> {
+        self.repo.bundle(&[]).map_err(CliError::from)
     }
 
     // --- named mutations (R1): the with_repo escapes, given names ---
@@ -513,14 +514,14 @@ impl Workspace {
     pub fn apply_bundle(
         &mut self,
         bytes: Vec<u8>,
-    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, CliError> {
         let now = self.now;
         // The local abandoned set rides into ingest classification (#216): an
         // incoming co-version of an abandoned version is not divergence-forming.
         let abandoned = self.store.read_abandoned();
         self.with_repo(|repo| {
             repo.apply_with(&loot_core::SyncBundle(bytes), now, &abandoned)
-                .map_err(|e| e.to_string())
+                .map_err(CliError::from)
         })
     }
 
@@ -531,7 +532,7 @@ impl Workspace {
         &mut self,
         bundle_bytes: Vec<u8>,
         grantor_pubkey: [u8; 32],
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         let now = self.now;
         let signer = self.signer.as_ref().ok_or("this repo has no keypair (run `loot keygen`)")?;
         self.repo
@@ -540,7 +541,7 @@ impl Workspace {
                     .unseal_key(wrapped)
                     .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         self.persist()
     }
 
@@ -557,7 +558,7 @@ impl Workspace {
         reveal_at: u64,
         seal: impl FnOnce(&[u8; 32]) -> Result<[u8; 80], loot_core::RepoError>,
         deliver: impl FnOnce(Vec<u8>) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         let now = self.now;
         let oid = oid.clone();
         let peer = peer.to_string();
@@ -566,8 +567,8 @@ impl Workspace {
                 // Push-time embargo deposits (ADR 0027) don't set an explicit
                 // grant expiry — only the embargo's own reveal_at applies.
                 .grant_sealed(&oid, &peer, peer_pubkey, grantor_pubkey, reveal_at, None, now, seal)
-                .map_err(|e| e.to_string())?;
-            deliver(bundle.0)
+                .map_err(CliError::from)?;
+            deliver(bundle.0).map_err(CliError::from)
         })
     }
 
@@ -577,9 +578,9 @@ impl Workspace {
     /// (#20), then persist. Reads the Manifest, not the working tree — no
     /// snapshot handle needed (ADR 0030 guards tree capture, and rotation
     /// captures nothing from disk).
-    pub fn rotate_regrants(&mut self) -> Result<loot_core::RotateReport, String> {
+    pub fn rotate_regrants(&mut self) -> Result<loot_core::RotateReport, CliError> {
         let now = self.now;
-        self.with_repo(|repo| repo.rotate_regrants(now).map_err(|e| e.to_string()))
+        self.with_repo(|repo| repo.rotate_regrants(now).map_err(CliError::from))
     }
 
     /// Snapshot the working tree into the working change (visibility-aware,
@@ -590,7 +591,7 @@ impl Workspace {
     /// Idempotent: if the working tree hash matches the last recorded hash AND
     /// the message matches, the engine call is skipped and the current working id
     /// is returned unchanged. This makes repeated `loot status` calls cheap.
-    pub fn snapshot(&mut self, message: &str) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+    pub fn snapshot(&mut self, message: &str) -> Result<(Oid, Vec<(PathBuf, Visibility)>), CliError> {
         self.snapshot_allowing(message, &[])
     }
 
@@ -600,7 +601,7 @@ impl Workspace {
         &mut self,
         message: &str,
         allow_demote: &[PathBuf],
-    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), CliError> {
         let tip = self.position.tip().cloned();
         self.snapshot_from(tip.as_ref(), message, allow_demote)
     }
@@ -610,8 +611,8 @@ impl Workspace {
     /// preview. Reads only; the caller decides whether to record.
     fn read_working_tree(
         &mut self,
-    ) -> Result<(Vec<(PathBuf, Vec<u8>, Visibility)>, Vec<(PathBuf, Visibility)>), String> {
-        read_tree_at(&mut self.repo, &self.root, self.now)
+    ) -> Result<(Vec<(PathBuf, Vec<u8>, Visibility)>, Vec<(PathBuf, Visibility)>), CliError> {
+        read_tree_at(&mut self.repo, &self.root, self.now).map_err(CliError::from)
     }
 
     /// `snapshot_allowing` with an explicit fork base instead of the ambient
@@ -622,7 +623,7 @@ impl Workspace {
         base: Option<&Oid>,
         message: &str,
         allow_demote: &[PathBuf],
-    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), String> {
+    ) -> Result<(Oid, Vec<(PathBuf, Visibility)>), CliError> {
         let (entries, reported) = self.read_working_tree()?;
 
         // Hash the current working tree content + message. Skip the engine
@@ -656,7 +657,7 @@ impl Workspace {
                 allow_demote,
                 assign,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         self.working = Some(id.clone());
         // The pending next-change handle is now recorded on the working node,
         // so it is no longer pending — clear it before persisting.
@@ -732,9 +733,9 @@ impl Workspace {
     /// signature, never the work) and **below** its redundant-capture drop (see
     /// [`drop_capture_if_redundant`](Self::drop_capture_if_redundant)) — a pass
     /// with no real work to sign must stay a no-op, not become a nag.
-    fn refuse_if_undescribed(&self, refusal: &str) -> Result<(), String> {
+    fn refuse_if_undescribed(&self, refusal: &str) -> Result<(), CliError> {
         if self.working.is_some() && self.working_is_undescribed() {
-            return Err(refusal.to_string());
+            return Err(refusal.to_string().into());
         }
         Ok(())
     }
@@ -758,7 +759,7 @@ impl Workspace {
     /// held to compare against (a bare `new` in a fresh repo) — over a
     /// non-empty tip it is a delete-everything change, and `same_tree_content`
     /// already equates it with a tip whose manifest is itself empty.
-    fn drop_capture_if_redundant(&mut self, id: &Oid, against: &[&Oid]) -> Result<bool, String> {
+    fn drop_capture_if_redundant(&mut self, id: &Oid, against: &[&Oid]) -> Result<bool, CliError> {
         let redundant = if against.is_empty() {
             self.repo.change_tree(id).is_none_or(|t| t.is_empty())
         } else {
@@ -793,7 +794,7 @@ impl Workspace {
         &mut self,
         allow_demote: &[PathBuf],
         skip_snapshot: bool,
-    ) -> Result<Option<Oid>, String> {
+    ) -> Result<Option<Oid>, CliError> {
         self.finalize_capturing_allowing(allow_demote, &[], skip_snapshot).map(|(id, _)| id)
     }
 
@@ -809,7 +810,7 @@ impl Workspace {
         allow_demote: &[PathBuf],
         allow_reveal: &[PathBuf],
         skip_snapshot: bool,
-    ) -> Result<(Option<Oid>, Vec<(PathBuf, Visibility)>), String> {
+    ) -> Result<(Option<Oid>, Vec<(PathBuf, Visibility)>), CliError> {
         // The mis-seal gate (#63/#353, ADR 0038 §1) at the signing seam: refuse
         // a first-time public-by-fallthrough seal of a secret-shaped path
         // before anything is captured or signed. Running it here (not only in
@@ -855,7 +856,7 @@ impl Workspace {
     ///
     /// A read-only preflight: it never mutates the store, so the subsequent
     /// capture sees the same disk tree it vetted.
-    pub fn seal_gate(&self, allow_reveal: &[PathBuf]) -> Result<Vec<(PathBuf, Visibility)>, String> {
+    pub fn seal_gate(&self, allow_reveal: &[PathBuf]) -> Result<Vec<(PathBuf, Visibility)>, CliError> {
         let anchor_tree = self
             .anchor()
             .and_then(|a| self.repo.change_tree(&a))
@@ -879,14 +880,14 @@ impl Workspace {
             }
         }
         if !refusals.is_empty() {
-            return Err(RepoError::MisSeal { paths: refusals }.to_string());
+            return Err(RepoError::MisSeal { paths: refusals }.into());
         }
         Ok(first_seals)
     }
 
     /// Finalize the working change and start fresh: the next snapshot appends a
     /// new change rather than rewriting this one.
-    pub fn finalize_working(&mut self) -> Result<(), String> {
+    pub fn finalize_working(&mut self) -> Result<(), CliError> {
         // Sign the finalized change id with our identity key (S3, ADR 0018). The
         // working change is ephemeral until now (rewritten on each `status`), so
         // we sign exactly once, here. A keyless repo finalizes unsigned (legacy).
@@ -900,7 +901,7 @@ impl Workspace {
                 signer.sign(&loot_core::change_signing_message(&working, &change_id, &preds));
             self.repo
                 .attach_signature(&working, sig)
-                .map_err(|e| e.to_string())?;
+                .map_err(CliError::from)?;
         }
         // The finalized change becomes this dock's tip — the anchor the next
         // change forks from. Persist it only once docks are in play; the pristine
@@ -934,7 +935,7 @@ impl Workspace {
     /// Used by `maroon`, which records a complete re-seal change the engine
     /// leaves unsigned. In a keyless repo the change is unauthored and already
     /// travels, so this is a no-op there.
-    pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), String> {
+    pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), CliError> {
         if let Some(signer) = &self.signer {
             // Same finalize signature as `finalize_working`: over
             // `version_id ‖ change_id ‖ predecessors` (ADR 0029/0032).
@@ -943,7 +944,7 @@ impl Workspace {
             let sig = signer.sign(&loot_core::change_signing_message(change_id, &cid, &preds));
             self.repo
                 .attach_signature(change_id, sig)
-                .map_err(|e| e.to_string())?;
+                .map_err(CliError::from)?;
             self.persist()?;
         }
         Ok(())
@@ -952,7 +953,7 @@ impl Workspace {
     /// Attest an existing change with this repo's identity (S4, ADR 0018): sign
     /// `change_id || attester || role` and record the attestation. Advisory — it
     /// never changes the change id. Errors if the repo has no keypair.
-    pub fn attest(&mut self, change_id: &Oid, role: &str) -> Result<(), String> {
+    pub fn attest(&mut self, change_id: &Oid, role: &str) -> Result<(), CliError> {
         let att = {
             let signer = self
                 .signer
@@ -975,14 +976,14 @@ impl Workspace {
     }
 
     /// Materialize what the current identity may see from the tip change.
-    pub fn surface(&mut self) -> Result<Oid, String> {
+    pub fn surface(&mut self) -> Result<Oid, CliError> {
         let (head, _, _) = self.surface_with_report()?;
         Ok(head)
     }
 
     /// Like `surface`, but also returns the written paths+visibility and the
     /// count of skipped (sealed) paths for richer CLI output.
-    pub fn surface_with_report(&mut self) -> Result<(Oid, Vec<(PathBuf, loot_core::Visibility)>, usize), String> {
+    pub fn surface_with_report(&mut self) -> Result<(Oid, Vec<(PathBuf, loot_core::Visibility)>, usize), CliError> {
         self.repo.flush_escrow(self.now);
         // Surface the ambient dock's own tip — its in-progress working change, or
         // its finalized tip, falling back to the graph head for the pre-dock home
@@ -996,7 +997,7 @@ impl Workspace {
             .ok_or("nothing to surface yet (no changes recorded)")?;
         let (written, skipped) = self.repo
             .surface_with_report(&head, &self.identity, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         self.persist()?;
         Ok((head, written, skipped))
     }
@@ -1005,7 +1006,7 @@ impl Workspace {
     /// with nothing recorded — for machine output (#428), where an empty repo is
     /// an empty tree, not an error. Otherwise materializes like
     /// [`surface_with_report`](Self::surface_with_report).
-    pub fn surface_tree(&mut self) -> Result<Option<Vec<(PathBuf, loot_core::Visibility)>>, String> {
+    pub fn surface_tree(&mut self) -> Result<Option<Vec<(PathBuf, loot_core::Visibility)>>, CliError> {
         let has_tip = self.working.is_some()
             || self.position.tip().is_some()
             || self.repo.heads().into_iter().next().is_some();
@@ -1033,7 +1034,7 @@ impl Workspace {
     /// version id + emptiness the engine computes from the current tree. Never
     /// persists. `None` when there is no working change to show — a keyless or
     /// pre-`new` repo with no pending handle and no in-progress change.
-    pub fn live_working_row(&mut self) -> Result<Option<WorkingRow>, String> {
+    pub fn live_working_row(&mut self) -> Result<Option<WorkingRow>, CliError> {
         if self.working.is_none() && self.next_change_id.is_none() {
             return Ok(None);
         }
@@ -1086,8 +1087,8 @@ impl Workspace {
     /// implementation underneath both.
     fn with_repo<T>(
         &mut self,
-        f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
-    ) -> Result<T, String> {
+        f: impl FnOnce(&mut DagRepo) -> Result<T, CliError>,
+    ) -> Result<T, CliError> {
         let out = f(&mut self.repo)?;
         self.persist()?;
         Ok(out)
@@ -1099,15 +1100,15 @@ impl Workspace {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_repo_mut<T>(
         &mut self,
-        f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
-    ) -> Result<T, String> {
+        f: impl FnOnce(&mut DagRepo) -> Result<T, CliError>,
+    ) -> Result<T, CliError> {
         self.with_repo(f)
     }
 
     /// Promote any due embargoed keys into the Keyring and persist (ADR 0007)
     /// — the bridge calls this before reading content, exactly as every
     /// content-reading verb does.
-    pub fn flush_due_escrow(&mut self) -> Result<(), String> {
+    pub fn flush_due_escrow(&mut self) -> Result<(), CliError> {
         let now = self.now;
         self.with_repo(|repo| {
             repo.flush_escrow(now);
@@ -1123,7 +1124,7 @@ impl Workspace {
     /// graph (append-only union store, like every abandonment); the re-run
     /// simply re-ingests. This is the recovery ritual the live incident ran
     /// by hand (`loot abandon --head` to the fixpoint), mechanized.
-    pub fn rollback_ingested(&mut self, minted: &[Oid]) -> Result<(), String> {
+    pub fn rollback_ingested(&mut self, minted: &[Oid]) -> Result<(), CliError> {
         if minted.is_empty() {
             return Ok(());
         }
@@ -1147,8 +1148,8 @@ impl Workspace {
     /// sits outside the lineage-filtered load, and composing over its
     /// silently-missing tree minted a delta-only change that read as a tree
     /// wipe (#307).
-    pub fn load_shared_lineage(&mut self, tip: &Oid) -> Result<bool, String> {
-        self.repo.ingest_shared_lineage(&self.store, tip).map_err(|e| e.to_string())
+    pub fn load_shared_lineage(&mut self, tip: &Oid) -> Result<bool, CliError> {
+        self.repo.ingest_shared_lineage(&self.store, tip).map_err(CliError::from)
     }
 
     /// Record one bridge-ingested change (ADR 0028): apply `acts` over
@@ -1163,7 +1164,7 @@ impl Workspace {
         parents: Vec<Oid>,
         message: &str,
         authored: bool,
-    ) -> Result<Oid, String> {
+    ) -> Result<Oid, CliError> {
         let message = message.to_string();
         self.with_repo(|repo| {
             let mut tree = parent_tree;
@@ -1176,16 +1177,16 @@ impl Workspace {
                         tree.insert(path, entry);
                     }
                     IngestAct::Put { bytes, vis } => {
-                        let oid = repo.put(&bytes, vis.clone()).map_err(|e| e.to_string())?;
+                        let oid = repo.put(&bytes, vis.clone()).map_err(CliError::from)?;
                         tree.insert(path, (oid, vis));
                     }
                 }
             }
             let change = loot_core::Change { id: Oid([0; 32]), parents, message, tree };
             if authored {
-                repo.record(change).map_err(|e| e.to_string())
+                repo.record(change).map_err(CliError::from)
             } else {
-                repo.record_unauthored(change).map_err(|e| e.to_string())
+                repo.record_unauthored(change).map_err(CliError::from)
             }
         })
     }
@@ -1198,7 +1199,7 @@ impl Workspace {
     /// cannot mutate, so the invariant is a type, not a hand-maintained call
     /// list (which had drifted across main.rs and ferry.rs — #182). Preserves
     /// a `describe`d name: an implicit capture must not clobber it.
-    pub fn snapshotted(&mut self, opts: &SnapshotOpts) -> Result<Snapshotted<'_>, String> {
+    pub fn snapshotted(&mut self, opts: &SnapshotOpts) -> Result<Snapshotted<'_>, CliError> {
         if !opts.skip {
             let msg = self.working_message_or_placeholder();
             self.snapshot_allowing(&msg, &opts.allow_demote)?;
@@ -1219,17 +1220,17 @@ impl Workspace {
     }
 
     /// The full operation log, oldest first (`loot op log`).
-    pub fn op_log(&self) -> Result<Vec<Operation>, String> {
-        oplog::read(&self.store).map_err(|e| e.to_string())
+    pub fn op_log(&self) -> Result<Vec<Operation>, CliError> {
+        oplog::read(&self.store).map_err(CliError::from)
     }
 
     /// `loot undo`: step the view back one operation, refusing across a barrier.
-    pub fn undo(&mut self) -> Result<StepReport, String> {
+    pub fn undo(&mut self) -> Result<StepReport, CliError> {
         self.step(oplog::undo)
     }
 
     /// `loot op restore <n>`: jump the view to operation `n` (redo included).
-    pub fn restore_op(&mut self, target: u32) -> Result<StepReport, String> {
+    pub fn restore_op(&mut self, target: u32) -> Result<StepReport, CliError> {
         self.step(move |s, dock, now| oplog::restore(s, dock, target, now))
     }
 
@@ -1241,7 +1242,7 @@ impl Workspace {
     fn step(
         &mut self,
         f: impl FnOnce(&RepoStore, &str, u64) -> Result<oplog::Stepped, oplog::StepError>,
-    ) -> Result<StepReport, String> {
+    ) -> Result<StepReport, CliError> {
         let old_paths = self.ambient_visible_paths();
         let stepped = f(&self.store, self.position.dock_name(), self.now).map_err(step_error)?;
         self.reload()?;
@@ -1270,7 +1271,7 @@ impl Workspace {
     /// files a view restore just rewrote. Re-runs the full open path so a `--at`
     /// worktree resolves its dock from its pointer, not the shared ambient one.
     /// Preserves the injected clock.
-    fn reload(&mut self) -> Result<(), String> {
+    fn reload(&mut self) -> Result<(), CliError> {
         let now = self.now;
         let root = self.root.clone();
         *self = Self::open_at(&root)?;
@@ -1287,7 +1288,7 @@ impl Workspace {
     /// `undo`/`abandon` resurface exists precisely to rewrite the tree the
     /// operator asked to walk back, so it never consults it — overwriting the
     /// current disk is the point, not an accident.
-    fn resurface(&mut self, old_paths: Vec<PathBuf>) -> Result<(), String> {
+    fn resurface(&mut self, old_paths: Vec<PathBuf>) -> Result<(), CliError> {
         self.repo.flush_escrow(self.now);
         let to = self
             .working
@@ -1298,7 +1299,7 @@ impl Workspace {
             Some(to) => self
                 .repo
                 .surface_with_report(to, &self.identity, self.now)
-                .map_err(|e| e.to_string())?
+                .map_err(CliError::from)?
                 .0,
             // Restored to an empty view: nothing to write, prune everything.
             None => Vec::new(),
@@ -1348,7 +1349,7 @@ impl Workspace {
     /// versions do not resolve (pre-#216 a superseded version still resolved
     /// here), and the still-changing working change is excluded. `loot
     /// abandon` targets a version by this id.
-    pub fn resolve_live_version(&self, prefix: &str) -> Result<Oid, String> {
+    pub fn resolve_live_version(&self, prefix: &str) -> Result<Oid, CliError> {
         let lv = self.liveness();
         let working = self.working.clone();
         let matches: Vec<Oid> = self
@@ -1359,9 +1360,9 @@ impl Workspace {
             .filter(|id| loot_core::hex::encode(&id.0).starts_with(prefix))
             .collect();
         match matches.len() {
-            0 => Err(format!("no live version matching '{prefix}'")),
+            0 => Err(format!("no live version matching '{prefix}'").into()),
             1 => Ok(matches.into_iter().next().unwrap()),
-            n => Err(format!("ambiguous version prefix '{prefix}' — matches {n} versions")),
+            n => Err(format!("ambiguous version prefix '{prefix}' — matches {n} versions").into()),
         }
     }
 
@@ -1376,13 +1377,13 @@ impl Workspace {
     /// | `<prefix>` | an id prefix; the **alphabet self-selects the namespace** (ADR 0029) — hex digits → a version id ([`resolve_live_version`]), letters `k–z` → a change id resolved *through liveness* to its live version (a divergent change errors, naming the versions) |
     ///
     /// [`resolve_live_version`]: Workspace::resolve_live_version
-    pub fn resolve_selector(&self, sel: &str) -> Result<Oid, String> {
+    pub fn resolve_selector(&self, sel: &str) -> Result<Oid, CliError> {
         // `@` — the working change (its live version's tree).
         if sel == "@" {
             return self.working.clone().ok_or_else(|| {
                 "@ names the working change, but there is none \
                  (run `loot describe -m \"<subject>\"` to start one)"
-                    .to_string()
+                    .into()
             });
         }
         // `HEAD` / `HEAD~n` — the dock tip and its single-parent ancestors.
@@ -1407,7 +1408,7 @@ impl Workspace {
         Err(format!(
             "'{sel}' is not a valid selector — use @ (working change), HEAD, HEAD~<n>, \
              a version-id prefix (hex digits), or a change-id prefix (letters k–z)"
-        ))
+        ).into())
     }
 
     /// The dock's tip for `HEAD` (see [`resolve_selector`](Self::resolve_selector)):
@@ -1416,7 +1417,7 @@ impl Workspace {
     /// (never the working node itself — that is `@`), else the sole head.
     /// Refuses honestly when the dock has diverged onto several heads with no
     /// working change or pinned tip to disambiguate — naming them to paste.
-    fn resolve_head(&self) -> Result<Oid, String> {
+    fn resolve_head(&self) -> Result<Oid, CliError> {
         if self.position.tip().is_none() && self.working.is_none() {
             let heads = self.heads();
             if heads.len() > 1 {
@@ -1425,17 +1426,17 @@ impl Workspace {
                     "HEAD is ambiguous — the dock has diverged onto {} heads; name one: {}",
                     heads.len(),
                     ids.join(", ")
-                ));
+                ).into());
             }
         }
-        self.anchor().ok_or_else(|| "HEAD: this dock has no finalized change yet".to_string())
+        self.anchor().ok_or_else(|| "HEAD: this dock has no finalized change yet".into())
     }
 
     /// Walk `n` parent edges from `start` for `HEAD~n`, one parent at a time.
     /// A merge (a node with several parents) has no single `~` ancestor, and a
     /// walk that reaches a root before `n` steps has none either — both refuse
     /// with the ids to use instead, never a guess.
-    fn walk_single_parent(&self, start: Oid, n: usize) -> Result<Oid, String> {
+    fn walk_single_parent(&self, start: Oid, n: usize) -> Result<Oid, CliError> {
         let mut cur = start;
         for step in 0..n {
             let parents = self.repo.parents_of(&cur);
@@ -1444,7 +1445,7 @@ impl Workspace {
                     return Err(format!(
                         "HEAD~{n}: reached the root after {step} step(s) — {} has no parent",
                         short_version(&cur)
-                    ))
+                    ).into())
                 }
                 1 => cur = parents.into_iter().next().unwrap(),
                 _ => {
@@ -1454,7 +1455,7 @@ impl Workspace {
                         short_version(&cur),
                         parents.len(),
                         ids.join(", ")
-                    ))
+                    ).into())
                 }
             }
         }
@@ -1467,7 +1468,7 @@ impl Workspace {
     /// change (several live versions) refuses, naming them. Parallels the
     /// prefix half of [`edit`](Self::edit), which additionally gates on
     /// finalized/childless — a selector only needs the live version.
-    fn resolve_change_to_version(&self, prefix: &str) -> Result<Oid, String> {
+    fn resolve_change_to_version(&self, prefix: &str) -> Result<Oid, CliError> {
         let mut cids: std::collections::BTreeSet<[u8; 16]> = std::collections::BTreeSet::new();
         for v in self.version_ids() {
             if let Some(cid) = self.repo.change_change_id(&v) {
@@ -1477,21 +1478,21 @@ impl Workspace {
             }
         }
         let cid = match cids.len() {
-            0 => return Err(format!("no change matching '{prefix}'")),
+            0 => return Err(format!("no change matching '{prefix}'").into()),
             1 => cids.into_iter().next().unwrap(),
-            n => return Err(format!("ambiguous change prefix '{prefix}' — matches {n} changes")),
+            n => return Err(format!("ambiguous change prefix '{prefix}' — matches {n} changes").into()),
         };
         let handle = loot_core::hex::short_letters(&cid, 4);
         let live = self.liveness().live_of(&cid);
         match live.len() {
-            0 => Err(format!("change {handle} has no live version (abandoned or superseded)")),
+            0 => Err(format!("change {handle} has no live version (abandoned or superseded)").into()),
             1 => Ok(live.into_iter().next().unwrap()),
             _ => {
                 let ids: Vec<String> = live.iter().map(short_version).collect();
                 Err(format!(
                     "change {handle} is divergent (!) — name a version: {}",
                     ids.join(", ")
-                ))
+                ).into())
             }
         }
     }
@@ -1522,7 +1523,7 @@ impl Workspace {
     /// modified; an identical pair is dropped. A path the ambient identity can't
     /// read on its side is marked **sealed** so the renderer degrades it to the
     /// content address (never the plaintext name), per the #306 contract.
-    pub fn diff(&self, from: &Oid, to: &Oid) -> Result<Vec<PathDelta>, String> {
+    pub fn diff(&self, from: &Oid, to: &Oid) -> Result<Vec<PathDelta>, CliError> {
         let tree_from = self.repo.change_tree(from).unwrap_or_default();
         let tree_to = self.repo.change_tree(to).unwrap_or_default();
         let visible_from: std::collections::BTreeSet<PathBuf> =
@@ -1586,7 +1587,7 @@ impl Workspace {
     /// identity is carried forward untouched by snapshot (ADR 0006), so its
     /// absence from disk is not a deletion and it does not row; a deleted row
     /// keeps the base side's stored address and visibility, as `diff` does.
-    pub fn working_delta(&mut self) -> Result<Vec<PathDelta>, String> {
+    pub fn working_delta(&mut self) -> Result<Vec<PathDelta>, CliError> {
         let base_tree = match self.anchor() {
             Some(a) => self.repo.change_tree(&a).unwrap_or_default(),
             None => Default::default(),
@@ -1656,7 +1657,7 @@ impl Workspace {
     /// version stops being a live head and joins the abandoned set — and the whole
     /// step is one **undoable** operation (ADR 0031): the oplog captures both the
     /// heads and the abandoned set, so `loot undo` brings the version back.
-    pub fn abandon(&mut self, version: &Oid) -> Result<(), String> {
+    pub fn abandon(&mut self, version: &Oid) -> Result<(), CliError> {
         let mut abandoned = self.store.read_abandoned();
         if abandoned.contains(version) {
             return Err("that version is already abandoned".into());
@@ -1714,7 +1715,7 @@ impl Workspace {
     /// abandoned set keeps it out of the live view, and `loot undo` restores it.
     /// Refuses a version that is not a live head, and refuses dropping the dock's
     /// *last* live head so the operation can never leave the dock with no line.
-    pub fn abandon_fork(&mut self, version: &Oid) -> Result<(), String> {
+    pub fn abandon_fork(&mut self, version: &Oid) -> Result<(), CliError> {
         let mut abandoned = self.store.read_abandoned();
         if abandoned.contains(version) {
             return Err("that version is already abandoned".into());
@@ -1783,7 +1784,7 @@ impl Workspace {
     ///
     /// [`abandon_head`]: DagRepo::abandon_head
     /// [`drop_working`]: DagRepo::drop_working
-    pub fn adopt(&mut self, prefix: &str, discard_wip: bool) -> Result<AdoptReport, String> {
+    pub fn adopt(&mut self, prefix: &str, discard_wip: bool) -> Result<AdoptReport, CliError> {
         // The unsigned working change is never a target: adopt settles a dock on
         // *landed* work (§4). Name that precisely before the generic resolver's
         // "no live version" — the operator pointed at their own WIP.
@@ -1802,7 +1803,7 @@ impl Workspace {
         // live version" for a landed change). Pull the harbor lineage in from
         // the shared graph first so every fence-legal target resolves.
         if let Some(m) = self.mirror_main_change() {
-            self.repo.ingest_shared_lineage(&self.store, &m).map_err(|e| e.to_string())?;
+            self.repo.ingest_shared_lineage(&self.store, &m).map_err(CliError::from)?;
         }
         // Resolve among live, finalized versions (the working change is excluded).
         let target = self.resolve_live_version(prefix)?;
@@ -1857,7 +1858,7 @@ impl Workspace {
             return Err(format!(
                 "{} is not on any live line of this dock — nothing to settle onto",
                 short_version(&target)
-            ));
+            ).into());
         }
 
         let old_paths = self.ambient_visible_paths();
@@ -1918,7 +1919,7 @@ impl Workspace {
     /// A live working change is captured and finalized into the merge, not
     /// discarded — so there is no `--discard-wip`. Allowed from a lane (its whole
     /// point is catching a lane up), so it does not `ensure_primary`.
-    pub fn adopt_harbor(&mut self, seal_wip: bool) -> Result<AdoptCatchupReport, String> {
+    pub fn adopt_harbor(&mut self, seal_wip: bool) -> Result<AdoptCatchupReport, CliError> {
         let their = self.mirror_main_change().ok_or(
             "no mirror main to catch up to — bind and `loot ferry` a mirror first, \
              or name a landed change: `loot adopt <version-id>`",
@@ -1929,12 +1930,12 @@ impl Workspace {
         // prove the fast-forward and every catch-up degenerates to a merge.
         // `false` means the shared graph lost the node (pruned before the #265
         // gc guard); the recovery for that is ferry's baseline adoption (#263).
-        if !self.repo.ingest_shared_lineage(&self.store, &their).map_err(|e| e.to_string())? {
+        if !self.repo.ingest_shared_lineage(&self.store, &their).map_err(CliError::from)? {
             return Err(format!(
                 "landed main {} is not in the shared graph (pruned before the #265 gc \
                  guard?) — run `loot ferry` to re-adopt its content as a baseline (#263)",
                 short_version(&their)
-            ));
+            ).into());
         }
         // Capture-first (#219, ADR 0030): fold any uncaptured disk edits into a
         // working change *before* we choose fast-forward vs merge. Otherwise a
@@ -2028,7 +2029,7 @@ impl Workspace {
                     subject: self.working_subject(),
                     verb: "loot adopt".into(),
                 }
-                .to_string());
+                .into());
             }
             Some(self.working_subject())
         } else {
@@ -2063,7 +2064,7 @@ impl Workspace {
     /// the mirror's `refs/heads/main` tip sha, mapped through the mark map to its
     /// loot change. No network and no git process — a pure graph reachability
     /// check over data already on disk.
-    fn assert_on_mirror_main_lineage(&self, target: &Oid) -> Result<(), String> {
+    fn assert_on_mirror_main_lineage(&self, target: &Oid) -> Result<(), CliError> {
         let main_change = self.mirror_main_change().ok_or(
             "no mirror main to settle onto — bind and `loot ferry` a mirror first; \
              `adopt <version>` settles a dock onto landed git-main work",
@@ -2075,7 +2076,7 @@ impl Workspace {
                 "{} is not on the mirror's main lineage — adopt settles only on landed work \
                  reachable from git-main (the ADR 0034 harbor-lineage fence)",
                 short_version(target)
-            ))
+            ).into())
         }
     }
 
@@ -2102,7 +2103,7 @@ impl Workspace {
     /// implicit-captures), a divergent handle (abandon a version first), and a
     /// change with descendants (v1 amends only a tip/childless change). One
     /// undoable operation (ADR 0031).
-    pub fn edit(&mut self, prefix: &str) -> Result<EditReport, String> {
+    pub fn edit(&mut self, prefix: &str) -> Result<EditReport, CliError> {
         // Refuse rather than capture (ADR 0032/0030): capture-first would
         // strand the WIP as an unsigned stray head, and carrying it would mix
         // in-flight work into the reopened change's content.
@@ -2134,9 +2135,9 @@ impl Workspace {
             }
         }
         let cid = match cids.len() {
-            0 => return Err(format!("no change id matching '{prefix}'")),
+            0 => return Err(format!("no change id matching '{prefix}'").into()),
             1 => cids.into_iter().next().unwrap(),
-            n => return Err(format!("ambiguous change id '{prefix}' ({n} matches) — give more letters")),
+            n => return Err(format!("ambiguous change id '{prefix}' ({n} matches) — give more letters").into()),
         };
         let handle = loot_core::hex::short_letters(&cid, 4);
 
@@ -2144,21 +2145,21 @@ impl Workspace {
         // truthful remedy (ADR 0032) rather than a guess or a disambiguator.
         let live = self.liveness().live_of(&cid);
         let target = match live.len() {
-            0 => return Err(format!("change {handle} has no live version (abandoned or superseded)")),
+            0 => return Err(format!("change {handle} has no live version (abandoned or superseded)").into()),
             1 => live.into_iter().next().unwrap(),
             _ => {
                 return Err(format!(
                     "change {handle} is divergent (!) — `loot abandon` a version first, then edit"
-                ))
+                ).into())
             }
         };
         if self.repo.change_signature(&target).is_none() {
-            return Err(format!("change {handle} is not finalized — edit reopens signed changes"));
+            return Err(format!("change {handle} is not finalized — edit reopens signed changes").into());
         }
         if self.repo.has_children(&target) {
             return Err(format!(
                 "change {handle} has descendants — v1 edits only a tip (childless) change"
-            ));
+            ).into());
         }
 
         // Reopen: the engine mints the superseding sibling working node; the
@@ -2171,7 +2172,7 @@ impl Workspace {
         // that never pinned a tip stays byte-for-byte unchanged on disk (the
         // compat guarantee) — a lane, or a primary that `adopt`/`lane merge`
         // seeded, re-anchors and so amends as a sibling.
-        let reopened = self.repo.reopen_change(&target).map_err(|e| e.to_string())?;
+        let reopened = self.repo.reopen_change(&target).map_err(CliError::from)?;
         let parent = self.repo.parents_of(&target).into_iter().next();
         self.working = Some(reopened.clone());
         self.position.advance(&self.store, parent);
@@ -2221,7 +2222,7 @@ impl Workspace {
             signer: None,
             now: real_now(),
         };
-        ws.persist()?;
+        ws.persist().map_err(|e| e.to_string())?;
         Ok(ws)
     }
 
@@ -2281,12 +2282,12 @@ impl Workspace {
     /// Refuse a single-owner store mutation from a lane (ADR 0034): a lane owns
     /// only its own position; `gc`, remotes, the dock family, and lane
     /// spawn/reap belong to the primary.
-    pub fn ensure_primary(&self, verb: &str) -> Result<(), String> {
+    pub fn ensure_primary(&self, verb: &str) -> Result<(), CliError> {
         match self.position.lane_id() {
             Some(id) => Err(format!(
                 "{verb} must run from the primary directory — this is lane '{id}', \
                  which owns only its own position (ADR 0034)"
-            )),
+            ).into()),
             None => Ok(()),
         }
     }
@@ -2310,7 +2311,7 @@ impl Workspace {
     /// path — no side dropped. Returns `(source lane id, per-path outcomes)`.
     ///
     /// [`fold_line_in`]: Workspace::fold_line_in
-    pub fn merge_lane(&mut self, key: &str) -> Result<(String, BTreeMap<PathBuf, MergeOutcome>), String> {
+    pub fn merge_lane(&mut self, key: &str) -> Result<(String, BTreeMap<PathBuf, MergeOutcome>), CliError> {
         self.ensure_primary("`loot lane merge`")?;
         // Resolve the source from the registry (by id or promoted name) and read
         // its finalized tip from the lane's own `.loot/` — the same peek
@@ -2324,7 +2325,7 @@ impl Workspace {
                 entry.id,
                 entry.path.display(),
                 entry.id
-            ));
+            ).into());
         }
         let lane_store = RepoStore::for_lane(&self.dot, &lane_dot);
         let their = lane_store.read_tip(None).ok_or_else(|| {
@@ -2339,13 +2340,13 @@ impl Workspace {
         // means the shared graph never recorded it — the lane finalized nothing
         // that crossed the seal (a spawn-anchor-only lane), so there is nothing
         // to merge.
-        if !self.repo.ingest_shared_lineage(&self.store, &their).map_err(|e| e.to_string())? {
+        if !self.repo.ingest_shared_lineage(&self.store, &their).map_err(CliError::from)? {
             return Err(format!(
                 "lane '{}'s tip {} is not in the shared graph — it has no finalized \
                  change that crossed the seal to merge",
                 entry.id,
                 short_version(&their)
-            ));
+            ).into());
         }
 
         let msg = format!("merge lane '{}' into '{}'", entry.id, self.position.dock_name());
@@ -2387,7 +2388,7 @@ impl Workspace {
         &mut self,
         their: &Oid,
         msg: &str,
-    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, CliError> {
         // Short-circuit BEFORE touching our work: their tip is already our
         // finalized tip. `anchor()` reads it without disturbing any in-progress
         // change, so an up-to-date no-op never seals pending work into a spurious tip.
@@ -2439,22 +2440,22 @@ impl Workspace {
         let (merge_id, outcomes) = self
             .repo
             .merge_tips(&ours, their, msg, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         self.working = Some(merge_id.clone());
         self.finalize_working()?;
         self.repo
             .materialize(Some(&ours), &merge_id, &self.identity, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         Ok(outcomes)
     }
 
     /// Fast-forward this dock's tip from `from` onto `target` (which contains
     /// `from`), materializing target's tree. Used when a merge would be redundant:
     /// a supersession, or a line strictly behind the one it folds in.
-    fn fast_forward_to(&mut self, from: &Oid, target: &Oid) -> Result<(), String> {
+    fn fast_forward_to(&mut self, from: &Oid, target: &Oid) -> Result<(), CliError> {
         self.repo
             .materialize(Some(from), target, &self.identity, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         self.position.seed(&self.store, Some(target.clone()));
         self.persist()
     }
@@ -2468,7 +2469,7 @@ impl Workspace {
     /// defers convergence for this pass (the heads stay flat until the operator
     /// finalizes). Returns the working change id when the tree was dirty (or one
     /// was already in progress), else `None`.
-    pub fn capture_uncaptured_edits(&mut self) -> Result<Option<Oid>, String> {
+    pub fn capture_uncaptured_edits(&mut self) -> Result<Option<Oid>, CliError> {
         // An in-progress working change already holds the edits and converge
         // defers on it; there is nothing new to capture.
         if let Some(w) = &self.working {
@@ -2512,7 +2513,7 @@ impl Workspace {
     /// [`resurface`](Self::resurface) is the one deliberate exemption —
     /// rewriting the tree is exactly what the operator asked for — and never
     /// consults it.
-    fn tree_is_dirty_over(&mut self, reflected: Option<&Oid>) -> Result<bool, String> {
+    fn tree_is_dirty_over(&mut self, reflected: Option<&Oid>) -> Result<bool, CliError> {
         let (entries, _) = self.read_working_tree()?;
         Ok(!self.repo.working_preview(reflected, &entries, "", self.now).1)
     }
@@ -2538,7 +2539,7 @@ impl Workspace {
     pub fn pull_via(
         &mut self,
         transport: &impl SyncTransport,
-    ) -> Result<PullReport, String> {
+    ) -> Result<PullReport, CliError> {
         // Capture-first (#219, ADR 0030 amendment): fold any uncaptured disk
         // edits into the working change before we touch the tree. A dirty tree
         // then holds a working change, so the ingest below still runs (graph
@@ -2617,7 +2618,7 @@ impl Workspace {
     /// (The former "`pull`/`apply` have none" claim was an accident of ADR 0030
     /// not yet reaching them, not a guarantee — ADR 0030 amendment.) Returns the
     /// per-path merge outcomes.
-    pub fn converge_heads(&mut self, base: Option<&Oid>) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+    pub fn converge_heads(&mut self, base: Option<&Oid>) -> Result<BTreeMap<PathBuf, MergeOutcome>, CliError> {
         // You cannot fold heads under an in-progress working change without
         // orphaning it, so converge defers whenever capture-first captured a
         // dirty tree — ingest already ran; the operator finalizes then re-pulls.
@@ -2663,7 +2664,7 @@ impl Workspace {
                     self.position.advance(&self.store, Some(survivor.clone()));
                     self.repo
                         .materialize(from.as_ref(), &survivor, &self.identity, self.now)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(CliError::from)?;
                     self.persist()?;
                 }
             }
@@ -2701,7 +2702,7 @@ impl Workspace {
             let (merge_id, outcomes) = self
                 .repo
                 .merge_tips(&acc, &h, &msg, self.now)
-                .map_err(|e| e.to_string())?;
+                .map_err(CliError::from)?;
             self.working = Some(merge_id.clone());
             self.finalize_working()?;
             acc = merge_id;
@@ -2714,7 +2715,7 @@ impl Workspace {
         // sealed paths the identity can't open are skipped, staying relayed).
         self.repo
             .materialize(Some(&from), &acc, &self.identity, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         self.persist()?;
         Ok(all)
     }
@@ -2733,12 +2734,12 @@ impl Workspace {
         path: &Path,
         resolution: &[u8],
         vis: Visibility,
-    ) -> Result<(Oid, String), String> {
+    ) -> Result<(Oid, String), CliError> {
         let base = self.position.tip().cloned();
         let (change_id, content) = self
             .repo
             .resolve(base.as_ref(), path, resolution, vis, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         // A resolution is a deliberate, finished change — sign it now (S3, ADR
         // 0018) in both modes. The pre-dock hint to "finalize with `loot new`"
         // never worked: resolve doesn't set the working pointer, so `new` had
@@ -2753,7 +2754,7 @@ impl Workspace {
             let sig = signer.sign(&loot_core::change_signing_message(&change_id, &cid, &preds));
             self.repo
                 .attach_signature(&change_id, sig)
-                .map_err(|e| e.to_string())?;
+                .map_err(CliError::from)?;
         }
         // On any tip-tracking position, the resolution also advances the tip so
         // it isn't orphaned and the next snapshot builds on it —
@@ -2773,9 +2774,9 @@ impl Workspace {
             // path and leave every other file on disk untouched.
             let dest = self.root.join(path);
             if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                std::fs::create_dir_all(parent).map_err(|e| CliError::from(e.to_string()))?;
             }
-            std::fs::write(&dest, resolution).map_err(|e| e.to_string())?;
+            std::fs::write(&dest, resolution).map_err(|e| CliError::from(e.to_string()))?;
             self.position.advance(&self.store, Some(change_id.clone()));
         }
         self.persist()?;
@@ -2797,11 +2798,11 @@ impl Workspace {
     /// referencing change that was projected is reported so the CLI can print
     /// the mirror-rewrite guidance (§4). Signs each tombstone with this repo's
     /// key when it has one; a keyless repo records unauthored tombstones.
-    pub fn burn_path(&mut self, path: &Path, only_oid: Option<Oid>) -> Result<BurnReport, String> {
+    pub fn burn_path(&mut self, path: &Path, only_oid: Option<Oid>) -> Result<BurnReport, CliError> {
         // Tier from the disclosure barrier (ADR 0038 §3): a `push` op ever
         // recorded means the bytes may have left this machine.
         let pushed = oplog::read(&self.store)
-            .map_err(|e| e.to_string())?
+            .map_err(CliError::from)?
             .iter()
             .any(|op| op.barrier && op.command == "push");
         let tier = if pushed {
@@ -2816,7 +2817,7 @@ impl Workspace {
         let scanned = self
             .repo
             .objects_at_path(&self.store, path)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         let targets: std::collections::BTreeMap<Oid, Vec<Oid>> = match only_oid {
             Some(oid) => {
                 let refs = scanned.get(&oid).cloned().unwrap_or_default();
@@ -2828,7 +2829,7 @@ impl Workspace {
             return Err(format!(
                 "no historical object recorded at {} — nothing to burn (pass `--oid <hex>` to burn a specific address)",
                 path.display()
-            ));
+            ).into());
         }
 
         // Git-mirror detection (ADR 0038 §4): the mark map keys git commits by
@@ -3009,7 +3010,7 @@ impl Workspace {
         pinned: Option<&Oid>,
         label: &str,
         seal_wip: bool,
-    ) -> Result<(BTreeMap<PathBuf, MergeOutcome>, Option<String>), String> {
+    ) -> Result<(BTreeMap<PathBuf, MergeOutcome>, Option<String>), CliError> {
         // The incoming change may have landed from a lane this dock never
         // adopted — outside the lineage-filtered load (#265). Pull its line in
         // from the shared graph first, so the arms below see the truth: the
@@ -3022,7 +3023,7 @@ impl Workspace {
         let Some(target) = target else {
             return Ok((BTreeMap::new(), None));
         };
-        self.repo.ingest_shared_lineage(&self.store, target).map_err(|e| e.to_string())?;
+        self.repo.ingest_shared_lineage(&self.store, target).map_err(CliError::from)?;
 
         // No-op fast paths — our line already covers `target`, so nothing will
         // materialize: we are exactly on it, ahead of it, or hold a version that
@@ -3079,7 +3080,7 @@ impl Workspace {
         };
         match reconcile::decide(&view) {
             reconcile::Plan::NoOp => Ok((BTreeMap::new(), None)),
-            reconcile::Plan::Refuse(refusal) => Err(refusal.message().to_string()),
+            reconcile::Plan::Refuse(refusal) => Err(refusal.message().to_string().into()),
             reconcile::Plan::Adopt => {
                 self.reconcile_adopt(target)?;
                 Ok((BTreeMap::new(), None))
@@ -3103,7 +3104,7 @@ impl Workspace {
                             subject: self.working_subject(),
                             verb: "loot ferry".into(),
                         }
-                        .to_string());
+                        .into());
                     }
                     // Read the subject before `finalize_working` clears the
                     // working change — this seam decided to seal, so it reports
@@ -3144,14 +3145,14 @@ impl Workspace {
         ours: &Oid,
         target: &Oid,
         label: &str,
-    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, CliError> {
         if self.signer.is_none() {
             // A carried version must finalize to travel; with no signer the
             // merge shape (whose caller-visible contract predates signing)
             // is the only honest reconcile.
             return self.reconcile_merge(ours, target, label);
         }
-        match self.repo.carry_line(ours, target, self.now).map_err(|e| e.to_string())? {
+        match self.repo.carry_line(ours, target, self.now).map_err(CliError::from)? {
             loot_core::CarryOutcome::Foreign => self.reconcile_merge(ours, target, label),
             loot_core::CarryOutcome::Covered => {
                 self.reconcile_adopt(target)?;
@@ -3174,7 +3175,7 @@ impl Workspace {
                         let preds = self.repo.change_predecessors(id);
                         let sig =
                             signer.sign(&loot_core::change_signing_message(id, &cid, &preds));
-                        self.repo.attach_signature(id, sig).map_err(|e| e.to_string())?;
+                        self.repo.attach_signature(id, sig).map_err(CliError::from)?;
                     }
                 }
                 let tip = minted.last().expect("Carried always mints").clone();
@@ -3182,7 +3183,7 @@ impl Workspace {
                 // `ours`'s tree — materialize the carried tip's tree over it.
                 self.repo
                     .materialize(Some(ours), &tip, &self.identity, self.now)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(CliError::from)?;
                 self.position.advance(&self.store, Some(tip));
                 self.store.clear_tree_hash(self.dock_opt());
                 self.persist()?;
@@ -3218,7 +3219,7 @@ impl Workspace {
         &mut self,
         base: Option<&Oid>,
         target: Option<&Oid>,
-    ) -> Result<Option<Oid>, String> {
+    ) -> Result<Option<Oid>, CliError> {
         let msg = self.working_message_or_placeholder();
         let (id, _) = self.snapshot_from(base, &msg, &[])?;
         let against: Vec<&Oid> = [base, target].into_iter().flatten().collect();
@@ -3232,11 +3233,11 @@ impl Workspace {
     /// Fast-forward the ambient dock to `new_tip` (an ingested change that
     /// descends from the current anchor) and materialize its tree. The bridge's
     /// no-fork path: git advanced, loot didn't.
-    fn reconcile_adopt(&mut self, new_tip: &Oid) -> Result<(), String> {
+    fn reconcile_adopt(&mut self, new_tip: &Oid) -> Result<(), CliError> {
         let from = self.anchor();
         self.repo
             .materialize(from.as_ref(), new_tip, &self.identity, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         // A pinned tip must advance too — a home dock seeded by a spawn,
         // `adopt`, or `dock merge` carries one even with no named docks, and
         // leaving it behind keeps `anchor()` at the seed forever: the ferry
@@ -3265,19 +3266,19 @@ impl Workspace {
         ours: &Oid,
         their: &Oid,
         message: &str,
-    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, String> {
+    ) -> Result<BTreeMap<PathBuf, MergeOutcome>, CliError> {
         if ours == their {
             return Ok(BTreeMap::new());
         }
         let (merge_id, outcomes) = self
             .repo
             .merge_tips(ours, their, message, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         self.working = Some(merge_id.clone());
         self.finalize_working()?;
         self.repo
             .materialize(Some(ours), &merge_id, &self.identity, self.now)
-            .map_err(|e| e.to_string())?;
+            .map_err(CliError::from)?;
         Ok(outcomes)
     }
 
@@ -3285,16 +3286,16 @@ impl Workspace {
     // docks (#253/ADR 0034): the primary is the only dock, and every other
     // position is a lane surfaced by `loot lanes` ([`Workspace::lane_statuses`]).
 
-    fn persist(&self) -> Result<(), String> {
+    fn persist(&self) -> Result<(), CliError> {
         // Two-root save (ADR 0034): shared artifacts to the store root, this
         // position's heads/working-change to the lane root (equal on the primary).
-        self.repo.save_to(&self.store).map_err(|e| e.to_string())?;
+        self.repo.save_to(&self.store).map_err(CliError::from)?;
         self.store
             .write_working(self.dock_opt(), self.working.as_ref())
             .map_err(|e| format!("write working: {e}"))?;
         self.store
             .write_next_change(self.dock_opt(), self.next_change_id.as_ref())
-            .map_err(|e| format!("write next-change: {e}"))
+            .map_err(|e| CliError::from(format!("write next-change: {e}")))
     }
 }
 
@@ -3693,14 +3694,14 @@ impl Snapshotted<'_> {
     /// verbs' `with_repo`, reachable only through the capture.
     pub fn mutate<T>(
         &mut self,
-        f: impl FnOnce(&mut DagRepo) -> Result<T, String>,
-    ) -> Result<T, String> {
+        f: impl FnOnce(&mut DagRepo) -> Result<T, CliError>,
+    ) -> Result<T, CliError> {
         self.ws.with_repo(f)
     }
 
     /// Finalize (sign) a change this verb recorded — maroon's re-seal must be
     /// signed or it never travels (ADR 0018).
-    pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), String> {
+    pub fn sign_change(&mut self, change_id: &Oid) -> Result<(), CliError> {
         self.ws.sign_change(change_id)
     }
 
@@ -4343,13 +4344,13 @@ mod tests {
                     Change { id: Oid([0; 32]), parents: vec![], message: "solo".into(), tree: Default::default() },
                     Some([1u8; 16]),
                 )
-                .map_err(|e| e.to_string())
+                .map_err(CliError::from)
             })
             .unwrap();
         // A change with a single version is not divergent — abandon must refuse
         // rather than hide the change's only version.
         let err = ws.abandon(&only).unwrap_err();
-        assert!(err.contains("not divergent"), "message explains the refusal: {err}");
+        assert!(err.message.contains("not divergent"), "message explains the refusal: {err}");
         assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4422,10 +4423,10 @@ mod tests {
         ws.record_op("seed", "seeded", false);
         // The root is not a head (`only` descends from it) → refuse.
         let err = ws.abandon_fork(&root).unwrap_err();
-        assert!(err.contains("not a live head"), "{err}");
+        assert!(err.message.contains("not a live head"), "{err}");
         // The sole live head is refused — never empty the dock.
         let err = ws.abandon_fork(&only).unwrap_err();
-        assert!(err.contains("only live head"), "{err}");
+        assert!(err.message.contains("only live head"), "{err}");
         assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4507,7 +4508,7 @@ mod tests {
 
         let a_hex = loot_core::hex::encode(&a.0);
         let err = ws.adopt(&a_hex, false).unwrap_err();
-        assert!(err.contains("discard-wip"), "message names the remedy: {err}");
+        assert!(err.message.contains("discard-wip"), "message names the remedy: {err}");
         assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
         assert!(dir.join("dirty.txt").exists(), "the edit was left intact");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4543,7 +4544,7 @@ mod tests {
 
         let b_hex = loot_core::hex::encode(&b.0);
         let err = ws.adopt(&b_hex, false).unwrap_err();
-        assert!(err.contains("lineage"), "refuses an off-lineage target: {err}");
+        assert!(err.message.contains("lineage"), "refuses an off-lineage target: {err}");
         assert!(ws.store().read_abandoned().is_empty(), "nothing was abandoned");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4559,7 +4560,7 @@ mod tests {
 
         let w_hex = loot_core::hex::encode(&w.0);
         let err = ws.adopt(&w_hex, false).unwrap_err();
-        assert!(err.contains("working change"), "refuses adopting onto WIP: {err}");
+        assert!(err.message.contains("working change"), "refuses adopting onto WIP: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4674,7 +4675,7 @@ mod tests {
         let mut ws = authored_ws(&dir);
         seed_fork(&mut ws);
         let err = ws.adopt_harbor(true).unwrap_err();
-        assert!(err.contains("no mirror main"), "names the missing mirror: {err}");
+        assert!(err.message.contains("no mirror main"), "names the missing mirror: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4711,7 +4712,7 @@ mod tests {
                     Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "landed c2".into(), tree: Default::default() },
                     Some([5u8; 16]),
                 )
-                .map_err(|e| e.to_string())
+                .map_err(CliError::from)
             })
             .unwrap();
         ws.record_op("seed", "harbor advanced to c2", false);
@@ -4749,7 +4750,7 @@ mod tests {
                     Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "landed f".into(), tree: Default::default() },
                     Some([6u8; 16]),
                 )
-                .map_err(|e| e.to_string())
+                .map_err(CliError::from)
             })
             .unwrap();
         ws.record_op("seed", "harbor advanced to f", false);
@@ -4789,7 +4790,7 @@ mod tests {
                     Change { id: Oid([0; 32]), parents: vec![c1.clone()], message: "landed f".into(), tree: Default::default() },
                     Some([7u8; 16]),
                 )
-                .map_err(|e| e.to_string())
+                .map_err(CliError::from)
             })
             .unwrap();
         ws.record_op("seed", "harbor advanced to f", false);
@@ -4800,7 +4801,7 @@ mod tests {
         // (the #250 guarantee this test exists for) and refuses to sign it
         // nameless; the materialize never runs, so nothing is clobbered.
         let err = ws.adopt_harbor(true).unwrap_err();
-        assert!(err.contains("describe"), "nameless dirt holds the merge: {err}");
+        assert!(err.message.contains("describe"), "nameless dirt holds the merge: {err}");
         assert!(ws.working_id().is_some(), "pass 1 captured the edit — #250's whole point");
         assert_eq!(
             std::fs::read(dir.join("local.txt")).unwrap(),
@@ -4886,7 +4887,7 @@ mod tests {
         let mut ws = Workspace::open_at(&dir).unwrap();
         let before = ws.finalized_anchor();
         let err = ws.adopt_harbor(true).unwrap_err();
-        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        assert!(err.message.contains("describe"), "the refusal names the verb to run: {err}");
 
         // Safe, not lossy: the capture happened, only the signature was withheld.
         // The working change is still a placeholder-named head — that is fine and
@@ -4935,7 +4936,7 @@ mod tests {
         let err = ws
             .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", true)
             .unwrap_err();
-        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        assert!(err.message.contains("describe"), "the refusal names the verb to run: {err}");
         assert!(ws.working_id().is_some(), "the local work is captured, not dropped");
         let _ = std::fs::remove_dir_all(&area);
     }
@@ -4991,9 +4992,9 @@ mod tests {
         let err = ws
             .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", false)
             .unwrap_err();
-        assert!(err.contains("--seal-wip"), "the refusal names the override: {err}");
+        assert!(err.message.contains("--seal-wip"), "the refusal names the override: {err}");
         assert!(
-            err.contains("feat: my described line"),
+            err.message.contains("feat: my described line"),
             "and the described line it protects: {err}"
         );
         // Safe, not lossy: the capture is on disk, only the signature withheld.
@@ -5020,7 +5021,7 @@ mod tests {
 
         let before = ws.finalized_anchor();
         let err = ws.adopt_harbor(false).unwrap_err();
-        assert!(err.contains("--seal-wip"), "the refusal names the override: {err}");
+        assert!(err.message.contains("--seal-wip"), "the refusal names the override: {err}");
         assert!(ws.working_id().is_some(), "the described work is captured, not sealed");
         assert_eq!(ws.finalized_anchor(), before, "nothing was signed");
 
@@ -5049,8 +5050,8 @@ mod tests {
         let err = ws
             .reconcile_onto(Some(&c2), ours.as_ref(), "ferry: reconcile git main", false)
             .unwrap_err();
-        assert!(err.contains("describe"), "un-described stays the #275 refusal: {err}");
-        assert!(!err.contains("--seal-wip"), "not the seal-WIP guard: {err}");
+        assert!(err.message.contains("describe"), "un-described stays the #275 refusal: {err}");
+        assert!(!err.message.contains("--seal-wip"), "not the seal-WIP guard: {err}");
         let _ = std::fs::remove_dir_all(&area);
     }
 
@@ -5315,8 +5316,8 @@ mod tests {
         ws.record_op("push", "push → origin", true); // op 2 — a barrier
 
         let err = ws.undo().unwrap_err();
-        assert!(err.contains("barrier"), "message names the barrier: {err}");
-        assert!(err.contains("push"), "message names the offending op: {err}");
+        assert!(err.message.contains("barrier"), "message names the barrier: {err}");
+        assert!(err.message.contains("push"), "message names the offending op: {err}");
         assert_eq!(ws.op_log().unwrap().len(), 2, "a refused undo appends no op");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5426,9 +5427,9 @@ mod tests {
         std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
         std::fs::write(dir.join("README.md"), b"# hi").unwrap();
         let err = ws.seal_gate(&[]).unwrap_err();
-        assert!(err.contains("refusing to seal"), "{err}");
-        assert!(err.contains(".env"), "names the offending path: {err}");
-        assert!(err.contains("--allow-reveal"), "points at the fix: {err}");
+        assert!(err.message.contains("refusing to seal"), "{err}");
+        assert!(err.message.contains(".env"), "names the offending path: {err}");
+        assert!(err.message.contains("--allow-reveal"), "points at the fix: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5454,8 +5455,8 @@ mod tests {
         std::fs::write(dir.join("server.pem"), b"-----BEGIN-----").unwrap();
         // Only `.env` is allowed → `server.pem` still refuses, `.env` does not.
         let err = ws.seal_gate(&[PathBuf::from(".env")]).unwrap_err();
-        assert!(err.contains("server.pem"), "the un-allowed path is named: {err}");
-        assert!(!err.contains(".env"), "the allowed path is waved through: {err}");
+        assert!(err.message.contains("server.pem"), "the un-allowed path is named: {err}");
+        assert!(!err.message.contains(".env"), "the allowed path is waved through: {err}");
         // Both allowed → clean.
         ws.seal_gate(&[PathBuf::from(".env"), PathBuf::from("server.pem")])
             .expect("both overridden");
@@ -5482,7 +5483,7 @@ mod tests {
         std::fs::write(dir.join("id_rsa"), b"PRIVATE KEY").unwrap();
         std::fs::write(dir.join(".lootattributes"), "* public\n").unwrap();
         let err = ws.seal_gate(&[]).unwrap_err();
-        assert!(err.contains("id_rsa"), "catch-all does not count as consent: {err}");
+        assert!(err.message.contains("id_rsa"), "catch-all does not count as consent: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5523,8 +5524,8 @@ mod tests {
         std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
         // The re-finalize must run the gate: refuse, and sign nothing.
         let err = ws.finalize_capturing(&[], false).unwrap_err();
-        assert!(err.contains("refusing to seal"), "{err}");
-        assert!(err.contains(".env"), "names the offending path: {err}");
+        assert!(err.message.contains("refusing to seal"), "{err}");
+        assert!(err.message.contains(".env"), "names the offending path: {err}");
         let reopened = ws.working_id().cloned();
         assert!(reopened.is_some(), "the reopen is still in progress — nothing was signed");
         let live = ws.liveness().live_of(&cid);
@@ -5625,13 +5626,13 @@ mod tests {
                     },
                     Some([7u8; 16]),
                 )
-                .map_err(|e| e.to_string())
+                .map_err(CliError::from)
             })
             .unwrap();
         std::fs::write(dir.join(".env"), b"TOKEN=hunter2").unwrap();
         let err = ws.fold_line_in(&their, "fold").unwrap_err();
-        assert!(err.contains("refusing to seal"), "{err}");
-        assert!(err.contains(".env"), "names the offending path: {err}");
+        assert!(err.message.contains("refusing to seal"), "{err}");
+        assert!(err.message.contains(".env"), "names the offending path: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5795,7 +5796,7 @@ mod tests {
         std::fs::write(dir.join(".lootattributes"), "").unwrap();
         let mut ws = Workspace::open_at(&dir).unwrap();
         let err = ws.snapshot("oops").unwrap_err();
-        assert!(err.contains("demote") && err.contains("secret.txt"), "got: {err}");
+        assert!(err.message.contains("demote") && err.message.contains("secret.txt"), "got: {err}");
 
         // Deliberate demotion goes through with --allow-demote.
         let mut ws = Workspace::open_at(&dir).unwrap();
@@ -6038,7 +6039,7 @@ mod tests {
         // `main` (the primary's review handle) never becomes a lane id: handle
         // validation already refuses the default dock's name.
         let err = ws.spawn_lane_as(None, Some(&area.join("lane-c")), Some("main")).unwrap_err();
-        assert!(err.contains("default dock"), "{err}");
+        assert!(err.message.contains("default dock"), "{err}");
 
         let _ = std::fs::remove_dir_all(&area);
     }
@@ -6051,7 +6052,7 @@ mod tests {
         keyless.snapshot("base").unwrap();
         keyless.finalize_working().unwrap();
         let err = keyless.spawn_lane(None, None).unwrap_err();
-        assert!(err.contains("keyed"), "{err}");
+        assert!(err.message.contains("keyed"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
 
         // From a lane: spawn (and the other single-owner verbs) refuse.
@@ -6065,7 +6066,7 @@ mod tests {
             lw.remove_lane("l1").map(|_| ()).unwrap_err(),
             lw.lane_gc(0).map(|_| ()).unwrap_err(),
         ] {
-            assert!(err.contains("primary"), "expected a primary-only refusal, got: {err}");
+            assert!(err.message.contains("primary"), "expected a primary-only refusal, got: {err}");
         }
         let _ = std::fs::remove_dir_all(&area);
     }
@@ -6192,7 +6193,7 @@ mod tests {
 
         std::fs::write(dir.join("work.txt"), b"unreviewed").unwrap();
         let err = ws.finalize_capturing(&[], false).unwrap_err();
-        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        assert!(err.message.contains("describe"), "the refusal names the verb to run: {err}");
 
         // Refusing is safe, not lossy: the capture still happened, so the edits
         // are held in the working change — only the *signing* was withheld.
@@ -6218,7 +6219,7 @@ mod tests {
         std::fs::write(dir.join("work.txt"), b"unreviewed").unwrap();
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
         let err = ws.finalize_capturing(&[], false).unwrap_err();
-        assert!(err.contains("describe"), "a stored placeholder is un-described too: {err}");
+        assert!(err.message.contains("describe"), "a stored placeholder is un-described too: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6232,7 +6233,7 @@ mod tests {
         std::fs::write(dir.join("work.txt"), b"unreviewed").unwrap();
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
         let err = ws.finalize_capturing(&[], true).unwrap_err();
-        assert!(err.contains("describe"), "--no-snapshot still refuses: {err}");
+        assert!(err.message.contains("describe"), "--no-snapshot still refuses: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6317,7 +6318,7 @@ mod tests {
 
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
         let err = ws.finalize_capturing(&[], false).unwrap_err();
-        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        assert!(err.message.contains("describe"), "the refusal names the verb to run: {err}");
         assert!(ws.working.is_some(), "the deletion capture is held, not dropped");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6495,7 +6496,7 @@ mod tests {
         )
         .unwrap();
         let err = ws.remove_lane(&b.id).unwrap_err();
-        assert!(err.contains("refusing"), "{err}");
+        assert!(err.message.contains("refusing"), "{err}");
         assert!(innocent.join("precious.txt").exists(), "innocent tree untouched");
         assert!(b.dir.exists(), "the real lane dir was not the recorded path — untouched");
 
@@ -6510,7 +6511,7 @@ mod tests {
         let (area, dir, mut ws) = lane_setup("nest");
         let inside = dir.join("sub").join("lane");
         let err = ws.spawn_lane(None, Some(&inside)).unwrap_err();
-        assert!(err.contains("inside the primary"), "{err}");
+        assert!(err.message.contains("inside the primary"), "{err}");
         assert!(!inside.exists(), "the refused spawn cleans up the dir it created");
         assert!(ws.lane_list().is_empty(), "nothing registered");
         let _ = std::fs::remove_dir_all(&area);
@@ -6573,7 +6574,7 @@ mod tests {
         ws.snapshot(UNDESCRIBED_MESSAGE).unwrap();
 
         let err = ws.merge_lane("feature").map(|_| ()).unwrap_err();
-        assert!(err.contains("describe"), "the refusal names the verb to run: {err}");
+        assert!(err.message.contains("describe"), "the refusal names the verb to run: {err}");
         let _ = std::fs::remove_dir_all(&area);
     }
 
@@ -6935,20 +6936,20 @@ mod tests {
         let base = ws.repo().parents_of(&x).into_iter().next().unwrap();
         let base_cid = ws.repo().change_change_id(&base).unwrap();
         let err = ws.edit(&loot_core::hex::letters(&base_cid)).unwrap_err();
-        assert!(err.contains("descendants"), "unexpected: {err}");
+        assert!(err.message.contains("descendants"), "unexpected: {err}");
 
         // Uncaptured edits on disk: edit refuses instead of capturing (the ADR
         // 0030 exception class) — the e6fde8e sweep must be impossible here.
         std::fs::write(dir.join("b.txt"), b"uncaptured").unwrap();
         let err = ws.edit(&letters).unwrap_err();
-        assert!(err.contains("uncaptured"), "unexpected: {err}");
+        assert!(err.message.contains("uncaptured"), "unexpected: {err}");
         std::fs::remove_file(dir.join("b.txt")).unwrap();
 
         // An in-progress working change: same refusal family.
         std::fs::write(dir.join("a.txt"), b"wip").unwrap();
         ws.snapshot("wip").unwrap();
         let err = ws.edit(&letters).unwrap_err();
-        assert!(err.contains("working change is in progress"), "unexpected: {err}");
+        assert!(err.message.contains("working change is in progress"), "unexpected: {err}");
         ws.finalize_working().unwrap();
 
         // A divergent handle: refuse with the abandon-first remedy. Seed two
@@ -6979,7 +6980,7 @@ mod tests {
         .unwrap();
         assert!(ws.divergent_change_ids().contains(&dcid), "precondition: divergent");
         let err = ws.edit(&loot_core::hex::letters(&dcid)).unwrap_err();
-        assert!(err.contains("divergent"), "unexpected: {err}");
+        assert!(err.message.contains("divergent"), "unexpected: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7124,7 +7125,7 @@ mod tests {
                     Some(cid),
                     vec![x.clone()],
                 )
-                .map_err(|e| e.to_string())
+                .map_err(CliError::from)
             })
             .unwrap();
         (dir, ws, x2, theirs, cid)
@@ -7222,7 +7223,7 @@ mod tests {
         let wants = bob.missing_objects(&relay.0.offered_objects(&bob.heads()));
         assert_eq!(wants.len(), 1, "the new change introduces one object bob lacks");
         let grant = alice
-            .with_repo_mut(|r| r.grant(&wants[0], "bob", 100, None).map_err(|e| e.to_string()))
+            .with_repo_mut(|r| r.grant(&wants[0], "bob", 100, None).map_err(CliError::from))
             .unwrap();
         bob.apply_bundle(grant.0).unwrap();
         assert!(
@@ -7389,7 +7390,7 @@ mod tests {
             fetches_before_failure: std::cell::Cell::new(1), // batch 1 lands, batch 2 dies
         };
         let err = bob.pull_via(&flaky).unwrap_err();
-        assert!(err.contains("transport died"), "the failure surfaces: {err}");
+        assert!(err.message.contains("transport died"), "the failure surfaces: {err}");
 
         // Resume over a healthy transport: negotiation finds only the rest.
         // (Negotiation must use COMPLETE heads — the #217 find: the partial
@@ -7585,7 +7586,7 @@ mod tests {
         std::fs::write(dir.join("ours.txt"), b"O edited but not captured").unwrap();
         let ours = ws.anchor();
         let err = ws.converge_heads(ours.as_ref()).unwrap_err();
-        assert!(err.contains("uncaptured"), "unexpected refusal: {err}");
+        assert!(err.message.contains("uncaptured"), "unexpected refusal: {err}");
         assert_eq!(ws.repo().heads().len(), heads_before, "refusal is atomic — no side merged");
         assert_eq!(
             std::fs::read(dir.join("ours.txt")).unwrap(),
@@ -7666,7 +7667,7 @@ mod tests {
         let x2 = ws.liveness().live_of(&cid).into_iter().next().unwrap();
 
         let err = ws.resolve_live_version(&loot_core::hex::encode(&x.0)).unwrap_err();
-        assert!(err.contains("no live version"), "superseded must not resolve: {err}");
+        assert!(err.message.contains("no live version"), "superseded must not resolve: {err}");
         assert_eq!(
             ws.resolve_live_version(&loot_core::hex::encode(&x2.0)).unwrap(),
             x2,
@@ -7696,7 +7697,7 @@ mod tests {
         ws.snapshot("m").unwrap();
         ws.finalize_working().unwrap(); // finalize clears the working change
         let err = ws.resolve_selector("@").unwrap_err();
-        assert!(err.contains("no working change") || err.contains("there is none"), "{err}");
+        assert!(err.message.contains("no working change") || err.message.contains("there is none"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7718,7 +7719,7 @@ mod tests {
         assert_eq!(ws.resolve_selector("HEAD~0").unwrap(), second, "HEAD~0 is HEAD");
         // Walking past the root refuses, naming the id it stalled on.
         let err = ws.resolve_selector("HEAD~5").unwrap_err();
-        assert!(err.contains("root") && err.contains("HEAD~5"), "{err}");
+        assert!(err.message.contains("root") && err.message.contains("HEAD~5"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7773,7 +7774,7 @@ mod tests {
         let ws = authored_ws(&dir);
         // 'g'..'j' are in neither alphabet (hex is 0-9a-f, change is k-z).
         let err = ws.resolve_selector("ghij").unwrap_err();
-        assert!(err.contains("not a valid selector"), "{err}");
+        assert!(err.message.contains("not a valid selector"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8245,8 +8246,8 @@ mod tests {
         // Record the barrier op exactly as cmd_burn does, then undo must refuse.
         ws.record_op("burn", "burn .env", true);
         let err = ws.undo().unwrap_err();
-        assert!(err.contains("barrier"), "undo refuses across a burn: {err}");
-        assert!(err.to_lowercase().contains("rotate"), "the refusal names the rotate-the-secret remedy");
+        assert!(err.message.contains("barrier"), "undo refuses across a burn: {err}");
+        assert!(err.message.to_lowercase().contains("rotate"), "the refusal names the rotate-the-secret remedy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8289,7 +8290,7 @@ mod tests {
         let mut ws = authored_ws(&dir);
         let _ = committed_secret(&mut ws, &dir);
         let err = ws.burn_path(Path::new("nonexistent"), None).unwrap_err();
-        assert!(err.contains("no historical object"), "burning an unknown path refuses: {err}");
+        assert!(err.message.contains("no historical object"), "burning an unknown path refuses: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

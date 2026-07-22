@@ -508,7 +508,7 @@ pub fn land(
     // Bound once so `current_version` and `current_subject` (#316) read the
     // same row instead of two separate `live_working_row()` calls disagreeing
     // under a race.
-    let row = ws.live_working_row()?;
+    let row = ws.live_working_row().map_err(|e| e.to_string())?;
     let current = row.as_ref().and_then(|r| (!r.empty).then(|| r.version_hex()));
     let current_subject = row.as_ref().and_then(|r| (!r.empty).then(|| r.message.as_str()));
 
@@ -556,7 +556,7 @@ pub fn land(
     // this signing runs gated with no override: a first-seal secret refuses the
     // land; the remedy is a `.lootattributes` rule or an explicit
     // `loot new --allow-reveal <path>` in the lane, then re-land.
-    ws.finalize_capturing(&[], false)?;
+    ws.finalize_capturing(&[], false).map_err(|e| e.to_string())?;
     ws.record_op("new", "finalize (loot-first land)", false);
 
     // The harbor (ADR 0036): one land projects to git-main at a time. Take the

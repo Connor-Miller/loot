@@ -23,7 +23,7 @@ impl Workspace {
     /// root under `<repo>-lanes/`, never nested inside the primary's tree.
     /// Primary-only, and requires a keyed repo: only signed changes can cross
     /// the seal, so a keyless lane could never land anything.
-    pub fn spawn_lane(&mut self, name: Option<&str>, at: Option<&Path>) -> Result<SpawnedLane, String> {
+    pub fn spawn_lane(&mut self, name: Option<&str>, at: Option<&Path>) -> Result<SpawnedLane, CliError> {
         self.spawn_lane_as(name, at, None)
     }
 
@@ -38,7 +38,7 @@ impl Workspace {
         name: Option<&str>,
         at: Option<&Path>,
         handle: Option<&str>,
-    ) -> Result<SpawnedLane, String> {
+    ) -> Result<SpawnedLane, CliError> {
         self.ensure_primary("`loot lane new`")?;
         if let Some(h) = handle {
             valid_dock_name(h).map_err(|e| format!("lane handle: {e}"))?;
@@ -77,7 +77,7 @@ impl Workspace {
             return Err(format!(
                 "{} is already a loot position (its .loot exists)",
                 dir.display()
-            ));
+            ).into());
         }
         let created = !dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -94,7 +94,7 @@ impl Workspace {
                 "a lane cannot live inside the primary's working tree ({}) — \
                  pick a sibling directory (the default is <repo>-lanes/)",
                 root.display()
-            ));
+            ).into());
         }
         let shared =
             std::fs::canonicalize(&self.dot).map_err(|e| format!("resolve store path: {e}"))?;
@@ -129,7 +129,7 @@ impl Workspace {
     /// a dock (ADR 0034) and persists until an explicit `loot lane rm`; the
     /// gc-sweep never touches it. Lane-side on purpose: the registry entry is
     /// per-entry single-writer, and the entry's writer is its own lane.
-    pub fn name_lane(&self, name: &str) -> Result<(), String> {
+    pub fn name_lane(&self, name: &str) -> Result<(), CliError> {
         let id = self.position.lane_id().ok_or(
             "`loot lane name` runs inside a lane — the primary is not a lane \
              (`loot lane new` spawns one)",
@@ -138,7 +138,7 @@ impl Workspace {
         self.ensure_lane_name_free(name, Some(id))?;
         self.store
             .write_lane_name(id, name)
-            .map_err(|e| format!("name lane: {e}"))
+            .map_err(|e| CliError::from(format!("name lane: {e}")))
     }
 
     /// Every registered lane (for `loot lane list`), sorted by id.
@@ -218,7 +218,7 @@ impl Workspace {
     /// lane-local); the lane's *signed* changes stay in the shared graph
     /// regardless, exactly like `loot dock rm`'s pointer rationale. Not
     /// undoable: the op log never captures lane state. Primary-only.
-    pub fn remove_lane(&mut self, id_or_name: &str) -> Result<LaneEntry, String> {
+    pub fn remove_lane(&mut self, id_or_name: &str) -> Result<LaneEntry, CliError> {
         self.ensure_primary("`loot lane rm`")?;
         let entry = self.find_lane(id_or_name)?;
         reap_lane_dir(&entry)?;
@@ -233,7 +233,7 @@ impl Workspace {
     /// longer than `stale_secs` (abandoned; their unsigned WIP drops, the
     /// premise's stance). Named lanes always survive. Returns every entry with
     /// its outcome. Primary-only.
-    pub fn lane_gc(&mut self, stale_secs: u64) -> Result<Vec<(LaneEntry, SweepOutcome)>, String> {
+    pub fn lane_gc(&mut self, stale_secs: u64) -> Result<Vec<(LaneEntry, SweepOutcome)>, CliError> {
         self.ensure_primary("`loot lane gc`")?;
         let mut out = Vec::new();
         for entry in self.store.list_lane_entries() {
@@ -261,23 +261,23 @@ impl Workspace {
         SweepOutcome::Reaped(why)
     }
 
-    pub(super) fn find_lane(&self, key: &str) -> Result<LaneEntry, String> {
+    pub(super) fn find_lane(&self, key: &str) -> Result<LaneEntry, CliError> {
         self.store
             .list_lane_entries()
             .into_iter()
             .find(|e| e.id == key || e.name.as_deref() == Some(key))
-            .ok_or_else(|| format!("no such lane '{key}' (see `loot lane list`)"))
+            .ok_or_else(|| CliError::from(format!("no such lane '{key}' (see `loot lane list`)")))
     }
 
     /// Refuse a lane name (or id) already claimed by another lane. Ids share
     /// the lookup space with names (`lane rm <id-or-name>`), so both count.
-    fn ensure_lane_name_free(&self, name: &str, except: Option<&str>) -> Result<(), String> {
+    fn ensure_lane_name_free(&self, name: &str, except: Option<&str>) -> Result<(), CliError> {
         for e in self.store.list_lane_entries() {
             if Some(e.id.as_str()) == except {
                 continue;
             }
             if e.id == name || e.name.as_deref() == Some(name) {
-                return Err(format!("lane name '{name}' is taken (by lane '{}')", e.id));
+                return Err(format!("lane name '{name}' is taken (by lane '{}')", e.id).into());
             }
         }
         Ok(())
@@ -291,7 +291,7 @@ impl Workspace {
     /// (ids *and* promoted names) and the disk, so
     /// [`free_lane_id`](Self::free_lane_id) then derives an id equal to the
     /// directory name.
-    fn default_lane_dir(&self, handle: Option<&str>) -> Result<PathBuf, String> {
+    fn default_lane_dir(&self, handle: Option<&str>) -> Result<PathBuf, CliError> {
         let root =
             std::fs::canonicalize(&self.root).map_err(|e| format!("resolve repo root: {e}"))?;
         let name = root

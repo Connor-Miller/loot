@@ -500,7 +500,11 @@ fn json_opt_addr(oid: Option<Oid>, out: &mut String) {
 /// Append `s` as a quoted, escaped JSON string. Handles the RFC 8259 required
 /// escapes plus any other control char via `\u00XX` — so a path containing a
 /// tab or newline round-trips cleanly (the whole reason `--json` exists).
-fn json_string(s: &str, out: &mut String) {
+///
+/// `pub` because it is the single JSON-string escaper every machine contract
+/// shares: `loot-cli`'s [`CliError::to_json`](../../loot_cli/error/struct.CliError.html)
+/// (#430) reaches it here rather than keeping a byte-identical twin.
+pub fn json_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {

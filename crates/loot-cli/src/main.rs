@@ -1247,7 +1247,7 @@ fn cmd_grant(args: &[String]) -> Emitted {
         // `None`: the file path never sets an expiry (refused above, #352).
         // The engine parameter stays — maroon's re-grant uses it to carry a
         // grantee's recorded expiry forward in the manifest (#20).
-        repo.grant(&oid, grantee, now, None).map_err(|e| e.to_string())
+        repo.grant(&oid, grantee, now, None).map_err(CliError::from)
     })?;
     std::fs::write(out, &bundle.0).map_err(|e| format!("write {out}: {e}"))?;
     let mut text = String::new();
@@ -1323,7 +1323,7 @@ fn cmd_grant_relay(args: &[String]) -> Emitted {
         repo.grant_sealed(&oid, grantee, grantee_ed_pubkey, grantor_pubkey, reveal_at, expires_at, now, |content_key| {
             identity::seal_key(content_key, &recipient_x25519)
                 .map_err(|e| loot_core::RepoError::Backend(e.to_string()))
-        }).map_err(|e| e.to_string())
+        }).map_err(CliError::from)
     })?;
 
     // Wrap in a push envelope so the recipient can verify the grantor (ADR 0015).
@@ -1471,9 +1471,9 @@ fn cmd_maroon(args: &[String]) -> Emitted {
     let now = snap.ws().now();
     let result: MaroonResult = snap.mutate(|repo| {
         if hard {
-            repo.maroon_hard(path, marooned, now).map_err(|e| e.to_string())
+            repo.maroon_hard(path, marooned, now).map_err(CliError::from)
         } else {
-            repo.maroon(path, marooned, now).map_err(|e| e.to_string())
+            repo.maroon(path, marooned, now).map_err(CliError::from)
         }
     })?;
 
@@ -1642,7 +1642,7 @@ fn cmd_migrate(args: &[String]) -> Emitted {
     let mut snap = ws.snapshotted(&opts)?;
     let now = snap.ws().now();
     let result: MigrateResult = snap.mutate(|repo| {
-        repo.migrate(path, new_vis.clone(), now).map_err(|e| e.to_string())
+        repo.migrate(path, new_vis.clone(), now).map_err(CliError::from)
     })?;
 
     let vis_label = verdict::visibility_token(&new_vis);
@@ -3067,7 +3067,8 @@ fn deposit_embargo_grants(
                 let envelope = id.wrap_envelope(&bundle);
                 loot_net::deliver_grant(url, &d.peer_pubkey, &envelope).map_err(|e| e.to_string())
             },
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         println!("  {} → {} (embargoed until {})", d.path.display(), d.peer, d.reveal_at);
     }
     println!(

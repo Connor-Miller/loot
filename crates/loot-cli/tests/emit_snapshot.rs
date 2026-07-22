@@ -67,9 +67,12 @@ fn run(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// As [`run`], plus the process exit code (`buoy`'s ambiguous/none outcomes
-/// exit non-zero by design, ADR 0025).
-fn run_with_code(dir: &Path, args: &[&str]) -> (String, i32) {
+/// As [`run`], plus the sibling stream and the process exit code — the single
+/// spawn helper the coded-outcome tests share. `buoy`'s ambiguous/none outcomes
+/// (ADR 0025) read their prose off **stdout** with a non-zero code; the #430
+/// machine error channel reads its JSON off **stderr**. Returning both streams
+/// lets one helper serve both (was `run_with_code` + `run_stderr_with_code`).
+fn run_streams(dir: &Path, args: &[&str]) -> (String, String, i32) {
     let out = Command::new(env!("CARGO_BIN_EXE_loot"))
         .args(args)
         .env("LOOT_CLOCK", FIXED_CLOCK)
@@ -78,6 +81,7 @@ fn run_with_code(dir: &Path, args: &[&str]) -> (String, i32) {
         .unwrap();
     (
         String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
         out.status.code().unwrap_or(-1),
     )
 }
@@ -516,12 +520,12 @@ fn buoy_reports_a_resolved_role_and_the_none_outcome_in_every_format() {
 
     // `None` (no attestation for the role): the exit code carries the
     // outcome, and porcelain emits no rows at all (ADR 0025).
-    let (human_none, code_none) = run_with_code(&dir, &["buoy", "no-such-role"]);
+    let (human_none, _, code_none) = run_streams(&dir, &["buoy", "no-such-role"]);
     assert_eq!(human_none, "no buoy for role 'no-such-role'\n");
     assert_eq!(code_none, 2);
-    let (porcelain_none, _) = run_with_code(&dir, &["buoy", "no-such-role", "--porcelain"]);
+    let (porcelain_none, _, _) = run_streams(&dir, &["buoy", "no-such-role", "--porcelain"]);
     assert_eq!(porcelain_none, "");
-    let (json_none, _) = run_with_code(&dir, &["buoy", "no-such-role", "--json"]);
+    let (json_none, _, _) = run_streams(&dir, &["buoy", "no-such-role", "--json"]);
     assert_eq!(
         json_none,
         format!("{{\"contract\":{FORMAT_MAJOR},\"role\":\"no-such-role\",\"status\":\"none\"}}\n")
@@ -593,18 +597,6 @@ fn pull_reports_a_converged_change_in_every_format() {
 
 // --- machine error channel (#430) -------------------------------------------
 
-/// Run the binary and return `(stderr, exit_code)`. The error channel writes to
-/// stderr, so these tests read it directly rather than stdout.
-fn run_stderr_with_code(dir: &Path, args: &[&str]) -> (String, i32) {
-    let out = Command::new(env!("CARGO_BIN_EXE_loot"))
-        .args(args)
-        .env("LOOT_CLOCK", FIXED_CLOCK)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    (String::from_utf8(out.stderr).unwrap(), out.status.code().unwrap_or(-1))
-}
-
 /// The whole contract, both directions: a `Workspace::open` failure in a
 /// non-repo directory carries the CLI-level `no_repo` slug. Under `--json` the
 /// taxonomy travels as a `{"contract":N,"error":{"code","message"}}` object on
@@ -620,12 +612,12 @@ fn json_failure_emits_coded_error_object_non_json_is_unchanged() {
     let message = "not a loot repo at . (no .loot/). Run `loot init` first.";
 
     // Non-`--json`: byte-for-byte the old `loot: <message>` line, exit non-zero.
-    let (stderr, code) = run_stderr_with_code(&dir, &["status"]);
+    let (_, stderr, code) = run_streams(&dir, &["status"]);
     assert_eq!(stderr, format!("loot: {message}\n"));
     assert_ne!(code, 0, "a failure exits non-zero");
 
     // `--json`: the coded object, contract-versioned, exit non-zero.
-    let (stderr, code) = run_stderr_with_code(&dir, &["status", "--json"]);
+    let (_, stderr, code) = run_streams(&dir, &["status", "--json"]);
     assert_eq!(
         stderr,
         format!(
@@ -645,7 +637,7 @@ fn unknown_flag_carries_its_slug_under_json() {
     let dir = area("err-unknown-flag");
     keyed_repo(&dir, "connor");
 
-    let (stderr, code) = run_stderr_with_code(&dir, &["status", "--json", "--bogus"]);
+    let (_, stderr, code) = run_streams(&dir, &["status", "--json", "--bogus"]);
     assert!(
         stderr.starts_with(&format!("{{\"contract\":{FORMAT_MAJOR},\"error\":{{\"code\":\"unknown_flag\",")),
         "coded unknown_flag object on stderr: {stderr}"
@@ -654,9 +646,65 @@ fn unknown_flag_carries_its_slug_under_json() {
     assert_ne!(code, 0);
 
     // Without `--json`, the same failure prints the unchanged `loot: <prose>`.
-    let (stderr, _) = run_stderr_with_code(&dir, &["status", "--bogus"]);
+    let (_, stderr, _) = run_streams(&dir, &["status", "--bogus"]);
     assert!(stderr.starts_with("loot: unknown flag '--bogus'"), "unchanged prose: {stderr}");
     assert!(!stderr.contains("\"code\""), "no JSON leaks into the human path: {stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gap #430 was landed to close: a genuine **engine** `RepoError` — not a
+/// CLI-level slug — travels as its own `code()` value to `--json` stderr on a
+/// live verb path. `loot apply <garbage>` reaches `DagRepo::apply_with` through
+/// `Workspace::apply_bundle` → `with_repo`; the bundle's leading byte reads as a
+/// future format version, so the engine returns `RepoError::UnsupportedFormat`
+/// (slug `unsupported_format`). The Workspace used to stringify that with
+/// `.map_err(|e| e.to_string())` **before** the verb's `?` ran, collapsing every
+/// engine variant to the generic `error` code; now it converts via
+/// `From<RepoError>`, so the real slug arrives as data. The non-`--json` path
+/// stays byte-for-byte the pre-#430 `loot: <message>` line.
+#[test]
+fn engine_repo_error_slug_travels_to_json_stderr_on_a_live_verb() {
+    let dir = area("err-engine-slug");
+    keyed_repo(&dir, "connor");
+    // A bundle whose first bytes are not a supported format frame — the engine's
+    // format check is the first thing `apply_with` runs, so this is a genuine
+    // engine `RepoError`, deterministic from these bytes.
+    std::fs::write(dir.join("bad.bundle"), b"not a loot bundle at all").unwrap();
+
+    // Non-`--json`: the unchanged human line, exit non-zero, no JSON.
+    let (_, human, human_code) = run_streams(&dir, &["apply", "bad.bundle"]);
+    assert!(
+        human.starts_with("loot: unsupported format version v"),
+        "unchanged human prose: {human}"
+    );
+    assert!(human.ends_with('\n'));
+    assert!(!human.contains("\"code\""), "no JSON leaks into the human path: {human}");
+    assert_ne!(human_code, 0);
+
+    // `--json`: the coded object carries the engine variant's own slug —
+    // `unsupported_format`, NOT the generic `error` a pre-stringified failure got.
+    let (_, json, json_code) = run_streams(&dir, &["apply", "bad.bundle", "--json"]);
+    assert!(
+        json.starts_with(&format!(
+            "{{\"contract\":{FORMAT_MAJOR},\"error\":{{\"code\":\"unsupported_format\",\"message\":"
+        )),
+        "engine slug (not the generic `error`) on stderr: {json}"
+    );
+    assert!(
+        !json.contains("\"code\":\"error\""),
+        "the slug is the engine variant, not the fallback `error`: {json}"
+    );
+    assert_ne!(json_code, 0);
+
+    // Both directions carry the identical message: the JSON `message` is exactly
+    // the human line minus its `loot: ` prefix — proof the prose is unchanged and
+    // only the machine channel is new.
+    let human_message = human.strip_prefix("loot: ").and_then(|s| s.strip_suffix('\n')).unwrap();
+    assert!(
+        json.contains(&format!("\"message\":\"{human_message}\"")),
+        "json message == the unchanged human message: {json}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

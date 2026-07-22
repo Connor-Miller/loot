@@ -162,7 +162,7 @@ pub fn run(
 
     // Promote any due embargoed keys before reading content, as every
     // content-reading verb does (ADR 0007) — a due path projects readable.
-    ws.flush_due_escrow()?;
+    ws.flush_due_escrow().map_err(|e| e.to_string())?;
 
     // Bootstrap: pre-bridge git history (no trailers, no state) is adopted as
     // the baseline, not ingested — the dogfood repo's dual-run past stays
@@ -222,7 +222,7 @@ pub fn run(
             }
         }
         if let Some(e) = ingest_err {
-            return Err(rollback_note(ws.rollback_ingested(&minted), e));
+            return Err(rollback_note(ws.rollback_ingested(&minted).map_err(|e| e.to_string()), e));
         }
         let target = marks.change_for(tip).cloned().map(|(t, _)| t);
 
@@ -253,7 +253,12 @@ pub fn run(
             }
             // A reconcile refusal (#275 un-described, #418 seal-WIP) aborts the
             // pass — roll the freshly ingested changes back with it (#307).
-            Err(e) => return Err(rollback_note(ws.rollback_ingested(&minted), e)),
+            Err(e) => {
+                return Err(rollback_note(
+                    ws.rollback_ingested(&minted).map_err(|e| e.to_string()),
+                    e.to_string(),
+                ))
+            }
         };
         // Past the reconcile the ingested changes are folded into the dock's
         // line — rollback is no longer safe, so their marks persist NOW,
@@ -421,7 +426,7 @@ pub fn run(
         // unchanged tree a no-op, and the demotion guard applies exactly as on
         // any snapshot (#135). The handle drops immediately; the projection
         // below reads the captured working change.
-        let _ = ws.snapshotted(&crate::workspace::SnapshotOpts::default())?;
+        let _ = ws.snapshotted(&crate::workspace::SnapshotOpts::default()).map_err(|e| e.to_string())?;
         match ws.working_id().cloned() {
             None => {
                 report.review =
@@ -701,7 +706,7 @@ fn ingest_commit(
         // The named change may sit outside this position's lineage-filtered
         // load (landed from a lane, #265) — pull its line in before judging it
         // absent, or a merely-out-of-view change re-mints as a duplicate (#307).
-        if ws.load_shared_lineage(&id)? {
+        if ws.load_shared_lineage(&id).map_err(|e| e.to_string())? {
             marks.insert(sha.to_string(), id, MarkOrigin::Loot);
             return Ok(());
         }
@@ -740,7 +745,7 @@ fn ingest_commit(
     let parent_tree: BTreeMap<PathBuf, (Oid, Visibility)> = match parents_loot.first() {
         None => BTreeMap::new(), // a true root commit composes over the empty tree
         Some(p) => {
-            ws.load_shared_lineage(p)?;
+            ws.load_shared_lineage(p).map_err(|e| e.to_string())?;
             ws.graph().tree(p).ok_or_else(|| {
                 format!(
                     "commit {}: mapped loot parent {} has no loadable tree — refusing to \
@@ -864,12 +869,13 @@ fn ingest_commit(
         )
     };
 
-    let change_id = ws.ingest_change(parent_tree, acts, parents_loot, &loot_message, is_self)?;
+    let change_id =
+        ws.ingest_change(parent_tree, acts, parents_loot, &loot_message, is_self).map_err(|e| e.to_string())?;
     minted.push(change_id.clone());
     marks.insert(sha.to_string(), change_id.clone(), MarkOrigin::Git);
     report.ingested += 1;
     if is_self {
-        ws.sign_change(&change_id)?;
+        ws.sign_change(&change_id).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

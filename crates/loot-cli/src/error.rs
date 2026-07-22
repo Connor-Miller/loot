@@ -58,9 +58,9 @@ impl CliError {
         let mut out = String::from("{\"contract\":");
         out.push_str(&loot_core::format::FORMAT_MAJOR.to_string());
         out.push_str(",\"error\":{\"code\":");
-        json_string(self.code, &mut out);
+        loot_core::verdict::json_string(self.code, &mut out);
         out.push_str(",\"message\":");
-        json_string(&self.message, &mut out);
+        loot_core::verdict::json_string(&self.message, &mut out);
         out.push_str("}}");
         out
     }
@@ -93,28 +93,6 @@ impl From<&str> for CliError {
     fn from(message: &str) -> Self {
         Self { code: "error", message: message.to_string() }
     }
-}
-
-/// Append `s` as a quoted, escaped JSON string — the same RFC 8259 handling
-/// `loot_core::verdict` uses for the other machine contracts (that module's
-/// `json_string` is private, so this is its twin). Control chars below 0x20
-/// become `\u00XX` so a message with a newline or tab round-trips.
-fn json_string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
 }
 
 #[cfg(test)]
