@@ -10,6 +10,7 @@ export type LootErrorCode =
   | "unauthorized"
   | "conflict"
   | "guard"
+  | "setup"
   | "unsupported";
 
 export class LootError extends Error {
@@ -18,6 +19,18 @@ export class LootError extends Error {
     super(message);
     this.name = "LootError";
     this.code = code;
+  }
+}
+
+/**
+ * A setup/environment problem, distinct from a loot-level failure: the `loot`
+ * binary is missing or too old (physical mode, #428), so an operator can tell
+ * "install/upgrade loot" apart from a genuine repo error.
+ */
+export class SetupError extends LootError {
+  constructor(message: string) {
+    super("setup", message);
+    this.name = "SetupError";
   }
 }
 

@@ -27,6 +27,7 @@ export {
   AuthError,
   ConflictError,
   GuardError,
+  SetupError,
 } from "./errors.js";
 export type { LootErrorCode } from "./errors.js";
 

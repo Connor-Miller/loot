@@ -1001,6 +1001,21 @@ impl Workspace {
         Ok((head, written, skipped))
     }
 
+    /// The current readable tree (path + visibility), or `None` on a fresh repo
+    /// with nothing recorded — for machine output (#428), where an empty repo is
+    /// an empty tree, not an error. Otherwise materializes like
+    /// [`surface_with_report`](Self::surface_with_report).
+    pub fn surface_tree(&mut self) -> Result<Option<Vec<(PathBuf, loot_core::Visibility)>>, String> {
+        let has_tip = self.working.is_some()
+            || self.position.tip().is_some()
+            || self.repo.heads().into_iter().next().is_some();
+        if !has_tip {
+            return Ok(None);
+        }
+        let (_head, written, _skipped) = self.surface_with_report()?;
+        Ok(Some(written))
+    }
+
     /// The id of the current working change, if one is in progress.
     pub fn working_id(&self) -> Option<&Oid> {
         self.working.as_ref()

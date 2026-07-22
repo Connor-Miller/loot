@@ -847,11 +847,7 @@ fn cmd_surface(args: &[String]) -> Emitted {
     // Sealed-skipped/burned paths are a human concern, omitted from the tree; an
     // empty repo (no head yet) is an empty tree, not an error.
     if matches!(fmt, OutFmt::Porcelain | OutFmt::Json) {
-        let written = match ws.surface_with_report() {
-            Ok((_head, written, _skipped)) => written,
-            Err(e) if e.contains("nothing to surface") => Vec::new(),
-            Err(e) => return Err(e),
-        };
+        let written = ws.surface_tree()?.unwrap_or_default();
         return match fmt {
             OutFmt::Porcelain => msg(verdict::surface_porcelain(&written)),
             OutFmt::Json => msg(format!("{}\n", verdict::surface_json(&written))),
