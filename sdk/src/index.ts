@@ -7,6 +7,8 @@
  * slices.
  */
 export { connectRelay } from "./repo.js";
+export { openRepo } from "./physical.js";
+export type { OpenRepoOptions } from "./physical.js";
 export type {
   LootRepo,
   PathEntry,

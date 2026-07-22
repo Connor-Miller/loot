@@ -15,17 +15,14 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { connectRelay, Identity, NotFoundError, type LootRepo } from "../src/index.js";
+import { connectRelay, Identity } from "../src/index.js";
 import { WasmBundle, encodeFetchRequest } from "../wasm/loot_wasm.js";
+import { OTHER, OTHER_TEXT, README, README_TEXT, runReadContract } from "./read-contract.js";
 
 const REPO_ROOT = join(process.cwd(), "..");
 const LOOT = join(REPO_ROOT, "target", "release", process.platform === "win32" ? "loot.exe" : "loot");
 const PORT = 47800 + Math.floor(Math.random() * 800);
 const URL = `http://127.0.0.1:${PORT}`;
-const README = "readme.md";
-const OTHER = "notes.md";
-const README_TEXT = "hello from the loot in-memory SDK — slice 1 tracer bullet. ".repeat(4);
-const OTHER_TEXT = "a second public file, distinct content, to make path-scoping observable. ".repeat(3);
 const EMPTY = new Uint8Array(0);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -93,38 +90,6 @@ afterAll(() => {
     }
   }
 });
-
-/** Backend-agnostic read contract — reused verbatim by any `LootRepo` (#422). */
-function runReadContract(label: string, makeRepo: () => Promise<LootRepo>) {
-  describe(label, () => {
-    let repo: LootRepo;
-    beforeAll(async () => {
-      repo = await makeRepo();
-    });
-
-    it("lists both pushed paths with their visibility", async () => {
-      const entries = await repo.list();
-      expect(entries).toContainEqual({ path: README, visibility: "public" });
-      expect(entries).toContainEqual({ path: OTHER, visibility: "public" });
-    });
-
-    it("reads each public file back byte-for-byte (decrypt + host zstd inflate)", async () => {
-      const dec = new TextDecoder();
-      expect(dec.decode(await repo.read(README).bytes())).toBe(README_TEXT);
-      expect(dec.decode(await repo.read(OTHER).bytes())).toBe(OTHER_TEXT);
-    });
-
-    it("yields the same bytes via async iteration", async () => {
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of repo.read(README)) chunks.push(chunk);
-      expect(Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8")).toBe(README_TEXT);
-    });
-
-    it("throws NotFoundError for an absent path", async () => {
-      await expect(repo.read("does-not-exist.md").bytes()).rejects.toBeInstanceOf(NotFoundError);
-    });
-  });
-}
 
 runReadContract("in-memory (connectRelay) against a real relay", () =>
   connectRelay(URL, Identity.generate()),

@@ -123,7 +123,7 @@ const COMMANDS: &[Verb] = &[
     verb("adopt", &[], &["--discard-wip", "--seal-wip"], cmd_adopt),
     verb("undo", &[], &[], |_| cmd_undo()),
     verb("op", &[], &[], cmd_op),
-    verb("surface", &[], &[], |_| cmd_surface()),
+    verb("surface", &[], OUT, cmd_surface),
     verb("lane", &["--ticket", "--name", "--at", "--stale-hours"], OUT, cmd_lane),
     verb("lanes", &[], OUT, cmd_lane_list),
     verb("log", &["--path"], &[], cmd_log),
@@ -839,8 +839,25 @@ fn print_step(r: &StepReport) -> String {
     out
 }
 
-fn cmd_surface() -> Emitted {
+fn cmd_surface(args: &[String]) -> Emitted {
+    let fmt = out_fmt(args);
     let mut ws = Workspace::open()?;
+    // Machine output (#428): the full readable tree as path+visibility, so the
+    // physical SDK backend can enumerate `list()` without human-text scraping.
+    // Sealed-skipped/burned paths are a human concern, omitted from the tree; an
+    // empty repo (no head yet) is an empty tree, not an error.
+    if matches!(fmt, OutFmt::Porcelain | OutFmt::Json) {
+        let written = match ws.surface_with_report() {
+            Ok((_head, written, _skipped)) => written,
+            Err(e) if e.contains("nothing to surface") => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        return match fmt {
+            OutFmt::Porcelain => msg(verdict::surface_porcelain(&written)),
+            OutFmt::Json => msg(format!("{}\n", verdict::surface_json(&written))),
+            OutFmt::Human => unreachable!(),
+        };
+    }
     let (head, written, skipped) = ws.surface_with_report()?;
     let burned = ws.burned_paths_at(&head);
     if written.is_empty() && skipped == 0 && burned.is_empty() {

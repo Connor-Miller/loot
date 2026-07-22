@@ -224,6 +224,47 @@ pub fn status_json(
     s
 }
 
+/// Leading marker for a `loot surface` machine-output row (one surfaced path).
+pub const SURFACE_MARK: char = 'S';
+
+/// Porcelain for `loot surface`: one `S\t<path>\t<visibility>` line per surfaced
+/// path — the current readable tree. Unlike `status` (the pending *delta*), this
+/// is the whole materialized tree, so a caller can enumerate paths + visibility
+/// without disk-walking (the physical SDK backend's `list()` source, #428).
+pub fn surface_porcelain(entries: &[(PathBuf, Visibility)]) -> String {
+    let mut out = String::new();
+    for (path, vis) in entries {
+        out.push(SURFACE_MARK);
+        out.push('\t');
+        out.push_str(&path.to_string_lossy());
+        out.push('\t');
+        out.push_str(&visibility_token(vis));
+        out.push('\n');
+    }
+    out
+}
+
+/// JSON for `loot surface`: `{"contract":<n>,"tree":[{path,visibility},...]}` —
+/// the current readable tree.
+pub fn surface_json(entries: &[(PathBuf, Visibility)]) -> String {
+    let mut s = String::new();
+    s.push_str("{\"contract\":");
+    s.push_str(&VERDICT_CONTRACT.to_string());
+    s.push_str(",\"tree\":[");
+    for (i, (path, vis)) in entries.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"path\":");
+        json_string(&path.to_string_lossy(), &mut s);
+        s.push_str(",\"visibility\":");
+        json_string(&visibility_token(vis), &mut s);
+        s.push('}');
+    }
+    s.push_str("]}");
+    s
+}
+
 // --- lane encoders (`loot lanes` — the sealed-lane observability shape, #232) ---
 
 /// Leading marker for a `loot lanes` row — one registered lane per line.
