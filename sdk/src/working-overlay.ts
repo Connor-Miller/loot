@@ -16,12 +16,12 @@
 import type { ChangeSummary, Visibility, VisibilityGuard } from "./repo.js";
 
 /** One overlay slot: a path replaced with a new payload (with an optionally
- * explicit `visibility` — `undefined` means "inherit"), or removed. */
-export interface OverlayEntry<P> {
-  kind: "put" | "remove";
-  visibility?: Visibility;
-  payload?: P;
-}
+ * explicit `visibility` — `undefined` means "inherit"), or removed. A
+ * discriminated union so the fold site narrows on `kind` and reads `payload`
+ * without a non-null assertion. */
+export type OverlayEntry<P> =
+  | { kind: "put"; payload: P; visibility?: Visibility }
+  | { kind: "remove" };
 
 /** Union two guards: paths named by either may demote; either enabling reveal
  * enables it. Lets `describe`-time and `push`-time guards combine. */

@@ -304,7 +304,7 @@ class RelayRepo implements LootRepo {
       builder.carry(entry.path, hexToBytes(entry.oid), toVisibility(entry.visibility));
     }
     for (const [path, pending] of overlay) {
-      if (pending.kind === "put") builder.put(path, pending.payload!, resolved.get(path)!);
+      if (pending.kind === "put") builder.put(path, pending.payload, resolved.get(path)!);
     }
     const authored = builder.finish();
 
