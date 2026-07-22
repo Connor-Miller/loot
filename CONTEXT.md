@@ -36,6 +36,20 @@ enforces *never materialize over uncaptured dirt* (ADR 0030 amendment).
 (`status` is read-only — it recomputes the pending delta live and records
 nothing, S2 #145.) This kills git's add/commit ceremony.
 
+**Working overlay** *(SDK tier, #429)* — the loot-sdk analogue of the
+[[Working change]]: `WorkingOverlay<P>`, the in-RAM capture-first overlay that
+*is* the pending change until `push` folds it into a signed change. Both
+`LootRepo` backends compose one (relay's payload is the bytes to seal;
+physical's is the absolute path written), so the status-kind classification, the
+two push preconditions, `describe`/message, and the guard union live **once**
+here rather than copied into each adapter. It is pure and synchronous:
+`classify(committed)` derives added/modified/removed against a committed-tree
+baseline passed *in* — the overlay never fetches or spawns. What stays in each
+adapter is genuinely backend behaviour: the transport, the committed-baseline
+*source*, relay's client-side [[Visibility]] resolution + guard enforcement
+(physical delegates that to the binary), the private keyring, and
+`have`-tracking.
+
 **Snapshot (reconcile)** — turning the current working tree into the working
 change, *visibility-aware* (ADR 0006). Against the last change's full tree, at
 time `now`: paths the current identity can open are updated/deleted to match the

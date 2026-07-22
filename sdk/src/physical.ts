@@ -5,7 +5,6 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { ConflictError, LootError, NotFoundError, SetupError } from "./errors.js";
 import type {
-  ChangeKind,
   ChangeSummary,
   EditOptions,
   LootRepo,
@@ -15,6 +14,7 @@ import type {
   Visibility,
   VisibilityGuard,
 } from "./repo.js";
+import { WorkingOverlay } from "./working-overlay.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -22,10 +22,6 @@ const execFileAsync = promisify(execFile);
 export interface OpenRepoOptions {
   loot?: string;
 }
-
-/** The overlay: a path replaced with new bytes, or removed. Mirrors the
- * in-memory backend so `status`/`diff` report kinds without extra CLI output. */
-type Pending = { kind: "put"; visibility?: Visibility } | { kind: "remove" };
 
 interface SurfaceEntry {
   path: string;
@@ -55,9 +51,10 @@ async function* streamFile(abs: string, path: string): AsyncGenerator<Uint8Array
  * the materialized file.
  */
 class PhysicalRepo implements LootRepo {
-  private readonly overlay = new Map<string, Pending>();
-  private message: string | null = null;
-  private guard: VisibilityGuard = {};
+  /** Capture-first pending change (#429). Physical's payload is the absolute
+   * path written; the overlay owns the message + guard union + status kinds.
+   * Visibility resolution / guard enforcement is delegated to the binary. */
+  private readonly working = new WorkingOverlay<string>();
   /** The committed tree paths the overlay is authored on top of — captured at
    * open and refreshed after each `push`. Kept separate from live `surface`
    * because loot folds a *described* working change into the current tree, so
@@ -148,12 +145,12 @@ class PhysicalRepo implements LootRepo {
     const abs = join(this.path, path);
     await mkdir(dirname(abs), { recursive: true });
     await writeFile(abs, bytes); // capture-first: the working copy IS the change
-    this.overlay.set(path, { kind: "put", visibility: opts?.visibility });
+    this.working.put(path, abs, opts?.visibility);
   }
 
   async remove(path: string): Promise<void> {
     await rm(join(this.path, path), { force: true });
-    this.overlay.set(path, { kind: "remove" });
+    this.working.remove(path);
   }
 
   /** Map a guard onto the binary's flags. `allowReveal` (private→public) can't
@@ -170,18 +167,12 @@ class PhysicalRepo implements LootRepo {
   }
 
   async describe(message: string, guard?: VisibilityGuard): Promise<void> {
-    this.message = message;
-    if (guard) this.guard = guard;
+    this.working.describe(message, guard);
     await this.run(["describe", "-m", message, ...this.guardArgs(guard ?? {})]);
   }
 
   async status(): Promise<Status> {
-    const changes: ChangeSummary[] = [...this.overlay.entries()].map(([path, p]) => {
-      const kind: ChangeKind =
-        p.kind === "remove" ? "removed" : this.baseline.has(path) ? "modified" : "added";
-      return { path, kind };
-    });
-    return { message: this.message, changes };
+    return { message: this.working.message, changes: this.working.classify(this.baseline) };
   }
 
   async diff(): Promise<ChangeSummary[]> {
@@ -189,20 +180,15 @@ class PhysicalRepo implements LootRepo {
   }
 
   async push(guard?: VisibilityGuard): Promise<string> {
-    if (this.message === null) throw new Error("describe the change before pushing (no message set)");
-    if (this.overlay.size === 0) throw new Error("nothing to push (no pending edits)");
-    const effective: VisibilityGuard = {
-      allowDemote: [...(this.guard.allowDemote ?? []), ...(guard?.allowDemote ?? [])],
-      allowReveal: Boolean(this.guard.allowReveal || guard?.allowReveal),
-    };
+    // The two push preconditions (usage bugs, plain Error) live in the overlay.
+    this.working.requirePushable();
+    const effective = this.working.effectiveGuard(guard);
     // Finalize the working copy into a signed change (the binary snapshots +
     // signs). A configured remote is pushed to separately by the operator.
-    await this.run(["new", "-m", this.message, ...this.guardArgs(effective)]);
+    await this.run(["new", "-m", this.working.message!, ...this.guardArgs(effective)]);
     // The durable change id is the `change` field of the machine status.
     const { change } = JSON.parse(await this.run(["status", "--json"])) as { change: string | null };
-    this.overlay.clear();
-    this.message = null;
-    this.guard = {};
+    this.working.clear();
     // The just-finalized change is the new baseline for the next edit cycle.
     this.baseline = new Set((await this.list()).map((e) => e.path));
     return change ?? "";

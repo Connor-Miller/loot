@@ -8,6 +8,7 @@ import {
 import type { Identity } from "../wasm/loot_wasm.js";
 import { decompress as zstdInflate } from "fzstd";
 import { AuthError, GuardError, NotFoundError, TransportError } from "./errors.js";
+import { WorkingOverlay } from "./working-overlay.js";
 
 export type Visibility = "public" | "private";
 
@@ -94,12 +95,6 @@ interface ChangeView {
   tree: TreeEntry[];
 }
 
-/** The overlay: a path is either replaced with new bytes (with an optionally
- * explicit visibility — `undefined` means "inherit"), or removed. */
-type Pending =
-  | { kind: "put"; bytes: Uint8Array; visibility?: Visibility }
-  | { kind: "remove" };
-
 const EMPTY = new Uint8Array(0);
 
 function hexToBytes(hex: string): Uint8Array {
@@ -113,18 +108,11 @@ function bytesToHex(bytes: Uint8Array): string {
 function toVisibility(raw: string): Visibility {
   return raw === "public" ? "public" : "private";
 }
-/** Union two guards: paths named by either may demote; either enabling reveal
- * enables it. Lets `describe`-time and `push`-time guards combine. */
-function mergeGuards(a: VisibilityGuard, b: VisibilityGuard): VisibilityGuard {
-  return {
-    allowDemote: [...new Set([...(a.allowDemote ?? []), ...(b.allowDemote ?? [])])],
-    allowReveal: Boolean(a.allowReveal || b.allowReveal),
-  };
-}
 
 class RelayRepo implements LootRepo {
-  private readonly overlay = new Map<string, Pending>();
-  private message: string | null = null;
+  /** Capture-first pending change (#429). Relay's payload is the `Uint8Array`
+   * bytes to seal; the overlay owns the message + guard union + status kinds. */
+  private readonly working = new WorkingOverlay<Uint8Array>();
   /**
    * Change-ids (hex, the 32-byte change-graph node id) this session already
    * holds. `pull` sends this as its `/negotiate` `have` so the relay ships only
@@ -133,7 +121,6 @@ class RelayRepo implements LootRepo {
    * never re-pulls what it just authored.
    */
   private readonly have = new Set<string>();
-  private guard: VisibilityGuard = {};
   /** In-RAM keyring for content this identity authored privately: object-id
    * (hex) → the content key ECIES-wrapped to this identity. Lets the author read
    * their own just-sealed content back this session by unwrapping the key. The
@@ -248,26 +235,23 @@ class RelayRepo implements LootRepo {
   // --- capture-first authoring (#424) --------------------------------------
 
   async edit(path: string, bytes: Uint8Array, opts?: EditOptions): Promise<void> {
-    this.overlay.set(path, { kind: "put", bytes, visibility: opts?.visibility });
+    this.working.put(path, bytes, opts?.visibility);
   }
 
   async remove(path: string): Promise<void> {
-    this.overlay.set(path, { kind: "remove" });
+    this.working.remove(path);
   }
 
   async describe(message: string, guard?: VisibilityGuard): Promise<void> {
-    this.message = message;
-    if (guard) this.guard = mergeGuards(this.guard, guard);
+    this.working.describe(message, guard);
   }
 
   async status(): Promise<Status> {
     const { tree } = await this.snapshot();
-    const existing = new Set(tree.map((e) => e.path));
-    const changes: ChangeSummary[] = [...this.overlay.entries()].map(([path, p]) => ({
-      path,
-      kind: p.kind === "remove" ? "removed" : existing.has(path) ? "modified" : "added",
-    }));
-    return { message: this.message, changes };
+    return {
+      message: this.working.message,
+      changes: this.working.classify(new Set(tree.map((e) => e.path))),
+    };
   }
 
   async diff(): Promise<ChangeSummary[]> {
@@ -275,22 +259,21 @@ class RelayRepo implements LootRepo {
   }
 
   async push(guard?: VisibilityGuard): Promise<string> {
-    // Caller preconditions (usage bugs), not loot-domain errors — a plain Error,
-    // not a typed LootError, since "conflict" means a real same-path bounce.
-    if (this.message === null) {
-      throw new Error("describe the change before pushing (no message set)");
-    }
-    if (this.overlay.size === 0) {
-      throw new Error("nothing to push (no pending edits)");
-    }
-    const effectiveGuard = guard ? mergeGuards(this.guard, guard) : this.guard;
+    // The two push preconditions (usage bugs, plain Error) live in the overlay.
+    this.working.requirePushable();
+    const message = this.working.message!; // requirePushable guarantees non-null
+    const effectiveGuard = this.working.effectiveGuard(guard);
     const { parents, tree } = await this.snapshot();
     const existing = new Map(tree.map((e) => [e.path, toVisibility(e.visibility)]));
+    const overlay = new Map(this.working.entries());
 
     // Resolve each edited path's visibility (inherit / new-path default) and
     // enforce the guard model BEFORE composing — a refused change stows nothing.
+    // This client-side visibility resolution + GuardError enforcement is
+    // genuinely relay behaviour, so it stays here (physical delegates to the
+    // binary), not in the backend-agnostic overlay.
     const resolved = new Map<string, Visibility>();
-    for (const [path, pending] of this.overlay) {
+    for (const [path, pending] of overlay) {
       if (pending.kind !== "put") continue;
       const prior = existing.get(path);
       const target: Visibility = pending.visibility ?? prior ?? "public";
@@ -314,15 +297,14 @@ class RelayRepo implements LootRepo {
     // Compose the full-tree change in the WASM core: carry unchanged paths,
     // seal + put edited ones, skip removed. Composition (id fold, signing,
     // sealing, bundle encode, envelope) never leaves Rust.
-    const builder = new ChangeBuilder(this.identity, this.message);
+    const builder = new ChangeBuilder(this.identity, message);
     for (const id of parents) builder.addParent(hexToBytes(id));
     for (const entry of tree) {
-      const pending = this.overlay.get(entry.path);
-      if (pending) continue; // removed (skip) or replaced (put below)
+      if (overlay.has(entry.path)) continue; // removed (skip) or replaced (put below)
       builder.carry(entry.path, hexToBytes(entry.oid), toVisibility(entry.visibility));
     }
-    for (const [path, pending] of this.overlay) {
-      if (pending.kind === "put") builder.put(path, pending.bytes, resolved.get(path)!);
+    for (const [path, pending] of overlay) {
+      if (pending.kind === "put") builder.put(path, pending.payload!, resolved.get(path)!);
     }
     const authored = builder.finish();
 
@@ -335,9 +317,7 @@ class RelayRepo implements LootRepo {
     // Record the authored change (by its graph node id, the `/negotiate` unit)
     // so a later `pull` does not stream our own change back as "new".
     this.have.add(bytesToHex(authored.versionId));
-    this.overlay.clear();
-    this.message = null;
-    this.guard = {};
+    this.working.clear();
     return bytesToHex(authored.changeId);
   }
 
