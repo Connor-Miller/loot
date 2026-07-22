@@ -19,6 +19,11 @@ thiserror.workspace = true
 blake3.workspace = true
 aes-gcm = "0.10"
 ed25519-dalek.workspace = true
+# ECIES key-wrapping (key_seal) — pure Rust, wasm-buildable, so the in-memory
+# SDK can seal a private content key to the author and unwrap it for read-back.
+x25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
 getrandom = "0.2"
 zstd = { version = "0.13", optional = true }
 

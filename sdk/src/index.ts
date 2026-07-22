@@ -11,12 +11,21 @@ export type {
   LootRepo,
   PathEntry,
   Visibility,
+  EditOptions,
+  VisibilityGuard,
   ReadStream,
   Status,
   ChangeSummary,
   ChangeKind,
 } from "./repo.js";
-export { LootError, TransportError, NotFoundError, AuthError, ConflictError } from "./errors.js";
+export {
+  LootError,
+  TransportError,
+  NotFoundError,
+  AuthError,
+  ConflictError,
+  GuardError,
+} from "./errors.js";
 export type { LootErrorCode } from "./errors.js";
 
 // The diskless identity (generate / fromSeed / publicKey), straight from the

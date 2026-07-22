@@ -1,75 +1,29 @@
 //! ECIES key wrapping for sealed grant bundle delivery (ADR 0013/0014).
 //!
-//! Seals a 32-byte content key to a recipient's x25519 public key so a grant
-//! bundle can travel through a relay without exposing the key. The relay stores
-//! the ciphertext but cannot derive the wrapping key — ECDH requires the
-//! recipient's private key.
-//!
-//! ## Wire format (80 bytes)
-//!
-//! ```text
-//! [ ephemeral_pubkey (32) ][ chacha20poly1305 ciphertext (32 plaintext + 16 tag = 48) ]
-//! ```
-//!
-//! ## Protocol (ECIES over X25519 + ChaCha20-Poly1305)
-//!
-//! Seal:
-//! 1. Generate ephemeral x25519 keypair.
-//! 2. ECDH: `shared = ephemeral_private * recipient_x25519_pubkey`.
-//! 3. Derive 32-byte wrapping key: `blake3_derive("loot grant key wrap 2024", shared || eph_pub)`.
-//! 4. Encrypt the 32-byte content key (nonce = 0 — safe since eph key is unique per seal).
-//! 5. Transmit `[ephemeral_pubkey (32)][ciphertext (48)]`.
-//!
-//! Unseal:
-//! 1. Derive x25519 secret from the recipient's ed25519 signing key (see below).
-//! 2. ECDH with the ephemeral pubkey from the envelope.
-//! 3. Derive wrapping key identically.
-//! 4. Decrypt and return the 32-byte content key.
-//!
-//! ## ed25519 → x25519 derivation
-//!
-//! The x25519 secret is derived by applying the standard Curve25519 field
-//! mapping to the ed25519 signing key bytes (the seed). The corresponding
-//! x25519 PUBLIC key is derivable from the ed25519 public key via the
-//! Edwards→Montgomery birational map (`VerifyingKey::to_montgomery()`), which
-//! means peers need only share their ed25519 pubkey (the OpenSSH line) — the
-//! x25519 pubkey for encryption follows automatically.
+//! The composition (ECDH over X25519 + ChaCha20-Poly1305, the "loot grant key
+//! wrap 2024" KDF, the ed25519→x25519 derivation, the 80-byte wire format) now
+//! lives in [`loot_codec::key_seal`] so the wasm in-memory SDK builds the exact
+//! same code (ADR: TS SDK bridging, #381). This module stays as loot-identity's
+//! native surface: thin delegates that preserve the [`IdentityError`] return type
+//! its callers (loot-cli, loot-net) already expect. See `loot_codec::key_seal`
+//! for the protocol and wire-format documentation.
 
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Key, Nonce,
-};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
-use rand::rngs::OsRng;
+use loot_codec::key_seal as core;
 use super::IdentityError;
 
-/// The total size of a wrapped content key on the wire.
-pub const WRAPPED_KEY_SIZE: usize = 80; // 32 ephemeral pubkey + 48 ciphertext (32 + 16 tag)
+/// The total size of a wrapped content key on the wire (80 bytes).
+pub use core::WRAPPED_KEY_SIZE;
 
-/// Derive an x25519 StaticSecret from an ed25519 signing key.
-/// Uses `to_scalar_bytes()` — the SHA-512 lower half of the seed, clamped per
-/// RFC 8032. The corresponding x25519 public key is `vk.to_montgomery()`.
-/// This is the standard ed25519→x25519 derivation (Signal, WireGuard, etc.).
-fn x25519_secret_from_signing_key(signing_key: &SigningKey) -> StaticSecret {
-    StaticSecret::from(signing_key.to_scalar_bytes())
-}
-
-/// Derive the x25519 public key from an ed25519 verifying key via the
-/// standard Edwards→Montgomery birational map. This allows a sender to
-/// compute the recipient's x25519 pubkey from their stored ed25519 pubkey
-/// (the OpenSSH line) without needing the recipient's private key.
+/// Derive the x25519 public key from an ed25519 verifying key
+/// (Edwards→Montgomery). Infallible — a re-export of the core primitive.
 pub fn x25519_pubkey_from_verifying_key(vk: &VerifyingKey) -> [u8; 32] {
-    vk.to_montgomery().to_bytes()
+    core::x25519_pubkey_from_verifying_key(vk)
 }
 
-/// Derive the x25519 public key from raw ed25519 public key bytes (32 bytes,
-/// compressed Edwards Y). Returns an error if the bytes are not a valid
-/// compressed Edwards point.
+/// Derive the x25519 public key from raw ed25519 public key bytes.
 pub fn x25519_pubkey_from_ed25519_bytes(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], IdentityError> {
-    let vk = VerifyingKey::from_bytes(ed25519_pub)
-        .map_err(|e| IdentityError::Format(format!("invalid ed25519 pubkey: {e}")))?;
-    Ok(x25519_pubkey_from_verifying_key(&vk))
+    core::x25519_pubkey_from_ed25519_bytes(ed25519_pub).map_err(codec_err)
 }
 
 /// Seal (wrap) a 32-byte content key to a recipient's x25519 public key.
@@ -78,23 +32,7 @@ pub fn seal_key(
     content_key: &[u8; 32],
     recipient_x25519_pubkey: &[u8; 32],
 ) -> Result<[u8; WRAPPED_KEY_SIZE], IdentityError> {
-    let recipient_pub = X25519PublicKey::from(*recipient_x25519_pubkey);
-    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-    let ephemeral_pub = X25519PublicKey::from(&ephemeral_secret);
-    let shared = ephemeral_secret.diffie_hellman(&recipient_pub);
-
-    let wrapping_key = derive_wrapping_key(shared.as_bytes(), ephemeral_pub.as_bytes());
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&wrapping_key));
-    let nonce = Nonce::default(); // all zeros — safe since ephemeral key is unique per seal
-
-    let ct = cipher
-        .encrypt(&nonce, content_key.as_ref())
-        .map_err(|e| IdentityError::Format(format!("key seal encrypt: {e}")))?;
-
-    let mut out = [0u8; WRAPPED_KEY_SIZE];
-    out[..32].copy_from_slice(ephemeral_pub.as_bytes());
-    out[32..].copy_from_slice(&ct);
-    Ok(out)
+    core::seal_key(content_key, recipient_x25519_pubkey).map_err(codec_err)
 }
 
 /// Unseal (unwrap) a 80-byte wrapped key using the recipient's signing key.
@@ -102,37 +40,21 @@ pub fn unseal_key(
     wrapped: &[u8; WRAPPED_KEY_SIZE],
     signing_key: &SigningKey,
 ) -> Result<[u8; 32], IdentityError> {
-    let mut ephemeral_pub_bytes = [0u8; 32];
-    ephemeral_pub_bytes.copy_from_slice(&wrapped[..32]);
-    let ct = &wrapped[32..];
-
-    let ephemeral_pub = X25519PublicKey::from(ephemeral_pub_bytes);
-    let recipient_secret = x25519_secret_from_signing_key(signing_key);
-    let shared = recipient_secret.diffie_hellman(&ephemeral_pub);
-
-    let wrapping_key = derive_wrapping_key(shared.as_bytes(), &ephemeral_pub_bytes);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&wrapping_key));
-    let nonce = Nonce::default();
-
-    let plaintext = cipher
-        .decrypt(&nonce, ct)
-        .map_err(|_| IdentityError::BadSignature)?;
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&plaintext);
-    Ok(key)
+    core::unseal_key(wrapped, signing_key).map_err(codec_err)
 }
 
-fn derive_wrapping_key(shared_secret: &[u8; 32], ephemeral_pub: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new_derive_key("loot grant key wrap 2024");
-    h.update(shared_secret);
-    h.update(ephemeral_pub);
-    *h.finalize().as_bytes()
+/// Map a `loot-codec` crypto error into loot-identity's error surface. A failed
+/// unseal is a wrong-recipient/corrupt-envelope condition — the same class the
+/// native path previously reported as `BadSignature`.
+fn codec_err(e: loot_codec::RepoError) -> IdentityError {
+    IdentityError::Format(e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     fn test_signing_key() -> SigningKey {
         SigningKey::generate(&mut OsRng)
@@ -146,22 +68,9 @@ mod tests {
     fn seal_unseal_round_trip() {
         let sk = test_signing_key();
         let x25519_pub = recipient_x25519(&sk);
-
         let content_key = [0x42u8; 32];
         let wrapped = seal_key(&content_key, &x25519_pub).unwrap();
-        let recovered = unseal_key(&wrapped, &sk).unwrap();
-        assert_eq!(recovered, content_key);
-    }
-
-    #[test]
-    fn x25519_pubkey_derived_from_ed25519_pub_matches_private_derivation() {
-        // The core correctness property: the x25519 pubkey derived from the
-        // ed25519 pubkey matches the one the private key would produce.
-        let sk = test_signing_key();
-        let from_pub = x25519_pubkey_from_verifying_key(&sk.verifying_key());
-        let from_priv = *X25519PublicKey::from(&x25519_secret_from_signing_key(&sk)).as_bytes();
-        assert_eq!(from_pub, from_priv,
-            "x25519 pubkey derived from ed25519 pubkey must match private derivation");
+        assert_eq!(unseal_key(&wrapped, &sk).unwrap(), content_key);
     }
 
     #[test]
@@ -176,19 +85,14 @@ mod tests {
     fn wrong_recipient_cannot_unseal() {
         let alice = test_signing_key();
         let bob = test_signing_key();
-        let alice_x25519 = recipient_x25519(&alice);
-
-        let content_key = [0xABu8; 32];
-        let wrapped = seal_key(&content_key, &alice_x25519).unwrap();
-        let result = unseal_key(&wrapped, &bob);
-        assert!(result.is_err(), "wrong recipient must not unseal");
+        let wrapped = seal_key(&[0xABu8; 32], &recipient_x25519(&alice)).unwrap();
+        assert!(unseal_key(&wrapped, &bob).is_err(), "wrong recipient must not unseal");
     }
 
     #[test]
     fn wrapped_key_is_80_bytes() {
         let sk = test_signing_key();
-        let x25519_pub = recipient_x25519(&sk);
-        let wrapped = seal_key(&[0u8; 32], &x25519_pub).unwrap();
+        let wrapped = seal_key(&[0u8; 32], &recipient_x25519(&sk)).unwrap();
         assert_eq!(wrapped.len(), WRAPPED_KEY_SIZE);
     }
 }

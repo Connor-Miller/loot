@@ -1122,9 +1122,12 @@ version = "0.0.0"
 dependencies = [
  "aes-gcm",
  "blake3",
+ "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "rand 0.8.6",
  "thiserror 2.0.18",
+ "x25519-dalek",
  "zstd",
 ]
 
@@ -1155,6 +1158,7 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "ed25519-dalek",
+ "loot-codec",
  "rand 0.8.6",
  "rpassword",
  "ssh-key",

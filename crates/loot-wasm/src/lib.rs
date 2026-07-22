@@ -26,6 +26,7 @@ pub mod core {
     use ed25519_dalek::{Signer, SigningKey};
     use loot_codec::bundle_codec::{BundleBody, Frame};
     use loot_codec::change_id;
+    use loot_codec::key_seal::{self, WRAPPED_KEY_SIZE};
     use loot_codec::sealed::{self, ContentKey, SealedObject};
     use loot_codec::{ChangeNode, Oid, Visibility};
     use serde::Serialize;
@@ -38,9 +39,11 @@ pub mod core {
     fn visibility_from(tag: &str) -> Result<Visibility, String> {
         match tag {
             "public" => Ok(Visibility::Public),
-            // Slice 2 authors public content only. A carried non-public path is
-            // collapsed to Restricted with no grants — enough to round-trip a
-            // public-only tree; preserving real grant ids on carry is slice 4.
+            // Private content is `Restricted` with no named grants: the content
+            // key never rides in the bundle (it is ECIES-wrapped to the author for
+            // read-back, see [`ChangeBuilder::put`]), and the relay never serves a
+            // Restricted key regardless of the grant list. Cross-session grant
+            // delivery — populating real grantee ids — is the deferred flow (#383).
             "private" => Ok(Visibility::Restricted(Vec::new())),
             other => Err(format!("unknown visibility {other:?}")),
         }
@@ -236,6 +239,33 @@ pub mod core {
             self.signing_key.sign(message).to_bytes().to_vec()
         }
 
+        /// This identity's x25519 public key (32 bytes), derived from its ed25519
+        /// verifying key — the address a content key is ECIES-sealed to.
+        pub fn x25519_public_key(&self) -> Vec<u8> {
+            key_seal::x25519_pubkey_from_verifying_key(&self.signing_key.verifying_key()).to_vec()
+        }
+
+        /// ECIES-seal a 32-byte content key to this identity's OWN x25519 key,
+        /// returning the 80-byte wrapped key. Used when authoring private content:
+        /// the wrap lets the author recover the key for same-session read-back
+        /// without the key ever riding openly in the bundle.
+        pub fn seal_key_to_self(&self, content_key: &[u8]) -> Result<Vec<u8>, String> {
+            let ck: [u8; 32] =
+                content_key.try_into().map_err(|_| "content key must be 32 bytes".to_string())?;
+            let recipient = key_seal::x25519_pubkey_from_verifying_key(&self.signing_key.verifying_key());
+            Ok(key_seal::seal_key(&ck, &recipient).map_err(|e| e.to_string())?.to_vec())
+        }
+
+        /// Unseal an 80-byte wrapped content key addressed to this identity,
+        /// returning the 32-byte content key. Errors for a wrong recipient or a
+        /// corrupt envelope.
+        pub fn unseal_key(&self, wrapped: &[u8]) -> Result<Vec<u8>, String> {
+            let w: [u8; WRAPPED_KEY_SIZE] = wrapped
+                .try_into()
+                .map_err(|_| format!("wrapped key must be {WRAPPED_KEY_SIZE} bytes"))?;
+            Ok(key_seal::unseal_key(&w, &self.signing_key).map_err(|e| e.to_string())?.to_vec())
+        }
+
         /// Wrap `bundle` in a signed `/stow` envelope: `[0x01][pubkey 32][sig 64]
         /// [bundle]`, the signature over `bundle` — byte-identical to
         /// loot-identity's `wrap_envelope`.
@@ -250,6 +280,30 @@ pub mod core {
         pub envelope: Vec<u8>,
         pub change_id: [u8; 16],
         pub version_id: Oid,
+        /// For each private path put into this change: its object address and the
+        /// content key ECIES-wrapped to the author. These do NOT ride in the
+        /// `/stow` envelope — the caller files them into an in-memory keyring so
+        /// the author can read the just-sealed content back this session (#383's
+        /// cross-session delivery is deferred). `(oid, wrapped 80-byte key)`.
+        pub private_grants: Vec<(Oid, [u8; WRAPPED_KEY_SIZE])>,
+    }
+
+    impl AuthoredChange {
+        /// The private grants as JSON `[{"oid":<hex>,"wrapped":<hex>}]` — the shape
+        /// the TS SDK files into its RAM keyring for same-session read-back.
+        pub fn private_grants_json(&self) -> String {
+            #[derive(Serialize)]
+            struct Grant {
+                oid: String,
+                wrapped: String,
+            }
+            let grants: Vec<Grant> = self
+                .private_grants
+                .iter()
+                .map(|(oid, w)| Grant { oid: hex(&oid.0), wrapped: hex(w) })
+                .collect();
+            serde_json::to_string(&grants).unwrap_or_else(|_| "[]".into())
+        }
     }
 
     /// Composes a signed, full-tree change entirely in Rust (#381): the caller
@@ -265,6 +319,7 @@ pub mod core {
         tree: BTreeMap<PathBuf, (Oid, Visibility)>,
         objs: BTreeMap<Oid, SealedObject>,
         keys: BTreeMap<Oid, ContentKey>,
+        private_grants: Vec<(Oid, [u8; WRAPPED_KEY_SIZE])>,
     }
 
     impl ChangeBuilder {
@@ -277,6 +332,7 @@ pub mod core {
                 tree: BTreeMap::new(),
                 objs: BTreeMap::new(),
                 keys: BTreeMap::new(),
+                private_grants: Vec::new(),
             }
         }
 
@@ -294,15 +350,31 @@ pub mod core {
             Ok(())
         }
 
-        /// An edited/new path: seal the plaintext (uncompressed public content,
-        /// ADR 0040), record its object + public key, and place it in the tree.
+        /// An edited/new path: seal the plaintext (uncompressed, ADR 0040), record
+        /// its object, and place it in the tree.
+        ///
+        /// The key's fate depends on visibility:
+        ///   - **public** — the content key rides openly in the bundle's key
+        ///     section (an `ANYONE` grant), so any reader decrypts it.
+        ///   - **private** — the key must NOT ride in the bundle. It is ECIES-
+        ///     wrapped to the AUTHOR's own identity and returned via `finish`'s
+        ///     `private_grants` so the author can unwrap it for same-session
+        ///     read-back. The relay therefore stores only ciphertext (#383's
+        ///     cross-session grant delivery is deferred).
         pub fn put(&mut self, path: &str, plaintext: &[u8], visibility: &str) -> Result<(), String> {
             let vis = visibility_from(visibility)?;
-            if !matches!(vis, Visibility::Public) {
-                return Err("slice 2 authors public content only (private needs a grant, slice 4)".into());
-            }
             let (oid, sealed, key) = sealed::seal_uncompressed(plaintext, &vis).map_err(|e| e.to_string())?;
-            self.keys.insert(oid.clone(), key);
+            match vis {
+                Visibility::Public => {
+                    self.keys.insert(oid.clone(), key);
+                }
+                _ => {
+                    let recipient =
+                        key_seal::x25519_pubkey_from_verifying_key(&self.signing_key.verifying_key());
+                    let wrapped = key_seal::seal_key(&key, &recipient).map_err(|e| e.to_string())?;
+                    self.private_grants.push((oid.clone(), wrapped));
+                }
+            }
             self.objs.insert(oid.clone(), sealed);
             self.tree.insert(PathBuf::from(path), (oid, vis));
             Ok(())
@@ -333,7 +405,7 @@ pub mod core {
             let esig = self.signing_key.sign(&bundle).to_bytes();
             let envelope = envelope_bytes(&self.author, &esig, &bundle);
 
-            AuthoredChange { envelope, change_id, version_id }
+            AuthoredChange { envelope, change_id, version_id, private_grants: self.private_grants }
         }
     }
 }
@@ -438,6 +510,21 @@ impl Identity {
     pub fn wrap_envelope(&self, bundle: &[u8]) -> Vec<u8> {
         self.0.wrap_envelope(bundle)
     }
+    /// This identity's x25519 public key (32 bytes) — the ECIES seal address.
+    #[wasm_bindgen(js_name = x25519PublicKey)]
+    pub fn x25519_public_key(&self) -> Vec<u8> {
+        self.0.x25519_public_key()
+    }
+    /// ECIES-seal a 32-byte content key to this identity's own key (80 bytes out).
+    #[wasm_bindgen(js_name = sealKeyToSelf)]
+    pub fn seal_key_to_self(&self, content_key: &[u8]) -> Result<Vec<u8>, JsError> {
+        self.0.seal_key_to_self(content_key).map_err(js)
+    }
+    /// Unseal an 80-byte wrapped content key addressed to this identity (32 out).
+    #[wasm_bindgen(js_name = unsealKey)]
+    pub fn unseal_key(&self, wrapped: &[u8]) -> Result<Vec<u8>, JsError> {
+        self.0.unseal_key(wrapped).map_err(js)
+    }
 }
 
 /// The outcome of [`ChangeBuilder::finish`] — the envelope to POST to `/stow`
@@ -458,6 +545,12 @@ impl AuthoredChange {
     #[wasm_bindgen(getter, js_name = versionId)]
     pub fn version_id(&self) -> Vec<u8> {
         self.0.version_id.0.to_vec()
+    }
+    /// Private grants as JSON `[{"oid":<hex>,"wrapped":<hex>}]` — each private
+    /// path's content key ECIES-wrapped to the author, for RAM-keyring read-back.
+    #[wasm_bindgen(getter, js_name = privateGrantsJson)]
+    pub fn private_grants_json(&self) -> String {
+        self.0.private_grants_json()
     }
 }
 

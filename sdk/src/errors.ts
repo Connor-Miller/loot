@@ -9,6 +9,7 @@ export type LootErrorCode =
   | "not_found"
   | "unauthorized"
   | "conflict"
+  | "guard"
   | "unsupported";
 
 export class LootError extends Error {
@@ -74,5 +75,17 @@ export class ConflictError extends LootError {
   constructor(message: string) {
     super("conflict", message);
     this.name = "ConflictError";
+  }
+}
+
+/**
+ * A push would change an existing path's visibility without the matching guard.
+ * loot never seals or reveals content silently: demoting public→private needs
+ * `allowDemote` to name the path; revealing private→public needs `allowReveal`.
+ */
+export class GuardError extends LootError {
+  constructor(message: string) {
+    super("guard", message);
+    this.name = "GuardError";
   }
 }

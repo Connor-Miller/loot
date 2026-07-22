@@ -40,6 +40,13 @@ const CHANGE_MESSAGE: &str = "author a change";
 const PARENT_ID: [u8; 32] = [0x22; 32];
 const CARRY_OID: [u8; 32] = [0x33; 32];
 
+// ECIES key-seal (slice 4, #426). x25519 pubkey derivation is deterministic;
+// seal is randomized (ephemeral key), so we freeze ONE native-produced wrapped
+// key and prove both builds UNSEAL it back to the content key — the symmetric
+// miscompile can't cancel because nothing the wasm build seals is fed back in.
+const KEYSEAL_CONTENT_KEY: [u8; 32] = [0x5a; 32];
+const OTHER_SEED: [u8; 32] = [0x22; 32];
+
 // --- frozen native vectors (regenerated + re-asserted by the native run) ---
 /// blake3(ADDR_NONCE ‖ ADDR_CIPHERTEXT).
 const FROZEN_ADDRESS: &str = "270fc28469c89467298dc6454975985ba36dd2231ce075eba2f585d33d9793e7";
@@ -62,6 +69,11 @@ const FROZEN_ENVELOPE: &str = "01d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016ba
 /// version-id (change-id fold) of a carry-only change: SEED author, CHANGE_MESSAGE,
 /// parent PARENT_ID, tree {"readme.md" -> (CARRY_OID, public)}.
 const FROZEN_VERSION_ID: &str = "6d80c53008f7f9efd6559eb5f995d354ceca6e771fb64194a437220b12a9d6de";
+/// x25519 public key derived from the SEED identity (deterministic).
+const FROZEN_X25519_PUB: &str = "7a46e129fd805047448437e4744f1f1576be8c449fdf57e0c580d36c5cfc6668";
+/// A native ECIES wrap of KEYSEAL_CONTENT_KEY to the SEED identity's x25519 key.
+/// Frozen once (seal is randomized); both builds must unseal it to the key.
+const FROZEN_WRAPPED: &str = "c8ff3db598bd5b462c94bd7f6ce8ed7c3239c29f0440660553c756c892e0414050ab934e6a6e74d7d17610c2a2e842cd7df3bb23f8480c73f6ba9df17b4168cec600b0dc47b6157d2d66707dfa1a68af";
 /// A one-change, one-object Sync frame, encoded by native `loot-codec`.
 const FROZEN_BUNDLE: &str = "080000000000000100000062db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea4242424242424242424242420010000000424242424242424242424242424242420001000000010000002a0100000062db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea0505050505050505050505050505050505050505050505050505050505050505010000000101010101010101010101010101010101010101010101010101010101010101000000000c0000006669727374206368616e67650100000009000000726561646d652e6d6462db251da2e062dcf972f9009539614e88b47fcbbc745aede97685c0242c35ea000000000000000000000000";
 
@@ -139,6 +151,20 @@ fn check_write(pubkey: Vec<u8>, signature: Vec<u8>, envelope: Vec<u8>, version_i
     assert_eq!(&envelope[97..], ENV_BUNDLE, "envelope tail is the bundle verbatim");
 }
 
+/// ECIES parity: the deterministic x25519 pubkey, an unseal of the FROZEN native
+/// wrapped key, a same-build seal→unseal round-trip, and a wrong-identity refusal.
+fn check_key_seal(
+    x25519_pub: Vec<u8>,
+    unsealed_from_frozen: Vec<u8>,
+    roundtrip_recovered: Vec<u8>,
+    wrong_identity_errored: bool,
+) {
+    assert_eq!(hex(&x25519_pub), FROZEN_X25519_PUB, "x25519 pubkey != frozen native vector");
+    assert_eq!(unsealed_from_frozen, KEYSEAL_CONTENT_KEY, "unseal of frozen wrapped key != content key");
+    assert_eq!(roundtrip_recovered, KEYSEAL_CONTENT_KEY, "seal→unseal round-trip must recover the key");
+    assert!(wrong_identity_errored, "unseal by the wrong identity must error");
+}
+
 fn frozen_obj_addr_bytes() -> Vec<u8> {
     unhex(FROZEN_OBJ_ADDR)
 }
@@ -208,6 +234,9 @@ fn parity_native() {
     builder.carry("readme.md", &CARRY_OID, "public").unwrap();
     let version_id = builder.finish().version_id.0.to_vec();
 
+    // ECIES: x25519 pubkey is deterministic, so it joins the regeneration guard.
+    let x25519_pub = id.x25519_public_key();
+
     if hex(&addr.0) != FROZEN_OBJ_ADDR
         || hex(&ciphertext) != FROZEN_CIPHERTEXT
         || hex(&bundle_bytes) != FROZEN_BUNDLE
@@ -217,9 +246,10 @@ fn parity_native() {
         || hex(&signature) != FROZEN_SIGN
         || hex(&envelope) != FROZEN_ENVELOPE
         || hex(&version_id) != FROZEN_VERSION_ID
+        || hex(&x25519_pub) != FROZEN_X25519_PUB
     {
         panic!(
-            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_FETCH_REQ = {:?}\nFROZEN_NEGOTIATE_REQ = {:?}\nFROZEN_PUBKEY = {:?}\nFROZEN_SIGN = {:?}\nFROZEN_ENVELOPE = {:?}\nFROZEN_VERSION_ID = {:?}\nFROZEN_BUNDLE = {:?}",
+            "frozen vectors stale — update consts:\nFROZEN_OBJ_ADDR = {:?}\nFROZEN_CIPHERTEXT = {:?}\nFROZEN_FETCH_REQ = {:?}\nFROZEN_NEGOTIATE_REQ = {:?}\nFROZEN_PUBKEY = {:?}\nFROZEN_SIGN = {:?}\nFROZEN_ENVELOPE = {:?}\nFROZEN_VERSION_ID = {:?}\nFROZEN_X25519_PUB = {:?}\nFROZEN_BUNDLE = {:?}",
             hex(&addr.0),
             hex(&ciphertext),
             hex(&fetch_req),
@@ -228,6 +258,7 @@ fn parity_native() {
             hex(&signature),
             hex(&envelope),
             hex(&version_id),
+            hex(&x25519_pub),
             hex(&bundle_bytes)
         );
     }
@@ -237,6 +268,20 @@ fn parity_native() {
     check_fetch_request(encode_fetch_request(&REQ_HAVE, &REQ_WANTS).unwrap());
     check_negotiate_request(encode_negotiate_request(&negotiate_have()).unwrap());
     check_write(pubkey, signature, envelope, version_id);
+
+    // ECIES key-seal parity: unseal the frozen native wrapped key, round-trip a
+    // fresh seal, and confirm a different identity cannot unseal.
+    let other = Identity::from_seed(&OTHER_SEED).unwrap();
+    let rt = {
+        let w = id.seal_key_to_self(&KEYSEAL_CONTENT_KEY).unwrap();
+        id.unseal_key(&w).unwrap()
+    };
+    check_key_seal(
+        x25519_pub,
+        id.unseal_key(&unhex(FROZEN_WRAPPED)).unwrap(),
+        rt,
+        other.unseal_key(&unhex(FROZEN_WRAPPED)).is_err(),
+    );
 
     let frozen_ct = unhex(FROZEN_CIPHERTEXT);
     let got = decrypt(&DEC_NONCE, &frozen_ct, &DEC_KEY).unwrap();
@@ -279,6 +324,19 @@ fn parity_wasm() {
         id.sign(SIGN_MSG),
         id.wrap_envelope(ENV_BUNDLE),
         builder.finish().version_id(),
+    );
+
+    // ECIES key-seal parity — same assertions as native, through the wasm shell.
+    let other = Identity::from_seed(&OTHER_SEED).unwrap();
+    let rt = {
+        let w = id.seal_key_to_self(&KEYSEAL_CONTENT_KEY).unwrap();
+        id.unseal_key(&w).unwrap()
+    };
+    check_key_seal(
+        id.x25519_public_key(),
+        id.unseal_key(&unhex(FROZEN_WRAPPED)).unwrap(),
+        rt,
+        other.unseal_key(&unhex(FROZEN_WRAPPED)).is_err(),
     );
 
     let frozen_ct = unhex(FROZEN_CIPHERTEXT);

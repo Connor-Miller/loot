@@ -7,9 +7,24 @@ import {
 } from "../wasm/loot_wasm.js";
 import type { Identity } from "../wasm/loot_wasm.js";
 import { decompress as zstdInflate } from "fzstd";
-import { AuthError, NotFoundError, TransportError } from "./errors.js";
+import { AuthError, GuardError, NotFoundError, TransportError } from "./errors.js";
 
 export type Visibility = "public" | "private";
+
+/** Options for authoring a path (`edit`). Omitting `visibility` inherits the
+ * path's current visibility, or defaults a brand-new path to `public`. */
+export interface EditOptions {
+  visibility?: Visibility;
+}
+
+/** Guards that authorize a visibility change on an existing path. Without the
+ * matching guard, a change of visibility is refused (loot never seals or reveals
+ * content silently). `allowDemote` names paths that may go public→private;
+ * `allowReveal` permits private→public. */
+export interface VisibilityGuard {
+  allowDemote?: string[];
+  allowReveal?: boolean;
+}
 
 export interface PathEntry {
   path: string;
@@ -35,6 +50,8 @@ export interface Status {
  * into (e.g. `pull` over many changes). */
 export interface ReadStream extends AsyncIterable<Uint8Array> {
   bytes(): Promise<Uint8Array>;
+  /** The visibility of the path being read (`public` or `private`). */
+  visibility(): Promise<Visibility>;
 }
 
 /**
@@ -46,13 +63,17 @@ export interface ReadStream extends AsyncIterable<Uint8Array> {
 export interface LootRepo {
   list(): Promise<PathEntry[]>;
   read(path: string): ReadStream;
-  edit(path: string, bytes: Uint8Array): Promise<void>;
+  /** Stage `bytes` at `path`. `opts.visibility` sets visibility explicitly;
+   * omitted, it inherits the path's current visibility (new path → `public`). */
+  edit(path: string, bytes: Uint8Array, opts?: EditOptions): Promise<void>;
   remove(path: string): Promise<void>;
-  describe(message: string): Promise<void>;
+  /** Name the pending change; `guard` may be supplied here or at `push`. */
+  describe(message: string, guard?: VisibilityGuard): Promise<void>;
   status(): Promise<Status>;
   diff(): Promise<ChangeSummary[]>;
-  /** Sign + stow the pending change; returns its durable change-id (hex). */
-  push(): Promise<string>;
+  /** Sign + stow the pending change; returns its durable change-id (hex).
+   * `guard` authorizes any visibility changes (unioned with `describe`'s). */
+  push(guard?: VisibilityGuard): Promise<string>;
   /**
    * Stream changes authored elsewhere, advancing the session's view so later
    * `read`/`list` reflect them. Yields one chunk per new change; a pull with
@@ -73,8 +94,11 @@ interface ChangeView {
   tree: TreeEntry[];
 }
 
-/** The overlay: a path is either replaced with new bytes, or removed. */
-type Pending = { kind: "put"; bytes: Uint8Array } | { kind: "remove" };
+/** The overlay: a path is either replaced with new bytes (with an optionally
+ * explicit visibility — `undefined` means "inherit"), or removed. */
+type Pending =
+  | { kind: "put"; bytes: Uint8Array; visibility?: Visibility }
+  | { kind: "remove" };
 
 const EMPTY = new Uint8Array(0);
 
@@ -89,6 +113,14 @@ function bytesToHex(bytes: Uint8Array): string {
 function toVisibility(raw: string): Visibility {
   return raw === "public" ? "public" : "private";
 }
+/** Union two guards: paths named by either may demote; either enabling reveal
+ * enables it. Lets `describe`-time and `push`-time guards combine. */
+function mergeGuards(a: VisibilityGuard, b: VisibilityGuard): VisibilityGuard {
+  return {
+    allowDemote: [...new Set([...(a.allowDemote ?? []), ...(b.allowDemote ?? [])])],
+    allowReveal: Boolean(a.allowReveal || b.allowReveal),
+  };
+}
 
 class RelayRepo implements LootRepo {
   private readonly overlay = new Map<string, Pending>();
@@ -101,6 +133,12 @@ class RelayRepo implements LootRepo {
    * never re-pulls what it just authored.
    */
   private readonly have = new Set<string>();
+  private guard: VisibilityGuard = {};
+  /** In-RAM keyring for content this identity authored privately: object-id
+   * (hex) → the content key ECIES-wrapped to this identity. Lets the author read
+   * their own just-sealed content back this session by unwrapping the key. The
+   * cross-session delivery of these grants to OTHER parties is deferred (#383). */
+  private readonly privateKeyring = new Map<string, Uint8Array>();
 
   constructor(
     private readonly url: string,
@@ -153,10 +191,15 @@ class RelayRepo implements LootRepo {
   }
 
   read(path: string): ReadStream {
-    const load = async (): Promise<Uint8Array> => {
+    const resolve = async (): Promise<TreeEntry> => {
       const { tree } = await this.snapshot();
       const entry = tree.find((e) => e.path === path);
       if (!entry) throw new NotFoundError(`path not found: ${path}`);
+      return entry;
+    };
+
+    const load = async (): Promise<Uint8Array> => {
+      const entry = await resolve();
 
       // Scoped fetch: only this object's bytes. `have = []` is required — the
       // relay gathers object bytes + public keys by walking the changes NOT in
@@ -165,23 +208,37 @@ class RelayRepo implements LootRepo {
       const bundle = await this.fetchBundle(EMPTY, oid);
       const ciphertext = bundle.object(oid);
       const nonce = bundle.nonce(oid);
-      const key = bundle.publicKey(oid);
       if (!ciphertext || !nonce) {
         throw new NotFoundError(`object bytes for ${path} did not travel`);
       }
-      if (!key) {
+
+      // Public content ships its key in the bundle; private content's key never
+      // does (the relay stores only ciphertext). For a path THIS session sealed,
+      // unwrap the author-held key from the RAM keyring; otherwise it is private
+      // content we cannot read (cross-session grant delivery is deferred, #383).
+      const publicKey = bundle.publicKey(oid);
+      if (publicKey) {
+        const plain = decrypt(nonce, ciphertext, publicKey);
+        return bundle.compressed(oid) ? zstdInflate(plain) : plain;
+      }
+      const wrapped = this.privateKeyring.get(entry.oid);
+      if (!wrapped) {
         throw new AuthError(
-          `no content key for ${path}: private content's key travels only via a grant (out of slice 1)`,
+          `no content key for ${path}: private content's key is held only by its author (cross-session grant delivery is deferred)`,
         );
       }
-      const plain = decrypt(nonce, ciphertext, key);
-      return bundle.compressed(oid) ? zstdInflate(plain) : plain;
+      const contentKey = this.identity.unsealKey(wrapped);
+      // Private content is never compressed (S2, ADR 0020), so no zstd inflate.
+      return decrypt(nonce, ciphertext, contentKey);
     };
 
     let cached: Promise<Uint8Array> | undefined;
     const bytes = () => (cached ??= load());
     return {
       bytes,
+      async visibility() {
+        return toVisibility((await resolve()).visibility);
+      },
       async *[Symbol.asyncIterator]() {
         yield await bytes();
       },
@@ -190,16 +247,17 @@ class RelayRepo implements LootRepo {
 
   // --- capture-first authoring (#424) --------------------------------------
 
-  async edit(path: string, bytes: Uint8Array): Promise<void> {
-    this.overlay.set(path, { kind: "put", bytes });
+  async edit(path: string, bytes: Uint8Array, opts?: EditOptions): Promise<void> {
+    this.overlay.set(path, { kind: "put", bytes, visibility: opts?.visibility });
   }
 
   async remove(path: string): Promise<void> {
     this.overlay.set(path, { kind: "remove" });
   }
 
-  async describe(message: string): Promise<void> {
+  async describe(message: string, guard?: VisibilityGuard): Promise<void> {
     this.message = message;
+    if (guard) this.guard = mergeGuards(this.guard, guard);
   }
 
   async status(): Promise<Status> {
@@ -216,7 +274,7 @@ class RelayRepo implements LootRepo {
     return (await this.status()).changes;
   }
 
-  async push(): Promise<string> {
+  async push(guard?: VisibilityGuard): Promise<string> {
     // Caller preconditions (usage bugs), not loot-domain errors — a plain Error,
     // not a typed LootError, since "conflict" means a real same-path bounce.
     if (this.message === null) {
@@ -225,11 +283,37 @@ class RelayRepo implements LootRepo {
     if (this.overlay.size === 0) {
       throw new Error("nothing to push (no pending edits)");
     }
+    const effectiveGuard = guard ? mergeGuards(this.guard, guard) : this.guard;
     const { parents, tree } = await this.snapshot();
+    const existing = new Map(tree.map((e) => [e.path, toVisibility(e.visibility)]));
+
+    // Resolve each edited path's visibility (inherit / new-path default) and
+    // enforce the guard model BEFORE composing — a refused change stows nothing.
+    const resolved = new Map<string, Visibility>();
+    for (const [path, pending] of this.overlay) {
+      if (pending.kind !== "put") continue;
+      const prior = existing.get(path);
+      const target: Visibility = pending.visibility ?? prior ?? "public";
+      // A guard is required only to CHANGE an established path's visibility; a
+      // brand-new path (no prior) picks its initial visibility freely.
+      if (prior !== undefined && target !== prior) {
+        if (prior === "public" && !(effectiveGuard.allowDemote ?? []).includes(path)) {
+          throw new GuardError(
+            `refusing to make ${path} private without allowDemote (public→private is a demotion)`,
+          );
+        }
+        if (prior === "private" && !effectiveGuard.allowReveal) {
+          throw new GuardError(
+            `refusing to make ${path} public without allowReveal (private→public reveals sealed content)`,
+          );
+        }
+      }
+      resolved.set(path, target);
+    }
 
     // Compose the full-tree change in the WASM core: carry unchanged paths,
     // seal + put edited ones, skip removed. Composition (id fold, signing,
-    // bundle encode, envelope) never leaves Rust.
+    // sealing, bundle encode, envelope) never leaves Rust.
     const builder = new ChangeBuilder(this.identity, this.message);
     for (const id of parents) builder.addParent(hexToBytes(id));
     for (const entry of tree) {
@@ -238,9 +322,14 @@ class RelayRepo implements LootRepo {
       builder.carry(entry.path, hexToBytes(entry.oid), toVisibility(entry.visibility));
     }
     for (const [path, pending] of this.overlay) {
-      if (pending.kind === "put") builder.put(path, pending.bytes, "public");
+      if (pending.kind === "put") builder.put(path, pending.bytes, resolved.get(path)!);
     }
     const authored = builder.finish();
+
+    // File the author's private grants (content keys ECIES-wrapped to self) into
+    // the RAM keyring so read-back works; they do NOT travel in the envelope.
+    const grants: { oid: string; wrapped: string }[] = JSON.parse(authored.privateGrantsJson);
+    for (const g of grants) this.privateKeyring.set(g.oid, hexToBytes(g.wrapped));
 
     await this.stow(authored.envelope);
     // Record the authored change (by its graph node id, the `/negotiate` unit)
@@ -248,6 +337,7 @@ class RelayRepo implements LootRepo {
     this.have.add(bytesToHex(authored.versionId));
     this.overlay.clear();
     this.message = null;
+    this.guard = {};
     return bytesToHex(authored.changeId);
   }
 

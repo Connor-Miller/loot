@@ -21,6 +21,7 @@ pub mod attestation;
 pub mod bundle_codec;
 pub mod change_id;
 pub mod format;
+pub mod key_seal;
 pub mod sealed;
 
 pub use attestation::{Attestation, AttestationLog};

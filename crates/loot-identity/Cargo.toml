@@ -10,6 +10,7 @@ license.workspace = true
 # can depend on it without creating a cycle.
 
 [dependencies]
+loot-codec.workspace = true
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 ssh-key.workspace = true
