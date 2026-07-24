@@ -56,7 +56,7 @@ impl Workspace {
         }
         // Capture current disk edits so the lane forks from a real finalized
         // anchor (the same move as `bind_dock_dir`).
-        if self.working.is_some() {
+        if self.draft.working().is_some() {
             let msg = self.working_message_or_placeholder();
             self.snapshot(&msg)?;
         }

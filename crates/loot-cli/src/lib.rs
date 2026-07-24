@@ -18,6 +18,7 @@
 pub mod bisect;
 pub mod blame;
 pub mod doctor;
+mod draft;
 pub mod dup;
 pub mod emit;
 pub mod error;

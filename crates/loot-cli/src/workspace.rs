@@ -8,6 +8,7 @@
 //! Workspace only reads the working tree + `.lootattributes` into the entries
 //! the engine reconciles, and persists state after a mutation.
 
+use crate::draft::Draft;
 use crate::position::Position;
 use crate::reconcile::{self, REFUSE_UNDESCRIBED_PARENT};
 use loot_core::bridge::{FerryState, MarkMap};
@@ -73,16 +74,13 @@ pub struct Workspace {
     /// store instance, so a repo that never spawns a lane is byte-for-byte
     /// unchanged on disk.
     position: Position,
-    /// The working change being rewritten in place, if one is in progress.
-    /// `None` right after `init` or `apply` (finalized history, no WIP change).
-    working: Option<Oid>,
-    /// The durable change id `loot new` minted eagerly for the *next* change
-    /// (ADR 0029/0030), before any snapshot has recorded it. The fresh working
-    /// change already has a handle to print and show in `status`/`log`; the
-    /// first snapshot carries this id onto the change (then clears it). `None`
-    /// on a keyless repo (unsigned changes get no durable handle) or once
-    /// consumed.
-    next_change_id: Option<[u8; 16]>,
+    /// The state of the working change — the pointer plus the eagerly-minted
+    /// next-change handle (ADR 0029/0030) — as one state machine owned by
+    /// [`Draft`] (sibling of [`Position`]: Draft is state, Position is place).
+    /// Before this module the two facts were loose fields hand-mutated at ~19
+    /// sites; [`Draft`] makes the illegal "working change *and* a pending handle"
+    /// combination unrepresentable.
+    draft: Draft,
     /// The loaded signing keypair, if this repo has one. Stamps the author on new
     /// changes and signs at finalization (S3, ADR 0018). `None` for a keyless
     /// repo, which then produces unauthored (legacy) changes.
@@ -175,8 +173,7 @@ impl Workspace {
         let mut repo = DagRepo::load_from(&store, root.clone()).map_err(|e| e.to_string())?;
         let identity = read_to_string(&store.identity())?;
         let position = Position::load(&store, dock, lane_id);
-        let working = store.read_working(position.dock_opt());
-        let next_change_id = store.read_next_change(position.dock_opt());
+        let draft = Draft::load(&store, position.dock_opt());
         // Load the signing keypair if present and stamp its pubkey as the author,
         // so new changes are attributable and signable (S3, ADR 0018). A keyless
         // repo stays unauthored (legacy ids), which keeps older repos working.
@@ -194,8 +191,7 @@ impl Workspace {
             identity,
             repo,
             position,
-            working,
-            next_change_id,
+            draft,
             signer,
             now,
         })
@@ -211,8 +207,8 @@ impl Workspace {
     /// from birth just as `new` gives every later one. No-op once a change or a
     /// pending handle exists, and on a keyless repo (mints `None`).
     pub fn start_fresh_change(&mut self) -> Result<(), CliError> {
-        if self.working.is_none() && self.next_change_id.is_none() {
-            self.next_change_id = self.repo.mint_next_change_id();
+        if self.draft.is_clean() {
+            self.draft.arm(self.repo.mint_next_change_id());
             self.persist()?;
         }
         Ok(())
@@ -284,7 +280,7 @@ impl Workspace {
     /// (ADR 0029) — the per-head fork view instead of the flat list.
     pub fn history(&mut self) -> Result<HistoryView, CliError> {
         let working = self.live_working_row()?;
-        let working_node = self.working.clone();
+        let working_node = self.draft.working().cloned();
         // One Liveness view (#216): superseded versions (ADR 0032) leave the
         // live view exactly like abandoned ones — an amended change renders
         // once, as its live version. No hand-assembled union here anymore.
@@ -556,8 +552,9 @@ impl Workspace {
         // The line we apply onto: the in-progress working change if there is one,
         // else the finalized tip.
         let ours = self
-            .working
-            .clone()
+            .draft
+            .working()
+            .cloned()
             .or_else(|| self.anchor())
             .ok_or("nothing to apply onto yet — record a change first (`loot new`)")?;
 
@@ -639,7 +636,7 @@ impl Workspace {
         // anchor. `None` only on a repo with no history at all.
         let parent = match after {
             Some(sel) => Some(self.resolve_selector(sel)?),
-            None => self.working.clone().or_else(|| self.anchor()),
+            None => self.draft.working().cloned().or_else(|| self.anchor()),
         };
 
         // Copy the target's tree address-for-address (ADR 0004): every entry
@@ -808,7 +805,7 @@ impl Workspace {
         let tree_hash = hash_tree(&entries, message);
         let last_hash = self.store.read_tree_hash(self.dock_opt());
         if last_hash == tree_hash {
-            if let Some(id) = &self.working {
+            if let Some(id) = self.draft.working() {
                 return Ok((id.clone(), reported));
             }
         }
@@ -818,7 +815,7 @@ impl Workspace {
         // `new` and shown in `status`/`log` is the one that lands on the first
         // version. A re-snapshot (working `Some`) carries the node's own handle
         // and ignores this.
-        let assign = if self.working.is_none() { self.next_change_id } else { None };
+        let assign = self.draft.next();
 
         // Fork the working change from `base` — the ambient dock's tip (ADR
         // 0022) on the normal path. `None` (the pre-dock home dock) preserves
@@ -827,7 +824,7 @@ impl Workspace {
             .repo
             .snapshot_assigning(
                 base,
-                self.working.as_ref(),
+                self.draft.working(),
                 &entries,
                 message,
                 self.now,
@@ -835,10 +832,9 @@ impl Workspace {
                 assign,
             )
             .map_err(CliError::from)?;
-        self.working = Some(id.clone());
-        // The pending next-change handle is now recorded on the working node,
-        // so it is no longer pending — clear it before persisting.
-        self.next_change_id = None;
+        // The change is recorded; the working pointer moves onto it and the
+        // pending handle (if this was a fresh change) is consumed by construction.
+        self.draft.activate(id.clone());
         // Persist the new tree hash before persisting the rest of state.
         let _ = self.store.write_tree_hash(self.dock_opt(), &tree_hash);
         self.persist()?;
@@ -849,8 +845,8 @@ impl Workspace {
     /// implicit snapshot (ADR 0030) re-records the tree without clobbering a
     /// name a prior `describe` set. `None` when there is no working change.
     pub fn working_message(&self) -> Option<String> {
-        self.working
-            .as_ref()
+        self.draft
+            .working()
             .and_then(|w| self.repo.change_message(w))
     }
 
@@ -875,7 +871,7 @@ impl Workspace {
     /// verb would fold into a PR-less signed line (`working_is_undescribed` is
     /// the #275 refusal's job, not this guard's).
     pub fn has_described_working_change(&self) -> bool {
-        self.working.is_some() && !self.working_is_undescribed()
+        self.draft.working().is_some() && !self.working_is_undescribed()
     }
 
     /// The working change's subject (its message's first line) — what the #418
@@ -911,7 +907,7 @@ impl Workspace {
     /// [`drop_capture_if_redundant`](Self::drop_capture_if_redundant)) — a pass
     /// with no real work to sign must stay a no-op, not become a nag.
     fn refuse_if_undescribed(&self, refusal: &str) -> Result<(), CliError> {
-        if self.working.is_some() && self.working_is_undescribed() {
+        if self.draft.working().is_some() && self.working_is_undescribed() {
             return Err(refusal.to_string().into());
         }
         Ok(())
@@ -944,7 +940,7 @@ impl Workspace {
         };
         if redundant {
             self.repo.drop_working(id);
-            self.working = None;
+            self.draft.clear();
             self.persist()?;
         }
         Ok(redundant)
@@ -1004,7 +1000,7 @@ impl Workspace {
         // has no working change left by here, mints no signed change, and so has
         // no subject to get wrong — it must stay a no-op, not become a refusal.
         self.refuse_if_undescribed(REFUSE_UNDESCRIBED)?;
-        let finalized = self.working.clone();
+        let finalized = self.draft.working().cloned();
         self.finalize_working()?;
         Ok((finalized, first_seals))
     }
@@ -1068,7 +1064,7 @@ impl Workspace {
         // Sign the finalized change id with our identity key (S3, ADR 0018). The
         // working change is ephemeral until now (rewritten on each `status`), so
         // we sign exactly once, here. A keyless repo finalizes unsigned (legacy).
-        if let (Some(signer), Some(working)) = (&self.signer, self.working.clone()) {
+        if let (Some(signer), Some(working)) = (&self.signer, self.draft.working().cloned()) {
             // Sign over `version_id ‖ change_id ‖ predecessors` (ADR 0029/0032)
             // so the durable handle is bound to this exact version and a
             // supersession claim cannot be relabelled or stripped on the wire.
@@ -1090,20 +1086,37 @@ impl Workspace {
         // A seeded tip must always advance, even on the pristine-looking home
         // dock — `Position::tracks_tip` names the predicate and the stuck-tip
         // bug class it exists for (#229, #234, #265).
+        // Hand the finished working id off to the tip (a tracked position
+        // advances; an untracked pristine home discards it and stays
+        // byte-for-byte unchanged, ADR 0022). `take` leaves the Draft clean
+        // either way — the required precondition for the arm below.
+        let finished = self.draft.take();
         if self.position.tracks_tip() {
-            if self.working.is_some() {
-                self.position.advance(&self.store, self.working.take());
+            if finished.is_some() {
+                self.position.advance(&self.store, finished);
             }
-        } else {
-            self.working = None;
         }
         // Clear the tree-hash so the next snapshot always runs the engine.
         self.store.clear_tree_hash(self.dock_opt());
         // Eagerly mint the fresh change's durable handle (ADR 0029/0030): the
         // change that begins now has a name from birth, printed by `new` and
         // shown in `status`/`log`, and the first snapshot carries it onto the
-        // change's first version. Keyless repos mint `None` and stay legacy.
-        self.next_change_id = self.repo.mint_next_change_id();
+        // change's first version. Keyless repos mint `None` and stay clean.
+        self.draft.arm(self.repo.mint_next_change_id());
+        self.persist()
+    }
+
+    /// Restart the working change on a finalized `anchor`: pin the tip there,
+    /// clear the [`Draft`], drop the stale tree-hash, and arm a fresh handle.
+    /// The "abandon the working draft and start fresh on what we just landed"
+    /// dance `squash` and `absorb` share — a coordinator over [`Draft`] and
+    /// [`Position`] so neither the tip-seed nor the clear+re-mint can be
+    /// forgotten independently. Persists.
+    fn restart_on(&mut self, anchor: Oid) -> Result<(), CliError> {
+        self.draft.clear();
+        self.position.seed(&self.store, Some(anchor));
+        self.store.clear_tree_hash(self.dock_opt());
+        self.draft.arm(self.repo.mint_next_change_id());
         self.persist()
     }
 
@@ -1167,8 +1180,9 @@ impl Workspace {
         // dock. In a multi-dock (multi-head) graph `heads().next()` is arbitrary,
         // so a dock must name its own head (ADR 0022).
         let head = self
-            .working
-            .clone()
+            .draft
+            .working()
+            .cloned()
             .or_else(|| self.position.tip().cloned())
             .or_else(|| self.repo.heads().into_iter().next())
             .ok_or("nothing to surface yet (no changes recorded)")?;
@@ -1184,7 +1198,7 @@ impl Workspace {
     /// an empty tree, not an error. Otherwise materializes like
     /// [`surface_with_report`](Self::surface_with_report).
     pub fn surface_tree(&mut self) -> Result<Option<Vec<(PathBuf, loot_core::Visibility)>>, CliError> {
-        let has_tip = self.working.is_some()
+        let has_tip = self.draft.working().is_some()
             || self.position.tip().is_some()
             || self.repo.heads().into_iter().next().is_some();
         if !has_tip {
@@ -1211,8 +1225,9 @@ impl Workspace {
         let head = match target {
             Some(sel) => self.resolve_selector(sel)?,
             None => self
-                .working
-                .clone()
+                .draft
+                .working()
+                .cloned()
                 .or_else(|| self.position.tip().cloned())
                 .or_else(|| self.repo.heads().into_iter().next())
                 .ok_or("nothing to search yet (no changes recorded)")?,
@@ -1226,13 +1241,13 @@ impl Workspace {
 
     /// The id of the current working change, if one is in progress.
     pub fn working_id(&self) -> Option<&Oid> {
-        self.working.as_ref()
+        self.draft.working()
     }
 
     /// The durable change id `loot new` minted eagerly for the next change (ADR
     /// 0029/0030), if one is pending and unrecorded. `loot new` prints it.
     pub fn next_change_id(&self) -> Option<[u8; 16]> {
-        self.next_change_id
+        self.draft.next()
     }
 
     /// The live working-change row for read-only `status`/`log` (ADR 0030): the
@@ -1242,12 +1257,12 @@ impl Workspace {
     /// persists. `None` when there is no working change to show — a keyless or
     /// pre-`new` repo with no pending handle and no in-progress change.
     pub fn live_working_row(&mut self) -> Result<Option<WorkingRow>, CliError> {
-        if self.working.is_none() && self.next_change_id.is_none() {
+        if self.draft.is_clean() {
             return Ok(None);
         }
-        let change_id = match &self.working {
+        let change_id = match self.draft.working() {
             Some(w) => self.repo.change_change_id(w),
-            None => self.next_change_id,
+            None => self.draft.next(),
         };
         let (entries, reported) = self.read_working_tree()?;
         let message = self.working_message_or_placeholder();
@@ -1259,7 +1274,7 @@ impl Workspace {
         // mutating verbs. Only genuine un-snapshotted drift (a save with no loot
         // command since) falls through to the live plaintext fingerprint
         // (Seam #1, ADR 0030), which by construction differs from a sealed id.
-        if let Some(w) = &self.working {
+        if let Some(w) = self.draft.working() {
             let up_to_date = self.store.read_tree_hash(self.dock_opt()) == hash_tree(&entries, &message);
             if up_to_date {
                 // Same manifest judgment as the finalize drop (#289): a
@@ -1458,7 +1473,7 @@ impl Workspace {
             description: stepped.appended.description.clone(),
             restored_to: stepped.restored_to,
             heads: stepped.appended.heads(),
-            working: self.working.clone(),
+            working: self.draft.working().cloned(),
         })
     }
 
@@ -1477,7 +1492,7 @@ impl Workspace {
     /// `undo`/`op restore` restores to (the oplog captures `.loot/bisect`).
     fn surface_target(&self) -> Option<Oid> {
         self.active_bisect_midpoint()
-            .or_else(|| self.working.clone())
+            .or_else(|| self.draft.working().cloned())
             .or_else(|| self.position.tip().cloned())
             .or_else(|| self.repo.heads().into_iter().next())
     }
@@ -1569,7 +1584,7 @@ impl Workspace {
                 "a bisect is already in progress — `loot bisect reset` to end it first".into(),
             );
         }
-        let reflected = self.working.clone().or_else(|| self.anchor());
+        let reflected = self.draft.working().cloned().or_else(|| self.anchor());
         if self.tree_is_dirty_over(reflected.as_ref())? {
             return Err(REFUSE_UNCAPTURED_TREE.into());
         }
@@ -1805,7 +1820,7 @@ impl Workspace {
     /// abandon` targets a version by this id.
     pub fn resolve_live_version(&self, prefix: &str) -> Result<Oid, CliError> {
         let lv = self.liveness();
-        let working = self.working.clone();
+        let working = self.draft.working().cloned();
         let matches: Vec<Oid> = self
             .version_ids()
             .into_iter()
@@ -1834,7 +1849,7 @@ impl Workspace {
     pub fn resolve_selector(&self, sel: &str) -> Result<Oid, CliError> {
         // `@` — the working change (its live version's tree).
         if sel == "@" {
-            return self.working.clone().ok_or_else(|| {
+            return self.draft.working().cloned().ok_or_else(|| {
                 "@ names the working change, but there is none \
                  (run `loot describe -m \"<subject>\"` to start one)"
                     .into()
@@ -1872,7 +1887,7 @@ impl Workspace {
     /// Refuses honestly when the dock has diverged onto several heads with no
     /// working change or pinned tip to disambiguate — naming them to paste.
     fn resolve_head(&self) -> Result<Oid, CliError> {
-        if self.position.tip().is_none() && self.working.is_none() {
+        if self.position.tip().is_none() && self.draft.working().is_none() {
             let heads = self.heads();
             if heads.len() > 1 {
                 let ids: Vec<String> = heads.iter().map(short_version).collect();
@@ -2242,7 +2257,7 @@ impl Workspace {
         // The unsigned working change is never a target: adopt settles a dock on
         // *landed* work (§4). Name that precisely before the generic resolver's
         // "no live version" — the operator pointed at their own WIP.
-        if let Some(w) = &self.working {
+        if let Some(w) = self.draft.working() {
             if loot_core::hex::encode(&w.0).starts_with(prefix) {
                 return Err(
                     "cannot adopt onto an unsigned working change — adopt settles a dock on \
@@ -2274,7 +2289,7 @@ impl Workspace {
             let (_, clean) = self.repo.working_preview(anchor.as_ref(), &entries, "", self.now);
             !clean
         };
-        let has_wip = self.working.is_some() || dirty;
+        let has_wip = self.draft.working().is_some() || dirty;
         if has_wip && !discard_wip {
             return Err(
                 "the dock has work adopt would discard — finalize it (`loot new`) or walk it \
@@ -2319,9 +2334,9 @@ impl Workspace {
 
         // Drop the WIP first so the working node stops being a competing head.
         let discarded_wip = has_wip;
-        if let Some(w) = self.working.clone() {
+        if let Some(w) = self.draft.working().cloned() {
             self.repo.drop_working(&w);
-            self.working = None;
+            self.draft.clear();
         }
 
         // Abandon every competing head to a fixpoint: dropping a merge head
@@ -2420,7 +2435,7 @@ impl Workspace {
         // anchor, or is empty, is not local work: drop it so the catch-up
         // fast-forwards instead of minting a merge that re-lands the same
         // tree.
-        if let Some(mut w) = self.working.clone() {
+        if let Some(mut w) = self.draft.working().cloned() {
             // Refresh a stale capture first: the disk may have moved *past* it
             // (a `git reset` onto landed main left an older-era snapshot
             // behind — the #265 dogfood case). `capture_uncaptured_edits`
@@ -2444,7 +2459,7 @@ impl Workspace {
                 || anchor.as_ref().is_some_and(|a| self.repo.same_tree_content(a, &w, self.now));
             if redundant {
                 self.repo.drop_working(&w);
-                self.working = None;
+                self.draft.clear();
                 self.persist()?;
             }
         }
@@ -2454,7 +2469,7 @@ impl Workspace {
         // primary's tip == git-main after a lane land (the common case, unlike
         // `dock merge` which reports the fold as merge outcomes). With captured
         // WIP we fall through to the merge, folding the local line in.
-        if self.working.is_none() {
+        if self.draft.working().is_none() {
             if let Some(o) = anchor.clone() {
                 if self.graph().is_ancestor(&o, &their) {
                     self.fast_forward_to(&o, &their)?;
@@ -2561,7 +2576,7 @@ impl Workspace {
         // Refuse rather than capture (ADR 0032/0030): capture-first would
         // strand the WIP as an unsigned stray head, and carrying it would mix
         // in-flight work into the reopened change's content.
-        if self.working.is_some() {
+        if self.draft.working().is_some() {
             return Err(
                 "a working change is in progress — finalize it (`loot new`) or walk it back \
                  (`loot undo`) first; `edit` replaces the working change"
@@ -2628,7 +2643,7 @@ impl Workspace {
         // seeded, re-anchors and so amends as a sibling.
         let reopened = self.repo.reopen_change(&target).map_err(CliError::from)?;
         let parent = self.repo.parents_of(&target).into_iter().next();
-        self.working = Some(reopened.clone());
+        self.draft.activate(reopened.clone());
         self.position.advance(&self.store, parent);
         // Prime the snapshot-idempotence hash for the reopened content so the
         // next command doesn't spuriously re-record an unchanged tree.
@@ -2704,8 +2719,9 @@ impl Workspace {
         let msg = self.working_message_or_placeholder();
         self.snapshot_allowing(&msg, &[])?;
         let working = self
-            .working
-            .clone()
+            .draft
+            .working()
+            .cloned()
             .ok_or("nothing to split — there is no working change (make some edits first)")?;
         let working_tree = self.repo.change_tree(&working).unwrap_or_default();
 
@@ -2772,7 +2788,7 @@ impl Workspace {
         // already the first split's parent — no dangling live head remains).
         self.repo.drop_working(&working);
 
-        self.working = Some(remainder.clone());
+        self.draft.activate(remainder.clone());
         self.position.advance(&self.store, Some(first.clone()));
         // Prime the snapshot-idempotence hash for the remainder's tree so the
         // next command does not spuriously re-record the unchanged working tree.
@@ -2827,8 +2843,9 @@ impl Workspace {
         let msg = self.working_message_or_placeholder();
         self.snapshot_allowing(&msg, &[])?;
         let source = self
-            .working
-            .clone()
+            .draft
+            .working()
+            .cloned()
             .ok_or("nothing to squash — there is no working change (make some edits first)")?;
         let source_tree = self.repo.change_tree(&source).unwrap_or_default();
 
@@ -2964,11 +2981,7 @@ impl Workspace {
         // The source's content now lives entirely in the new tip; abandon the
         // unsigned working draft and start a fresh working change on the tip.
         self.repo.drop_working(&source);
-        self.working = None;
-        self.position.seed(&self.store, Some(cur_parent.clone()));
-        self.store.clear_tree_hash(self.dock_opt());
-        self.next_change_id = self.repo.mint_next_change_id();
-        self.persist()?;
+        self.restart_on(cur_parent.clone())?;
         self.record_op(
             "squash",
             &format!(
@@ -3041,8 +3054,9 @@ impl Workspace {
         let msg = self.working_message_or_placeholder();
         self.snapshot_allowing(&msg, &[])?;
         let source = self
-            .working
-            .clone()
+            .draft
+            .working()
+            .cloned()
             .ok_or("nothing to absorb — there is no working change (make some edits first)")?;
         let source_tree = self.repo.change_tree(&source).unwrap_or_default();
         let parent = self
@@ -3186,22 +3200,14 @@ impl Workspace {
         // leftover leaves no working change at all (like squash).
         let src_msg = self.repo.change_message(&source).unwrap_or_default();
         self.repo.drop_working(&source);
-        self.working = None;
-        self.position.seed(&self.store, Some(new_tip.clone()));
-        self.store.clear_tree_hash(self.dock_opt());
-        self.next_change_id = self.repo.mint_next_change_id();
-        self.persist()?;
+        self.restart_on(new_tip.clone())?;
         self.snapshot_allowing(&src_msg, &[])?;
-        if let Some(w) = self.working.clone() {
+        if let Some(w) = self.draft.working().cloned() {
             let wt = self.repo.change_tree(&w).unwrap_or_default();
             let tip_tree = self.repo.change_tree(&new_tip).unwrap_or_default();
             if tree_delta(&tip_tree, &wt).is_empty() {
                 self.repo.drop_working(&w);
-                self.working = None;
-                self.position.seed(&self.store, Some(new_tip.clone()));
-                self.store.clear_tree_hash(self.dock_opt());
-                self.next_change_id = self.repo.mint_next_change_id();
-                self.persist()?;
+                self.restart_on(new_tip.clone())?;
             }
         }
 
@@ -3244,8 +3250,7 @@ impl Workspace {
             repo,
             // A fresh repo starts on the home dock with pre-dock semantics.
             position: Position::fresh(HOME_DOCK.to_string()),
-            working: None,
-            next_change_id: None,
+            draft: Draft::Clean,
             // A freshly-initialized repo has no keypair yet (`loot keygen` adds one);
             // its early changes are unauthored until then (S3, ADR 0018).
             signer: None,
@@ -3282,7 +3287,7 @@ impl Workspace {
     /// from here. Uses the pinned tip when present, else derives it from the
     /// graph (the pre-dock home case): the working change's parent, or the head.
     fn anchor(&self) -> Option<Oid> {
-        self.position.anchor(&self.repo, self.working.as_ref())
+        self.position.anchor(&self.repo, self.draft.working())
     }
 
     // Named docks and in-place switching are fully retired (#253/ADR 0034):
@@ -3431,7 +3436,7 @@ impl Workspace {
         // that adds nothing over our tip is dropped rather than signed (and so
         // never nagged about), exactly as `finalize_capturing` and the bridge's
         // `reconcile_capture` do.
-        if self.working.is_some() {
+        if self.draft.working().is_some() {
             // Mis-seal gate (#353, ADR 0038 §1): this capture-and-sign is a
             // signing seam too — a secret that reached the disk after the WIP
             // was described (describe's own gate ran on the pre-secret tree)
@@ -3470,7 +3475,7 @@ impl Workspace {
             .repo
             .merge_tips(&ours, their, msg, self.now)
             .map_err(CliError::from)?;
-        self.working = Some(merge_id.clone());
+        self.draft.activate(merge_id.clone());
         self.finalize_working()?;
         self.repo
             .materialize(Some(&ours), &merge_id, &self.identity, self.now)
@@ -3501,7 +3506,7 @@ impl Workspace {
     pub fn capture_uncaptured_edits(&mut self) -> Result<Option<Oid>, CliError> {
         // An in-progress working change already holds the edits and converge
         // defers on it; there is nothing new to capture.
-        if let Some(w) = &self.working {
+        if let Some(w) = self.draft.working() {
             return Ok(Some(w.clone()));
         }
         let anchor = self.anchor();
@@ -3651,7 +3656,7 @@ impl Workspace {
         // You cannot fold heads under an in-progress working change without
         // orphaning it, so converge defers whenever capture-first captured a
         // dirty tree — ingest already ran; the operator finalizes then re-pulls.
-        if self.working.is_some() {
+        if self.draft.working().is_some() {
             return Ok(BTreeMap::new());
         }
         // Chokepoint (#219): evaluate dirtiness ONCE, up front — before any
@@ -3732,7 +3737,7 @@ impl Workspace {
                 .repo
                 .merge_tips(&acc, &h, &msg, self.now)
                 .map_err(CliError::from)?;
-            self.working = Some(merge_id.clone());
+            self.draft.activate(merge_id.clone());
             self.finalize_working()?;
             acc = merge_id;
             for (path, outcome) in outcomes {
@@ -4073,7 +4078,7 @@ impl Workspace {
         // the tree.
         let covered = pinned.is_some_and(|o| {
             o == target || self.graph().is_ancestor(target, o) || self.repo.supersedes(o, target)
-        }) || self.working.as_ref().is_some_and(|w| self.repo.supersedes(w, target));
+        }) || self.draft.working().is_some_and(|w| self.repo.supersedes(w, target));
         if covered {
             return Ok((BTreeMap::new(), None));
         }
@@ -4303,7 +4308,7 @@ impl Workspace {
             .repo
             .merge_tips(ours, their, message, self.now)
             .map_err(CliError::from)?;
-        self.working = Some(merge_id.clone());
+        self.draft.activate(merge_id.clone());
         self.finalize_working()?;
         self.repo
             .materialize(Some(ours), &merge_id, &self.identity, self.now)
@@ -4319,12 +4324,9 @@ impl Workspace {
         // Two-root save (ADR 0034): shared artifacts to the store root, this
         // position's heads/working-change to the lane root (equal on the primary).
         self.repo.save_to(&self.store).map_err(CliError::from)?;
-        self.store
-            .write_working(self.dock_opt(), self.working.as_ref())
-            .map_err(|e| format!("write working: {e}"))?;
-        self.store
-            .write_next_change(self.dock_opt(), self.next_change_id.as_ref())
-            .map_err(|e| CliError::from(format!("write next-change: {e}")))
+        self.draft
+            .flush(&self.store, self.dock_opt())
+            .map_err(|e| CliError::from(format!("write working state: {e}")))
     }
 }
 
@@ -7592,7 +7594,7 @@ mod tests {
 
         // Refusing is safe, not lossy: the capture still happened, so the edits
         // are held in the working change — only the *signing* was withheld.
-        assert!(ws.working.is_some(), "the edits were captured, not dropped");
+        assert!(ws.working_id().is_some(), "the edits were captured, not dropped");
         assert_eq!(ws.finalized_anchor(), None, "nothing was signed");
 
         // And naming it clears the refusal — the two-step the hint now points at.
@@ -7714,7 +7716,7 @@ mod tests {
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
         let err = ws.finalize_capturing(&[], false).unwrap_err();
         assert!(err.message.contains("describe"), "the refusal names the verb to run: {err}");
-        assert!(ws.working.is_some(), "the deletion capture is held, not dropped");
+        assert!(ws.working_id().is_some(), "the deletion capture is held, not dropped");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7735,7 +7737,7 @@ mod tests {
         ws.snapshot("chore: describes nothing new").unwrap();
         assert_eq!(ws.finalize_capturing(&[], false).unwrap(), None, "identical capture dropped");
         assert_eq!(ws.finalized_anchor(), tip, "the tip did not move");
-        assert!(ws.working.is_none(), "no stray working change left behind");
+        assert!(ws.working_id().is_none(), "no stray working change left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8212,7 +8214,7 @@ mod tests {
         // An in-progress working change to stack the duplicate on top of.
         std::fs::write(dir.join("wip.txt"), b"W").unwrap();
         ws.snapshot("wip").unwrap();
-        let working = ws.working.clone().expect("a working change is in progress");
+        let working = ws.working_id().cloned().expect("a working change is in progress");
 
         let source_hex = loot_core::hex::encode(&source.0);
         let report = ws.duplicate(&source_hex, None).unwrap();
@@ -8224,7 +8226,7 @@ mod tests {
             "the copy is stacked on top of the working change"
         );
         assert_eq!(
-            ws.working,
+            ws.working_id().cloned(),
             Some(working),
             "the working change is left in place — duplicate does not become it"
         );

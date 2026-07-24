@@ -246,6 +246,29 @@ two of those sites disagree. `Workspace` keeps every old public accessor
 nothing outside `workspace.rs` needs to know `Position` exists. See
 [[Lane]]/[[Dock]]/[[Harbor]] for what a position sits *on*.
 
+**Draft** *(shipped this wave; `crates/loot-cli/src/draft.rs`)* — the sibling of
+[[Position]] for the *state* half of ADR 0034's "position is place, not state":
+the CLI's local state of the [[Working change]] — the working-change pointer
+*and* the eagerly-minted next-change handle (ADR 0029/0030) — held as **one**
+state machine rather than two loose [[Workspace]] fields. Its three legal
+variants are `Clean` (no working change, nothing armed), `Fresh` (a durable
+handle minted before any snapshot — `loot init`/`loot new` land here), and
+`Active` (a working change in progress; its own change id is the handle now).
+The fourth combination — a working change *and* a pending handle — is **never
+valid** (once a change exists the pending handle is dead), so the enum makes it
+*unconstructable*; every transition into `Active` drops the pending handle by
+construction, and `load` self-heals a legacy `(working, pending)` pair on disk.
+Before this module the two facts were hand-mutated at ~19 sites, each owing the
+invariant that they move together — the same missing-locality shape [[Position]]
+fixed for `tip` (the `edit`-from-`Fresh` path even transiently built the illegal
+state, leaking the dead handle until the next finalize overwrote it). Interface:
+`arm` / `activate` / `take` / `clear` + `load`/`flush`; minting stays in the
+caller (`Workspace`), so `Draft`'s whole dependency surface is [[RepoStore]],
+like `Position`. The composite dances that also move the [[Position]] tip
+(restart-on-anchor for `squash`/`absorb`, the finalize hand-off) are named
+`Workspace` coordinators over both modules. `Workspace` keeps every old public
+accessor (`working_id`, `next_change_id`) delegating here.
+
 **Shared store** *(the "share only the immutable store" half of ADR 0034;
 ownership classes locked #228, audited #230)* — the append-only surface every
 [[Lane]] forks over without a second clone: `objects/`, `graph`, `keyring`,
