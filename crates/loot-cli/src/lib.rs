@@ -27,6 +27,7 @@ pub mod ferry;
 pub mod flags;
 pub mod grep;
 pub mod history;
+pub mod hunks;
 mod kv;
 pub mod ledger;
 pub mod mergetool;

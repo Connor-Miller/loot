@@ -9,6 +9,7 @@
 //! the engine reconciles, and persists state after a mutation.
 
 use crate::draft::Draft;
+use crate::hunks;
 use crate::position::Position;
 use crate::reconcile::{self, REFUSE_UNDESCRIBED_PARENT};
 use loot_core::bridge::{FerryState, MarkMap};
@@ -3090,13 +3091,9 @@ impl Workspace {
             chain.iter().cloned().enumerate().map(|(i, id)| (id, i)).collect();
 
         // --- Phase A: attribute hunks (immutable reads only) ---
-        struct PathPlan {
-            parent_lines: Vec<String>,
-            movable: Vec<(LineHunk, usize)>, // (hunk, target chain index)
-        }
-        let mut path_plans: BTreeMap<PathBuf, PathPlan> = BTreeMap::new();
+        let mut path_plans: BTreeMap<PathBuf, hunks::PathHunks> = BTreeMap::new();
         let mut absorbed: Vec<(PathBuf, Oid)> = Vec::new();
-        let mut stayed: Vec<(PathBuf, AbsorbStay)> = Vec::new();
+        let mut stayed: Vec<(PathBuf, hunks::Stay)> = Vec::new();
 
         for path in source_delta.keys() {
             // Only a line-diffable modification distributes: the path present and
@@ -3105,29 +3102,23 @@ impl Workspace {
             let (Some((p_oid, _)), Some((s_oid, _))) =
                 (parent_tree.get(path), source_tree.get(path))
             else {
-                stayed.push((path.clone(), AbsorbStay::NoAncestor));
+                stayed.push((path.clone(), hunks::Stay::NoAncestor));
                 continue;
             };
             let (Ok(p_bytes), Ok(s_bytes)) = (
                 self.repo.get(p_oid, &self.identity, self.now),
                 self.repo.get(s_oid, &self.identity, self.now),
             ) else {
-                stayed.push((path.clone(), AbsorbStay::Sealed));
+                stayed.push((path.clone(), hunks::Stay::Sealed));
                 continue;
             };
-            let p_lines = split_content_lines(&p_bytes);
-            let s_lines = split_content_lines(&s_bytes);
+            // The line algebra lives in `hunks`: attribute the parent→working
+            // delta to owning ancestors, using this path's parent-side blame.
             let owners = self.blame_owners_at(&parent, path);
-
-            let mut movable = Vec::new();
-            for h in diff_hunks(&p_lines, &s_lines) {
-                match attribute_hunk(&h, &owners, &index_of, p_lines.len()) {
-                    HunkTarget::Ancestor(idx) => movable.push((h, idx)),
-                    HunkTarget::Stay(reason) => stayed.push((path.clone(), reason)),
-                }
-            }
-            if !movable.is_empty() {
-                path_plans.insert(path.clone(), PathPlan { parent_lines: p_lines, movable });
+            let (plan, path_stays) = hunks::attribute(&p_bytes, &s_bytes, &owners, &index_of);
+            stayed.extend(path_stays.into_iter().map(|reason| (path.clone(), reason)));
+            if let Some(plan) = plan {
+                path_plans.insert(path.clone(), plan);
             }
         }
 
@@ -3139,16 +3130,16 @@ impl Workspace {
 
         let maxdepth = path_plans
             .values()
-            .flat_map(|pp| pp.movable.iter().map(|(_, j)| *j))
+            .flat_map(|pp| pp.targets())
             .max()
             .expect("path_plans is non-empty");
 
         // Report which ORIGINAL ancestor each hunk lands in (before superseding).
         let mut targets: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for (path, pp) in &path_plans {
-            for (_, j) in &pp.movable {
-                absorbed.push((path.clone(), chain[*j].clone()));
-                targets.insert(*j);
+            for j in pp.targets() {
+                absorbed.push((path.clone(), chain[j].clone()));
+                targets.insert(j);
             }
         }
 
@@ -3163,24 +3154,19 @@ impl Workspace {
             let original = chain[i].clone();
             let mut new_tree = self.repo.change_tree(&original).unwrap_or_default();
             let is_target = targets.contains(&i);
-            for (path, pp) in &path_plans {
-                let in_effect: Vec<&LineHunk> =
-                    pp.movable.iter().filter(|(_, j)| *j >= i).map(|(h, _)| h).collect();
-                if in_effect.is_empty() {
-                    continue;
-                }
+            for (path, plan) in &path_plans {
                 let Some((oid, vis)) = new_tree.get(path).cloned() else {
                     continue;
                 };
                 let Ok(base_bytes) = self.repo.get(&oid, &self.identity, self.now) else {
                     continue;
                 };
-                let base_lines = split_content_lines(&base_bytes);
-                let Some(new_lines) = apply_hunks(&base_lines, &pp.parent_lines, &in_effect) else {
+                // `apply_at` folds only the hunks in effect at this ancestor and
+                // returns `None` (skip) when none apply or the splice would not
+                // land cleanly on this content.
+                let Some(new_bytes) = plan.apply_at(i, &base_bytes) else {
                     continue;
                 };
-                let new_bytes =
-                    join_content_lines(&new_lines, base_bytes.last() == Some(&b'\n'));
                 let new_oid = self.repo.put(&new_bytes, vis.clone()).map_err(CliError::from)?;
                 new_tree.insert(path.clone(), (new_oid, vis));
             }
@@ -4437,193 +4423,18 @@ fn apply_delta(
 }
 
 // --- `loot absorb` (#399): auto-distribute the working delta's hunks ---
-
-/// Why a hunk could not be absorbed and so stays in the working change. Absorb
-/// only moves what it can attribute to a readable ancestor (the key-oracle rule
-/// `blame`/`grep` share); everything else is left exactly where it was.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AbsorbStay {
-    /// No ancestor cleanly owns the lines the hunk touches — a new file, a
-    /// deletion, or lines with no origin in the walked history.
-    NoAncestor,
-    /// The ancestor that owns the lines is sealed to this identity (its content
-    /// cannot be opened), so `blame` renders its origin `<sealed>` and absorb
-    /// refuses to fold blindly into content it cannot read.
-    Sealed,
-}
+// The line algebra this drives lives in [`crate::hunks`]; `absorb` orchestrates
+// the chain-walk and the sealing/superseding only it can do.
 
 /// What [`Workspace::absorb`] returns: the hunks it folded into ancestors (each
 /// paired with the ORIGINAL ancestor version it landed in, still in the graph,
-/// now superseded), the hunks it left behind with the reason, and the count of
-/// intervening changes it rewrote so the moved hunks stay consistent.
+/// now superseded), the hunks it left behind with the reason ([`hunks::Stay`]),
+/// and the count of intervening changes it rewrote so the moved hunks stay
+/// consistent.
 pub struct AbsorbReport {
     pub absorbed: Vec<(PathBuf, Oid)>,
-    pub stayed: Vec<(PathBuf, AbsorbStay)>,
+    pub stayed: Vec<(PathBuf, hunks::Stay)>,
     pub rebased: usize,
-}
-
-/// One contiguous changed region turning a path's parent-side content `p` into
-/// its working-side content: parent lines `[p0, p1)` are replaced by `lines`
-/// (the working-side text of the region). A pure insertion has `p0 == p1`; a
-/// pure deletion has empty `lines`. Absorb attributes each hunk to the ancestor
-/// that owns the parent lines it touches, then folds it there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LineHunk {
-    p0: usize,
-    p1: usize,
-    lines: Vec<String>,
-}
-
-/// Decompose one path's parent→working line delta into [`LineHunk`]s, using the
-/// same LCS alignment `blame` walks ([`crate::blame::lcs_match`]): the matched
-/// lines are unchanged anchors, and every maximal run of non-anchor parent
-/// and/or working lines between two anchors (and before the first / after the
-/// last) is one hunk.
-fn diff_hunks(p: &[String], s: &[String]) -> Vec<LineHunk> {
-    let p_to_s = crate::blame::lcs_match(p, s);
-    let mut anchors: Vec<(usize, usize)> = Vec::new();
-    for (pi, m) in p_to_s.iter().enumerate() {
-        if let Some(sj) = *m {
-            anchors.push((pi, sj));
-        }
-    }
-    anchors.push((p.len(), s.len())); // sentinel that closes the trailing region
-    let mut out = Vec::new();
-    let (mut prev_p, mut prev_s) = (0usize, 0usize);
-    for (pi, sj) in anchors {
-        if pi > prev_p || sj > prev_s {
-            out.push(LineHunk { p0: prev_p, p1: pi, lines: s[prev_s..sj].to_vec() });
-        }
-        prev_p = pi + 1;
-        prev_s = sj + 1;
-    }
-    out
-}
-
-/// Apply hunks (defined against the parent content `p`) onto a *different*
-/// content `base` — an ancestor's own version of the path — that shares the
-/// parent lines each hunk touches. The lines a hunk targets trace (via blame)
-/// to `base`'s change or older, so they appear verbatim and contiguous in
-/// `base`; [`crate::blame::lcs_match`] locates them. Returns `None` (leave the
-/// hunk unabsorbed rather than corrupt the ancestor) if a hunk's parent lines
-/// are not present as a contiguous run, or if two hunks' target regions overlap.
-fn apply_hunks(base: &[String], p: &[String], hunks: &[&LineHunk]) -> Option<Vec<String>> {
-    let p_to_base = crate::blame::lcs_match(p, base);
-    let mut splices: Vec<(usize, usize, Vec<String>)> = Vec::new();
-    for h in hunks {
-        if h.p1 > h.p0 {
-            // A modification/deletion: the removed parent lines must all be
-            // present in `base` and contiguous there.
-            let mut mapped = Vec::with_capacity(h.p1 - h.p0);
-            for k in h.p0..h.p1 {
-                mapped.push((*p_to_base.get(k)?)?);
-            }
-            for w in mapped.windows(2) {
-                if w[1] != w[0] + 1 {
-                    return None;
-                }
-            }
-            let b0 = mapped[0];
-            let b1 = mapped[mapped.len() - 1] + 1;
-            splices.push((b0, b1, h.lines.clone()));
-        } else {
-            // A pure insertion: anchor on the parent line before it (else after,
-            // else the end of `base`).
-            let bpos = if h.p0 > 0 {
-                (*p_to_base.get(h.p0 - 1)?)? + 1
-            } else if h.p0 < p.len() {
-                (*p_to_base.get(h.p0)?)?
-            } else {
-                base.len()
-            };
-            splices.push((bpos, bpos, h.lines.clone()));
-        }
-    }
-    splices.sort_by_key(|s| s.0);
-    let mut out = Vec::new();
-    let mut cur = 0usize;
-    for (b0, b1, lines) in splices {
-        if b0 < cur {
-            return None; // overlapping splices — refuse rather than corrupt
-        }
-        out.extend_from_slice(&base[cur..b0]);
-        out.extend(lines);
-        cur = b1;
-    }
-    out.extend_from_slice(&base[cur..]);
-    Some(out)
-}
-
-/// Where a hunk was routed by [`attribute_hunk`]: the chain index of the
-/// nearest owning ancestor, or a reason it stays in the working change.
-enum HunkTarget {
-    Ancestor(usize),
-    Stay(AbsorbStay),
-}
-
-/// Attribute one hunk to the NEAREST ancestor that last modified the parent
-/// lines it touches, via the parent-side blame `owners` (one [`crate::blame::Attr`]
-/// per parent line). `index_of` maps a change to its first-parent chain index
-/// (smaller = nearer/newer), so the nearest owner is the one with the smallest
-/// index. A modification/deletion touches its removed lines; a pure insertion
-/// touches the parent lines bracketing the insertion point. A touched line
-/// whose origin is `<sealed>` sends the whole hunk to [`AbsorbStay::Sealed`];
-/// no ancestor owner at all is [`AbsorbStay::NoAncestor`].
-fn attribute_hunk(
-    h: &LineHunk,
-    owners: &[crate::blame::Attr],
-    index_of: &BTreeMap<Oid, usize>,
-    p_len: usize,
-) -> HunkTarget {
-    use crate::blame::Attr;
-    let mut touched: Vec<usize> = Vec::new();
-    if h.p1 > h.p0 {
-        touched.extend(h.p0..h.p1);
-    } else {
-        if h.p0 > 0 {
-            touched.push(h.p0 - 1);
-        }
-        if h.p0 < p_len {
-            touched.push(h.p0);
-        }
-    }
-    if touched.is_empty() {
-        return HunkTarget::Stay(AbsorbStay::NoAncestor);
-    }
-    let mut best: Option<usize> = None;
-    for t in touched {
-        match owners.get(t) {
-            Some(Attr::Change(id)) => {
-                if let Some(&idx) = index_of.get(id) {
-                    best = Some(best.map_or(idx, |b: usize| b.min(idx)));
-                }
-            }
-            Some(Attr::Sealed) => return HunkTarget::Stay(AbsorbStay::Sealed),
-            None => {}
-        }
-    }
-    match best {
-        // index 0 is the working change itself (a novel line) — not an ancestor.
-        Some(idx) if idx >= 1 => HunkTarget::Ancestor(idx),
-        _ => HunkTarget::Stay(AbsorbStay::NoAncestor),
-    }
-}
-
-/// Split raw bytes into lines for hunk math (lossy-UTF8, dropping the trailing
-/// newline), the twin of `join_content_lines`. Mirrors `blame::split_lines`.
-fn split_content_lines(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes).lines().map(str::to_string).collect()
-}
-
-/// Rejoin lines into bytes, restoring a trailing newline when the source had
-/// one — so a re-sealed ancestor's content matches on-disk content byte-for-byte
-/// where the plaintext is unchanged (letting the snapshot dedup reuse its oid).
-fn join_content_lines(lines: &[String], trailing_nl: bool) -> Vec<u8> {
-    let mut s = lines.join("\n");
-    if trailing_nl && !lines.is_empty() {
-        s.push('\n');
-    }
-    s.into_bytes()
 }
 
 /// The follow-up-round recovery recipe (#418, map #354): what to do once a
@@ -8840,52 +8651,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_hunks_decomposes_a_modification_and_an_insertion() {
-        let p = split_content_lines(b"a\nb\nc\n");
-        // Modify "b" -> "B" and insert "x" after "c".
-        let s = split_content_lines(b"a\nB\nc\nx\n");
-        let hunks = diff_hunks(&p, &s);
-        assert_eq!(
-            hunks,
-            vec![
-                LineHunk { p0: 1, p1: 2, lines: vec!["B".into()] },
-                LineHunk { p0: 3, p1: 3, lines: vec!["x".into()] },
-            ]
-        );
-    }
-
-    #[test]
-    fn apply_hunks_splices_into_a_smaller_ancestor_content() {
-        // Parent has 4 lines; the ancestor (base) has only the first three of
-        // them (the 4th was added later). A hunk over the parent's line 0 still
-        // lands in the ancestor because that line is present there.
-        let p = split_content_lines(b"alpha\nbeta\ngamma\ndelta\n");
-        let base = split_content_lines(b"alpha\nbeta\ngamma\n");
-        let hunk = LineHunk { p0: 0, p1: 1, lines: vec!["alphaX".into()] };
-        let got = apply_hunks(&base, &p, &[&hunk]).unwrap();
-        assert_eq!(got, split_content_lines(b"alphaX\nbeta\ngamma\n"));
-    }
-
-    #[test]
-    fn attribute_hunk_routes_a_sealed_owner_to_stay() {
-        use crate::blame::Attr;
-        let owners = vec![Attr::Sealed, Attr::Change(Oid([9; 32]))];
-        let index_of = BTreeMap::from([(Oid([9; 32]), 1usize)]);
-        // A hunk touching the sealed parent line 0 stays.
-        let sealed = LineHunk { p0: 0, p1: 1, lines: vec!["x".into()] };
-        assert!(matches!(
-            attribute_hunk(&sealed, &owners, &index_of, 2),
-            HunkTarget::Stay(AbsorbStay::Sealed)
-        ));
-        // A hunk touching line 1 (owned by change 9 at index 1) is absorbable.
-        let clean = LineHunk { p0: 1, p1: 2, lines: vec!["y".into()] };
-        assert!(matches!(
-            attribute_hunk(&clean, &owners, &index_of, 2),
-            HunkTarget::Ancestor(1)
-        ));
-    }
-
-    #[test]
     fn absorb_routes_each_hunk_to_its_owning_ancestor_and_rebases_the_intervening() {
         let dir = std::env::temp_dir().join(format!("loot-absorb-two-{}", std::process::id()));
         let mut ws = authored_ws(&dir);
@@ -8966,7 +8731,7 @@ mod tests {
         assert!(report.absorbed.is_empty(), "nothing had an ancestor");
         assert_eq!(
             report.stayed,
-            vec![(PathBuf::from("novel.txt"), AbsorbStay::NoAncestor)],
+            vec![(PathBuf::from("novel.txt"), hunks::Stay::NoAncestor)],
             "the new file stays with a NoAncestor reason"
         );
         assert_eq!(ws.working_id(), Some(&source), "the working change is untouched");
@@ -9042,7 +8807,7 @@ mod tests {
         assert_eq!(report.absorbed, vec![(PathBuf::from("f"), a3.clone())], "L4 -> A3");
         assert_eq!(
             report.stayed,
-            vec![(PathBuf::from("f"), AbsorbStay::Sealed)],
+            vec![(PathBuf::from("f"), hunks::Stay::Sealed)],
             "L1's owning ancestor is sealed — it stays"
         );
         let a3p = live1(&ws, &a3_cid);

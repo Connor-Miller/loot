@@ -54,7 +54,10 @@ pub struct BlameVersion {
 
 /// Split raw bytes into display lines. Lossy-UTF8 so a stray non-text byte
 /// annotates rather than aborts (blame is a best-effort read, never a gate).
-fn split_lines(bytes: &[u8]) -> Vec<String> {
+/// `pub(crate)` so [`crate::hunks`] — the write-side twin of this read-side
+/// line-ancestry engine — splits parent/base content the same way, keeping the
+/// two sides' line-spaces identical (its `owners` come from here).
+pub(crate) fn split_lines(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes).lines().map(str::to_string).collect()
 }
 

@@ -16,7 +16,8 @@
 use crate::emit::{self, Emit};
 use crate::error::CliError;
 use crate::render::{short, short_change};
-use crate::workspace::{AbsorbStay, Workspace};
+use crate::hunks::Stay;
+use crate::workspace::Workspace;
 use std::fmt::Write as _;
 
 /// `loot split -m <subject> <path...>` — cut the named paths out of the working
@@ -125,8 +126,8 @@ pub fn cmd_absorb(_args: &[String]) -> Result<Box<dyn Emit>, CliError> {
         );
         for (path, reason) in &report.stayed {
             let why = match reason {
-                AbsorbStay::NoAncestor => "no ancestor owns these lines (new file or novel lines)",
-                AbsorbStay::Sealed => "the owning ancestor is sealed to you — no key to read it",
+                Stay::NoAncestor => "no ancestor owns these lines (new file or novel lines)",
+                Stay::Sealed => "the owning ancestor is sealed to you — no key to read it",
             };
             let _ = writeln!(out, "  {} — {}", path.display(), why);
         }
